@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package replication;
+
+import "convex_identity.proto";
+
+// Service for forwarding mutations from Replica nodes to the Primary.
+// Replicas call ForwardMutation when they receive a mutation request
+// from a client, and the Primary executes it locally.
+service MutationForwarder {
+  rpc ForwardMutation(ForwardMutationRequest) returns (ForwardMutationResponse);
+}
+
+message ForwardMutationRequest {
+  // The function path to execute (e.g., "messages:send").
+  string path = 1;
+
+  // Serialized function arguments as a JSON array string.
+  string args = 2;
+
+  // The authenticated identity of the caller.
+  convex_identity.UncheckedIdentity identity = 3;
+
+  // Caller type for logging and rate limiting.
+  string caller = 4;
+
+  // Optional mutation identifier for idempotency.
+  // If set, the Primary will return the cached result if this mutation
+  // was already committed.
+  optional bytes mutation_identifier = 5;
+
+  // Optional hint about the mutation queue length on the Replica.
+  optional uint64 mutation_queue_length = 6;
+}
+
+message ForwardMutationResponse {
+  oneof result {
+    MutationSuccess success = 1;
+    MutationError error = 2;
+  }
+}
+
+message MutationSuccess {
+  // The return value as a JSON string.
+  string value = 1;
+
+  // Log lines captured during execution.
+  repeated string log_lines = 2;
+
+  // The commit timestamp.
+  uint64 ts = 3;
+}
+
+message MutationError {
+  // Error message from the mutation execution.
+  string error_message = 1;
+
+  // Optional structured error data as JSON.
+  optional string error_data = 2;
+
+  // Log lines captured during execution.
+  repeated string log_lines = 3;
+}
