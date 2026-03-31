@@ -83,6 +83,7 @@ postgres = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 runtime = { workspace = true }
+rustls = { version = "0.23", features = ["ring"] }
 search = { workspace = true }
 sentry = { workspace = true }
 sentry-tracing = { workspace = true }

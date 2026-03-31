@@ -40,6 +40,10 @@ use tokio::{
 };
 
 fn main() -> Result<(), MainError> {
+    // Install rustls crypto provider before any TLS connections.
+    // Required because async-nats pulls in rustls which needs an explicit provider.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let _guard = config_service();
     let config = LocalConfig::parse();
     tracing::info!("Starting a Convex backend");
