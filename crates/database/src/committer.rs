@@ -906,9 +906,13 @@ impl<RT: Runtime> Committer<RT> {
             write_bytes,
         };
         let distributed_log = self.distributed_log.clone();
+        let delta_ts = commit_ts;
         tokio_spawn("publish_commit_delta", async move {
             if let Err(e) = distributed_log.publish(delta).await {
-                tracing::error!("Failed to publish commit delta: {e:?}");
+                tracing::error!(
+                    "Failed to publish commit delta at ts={}: {e:#}",
+                    u64::from(delta_ts)
+                );
             }
         });
 

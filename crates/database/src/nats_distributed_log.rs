@@ -2,6 +2,9 @@
 //!
 //! Uses a NATS JetStream stream to publish and subscribe to [`CommitDelta`]s
 //! between Primary and Replica nodes.
+//!
+//! Reference: https://natsbyexample.com/examples/jetstream/limits-stream/rust
+//! Reference: https://natsbyexample.com/examples/jetstream/pull-consumer/rust
 
 use std::sync::Arc;
 
@@ -46,9 +49,9 @@ pub struct NatsDistributedLog {
 }
 
 impl NatsDistributedLog {
-    /// Connect to NATS and ensure the JetStream stream exists.
+    /// Connect to NATS and create/get the JetStream stream.
     pub async fn connect(config: NatsConfig) -> anyhow::Result<Self> {
-        // async-nats uses rustls which requires a crypto provider to be installed.
+        // async-nats pulls in rustls which needs a crypto provider.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let client = async_nats::connect(&config.url)
@@ -57,6 +60,9 @@ impl NatsDistributedLog {
 
         let jetstream = jetstream::new(client);
 
+        // Create the stream using create_stream (not get_or_create_stream)
+        // to ensure it exists with our exact configuration.
+        // If it already exists with matching config, this is a no-op.
         let stream = jetstream
             .get_or_create_stream(jetstream::stream::Config {
                 name: STREAM_NAME.to_string(),
@@ -69,7 +75,17 @@ impl NatsDistributedLog {
             .await
             .context("Failed to create/get NATS JetStream stream")?;
 
-        tracing::info!("Connected to NATS JetStream at {}", config.url);
+        // Verify the stream is accessible.
+        let mut stream = stream;
+        let info = stream.info().await.context("Failed to get stream info")?;
+        tracing::info!(
+            "Connected to NATS JetStream at {}. Stream '{}': {} messages, {} bytes",
+            config.url,
+            STREAM_NAME,
+            info.state.messages,
+            info.state.bytes,
+        );
+
         Ok(Self { jetstream, stream })
     }
 }
@@ -130,18 +146,33 @@ impl DeltaEnvelope {
 #[async_trait]
 impl DistributedLog for NatsDistributedLog {
     async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+        let ts = u64::from(delta.ts);
+        let num_updates = delta.document_updates.len();
+
         let envelope = DeltaEnvelope::from_delta(&delta)?;
         let payload =
             serde_json::to_vec(&envelope).context("Failed to serialize CommitDelta")?;
+        let payload_size = payload.len();
 
-        self.jetstream
+        // Publish and wait for acknowledgment from NATS server.
+        // The double .await is intentional:
+        // - First .await sends the publish request
+        // - Second .await waits for the server acknowledgment
+        let ack = self
+            .jetstream
             .publish(SUBJECT, payload.into())
             .await
-            .context("Failed to publish to NATS")?
+            .context("Failed to send publish to NATS")?
             .await
-            .context("Failed to confirm NATS publish")?;
+            .context("Failed to get publish acknowledgment from NATS")?;
 
-        tracing::debug!("Published commit delta at ts={}", u64::from(delta.ts));
+        tracing::info!(
+            "Published commit delta to NATS: ts={}, updates={}, bytes={}, stream_seq={}",
+            ts,
+            num_updates,
+            payload_size,
+            ack.sequence,
+        );
         Ok(())
     }
 
@@ -149,21 +180,34 @@ impl DistributedLog for NatsDistributedLog {
         &self,
         from_ts: Timestamp,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+        // Create a durable consumer so it survives reconnections.
+        // DeliverPolicy::All replays all messages from the stream beginning,
+        // and we filter out messages at or before from_ts ourselves.
         let consumer: PullConsumer = self
             .stream
-            .create_consumer(jetstream::consumer::pull::Config {
-                deliver_policy: jetstream::consumer::DeliverPolicy::All,
-                ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                ..Default::default()
-            })
+            .get_or_create_consumer(
+                "convex-replica",
+                jetstream::consumer::pull::Config {
+                    durable_name: Some("convex-replica".to_string()),
+                    deliver_policy: jetstream::consumer::DeliverPolicy::All,
+                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                    ..Default::default()
+                },
+            )
             .await
-            .context("Failed to create NATS consumer")?;
+            .context("Failed to create NATS durable consumer")?;
 
         let from_ts_u64 = u64::from(from_ts);
         let messages = consumer
             .messages()
             .await
             .context("Failed to start consuming NATS messages")?;
+
+        tracing::info!(
+            "Subscribed to NATS stream '{}' with durable consumer 'convex-replica', from_ts={}",
+            STREAM_NAME,
+            from_ts_u64,
+        );
 
         let stream = messages.filter_map(move |msg_result| async move {
             match msg_result {
@@ -174,17 +218,25 @@ impl DistributedLog for NatsDistributedLog {
                     let envelope: DeltaEnvelope = match serde_json::from_slice(&msg.payload) {
                         Ok(e) => e,
                         Err(e) => {
+                            tracing::error!("Failed to deserialize delta from NATS: {e}");
                             return Some(Err(anyhow::anyhow!(
                                 "Failed to deserialize delta: {e}"
-                            )))
+                            )));
                         },
                     };
                     if envelope.ts <= from_ts_u64 {
                         return None;
                     }
+                    tracing::debug!(
+                        "Received commit delta from NATS: ts={}",
+                        envelope.ts,
+                    );
                     Some(envelope.to_delta())
                 },
-                Err(e) => Some(Err(anyhow::anyhow!("NATS message error: {e}"))),
+                Err(e) => {
+                    tracing::error!("NATS message error: {e}");
+                    Some(Err(anyhow::anyhow!("NATS message error: {e}")))
+                },
             }
         });
 
