@@ -188,7 +188,7 @@ pub async fn make_app(
             Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
         )),
         deleted_tablet_sender,
-        distributed_log,
+        distributed_log.clone(),
         config.replication_mode == "replica",
     )
     .await?;
@@ -318,6 +318,18 @@ pub async fn make_app(
             config.beacon_fields.clone(),
         );
         runtime.spawn_background("beacon_worker", beacon_future);
+    }
+
+    // Start the ReplicaDeltaConsumer on Replica to tail NATS and apply deltas.
+    if config.replication_mode == "replica" && config.nats_url.is_some() {
+        let from_ts = database.now_ts_for_reads();
+        let _consumer = database::replica::ReplicaDeltaConsumer::start(
+            runtime.clone(),
+            distributed_log.clone(),
+            database.committer_client(),
+            *from_ts,
+        );
+        tracing::info!("Started ReplicaDeltaConsumer for replication");
     }
 
     let app_state = LocalAppState {

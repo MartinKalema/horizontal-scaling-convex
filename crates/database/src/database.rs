@@ -1157,6 +1157,12 @@ impl<RT: Runtime> Database<RT> {
     /// See PersistenceReader.load_documents_from_table for performance caveats!
     ///
     /// rate_limiter must be based on rows per second.
+    /// Get a clone of the CommitterClient for sending messages to the Committer.
+    /// Used by the ReplicaDeltaConsumer to feed deltas through the apply loop.
+    pub fn committer_client(&self) -> CommitterClient {
+        self.committer.clone()
+    }
+
     pub fn load_documents_in_table<'a>(
         &'a self,
         tablet_id: TabletId,

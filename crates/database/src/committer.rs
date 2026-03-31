@@ -395,6 +395,10 @@ impl<RT: Runtime> Committer<RT> {
                                 span_commit_id = None;
                             }
                         },
+                        Some(CommitterMessage::ApplyReplicaDelta { delta, result }) => {
+                            let apply_result = self.apply_replica_delta(delta);
+                            let _ = result.send(apply_result);
+                        },
                         #[cfg(any(test, feature = "testing"))]
                         Some(CommitterMessage::BumpMaxRepeatableTs { result }) => {
                             let span = Span::noop();
@@ -919,6 +923,43 @@ impl<RT: Runtime> Committer<RT> {
         apply_timer.finish();
     }
 
+    /// Apply a replicated delta from the Primary to this Replica's state.
+    /// This is the Replica equivalent of publish_commit — it updates the
+    /// SnapshotManager and WriteLog without writing to persistence (the
+    /// Primary already persisted the data).
+    fn apply_replica_delta(&mut self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
+        let commit_ts = delta.ts;
+        tracing::info!(
+            "Applying replica delta: ts={}, {} document updates",
+            u64::from(commit_ts),
+            delta.document_updates.len()
+        );
+
+        // Apply each document update to the snapshot.
+        let mut snapshot = self.snapshot_manager.read().latest_snapshot();
+        for update in &delta.document_updates {
+            snapshot
+                .update(update, commit_ts)
+                .with_context(|| format!(
+                    "Failed to apply replica delta update at ts={}",
+                    u64::from(commit_ts)
+                ))?;
+        }
+
+        // Convert document updates to write log entries.
+        let writes = crate::write_log::index_keys_from_document_updates(
+            &delta.document_updates,
+            &snapshot.index_registry,
+        );
+        self.log.append(commit_ts, writes, delta.write_source);
+
+        // Push the updated snapshot.
+        let mut sm = self.snapshot_manager.write();
+        sm.push(commit_ts, snapshot, delta.write_bytes);
+
+        Ok(commit_ts)
+    }
+
     #[fastrace::trace]
     /// Returns a future to add to the pending_writes queue, if the commit
     /// should be written.
@@ -1230,6 +1271,19 @@ impl CommitterClient {
         rx.await.map_err(|_| metrics::shutdown_error())?
     }
 
+    /// Send a replica delta through the Committer's apply loop.
+    /// Called by the ReplicaSnapshotUpdater to feed NATS deltas into the
+    /// single-writer state machine.
+    pub async fn apply_replica_delta(&self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::ApplyReplicaDelta { delta, result: tx };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
     pub async fn finish_table_summary_bootstrap(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::FinishTableSummaryBootstrap { result: tx };
@@ -1389,6 +1443,13 @@ enum CommitterMessage {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         write_source: WriteSource,
         parent_trace: EncodedSpan,
+    },
+    /// Apply a replicated delta from the distributed log.
+    /// Used on Replica nodes to apply changes from the Primary's commits.
+    /// Goes through the same serial apply loop as local commits.
+    ApplyReplicaDelta {
+        delta: CommitDelta,
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     #[cfg(any(test, feature = "testing"))]
     BumpMaxRepeatableTs { result: oneshot::Sender<Timestamp> },

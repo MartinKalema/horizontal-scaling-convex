@@ -1,56 +1,44 @@
 //! Replica node support for horizontal scaling.
 //!
-//! A [`ReplicaSnapshotUpdater`] consumes [`CommitDelta`]s from a
-//! [`DistributedLog`] and applies them to a local [`SnapshotManager`],
-//! keeping a Replica node's state in sync with the Primary.
+//! The [`ReplicaDeltaConsumer`] subscribes to the distributed log and feeds
+//! each [`CommitDelta`] through the Committer's apply loop — the single
+//! serialized state machine update path (following the etcd/TiKV/Kafka
+//! pattern of one apply thread per node).
 
 use std::sync::Arc;
 
 use anyhow::Context;
-use common::{
-    runtime::{
-        Runtime,
-        SpawnHandle,
-    },
-    sync::split_rw_lock::Writer,
-    types::Timestamp,
+use common::runtime::{
+    Runtime,
+    SpawnHandle,
 };
 use futures::StreamExt;
 
 use crate::{
     commit_delta::DistributedLog,
-    snapshot_manager::SnapshotManager,
-    write_log::LogWriter,
+    committer::CommitterClient,
 };
 
-/// Consumes [`CommitDelta`]s from a [`DistributedLog`] and applies them to a
-/// local [`SnapshotManager`] and [`LogWriter`].
+/// Consumes [`CommitDelta`]s from a [`DistributedLog`] and feeds them
+/// through the Committer's apply loop via `CommitterClient::apply_replica_delta`.
 ///
-/// This is the core replication component. On a Replica node, it runs as a
-/// background task that continuously tails the distributed log and replays
-/// each delta to keep the Replica's in-memory state consistent with the
-/// Primary.
-pub struct ReplicaSnapshotUpdater {
+/// This is the Replica's replication consumer. It runs as a background task
+/// after the Replica has finished local initialization.
+pub struct ReplicaDeltaConsumer {
     _handle: Box<dyn SpawnHandle>,
 }
 
-impl ReplicaSnapshotUpdater {
-    /// Start the updater as a background task.
-    ///
-    /// It will subscribe to the distributed log starting after `from_ts` and
-    /// apply each delta to the snapshot manager and write log in order.
+impl ReplicaDeltaConsumer {
+    /// Start the consumer as a background task.
     pub fn start<RT: Runtime>(
         runtime: RT,
         distributed_log: Arc<dyn DistributedLog>,
-        snapshot_manager: Writer<SnapshotManager>,
-        log_writer: LogWriter,
-        from_ts: Timestamp,
+        committer: CommitterClient,
+        from_ts: common::types::Timestamp,
     ) -> Self {
-        let handle = runtime.spawn("replica_snapshot_updater", async move {
-            if let Err(e) =
-                Self::run(distributed_log, snapshot_manager, log_writer, from_ts).await
-            {
-                tracing::error!("ReplicaSnapshotUpdater failed: {e:?}");
+        let handle = runtime.spawn("replica_delta_consumer", async move {
+            if let Err(e) = Self::run(distributed_log, committer, from_ts).await {
+                tracing::error!("ReplicaDeltaConsumer failed: {e:#}");
             }
         });
         Self { _handle: handle }
@@ -58,41 +46,44 @@ impl ReplicaSnapshotUpdater {
 
     async fn run(
         distributed_log: Arc<dyn DistributedLog>,
-        mut snapshot_manager: Writer<SnapshotManager>,
-        mut log_writer: LogWriter,
-        from_ts: Timestamp,
+        committer: CommitterClient,
+        from_ts: common::types::Timestamp,
     ) -> anyhow::Result<()> {
+        tracing::info!(
+            "ReplicaDeltaConsumer starting — subscribing to distributed log from ts={}",
+            u64::from(from_ts)
+        );
+
         let mut stream = distributed_log
             .subscribe(from_ts)
             .await
             .context("Failed to subscribe to distributed log")?;
 
+        tracing::info!("ReplicaDeltaConsumer subscribed, waiting for deltas...");
+
         while let Some(result) = stream.next().await {
             let delta = result.context("Error reading from distributed log")?;
-            let commit_ts = delta.ts;
+            let ts = delta.ts;
+            let num_updates = delta.document_updates.len();
 
-            // Apply each document update to the snapshot, collecting index
-            // updates along the way. This mirrors what the Primary's Committer
-            // does in compute_writes + publish_commit.
-            let mut sm = snapshot_manager.write();
-            let mut snapshot = sm.latest_snapshot();
-            for update in &delta.document_updates {
-                snapshot
-                    .update(update, commit_ts)
-                    .with_context(|| format!("Failed to apply update at ts={commit_ts}"))?;
+            match committer.apply_replica_delta(delta).await {
+                Ok(applied_ts) => {
+                    tracing::info!(
+                        "Applied replica delta: ts={}, {} updates",
+                        u64::from(applied_ts),
+                        num_updates,
+                    );
+                },
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to apply replica delta at ts={}: {e:#}",
+                        u64::from(ts),
+                    );
+                },
             }
-            sm.push(commit_ts, snapshot, delta.write_bytes);
-            drop(sm);
-
-            // Append to the write log so subscription workers on this Replica
-            // can detect invalidations from the Primary's commits.
-            let writes = crate::write_log::index_keys_from_document_updates(
-                &delta.document_updates,
-                &snapshot_manager.read().latest_snapshot().index_registry,
-            );
-            log_writer.append(commit_ts, writes, delta.write_source);
         }
 
+        tracing::warn!("ReplicaDeltaConsumer stream ended — no more deltas");
         Ok(())
     }
 }
