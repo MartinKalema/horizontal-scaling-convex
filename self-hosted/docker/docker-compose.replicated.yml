@@ -1,0 +1,111 @@
+# Primary-Replica setup for horizontal scaling demo.
+#
+# Usage:
+#   docker compose -f docker-compose.replicated.yml up
+#
+# Architecture:
+#   - PostgreSQL: shared persistence layer
+#   - NATS: distributed log (JetStream) for commit delta replication
+#   - Primary: single writer, publishes deltas to NATS
+#   - Replica: read-only, consumes deltas from NATS, serves queries
+#
+# This is a demonstration setup. In production you would run Primary and
+# Replica(s) on separate machines, potentially with a load balancer routing
+# mutations to Primary and queries to Replicas.
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: convex_self_hosted
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 5s
+      start_period: 10s
+
+  nats:
+    image: nats:latest
+    command: ["--jetstream", "--store_dir", "/data"]
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # Monitoring
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "nats-server", "--signal", "ldm"]
+      interval: 5s
+      start_period: 5s
+
+  primary:
+    image: ghcr.io/get-convex/convex-backend:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "3210:3210"
+      - "3211:3211"
+    environment:
+      - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
+      - DO_NOT_REQUIRE_SSL=1
+      - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3210
+      - CONVEX_SITE_ORIGIN=http://127.0.0.1:3211
+      - RUST_LOG=info
+      - DISABLE_BEACON=true
+      # Replication config (to be implemented)
+      # - REPLICATION_MODE=primary
+      # - NATS_URL=nats://nats:4222
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: curl -f http://localhost:3210/version
+      interval: 5s
+      start_period: 10s
+
+  # Replica is commented out until we wire replication into the binary.
+  # When ready, it will consume deltas from NATS and serve read-only queries.
+  #
+  # replica:
+  #   image: ghcr.io/get-convex/convex-backend:latest
+  #   stop_grace_period: 10s
+  #   stop_signal: SIGINT
+  #   ports:
+  #     - "3220:3210"
+  #     - "3221:3211"
+  #   environment:
+  #     - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
+  #     - DO_NOT_REQUIRE_SSL=1
+  #     - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3220
+  #     - CONVEX_SITE_ORIGIN=http://127.0.0.1:3221
+  #     - RUST_LOG=info
+  #     - DISABLE_BEACON=true
+  #     - REPLICATION_MODE=replica
+  #     - NATS_URL=nats://nats:4222
+  #     - PRIMARY_URL=http://primary:3210
+  #   depends_on:
+  #     primary:
+  #       condition: service_healthy
+  #     nats:
+  #       condition: service_healthy
+
+  dashboard:
+    image: ghcr.io/get-convex/convex-dashboard:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "6791:6791"
+    environment:
+      - NEXT_PUBLIC_DEPLOYMENT_URL=http://127.0.0.1:3210
+    depends_on:
+      primary:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  natsdata:
