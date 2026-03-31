@@ -1252,6 +1252,10 @@ impl CommitterClient {
         rx.await.map_err(|_| metrics::shutdown_error())?
     }
 
+    pub fn persistence_reader(&self) -> Arc<dyn PersistenceReader> {
+        self.persistence_reader.clone()
+    }
+
     pub fn commit<RT: Runtime>(
         &self,
         transaction: Transaction<RT>,
