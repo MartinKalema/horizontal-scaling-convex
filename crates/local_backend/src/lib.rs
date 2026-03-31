@@ -321,15 +321,27 @@ pub async fn make_app(
     }
 
     // Start the ReplicaDeltaConsumer on Replica to tail NATS and apply deltas.
-    if config.replication_mode == "replica" && config.nats_url.is_some() {
-        let from_ts = database.now_ts_for_reads();
-        let _consumer = database::replica::ReplicaDeltaConsumer::start(
-            runtime.clone(),
-            distributed_log.clone(),
-            database.committer_client(),
-            *from_ts,
-        );
-        tracing::info!("Started ReplicaDeltaConsumer for replication");
+    // Creates a fresh NATS connection dedicated to the consumer to avoid
+    // sharing the connection used during Database::load.
+    if config.replication_mode == "replica" {
+        if let Some(nats_url) = &config.nats_url {
+            let consumer_nats = Arc::new(
+                database::nats_distributed_log::NatsDistributedLog::connect(
+                    database::nats_distributed_log::NatsConfig {
+                        url: nats_url.clone(),
+                    },
+                )
+                .await?,
+            );
+            let from_ts = database.now_ts_for_reads();
+            let _consumer = database::replica::ReplicaDeltaConsumer::start(
+                runtime.clone(),
+                consumer_nats,
+                database.committer_client(),
+                *from_ts,
+            );
+            tracing::info!("Started ReplicaDeltaConsumer for replication");
+        }
     }
 
     let app_state = LocalAppState {
