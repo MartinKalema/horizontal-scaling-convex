@@ -1252,6 +1252,8 @@ pub enum StorageUseCase {
     Files,
     /// Search index snapshots
     SearchIndexes,
+    /// Replication checkpoints for Replica bootstrap
+    Checkpoints,
 }
 
 impl Display for StorageUseCase {
@@ -1262,6 +1264,7 @@ impl Display for StorageUseCase {
             StorageUseCase::Modules => write!(f, "modules"),
             StorageUseCase::Files => write!(f, "files"),
             StorageUseCase::SearchIndexes => write!(f, "search"),
+            StorageUseCase::Checkpoints => write!(f, "checkpoints"),
         }
     }
 }

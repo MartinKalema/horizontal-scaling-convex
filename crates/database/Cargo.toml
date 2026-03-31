@@ -38,6 +38,7 @@ async-broadcast = { workspace = true }
 async-nats = { workspace = true }
 async-recursion = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 async_lru = { workspace = true }
 cmd_util = { workspace = true }
 common = { workspace = true }
