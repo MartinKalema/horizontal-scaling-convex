@@ -58,6 +58,11 @@ use function_runner::{
     FunctionRunner,
 };
 use governor::Quota;
+use ::storage::{
+    LocalDirStorage,
+    Storage,
+    StorageUseCase,
+};
 use http_client::CachedHttpClient;
 use indexing::index_cache::SharedIndexCache;
 use model::{
@@ -204,6 +209,24 @@ pub async fn make_app(
         ),
         database: database.clone(),
     };
+
+    // Start the SnapshotCheckpointer on the Primary when NATS is configured.
+    if config.replication_mode == "primary" && config.nats_url.is_some() {
+        let checkpoint_storage: Arc<dyn Storage> = Arc::new(
+            LocalDirStorage::for_use_case(
+                runtime.clone(),
+                "convex_local_storage",
+                StorageUseCase::Checkpoints,
+            )?,
+        );
+        let _checkpointer = database::snapshot_checkpointer::SnapshotCheckpointer::start(
+            runtime.clone(),
+            persistence.reader(),
+            database.retention_validator(),
+            checkpoint_storage,
+        );
+        tracing::info!("Started SnapshotCheckpointer for replication");
+    }
 
     let node_process_timeout = *ACTION_USER_TIMEOUT + Duration::from_secs(5);
     let node_executor = Arc::new(LocalNodeExecutor::new(node_process_timeout).await?);
