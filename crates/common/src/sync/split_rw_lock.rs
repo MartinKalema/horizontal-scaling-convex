@@ -54,4 +54,5 @@ impl<T> Writer<T> {
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         self.inner.read()
     }
+
 }

@@ -1021,11 +1021,6 @@ impl<RT: Runtime> Database<RT> {
             ..
         } = db_snapshot;
 
-        let snapshot_for_dummy = if replica_mode {
-            Some(snapshot.clone())
-        } else {
-            None
-        };
         let snapshot_manager = SnapshotManager::new(*ts, snapshot);
         let (snapshot_reader, snapshot_writer) = new_split_rw_lock(snapshot_manager);
 
@@ -1042,45 +1037,37 @@ impl<RT: Runtime> Database<RT> {
         let persistence_reader = persistence.reader();
         let (log_owner, log_reader, log_writer) = new_write_log(*ts);
         let subscriptions = SubscriptionsWorker::start(log_owner, runtime.clone());
-        let committer = if replica_mode {
-            // In replica mode, give the snapshot writer and log writer to the
-            // ReplicaSnapshotUpdater instead of the Committer.
-            let _replica_updater = crate::replica::ReplicaSnapshotUpdater::start(
-                runtime.clone(),
-                distributed_log.clone(),
-                snapshot_writer,
-                log_writer,
-                *ts,
-            );
-            // Create a dummy Committer that will never receive writes.
-            // We need one because Database expects a CommitterClient.
-            let (_, _, dummy_log_writer) = new_write_log(*ts);
-            let dummy_snapshot = snapshot_for_dummy.expect("snapshot_for_dummy must be Some in replica mode");
-            let dummy_snapshot_manager = SnapshotManager::new(*ts, dummy_snapshot);
-            let (_, dummy_snapshot_writer) = new_split_rw_lock(dummy_snapshot_manager);
-            tracing::info!("Database loading in replica mode — tailing distributed log from ts={ts}");
-            Committer::start(
-                dummy_log_writer,
-                dummy_snapshot_writer,
-                persistence,
-                runtime.clone(),
-                retention_manager.clone(),
-                shutdown,
-                virtual_system_mapping.clone(),
-                Arc::new(crate::commit_delta::NoopDistributedLog),
-            )
+
+        // Both Primary and Replica use the same Committer — the single apply
+        // loop that serializes all state machine updates (following the
+        // etcd/TiKV/Kafka pattern of one apply thread per node).
+        //
+        // On Primary: the Committer handles local transactions and publishes
+        // deltas to the distributed log.
+        //
+        // On Replica: the Committer handles local initialization writes
+        // (system tables, application bootstrap). After initialization, the
+        // ReplicaSnapshotUpdater feeds remote deltas from NATS through the
+        // Committer's apply path.
+        //
+        // In replica mode, we use NoopDistributedLog for the Committer since
+        // the Replica should not re-publish deltas it receives.
+        let committer_distributed_log = if replica_mode {
+            tracing::info!("Database loading in replica mode — Committer will handle local initialization, then tail distributed log from ts={ts}");
+            Arc::new(crate::commit_delta::NoopDistributedLog) as Arc<dyn crate::commit_delta::DistributedLog>
         } else {
-            Committer::start(
-                log_writer,
-                snapshot_writer,
-                persistence,
-                runtime.clone(),
-                retention_manager.clone(),
-                shutdown,
-                virtual_system_mapping.clone(),
-                distributed_log,
-            )
+            distributed_log.clone()
         };
+        let committer = Committer::start(
+            log_writer,
+            snapshot_writer,
+            persistence,
+            runtime.clone(),
+            retention_manager.clone(),
+            shutdown,
+            virtual_system_mapping.clone(),
+            committer_distributed_log,
+        );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
         let by_id_indexes_snapshot_cache =

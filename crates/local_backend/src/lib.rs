@@ -192,9 +192,7 @@ pub async fn make_app(
         config.replication_mode == "replica",
     )
     .await?;
-    if config.replication_mode != "replica" {
-        initialize_application_system_tables(&database).await?;
-    }
+    initialize_application_system_tables(&database).await?;
     let application_storage = if config.replication_mode == "replica" {
         // Replica uses local storage — doesn't write storage config to DB.
         let (storage, search_storage) =

@@ -618,6 +618,7 @@ impl LogWriter {
         let snapshot = { self.inner.lock().log.clone() };
         block_in_place(|| snapshot.is_stale(reads, reads_ts, ts))
     }
+
 }
 
 /// Pending writes are used by the committer to detect conflicts between a new
