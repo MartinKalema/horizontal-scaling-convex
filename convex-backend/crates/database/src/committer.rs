@@ -116,6 +116,10 @@ use vector::VectorIndexWriteSize;
 
 use crate::{
     bootstrap_model::defaults::BootstrapTableIds,
+    commit_delta::{
+        CommitDelta,
+        DistributedLog,
+    },
     database::ConflictingReadWithWriteSource,
     metrics::{
         self,
@@ -160,6 +164,8 @@ enum PersistenceWrite {
         parent_trace: EncodedSpan,
         commit_id: usize,
         write_bytes: u64,
+        document_writes: Arc<Vec<DocumentLogEntry>>,
+        index_writes: Arc<Vec<PersistenceIndexEntry>>,
     },
     MaxRepeatableTimestamp {
         new_max_repeatable: Timestamp,
@@ -198,6 +204,10 @@ pub struct Committer<RT: Runtime> {
     virtual_system_mapping: VirtualSystemMapping,
 
     user_documents_size_gauge: Subgauge,
+
+    // Distributed log for replication. Publishes CommitDeltas after each commit
+    // so Replica nodes can update their state.
+    distributed_log: Arc<dyn DistributedLog>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -209,6 +219,7 @@ impl<RT: Runtime> Committer<RT> {
         retention_validator: Arc<dyn RetentionValidator>,
         shutdown: ShutdownSignal,
         virtual_system_mapping: VirtualSystemMapping,
+        distributed_log: Arc<dyn DistributedLog>,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
         let conflict_checker = PendingWrites::new();
@@ -225,6 +236,7 @@ impl<RT: Runtime> Committer<RT> {
             retention_validator: retention_validator.clone(),
             virtual_system_mapping,
             user_documents_size_gauge: user_documents_size_subgauge(),
+            distributed_log,
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -296,13 +308,15 @@ impl<RT: Runtime> Committer<RT> {
                             result,
                             parent_trace,
                             write_bytes,
+                            document_writes,
+                            index_writes,
                             ..
                         } => {
                             let parent_span = initialize_root_from_parent("Committer::publish_commit", parent_trace);
                             let publish_commit_span = committer_span.as_ref().map(|root| Span::enter_with_parents("publish_commit", [root, &parent_span])).unwrap_or_else(|| parent_span);
                             let _guard = publish_commit_span.set_local_parent();
                             let commit_ts = pending_write.must_commit_ts();
-                            self.publish_commit(pending_write, write_bytes);
+                            self.publish_commit(pending_write, write_bytes, document_writes, index_writes);
                             let _ = result.send(Ok(commit_ts));
 
                             // When we next get free cycles and there is no ongoing bump,
@@ -830,7 +844,13 @@ impl<RT: Runtime> Committer<RT> {
     /// After writing the new rows to persistence, mark the commit as complete
     /// and allow the updated rows to be read by other transactions.
     #[fastrace::trace]
-    fn publish_commit(&mut self, pending_write: PendingWriteHandle, write_bytes: u64) {
+    fn publish_commit(
+        &mut self,
+        pending_write: PendingWriteHandle,
+        write_bytes: u64,
+        document_writes: Arc<Vec<DocumentLogEntry>>,
+        index_writes: Arc<Vec<PersistenceIndexEntry>>,
+    ) {
         let apply_timer = metrics::commit_apply_timer();
         let commit_ts = pending_write.must_commit_ts();
 
@@ -856,7 +876,7 @@ impl<RT: Runtime> Committer<RT> {
         metrics::write_log_commit_bytes(write_bytes as usize);
 
         let timer = metrics::write_log_append_timer();
-        self.log.append(commit_ts, writes, write_source);
+        self.log.append(commit_ts, writes, write_source.clone());
         drop(timer);
 
         if let Some(table_summaries) = new_snapshot.table_summaries.as_ref() {
@@ -869,6 +889,21 @@ impl<RT: Runtime> Committer<RT> {
         // Publish the new version of our database metadata and the index.
         let mut snapshot_manager = self.snapshot_manager.write();
         snapshot_manager.push(commit_ts, new_snapshot, write_bytes);
+
+        // Publish delta to distributed log for Replica consumption.
+        let delta = CommitDelta {
+            ts: commit_ts,
+            document_writes,
+            index_writes,
+            write_source,
+            write_bytes,
+        };
+        let distributed_log = self.distributed_log.clone();
+        tokio_spawn("publish_commit_delta", async move {
+            if let Err(e) = distributed_log.publish(delta).await {
+                tracing::error!("Failed to publish commit delta: {e:?}");
+            }
+        });
 
         apply_timer.finish();
     }
@@ -1000,6 +1035,8 @@ impl<RT: Runtime> Committer<RT> {
                             parent_trace: parent_trace_copy,
                             commit_id,
                             write_bytes,
+                            document_writes,
+                            index_writes,
                         });
                     }
                 }

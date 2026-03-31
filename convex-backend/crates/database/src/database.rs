@@ -1043,6 +1043,7 @@ impl<RT: Runtime> Database<RT> {
             retention_manager.clone(),
             shutdown,
             virtual_system_mapping.clone(),
+            Arc::new(crate::commit_delta::NoopDistributedLog),
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");

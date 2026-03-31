@@ -11,6 +11,7 @@
 #![feature(once_cell_try)]
 
 mod bootstrap_model;
+pub mod commit_delta;
 mod committer;
 mod database;
 mod database_index_workers;
