@@ -543,6 +543,34 @@ pub struct ApplicationStorage {
     snapshot_imports_storage: Arc<dyn Storage>,
 }
 
+impl ApplicationStorage {
+    /// Create an ApplicationStorage with all fields using the same storage
+    /// instance. Used by Replicas that don't initialize storage via the
+    /// database.
+    pub fn new_local<RT: Runtime>(
+        runtime: RT,
+        dir: &str,
+    ) -> anyhow::Result<(Self, Arc<dyn Storage>)> {
+        let files = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::Files)?) as Arc<dyn Storage>;
+        let modules = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::Modules)?) as Arc<dyn Storage>;
+        let search = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::SearchIndexes)?) as Arc<dyn Storage>;
+        let exports = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::Exports)?) as Arc<dyn Storage>;
+        let snapshot_imports = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::SnapshotImports)?) as Arc<dyn Storage>;
+        let storage = Self {
+            files_storage: files,
+            modules_storage: modules,
+            search_storage: search.clone(),
+            exports_storage: exports,
+            snapshot_imports_storage: snapshot_imports,
+        };
+        Ok((storage, search))
+    }
+
+    pub fn storage_type(&self) -> &Arc<dyn Storage> {
+        &self.files_storage
+    }
+}
+
 #[derive(Clone)]
 pub struct Application<RT: Runtime> {
     runtime: RT,

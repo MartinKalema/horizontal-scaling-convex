@@ -192,14 +192,24 @@ pub async fn make_app(
         config.replication_mode == "replica",
     )
     .await?;
-    initialize_application_system_tables(&database).await?;
-    let application_storage = Application::initialize_storage(
-        runtime.clone(),
-        &database,
-        config.storage_tag_initializer(),
-        config.name(),
-    )
-    .await?;
+    if config.replication_mode != "replica" {
+        initialize_application_system_tables(&database).await?;
+    }
+    let application_storage = if config.replication_mode == "replica" {
+        // Replica uses local storage — doesn't write storage config to DB.
+        let (storage, search_storage) =
+            application::ApplicationStorage::new_local(runtime.clone(), "convex_local_storage")?;
+        database.set_search_storage(search_storage);
+        storage
+    } else {
+        Application::initialize_storage(
+            runtime.clone(),
+            &database,
+            config.storage_tag_initializer(),
+            config.name(),
+        )
+        .await?
+    };
 
     let file_storage = FileStorage {
         transactional_file_storage: TransactionalFileStorage::new(
