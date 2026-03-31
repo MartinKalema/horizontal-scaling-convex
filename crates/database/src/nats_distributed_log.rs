@@ -48,6 +48,9 @@ pub struct NatsDistributedLog {
 impl NatsDistributedLog {
     /// Connect to NATS and ensure the JetStream stream exists.
     pub async fn connect(config: NatsConfig) -> anyhow::Result<Self> {
+        // async-nats uses rustls which requires a crypto provider to be installed.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let client = async_nats::connect(&config.url)
             .await
             .with_context(|| format!("Failed to connect to NATS at {}", config.url))?;

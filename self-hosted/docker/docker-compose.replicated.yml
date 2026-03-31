@@ -44,7 +44,7 @@ services:
       retries: 3
 
   primary:
-    image: ghcr.io/get-convex/convex-backend:latest
+    image: convex-backend-replicated:latest
     stop_grace_period: 10s
     stop_signal: SIGINT
     ports:
@@ -73,7 +73,7 @@ services:
       start_period: 10s
 
   replica:
-    image: ghcr.io/get-convex/convex-backend:latest
+    image: convex-backend-replicated:latest
     stop_grace_period: 10s
     stop_signal: SIGINT
     ports:
