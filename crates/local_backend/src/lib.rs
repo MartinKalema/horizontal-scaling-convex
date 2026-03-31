@@ -157,6 +157,19 @@ pub async fn make_app(
     let segment_metadata_fetcher: Arc<dyn SegmentTermMetadataFetcher> = in_process_searcher;
     let (deleted_tablet_sender, deleted_tablet_receiver) = tokio::sync::mpsc::channel(100);
     let usage_event_logger = Arc::new(NoOpUsageEventLogger);
+    // Set up distributed log based on replication mode.
+    let distributed_log: Arc<dyn database::commit_delta::DistributedLog> =
+        if let Some(nats_url) = &config.nats_url {
+            let nats_config = database::nats_distributed_log::NatsConfig {
+                url: nats_url.clone(),
+            };
+            Arc::new(
+                database::nats_distributed_log::NatsDistributedLog::connect(nats_config).await?,
+            )
+        } else {
+            Arc::new(database::commit_delta::NoopDistributedLog)
+        };
+
     let database = Database::load(
         persistence.clone(),
         runtime.clone(),
@@ -169,7 +182,7 @@ pub async fn make_app(
             Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
         )),
         deleted_tablet_sender,
-        Arc::new(database::commit_delta::NoopDistributedLog),
+        distributed_log,
     )
     .await?;
     initialize_application_system_tables(&database).await?;

@@ -130,6 +130,18 @@ pub struct LocalConfig {
     /// of log integrations (eg axiom/datadog).
     #[clap(long)]
     pub local_log_sink: Option<String>,
+
+    /// Replication mode: "primary" (default) or "replica".
+    /// Primary nodes accept writes and publish deltas to NATS.
+    /// Replica nodes consume deltas from NATS and serve read-only queries.
+    #[clap(long, env = "REPLICATION_MODE", default_value = "primary")]
+    pub replication_mode: String,
+
+    /// NATS URL for distributed log replication.
+    /// Required when replication_mode is set.
+    /// Example: nats://localhost:4222
+    #[clap(long, env = "NATS_URL")]
+    pub nats_url: Option<String>,
 }
 
 impl fmt::Debug for LocalConfig {
