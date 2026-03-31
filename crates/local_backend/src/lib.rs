@@ -169,6 +169,7 @@ pub async fn make_app(
             Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
         )),
         deleted_tablet_sender,
+        Arc::new(database::commit_delta::NoopDistributedLog),
     )
     .await?;
     initialize_application_system_tables(&database).await?;

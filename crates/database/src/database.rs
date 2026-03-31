@@ -976,6 +976,7 @@ impl<RT: Runtime> Database<RT> {
         shared_index_cache: Option<SharedIndexCache>,
         retention_rate_limiter: Arc<RateLimiter<RT>>,
         deleted_tablet_sender: mpsc::Sender<TabletId>,
+        distributed_log: Arc<dyn crate::commit_delta::DistributedLog>,
     ) -> anyhow::Result<Self> {
         let _load_database_timer = metrics::load_database_timer();
 
@@ -1043,7 +1044,7 @@ impl<RT: Runtime> Database<RT> {
             retention_manager.clone(),
             shutdown,
             virtual_system_mapping.clone(),
-            Arc::new(crate::commit_delta::NoopDistributedLog),
+            distributed_log,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
