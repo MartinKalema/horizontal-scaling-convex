@@ -88,7 +88,7 @@ services:
       - CONVEX_SITE_ORIGIN=http://127.0.0.1:3221
       - RUST_LOG=info
       - DISABLE_BEACON=true
-      - INSTANCE_NAME=convex-primary
+      - INSTANCE_NAME=convex-replica
       - REPLICATION_MODE=replica
       - NATS_URL=nats://nats:4222
       - PRIMARY_GRPC_URL=http://primary:50051
