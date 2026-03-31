@@ -321,25 +321,46 @@ pub async fn make_app(
     }
 
     // Start the ReplicaDeltaConsumer on Replica to tail NATS and apply deltas.
-    // Creates a fresh NATS connection dedicated to the consumer to avoid
-    // sharing the connection used during Database::load.
+    // Creates a fresh NATS connection dedicated to the consumer.
+    // Uses spawn_background so the task outlives make_app scope.
     if config.replication_mode == "replica" {
         if let Some(nats_url) = &config.nats_url {
-            let consumer_nats = Arc::new(
-                database::nats_distributed_log::NatsDistributedLog::connect(
-                    database::nats_distributed_log::NatsConfig {
-                        url: nats_url.clone(),
+            let nats_url = nats_url.clone();
+            let committer = database.committer_client();
+            let from_ts = *database.now_ts_for_reads();
+            runtime.spawn_background("replica_delta_consumer_setup", async move {
+                let consumer_nats = match database::nats_distributed_log::NatsDistributedLog::connect(
+                    database::nats_distributed_log::NatsConfig { url: nats_url },
+                ).await {
+                    Ok(n) => Arc::new(n),
+                    Err(e) => {
+                        tracing::error!("Failed to connect NATS for ReplicaDeltaConsumer: {e:#}");
+                        return;
                     },
-                )
-                .await?,
-            );
-            let from_ts = database.now_ts_for_reads();
-            let _consumer = database::replica::ReplicaDeltaConsumer::start(
-                runtime.clone(),
-                consumer_nats,
-                database.committer_client(),
-                *from_ts,
-            );
+                };
+                let consumer_nats_dyn: Arc<dyn database::commit_delta::DistributedLog> = consumer_nats;
+                tracing::info!("ReplicaDeltaConsumer subscribing to NATS...");
+                match consumer_nats_dyn.subscribe(from_ts.into()).await {
+                    Ok(mut stream) => {
+                        tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
+                        while let Some(result) = futures::StreamExt::next(&mut stream).await {
+                            match result {
+                                Ok(delta) => {
+                                    let ts = delta.ts;
+                                    let n = delta.document_updates.len();
+                                    match committer.apply_replica_delta(delta).await {
+                                        Ok(_) => tracing::info!("Applied replica delta: ts={}, {} updates", u64::from(ts), n),
+                                        Err(e) => tracing::error!("Failed to apply delta at ts={}: {e:#}", u64::from(ts)),
+                                    }
+                                },
+                                Err(e) => tracing::error!("Error reading NATS delta: {e:#}"),
+                            }
+                        }
+                        tracing::warn!("ReplicaDeltaConsumer stream ended");
+                    },
+                    Err(e) => tracing::error!("Failed to subscribe to NATS: {e:#}"),
+                }
+            });
             tracing::info!("Started ReplicaDeltaConsumer for replication");
         }
     }
