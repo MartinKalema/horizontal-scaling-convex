@@ -97,6 +97,7 @@ pub mod node_action_callbacks;
 pub mod parse;
 pub mod proxy;
 pub mod public_api;
+pub mod mutation_forwarder;
 pub mod router;
 pub mod scheduling;
 pub mod schema;

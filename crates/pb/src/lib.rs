@@ -30,6 +30,9 @@ pub mod errors {
 pub mod outcome {
     include!(concat!(env!("OUT_DIR"), "/outcome.rs"));
 }
+pub mod replication {
+    include!(concat!(env!("OUT_DIR"), "/replication.rs"));
+}
 pub mod searchlight {
     include!(concat!(env!("OUT_DIR"), "/searchlight.rs"));
 }

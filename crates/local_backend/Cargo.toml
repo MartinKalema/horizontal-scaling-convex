@@ -78,6 +78,7 @@ model = { workspace = true }
 mysql = { workspace = true }
 node_executor = { workspace = true }
 parking_lot = { workspace = true }
+pb = { workspace = true }
 postgres = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
@@ -95,6 +96,7 @@ sync_types = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tonic = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
