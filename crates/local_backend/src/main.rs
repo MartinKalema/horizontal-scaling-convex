@@ -25,6 +25,7 @@ use futures::{
 use local_backend::{
     config::LocalConfig,
     make_app,
+    mutation_forwarder::MutationForwarderService,
     proxy::dev_site_proxy,
     router::router,
     HttpActionRouteMapper,
@@ -128,6 +129,28 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
         preempt_signal.clone(),
     )
     .await?;
+
+    // Start gRPC mutation forwarding server on the Primary.
+    if config.replication_mode == "primary" && config.nats_url.is_some() {
+        let grpc_addr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
+        let api: std::sync::Arc<dyn application::api::ApplicationApi> =
+            std::sync::Arc::new(st.application.clone());
+        let forwarder = MutationForwarderService::new(api, st.instance_name.clone());
+        let mut grpc_shutdown_rx = shutdown_rx.clone();
+        runtime.spawn_background("grpc_mutation_forwarder", async move {
+            tracing::info!("Starting gRPC mutation forwarder on {grpc_addr}");
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(forwarder.into_server())
+                .serve_with_shutdown(grpc_addr, async move {
+                    let _ = grpc_shutdown_rx.recv().await;
+                })
+                .await
+            {
+                tracing::error!("gRPC mutation forwarder failed: {e}");
+            }
+        });
+    }
+
     let router = router(st.clone());
     let mut shutdown_rx_ = shutdown_rx.clone();
     let http_service = ConvexHttpService::new(

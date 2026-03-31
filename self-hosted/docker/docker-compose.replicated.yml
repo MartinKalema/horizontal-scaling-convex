@@ -48,6 +48,7 @@ services:
     ports:
       - "3210:3210"
       - "3211:3211"
+      - "50051:50051"
     environment:
       - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
       - DO_NOT_REQUIRE_SSL=1
@@ -55,9 +56,9 @@ services:
       - CONVEX_SITE_ORIGIN=http://127.0.0.1:3211
       - RUST_LOG=info
       - DISABLE_BEACON=true
-      # Replication config (to be implemented)
-      # - REPLICATION_MODE=primary
-      # - NATS_URL=nats://nats:4222
+      - REPLICATION_MODE=primary
+      - NATS_URL=nats://nats:4222
+      - GRPC_PORT=50051
     depends_on:
       postgres:
         condition: service_healthy
@@ -86,6 +87,7 @@ services:
       - DISABLE_BEACON=true
       - REPLICATION_MODE=replica
       - NATS_URL=nats://nats:4222
+      - PRIMARY_GRPC_URL=http://primary:50051
     depends_on:
       primary:
         condition: service_healthy

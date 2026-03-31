@@ -142,6 +142,17 @@ pub struct LocalConfig {
     /// Example: nats://localhost:4222
     #[clap(long, env = "NATS_URL")]
     pub nats_url: Option<String>,
+
+    /// gRPC port for the mutation forwarding service.
+    /// Primary listens on this port. Replicas connect to PRIMARY_GRPC_URL.
+    #[clap(long, env = "GRPC_PORT", default_value = "50051")]
+    pub grpc_port: u16,
+
+    /// URL of the Primary's gRPC mutation forwarding service.
+    /// Only used in replica mode.
+    /// Example: http://primary:50051
+    #[clap(long, env = "PRIMARY_GRPC_URL")]
+    pub primary_grpc_url: Option<String>,
 }
 
 impl fmt::Debug for LocalConfig {

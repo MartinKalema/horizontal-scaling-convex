@@ -1,10 +1,14 @@
 //! gRPC service for forwarding mutations from Replica to Primary.
 //!
 //! The Primary runs a [`MutationForwarderService`] that accepts mutation
-//! requests from Replicas. The Replica uses a tonic client to send mutations.
+//! requests from Replicas via gRPC.
+//!
+//! The Replica runs a [`MutationForwarderGrpcClient`] that forwards mutations
+//! to the Primary when clients try to execute mutations on a Replica.
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use application::api::ApplicationApi;
 use common::{
     http::RequestDestination,
@@ -15,6 +19,7 @@ use common::{
 use keybroker::Identity;
 use pb::replication::{
     forward_mutation_response,
+    mutation_forwarder_client::MutationForwarderClient as TonicMutationForwarderClient,
     mutation_forwarder_server::{
         MutationForwarder,
         MutationForwarderServer as TonicMutationForwarderServer,
@@ -26,6 +31,7 @@ use pb::replication::{
 };
 use sync_types::types::SerializedArgs;
 use tonic::{
+    transport::Channel,
     Request,
     Response,
     Status,
@@ -118,5 +124,47 @@ impl MutationForwarder for MutationForwarderService {
             })),
             Err(e) => Err(Status::internal(format!("Mutation failed: {e}"))),
         }
+    }
+}
+
+/// gRPC client for forwarding mutations from Replica to Primary.
+pub struct MutationForwarderGrpcClient {
+    client: TonicMutationForwarderClient<Channel>,
+}
+
+impl MutationForwarderGrpcClient {
+    /// Connect to the Primary's gRPC mutation forwarding service.
+    pub async fn connect(primary_url: &str) -> anyhow::Result<Self> {
+        let client = TonicMutationForwarderClient::connect(primary_url.to_string())
+            .await
+            .with_context(|| format!("Failed to connect to Primary at {primary_url}"))?;
+        tracing::info!("Connected to Primary mutation forwarder at {primary_url}");
+        Ok(Self { client })
+    }
+
+    /// Forward a mutation to the Primary and return the result.
+    pub async fn forward(
+        &self,
+        path: &str,
+        args: &str,
+        identity: Identity,
+        caller: &str,
+    ) -> anyhow::Result<ForwardMutationResponse> {
+        let identity_proto: pb::convex_identity::UncheckedIdentity = identity.into();
+        let request = ForwardMutationRequest {
+            path: path.to_string(),
+            args: args.to_string(),
+            identity: Some(identity_proto),
+            caller: caller.to_string(),
+            mutation_identifier: None,
+            mutation_queue_length: None,
+        };
+        let response = self
+            .client
+            .clone()
+            .forward_mutation(Request::new(request))
+            .await
+            .context("gRPC mutation forwarding failed")?;
+        Ok(response.into_inner())
     }
 }
