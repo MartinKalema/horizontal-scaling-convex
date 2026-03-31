@@ -15,6 +15,7 @@ pub mod commit_client;
 pub mod commit_delta;
 mod committer;
 mod database;
+pub mod nats_distributed_log;
 pub mod replica;
 mod database_index_workers;
 mod execution_size;

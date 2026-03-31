@@ -197,6 +197,10 @@ impl WriteSource {
     pub fn new(source: impl Into<Cow<'static, str>>) -> Self {
         Self(Some(source.into()))
     }
+
+    pub fn as_str(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
 }
 
 impl From<Option<String>> for WriteSource {
