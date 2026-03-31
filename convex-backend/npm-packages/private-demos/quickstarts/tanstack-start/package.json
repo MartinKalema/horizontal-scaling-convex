@@ -1,0 +1,35 @@
+{
+  "name": "tanstack-start",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "convex dev --start 'vite dev'",
+    "dev:ts": "tsc -b -w",
+    "build": "vite build && tsc --noEmit",
+    "start": "node .output/server/index.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@convex-dev/react-query": "^0.1.0",
+    "@tanstack/react-query": "^5.90.2",
+    "@tanstack/react-router-ssr-query": "^1.163.3",
+    "@tanstack/react-router": "^1.163.3",
+    "@tanstack/react-start": "^1.163.3",
+    "convex": "^1.27.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.13",
+    "@types/react-dom": "^18.3.1",
+    "@types/react": "^18.3.12",
+    "@vitejs/plugin-react": "^5.0.3",
+    "typescript": "^5.6.3",
+    "vite-tsconfig-paths": "^5.1.4",
+    "vite": "^7.1.11"
+  }
+}

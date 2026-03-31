@@ -1,0 +1,16 @@
+{
+  "name": "convex",
+  "private": true,
+  "devDependencies": {
+    "@microsoft/rush": "^5.169.3",
+    "@rushstack/lockfile-explorer": "^2.2.7",
+    "pnpm": "10.30.3"
+  },
+  "overrides": {
+    "js-yaml@>=4.0.0 <4.1.1": "4.1.1",
+    "minimatch@10.2.1": "^10.2.3",
+    "path-to-regexp@^0.1.10": "0.1.12",
+    "qs@<6.14.2": "6.14.2",
+    "tar@<7.5.10": "7.5.10"
+  }
+}

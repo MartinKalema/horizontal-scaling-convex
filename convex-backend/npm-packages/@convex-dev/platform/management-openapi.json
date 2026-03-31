@@ -1,0 +1,2912 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Convex Management API",
+    "description": "Management API for provisioning and managing Convex projects and deployments.",
+    "license": {
+      "name": "LicenseRef-Convex",
+      "identifier": "LicenseRef-Convex"
+    },
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.convex.dev/v1",
+      "description": "Platform API"
+    }
+  ],
+  "paths": {
+    "/teams/{team_id}/create_project": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Create project",
+        "description": "Create a new project on a team, optionally provisioning a dev or prod\ndeployment.",
+        "operationId": "create project",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TeamId"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformCreateProjectArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformCreateProjectResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/teams/{team_id}/list_projects": {
+      "get": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "List projects",
+        "description": "List all projects for a team.",
+        "operationId": "list projects",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TeamId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PlatformProjectDetails"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/projects/{project_id}/list_deployments": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "List deployments",
+        "description": "List deployments for a projects.",
+        "operationId": "list deployments",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          },
+          {
+            "name": "includeLocal",
+            "in": "query",
+            "description": "If true, include local deployments in the response (filtered to only\nshow local deployments created by the requesting team member).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "isDefault",
+            "in": "query",
+            "description": "If true, only include default deployments. If false, only include\nnon-default deployments.",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "deploymentType",
+            "in": "query",
+            "description": "Only include deployments of the given deployment type.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/DeploymentType"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PlatformDeploymentResponse"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/projects/{project_id}/deployment": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Get deployment in project by id",
+        "description": "Get a deployment within a project by reference, default production\ndeployment, or default dev deployment for the calling user.",
+        "operationId": "get deployment in project by project id",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          },
+          {
+            "name": "reference",
+            "in": "query",
+            "description": "The reference of the deployment to retrieve.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/DeploymentReference"
+                }
+              ]
+            }
+          },
+          {
+            "name": "defaultProd",
+            "in": "query",
+            "description": "If true, retrieve the default production deployment.",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "defaultDev",
+            "in": "query",
+            "description": "If true, retrieve the default dev deployment for the calling user.",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformDeploymentResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/teams/{team_id_or_slug}/projects/{project_slug}/deployment": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Get deployment in project by slug",
+        "description": "Get a deployment within a project identified by team and project slug,\nby reference, default production deployment, or default dev deployment\nfor the calling user.",
+        "operationId": "get deployment in project by project slug",
+        "parameters": [
+          {
+            "name": "team_id_or_slug",
+            "in": "path",
+            "description": "Team ID or slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project_slug",
+            "in": "path",
+            "description": "Project slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "reference",
+            "in": "query",
+            "description": "The reference of the deployment to retrieve.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/DeploymentReference"
+                }
+              ]
+            }
+          },
+          {
+            "name": "defaultProd",
+            "in": "query",
+            "description": "If true, retrieve the default production deployment.",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "defaultDev",
+            "in": "query",
+            "description": "If true, retrieve the default dev deployment for the calling user.",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformDeploymentResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/projects/{project_id}/delete": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Delete project",
+        "description": "Delete a project. Deletes all deployments in the project as well.",
+        "operationId": "delete project",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/projects/{project_id}": {
+      "get": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Get project by ID",
+        "description": "Get a project by its ID.",
+        "operationId": "get project by id",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformProjectDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/teams/{team_id_or_slug}/projects/{project_slug}": {
+      "get": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Get project by slug",
+        "description": "Get a project by its slug.",
+        "operationId": "get project by slug",
+        "parameters": [
+          {
+            "name": "team_id_or_slug",
+            "in": "path",
+            "description": "Team ID or slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project_slug",
+            "in": "path",
+            "description": "Project slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformProjectDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/projects/{project_id}/create_deployment": {
+      "post": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Create deployment",
+        "description": "Create a new deployment for a project.",
+        "operationId": "create deployment",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformCreateDeploymentArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformDeploymentResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}/delete": {
+      "post": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Delete deployment",
+        "description": "Delete a deployment. This will delete all data and files in the deployment,\nso we recommend creating and downloading a backup before calling this\nendpoint. This does not delete the project itself.",
+        "operationId": "delete deployment",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment Name",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Get deployment",
+        "description": "Get details about a cloud deployment.",
+        "operationId": "platform_get_deployment",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment Name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformDeploymentResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Update deployment",
+        "description": "Updates properties of an existing deployment. Only the fields provided in\nthe request body are modified; omitted fields are left unchanged.",
+        "operationId": "update deployment",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment Name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformUpdateDeploymentArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}/transfer": {
+      "post": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Transfer deployment",
+        "description": "Transfer a deployment from its current project to another project within the\nsame team. For production deployments, the caller must be a project admin on\nboth the source and destination projects. For other deployment types, any\nteam member can transfer deployments they created, or project admins can\ntransfer any deployment.",
+        "operationId": "transfer deployment",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment Name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformTransferDeploymentArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/teams/{team_id}/list_deployment_classes": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "List deployment classes",
+        "description": "Lists the available deployment classes for a team.",
+        "operationId": "list deployment classes",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListDeploymentClassesResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/teams/{team_id}/list_deployment_regions": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "List deployment regions",
+        "description": "Lists the available deployment regions for a team.",
+        "operationId": "list deployment regions",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListDeploymentRegionsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/list_deployments": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "List deployments for team",
+        "description": "Lists deployments for a team with pagination, sorting, and filtering.",
+        "operationId": "list deployments for team",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TeamId"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Cursor for pagination",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max results per page (default: 100, max: 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "sortBy",
+            "in": "query",
+            "description": "Sort field: createTime, lastDeployTime, reference",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sortOrder",
+            "in": "query",
+            "description": "Sort order: asc, desc",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "deploymentType",
+            "in": "query",
+            "description": "Filter by type: dev, prod, preview, custom",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Search by deployment name or reference",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "projectId",
+            "in": "query",
+            "description": "Filter by project ID",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          },
+          {
+            "name": "creator",
+            "in": "query",
+            "description": "Filter by creator member ID",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/MemberId"
+            }
+          },
+          {
+            "name": "isDefault",
+            "in": "query",
+            "description": "Filter by default deployment status",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedDeploymentsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/teams/{team_id}/list_local_deployments": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "List local deployments",
+        "description": "Lists the local deployments for a team.",
+        "operationId": "list local deployments for team",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TeamId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListLocalDeploymentsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}/create_deploy_key": {
+      "post": {
+        "tags": [
+          "Deploy Keys"
+        ],
+        "summary": "Create deploy key",
+        "description": "Create a deploy key like \"dev:happy-animal-123|ey...\" which can be\nused with the Convex CLI to develop against or deploy code.\n\nWhen access to the deployment is granted through an OAuth token this\ndeploy key will use the same OAuth-granted token.\n\nWhen access to the deployment is granted any other way a new token will be\ncreated which grants access only to this deployment.",
+        "operationId": "create deploy key",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformCreateDeployKeyArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformCreateDeployKeyResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}/list_deploy_keys": {
+      "get": {
+        "tags": [
+          "Deploy Keys"
+        ],
+        "summary": "List deploy keys",
+        "description": "Lists all deploy keys for the specified deployment.",
+        "operationId": "list deploy keys",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PlatformDeployKeyResponse"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}/delete_deploy_key": {
+      "post": {
+        "tags": [
+          "Deploy Keys"
+        ],
+        "summary": "Delete deploy key",
+        "description": "Deletes a deploy key for the specified deployment. The `id` in the request\nbody can be the full deploy key (with prefix), encoded token, or the name of\nthe deploy key.",
+        "operationId": "delete deploy key",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformDeleteDeployKeyArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/projects/{project_id}/create_preview_deploy_key": {
+      "post": {
+        "tags": [
+          "Deploy Keys"
+        ],
+        "summary": "Create preview deploy key",
+        "description": "Create a preview deploy key like \"preview:team-slug:project-slug|ey...\"\nwhich can be used with the Convex CLI to create and manage preview\ndeployments within the project.",
+        "operationId": "create preview deploy key",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformCreatePreviewDeployKeyArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformCreatePreviewDeployKeyResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/projects/{project_id}/list_preview_deploy_keys": {
+      "get": {
+        "tags": [
+          "Deploy Keys"
+        ],
+        "summary": "List preview deploy keys",
+        "description": "Lists all preview deploy keys for the specified project.",
+        "operationId": "list preview deploy keys",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          },
+          {
+            "name": "includeManaged",
+            "in": "query",
+            "description": "If true, include managed preview deploy keys (e.g., created by external\nintegrations like Vercel) in the response. Defaults to false.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformListPreviewDeployKeysResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/projects/{project_id}/delete_preview_deploy_key": {
+      "post": {
+        "tags": [
+          "Deploy Keys"
+        ],
+        "summary": "Delete preview deploy key",
+        "description": "Deletes a preview deploy key for the specified project. The `id` in the\nrequest body can be the full preview deploy key (with prefix), encoded\ntoken, or the name of the preview deploy key.",
+        "operationId": "delete preview deploy key",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectId"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformDeletePreviewDeployKeyArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/list_personal_access_tokens": {
+      "get": {
+        "tags": [
+          "Access Tokens"
+        ],
+        "summary": "List personal access tokens",
+        "description": "Lists all personal access tokens for the authenticated user.",
+        "operationId": "list personal access tokens",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PersonalAccessTokenResponse"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          }
+        ]
+      }
+    },
+    "/create_personal_access_token": {
+      "post": {
+        "tags": [
+          "Access Tokens"
+        ],
+        "summary": "Create personal access token",
+        "description": "Creates a new personal access token for the authenticated user.",
+        "operationId": "create personal access token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePersonalAccessTokenArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatePersonalAccessTokenResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          }
+        ]
+      }
+    },
+    "/delete_personal_access_token": {
+      "post": {
+        "tags": [
+          "Access Tokens"
+        ],
+        "summary": "Delete personal access token",
+        "description": "Deletes a personal access token for the authenticated user. The `id` in the\nrequest body can be the encoded token secret or the name of the token.",
+        "operationId": "delete personal access token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeletePersonalAccessTokenArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          }
+        ]
+      }
+    },
+    "/token_details": {
+      "get": {
+        "tags": [
+          "Access Tokens"
+        ],
+        "summary": "Get token details",
+        "description": "Returns the team ID for team tokens.\nEspecially useful after receiving a team token from an OAuth flow\nsince most endpoints require team ID.",
+        "operationId": "get token details",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformTokenDetailsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}/create_custom_domain": {
+      "post": {
+        "tags": [
+          "Custom Domains"
+        ],
+        "summary": "Create custom domain",
+        "operationId": "create custom domain",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformDeleteCustomDomainArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}/delete_custom_domain": {
+      "post": {
+        "tags": [
+          "Custom Domains"
+        ],
+        "summary": "Delete custom domain",
+        "description": "Remove a custom domain from a deployment.",
+        "operationId": "delete custom domain",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformDeleteCustomDomainArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/deployments/{deployment_name}/custom_domains": {
+      "get": {
+        "tags": [
+          "Custom Domains"
+        ],
+        "summary": "List custom domains",
+        "description": "Get all custom domains configured for a deployment.",
+        "operationId": "list custom domains",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformListCustomDomainsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          },
+          {
+            "OAuth Project Token": []
+          }
+        ]
+      }
+    },
+    "/teams/{team_id}/list_members": {
+      "get": {
+        "tags": [
+          "Teams"
+        ],
+        "summary": "List team members",
+        "description": "List the members of the given team.",
+        "operationId": "list team members",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformListTeamMembersResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PAT": []
+          },
+          {
+            "OAuth Team Token": []
+          },
+          {
+            "Team Token": []
+          }
+        ]
+      }
+    },
+    "/teams/create_team": {
+      "post": {
+        "tags": [
+          "Teams"
+        ],
+        "summary": "Create a team",
+        "operationId": "create team",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformCreateTeamArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Team created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not authorized to create teams"
+          }
+        },
+        "security": []
+      }
+    },
+    "/teams/{team_id}/create_access_token": {
+      "post": {
+        "tags": [
+          "Access Tokens"
+        ],
+        "summary": "Create a team access token",
+        "operationId": "create team access token",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "",
+            "required": true
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Team access token created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTeamAccessTokenResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not authorized to create team access tokens"
+          }
+        },
+        "security": []
+      }
+    },
+    "/teams/{team_id}/invite_team_member": {
+      "post": {
+        "tags": [
+          "Team Members"
+        ],
+        "operationId": "invite team member",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "",
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInvitationArgs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": []
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AdminKey": {
+        "type": "string",
+        "description": "Encrypted admin key"
+      },
+      "CreateDeploymentType": {
+        "type": "string",
+        "enum": [
+          "dev",
+          "prod",
+          "preview",
+          "custom"
+        ]
+      },
+      "CreateInvitationArgs": {
+        "type": "object",
+        "required": [
+          "email",
+          "role"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          }
+        }
+      },
+      "CreatePersonalAccessTokenArgs": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name for the personal access token."
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreatePersonalAccessTokenResponse": {
+        "type": "object",
+        "required": [
+          "accessToken"
+        ],
+        "properties": {
+          "accessToken": {
+            "type": "string",
+            "description": "The generated personal access token."
+          }
+        }
+      },
+      "CreateTeamAccessTokenResponse": {
+        "type": "object",
+        "required": [
+          "accessToken",
+          "tokenType"
+        ],
+        "properties": {
+          "accessToken": {
+            "type": "string"
+          },
+          "tokenType": {
+            "type": "string"
+          }
+        }
+      },
+      "DeletePersonalAccessTokenArgs": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The token to delete. This can be the secret value of the token or the\ntoken's unique name."
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeploymentClass": {
+        "type": "string",
+        "enum": [
+          "s16",
+          "s256",
+          "d1024"
+        ]
+      },
+      "DeploymentClassMetadata": {
+        "type": "object",
+        "required": [
+          "type",
+          "available"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "type": {
+            "$ref": "#/components/schemas/DeploymentClass"
+          }
+        }
+      },
+      "DeploymentId": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0
+      },
+      "DeploymentReference": {
+        "type": "string",
+        "description": "An identifier that uniquely identifies this deployment within the project."
+      },
+      "DeploymentRegionMetadata": {
+        "type": "object",
+        "required": [
+          "name",
+          "displayName",
+          "available"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "name": {
+            "$ref": "#/components/schemas/RegionName"
+          }
+        }
+      },
+      "DeploymentType": {
+        "type": "string",
+        "enum": [
+          "dev",
+          "prod",
+          "preview",
+          "custom"
+        ]
+      },
+      "DeviceName": {
+        "type": "string"
+      },
+      "IsDefaultDeployment": {
+        "type": "boolean",
+        "description": "Indicates whether the deployment is the default prod deployment for the\nproject, or the default cloud dev deployment for the member in the project."
+      },
+      "ListDeploymentClassesResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentClassMetadata"
+            }
+          }
+        }
+      },
+      "ListDeploymentRegionsResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentRegionMetadata"
+            }
+          }
+        }
+      },
+      "ListLocalDeploymentsResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformDeploymentResponse"
+            }
+          }
+        }
+      },
+      "ManagedBy": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "vercel"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "oauthApp"
+            ],
+            "properties": {
+              "oauthApp": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "MemberId": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0
+      },
+      "PaginatedDeploymentsResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "pagination"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformDeploymentResponse"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/PaginationMetadata"
+          }
+        }
+      },
+      "PaginationMetadata": {
+        "type": "object",
+        "required": [
+          "hasMore"
+        ],
+        "properties": {
+          "hasMore": {
+            "type": "boolean"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PersonalAccessTokenResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "creationTime"
+        ],
+        "properties": {
+          "creationTime": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expirationTime": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "lastUsedTime": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "$ref": "#/components/schemas/DeviceName"
+          },
+          "ssoTeamId": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TeamId"
+              }
+            ]
+          }
+        }
+      },
+      "PlatformCreateDeployKeyArgs": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name for the deploy key."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlatformCreateDeployKeyResponse": {
+        "type": "object",
+        "required": [
+          "deployKey"
+        ],
+        "properties": {
+          "deployKey": {
+            "$ref": "#/components/schemas/AdminKey",
+            "description": "The generated deploy key."
+          }
+        }
+      },
+      "PlatformCreateDeploymentArgs": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The class to use for this deployment. If not provided, the default\ndeployment class for your team will be used."
+          },
+          "isDefault": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "When creating a prod deployment, whether the deployment is the default\nproduction deployment for the project (i.e. the one used by default\nwhen running `npx convex deploy`).\nWhen creating a dev deployment, whether the deployment is the default\ndevelopment deployment for the member that creates it (i.e. the one used\nby default when running `npx convex dev`).\nThis option can’t be set on other types of deployments.\nIf not provided, defaults to `true` when creating a dev or prod\ndeployment without providing a reference (and defaults to `false`\notherwise)."
+          },
+          "reference": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An identifier that uniquely identifies this deployment within the\nproject. By providing a reference, you can create multiple dev and prod\ndeployments in the project. If you don’t provide a reference, the\nendpoint will create the default production deployment for the project,\nor the default development deployment for the member that creates it\n(i.e. the deployment used by default when running `npx convex deploy`\nor `npx convex dev` respectively). When not providing a reference,\na reference will be automatically generated."
+          },
+          "region": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RegionName",
+                "description": "The hosting region to use for this deployment. If not provided, the\ndefault deployment region for your team will be used."
+              }
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/CreateDeploymentType"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlatformCreatePreviewDeployKeyArgs": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name for the preview deploy key."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlatformCreatePreviewDeployKeyResponse": {
+        "type": "object",
+        "required": [
+          "previewDeployKey"
+        ],
+        "properties": {
+          "previewDeployKey": {
+            "$ref": "#/components/schemas/AdminKey",
+            "description": "The generated preview deploy key."
+          }
+        }
+      },
+      "PlatformCreateProjectArgs": {
+        "type": "object",
+        "required": [
+          "projectName"
+        ],
+        "properties": {
+          "deploymentClass": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When creating a deployment, the class to use for the deployment.\nIf not provided, the default deployment class for your team will be\nused."
+          },
+          "deploymentRegion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RegionName",
+                "description": "When creating a deployment, the hosting region to use for the\ndeployment. If not provided, the default deployment region for your\nteam will be used."
+              }
+            ]
+          },
+          "deploymentType": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CreateDeploymentType",
+                "description": "Optionally provision a \"dev\" development deployment or \"prod\" production\ndeployment alongside the project. If omitted, a project is created\nwithout a deployment."
+              }
+            ]
+          },
+          "projectName": {
+            "$ref": "#/components/schemas/ProjectName",
+            "description": "The full name of the project as it will appear in the dashboard. Spaces\nand punctuations allowed."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlatformCreateProjectResponse": {
+        "type": "object",
+        "required": [
+          "projectId"
+        ],
+        "properties": {
+          "deploymentName": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The readable identifier for this deployment, something like\nplayful-otter-123. Only present when a deployment was requested."
+          },
+          "deploymentUrl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Deployment cloud URL, where this deployment lives. Only present when a\ndeployment was requested."
+          },
+          "projectId": {
+            "$ref": "#/components/schemas/ProjectId"
+          }
+        }
+      },
+      "PlatformCreateTeamArgs": {
+        "type": "object",
+        "required": [
+          "defaultRegion",
+          "name"
+        ],
+        "properties": {
+          "defaultRegion": {
+            "$ref": "#/components/schemas/RegionName"
+          },
+          "name": {
+            "$ref": "#/components/schemas/ProposedTeamName"
+          }
+        }
+      },
+      "PlatformCustomDomainResponse": {
+        "type": "object",
+        "required": [
+          "creationTime",
+          "deploymentName",
+          "requestDestination",
+          "domain"
+        ],
+        "properties": {
+          "creationTime": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timestamp in milliseconds when this domain was created."
+          },
+          "deploymentName": {
+            "type": "string",
+            "description": "The deployment name this domain is configured for."
+          },
+          "domain": {
+            "type": "string",
+            "description": "The custom domain name."
+          },
+          "requestDestination": {
+            "$ref": "#/components/schemas/RequestDestination",
+            "description": "The destination for this custom domain (convexCloud or convexSite)."
+          },
+          "verificationTime": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Timestamp in milliseconds when this domain was verified, or null if not\nyet verified."
+          }
+        }
+      },
+      "PlatformDeleteCustomDomainArgs": {
+        "type": "object",
+        "required": [
+          "requestDestination",
+          "domain"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The custom domain name to delete."
+          },
+          "requestDestination": {
+            "$ref": "#/components/schemas/RequestDestination",
+            "description": "The destination for this custom domain (convexCloud or convexSite)."
+          }
+        }
+      },
+      "PlatformDeleteDeployKeyArgs": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The token to delete. This can be the secret value of the token or the\ntoken's unique name."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlatformDeletePreviewDeployKeyArgs": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The token to delete. This can be the secret value of the token or the\ntoken's unique name."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlatformDeployKeyResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "creationTime"
+        ],
+        "properties": {
+          "creationTime": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timestamp in milliseconds when this token was created."
+          },
+          "creator": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MemberId",
+                "description": "The member ID that created this deploy key (if available)."
+              }
+            ]
+          },
+          "lastUsedTime": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Timestamp in milliseconds when this token was last used (if ever)."
+          },
+          "managedBy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ManagedBy",
+                "description": "The external integration that manages this deploy key, if any."
+              }
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "The name given to the deploy key at creation."
+          }
+        }
+      },
+      "PlatformDeploymentResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "createTime",
+              "deploymentType",
+              "projectId",
+              "region",
+              "isDefault",
+              "reference",
+              "deploymentUrl",
+              "class",
+              "kind"
+            ],
+            "properties": {
+              "class": {
+                "type": "string",
+                "description": "The deployment class for this deployment."
+              },
+              "createTime": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Timestamp in milliseconds when this deployment was created."
+              },
+              "creator": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/MemberId",
+                    "description": "The member who created this deployment."
+                  }
+                ]
+              },
+              "dashboardEditConfirmation": {
+                "type": [
+                  "boolean",
+                  "null"
+                ],
+                "description": "Controls whether the dashboard requires a confirmation before\nallowing edits during a browser session for this deployment.\nIf not set, defaults to true for prod deployments and false\nfor dev and preview deployments."
+              },
+              "deploymentType": {
+                "$ref": "#/components/schemas/DeploymentType",
+                "description": "The type of this deployment."
+              },
+              "deploymentUrl": {
+                "type": "string",
+                "description": "The full backend URL for this deployment (e.g. \"https://joyful-capybara-123.convex.cloud\" or \"https://calm-cow-456.eu-west-1.convex.cloud\"). This is always a `.convex.cloud` URL, even when the deployment is using custom domains. To get the canonical URL, use [`/get_canonical_urls`](https://docs.convex.dev/deployment-api/get-canonical-urls)."
+              },
+              "expiresAt": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Timestamp in milliseconds when this deployment will be\ndeleted. Preview deployments have this set by default unless\noverridden."
+              },
+              "id": {
+                "$ref": "#/components/schemas/DeploymentId"
+              },
+              "isDefault": {
+                "$ref": "#/components/schemas/IsDefaultDeployment",
+                "description": "For prod deployments, whether they are the default prod deployment\nof the project. For dev deployments, whether they are the default\ndev deployment for the member that created it.\nFor other deployments, set to false."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "cloud"
+                ]
+              },
+              "lastDeployTime": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Timestamp in milliseconds of the last deploy to this deployment, if\nany."
+              },
+              "name": {
+                "type": "string",
+                "description": "The readable identifier for this deployment, something like\nplayful-otter-123."
+              },
+              "previewIdentifier": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PreviewDeploymentIdentifier",
+                    "description": "Preview deployment identifier, if this is a preview deployment."
+                  }
+                ]
+              },
+              "projectId": {
+                "$ref": "#/components/schemas/ProjectId",
+                "description": "The project this deployment belongs to."
+              },
+              "reference": {
+                "$ref": "#/components/schemas/DeploymentReference",
+                "description": "An identifier that uniquely identifies this deployment within the\nproject."
+              },
+              "region": {
+                "$ref": "#/components/schemas/RegionName",
+                "description": "The region where this deployment is hosted."
+              },
+              "sendLogsToClient": {
+                "type": [
+                  "boolean",
+                  "null"
+                ],
+                "description": "Whether to send function logs to the client. If `null`, the\ndeployment-type default is used (true for dev/preview, false for\nprod)."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "createTime",
+              "deploymentType",
+              "projectId",
+              "creator",
+              "port",
+              "deviceName",
+              "isActive",
+              "kind"
+            ],
+            "properties": {
+              "createTime": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Timestamp in milliseconds when this deployment was created."
+              },
+              "creator": {
+                "$ref": "#/components/schemas/MemberId",
+                "description": "The member who created this deployment."
+              },
+              "deploymentType": {
+                "$ref": "#/components/schemas/DeploymentType",
+                "description": "Whether this is a \"dev\" development deployment or \"prod\" production\ndeployment. Note that this will always be \"dev\" for local\ndeployments."
+              },
+              "deviceName": {
+                "$ref": "#/components/schemas/DeviceName",
+                "description": "The device name where this local deployment is running."
+              },
+              "isActive": {
+                "type": "boolean",
+                "description": "Whether this local deployment is currently active."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "local"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "description": "The readable identifier for this deployment."
+              },
+              "port": {
+                "type": "integer",
+                "format": "int32",
+                "description": "The port where this local deployment is running.",
+                "minimum": 0
+              },
+              "previewIdentifier": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PreviewDeploymentIdentifier",
+                    "description": "Preview deployment identifier. Note that this will always be None\nfor local deployments."
+                  }
+                ]
+              },
+              "projectId": {
+                "$ref": "#/components/schemas/ProjectId",
+                "description": "The project this deployment belongs to."
+              }
+            }
+          }
+        ]
+      },
+      "PlatformListCustomDomainsResponse": {
+        "type": "object",
+        "required": [
+          "domains"
+        ],
+        "properties": {
+          "domains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformCustomDomainResponse"
+            },
+            "description": "List of custom domains configured for this deployment."
+          }
+        }
+      },
+      "PlatformListPreviewDeployKeysResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformDeployKeyResponse"
+            },
+            "description": "The list of preview deploy keys."
+          }
+        }
+      },
+      "PlatformListTeamMembersResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeamMember"
+            }
+          }
+        }
+      },
+      "PlatformProjectDetails": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "teamId",
+          "teamSlug",
+          "createTime"
+        ],
+        "properties": {
+          "createTime": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timestamp in milliseconds."
+          },
+          "id": {
+            "$ref": "#/components/schemas/ProjectId"
+          },
+          "name": {
+            "$ref": "#/components/schemas/ProjectName",
+            "description": "The full project name, including spaces and punctuation."
+          },
+          "slug": {
+            "$ref": "#/components/schemas/ProjectSlug",
+            "description": "This shortened version of the name used in Convex Dashboard URLs."
+          },
+          "teamId": {
+            "$ref": "#/components/schemas/TeamId"
+          },
+          "teamSlug": {
+            "$ref": "#/components/schemas/TeamSlug",
+            "description": "The slug of the team that owns this project."
+          }
+        }
+      },
+      "PlatformTokenDetailsResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "teamId",
+              "name",
+              "createTime",
+              "type"
+            ],
+            "properties": {
+              "createTime": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Timestamp in milliseconds when this token was created."
+              },
+              "name": {
+                "$ref": "#/components/schemas/DeviceName",
+                "description": "The name given to the token at creation."
+              },
+              "teamId": {
+                "$ref": "#/components/schemas/TeamId",
+                "description": "The team ID this token is associated with."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "teamToken"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "projectId",
+              "name",
+              "createTime",
+              "type"
+            ],
+            "properties": {
+              "createTime": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Timestamp in milliseconds when this token was created."
+              },
+              "name": {
+                "$ref": "#/components/schemas/DeviceName",
+                "description": "The name given to the token at creation."
+              },
+              "projectId": {
+                "$ref": "#/components/schemas/ProjectId",
+                "description": "The project ID this token is associated with."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "projectToken"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "PlatformTransferDeploymentArgs": {
+        "type": "object",
+        "required": [
+          "destinationProjectId"
+        ],
+        "properties": {
+          "destinationProjectId": {
+            "$ref": "#/components/schemas/ProjectId"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlatformUpdateDeploymentArgs": {
+        "type": "object",
+        "properties": {
+          "dashboardEditConfirmation": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Controls whether the dashboard requires a confirmation before allowing\nedits during a browser session for this deployment. If set to `null`,\nthe setting is reset to the default behavior (true for prod deployments,\nfalse for dev and preview deployments). If set to `true` or `false`, the\nsetting is explicitly overridden."
+          },
+          "expiresAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Timestamp in milliseconds when this deployment will be deleted.\nPreview deployments have this set by default unless overridden.\nMust be at least 30 minutes in the future and cannot exceed the\nteam's preview deployment retention days entitlement from now.\nSet to `null` to clear the expiration."
+          },
+          "reference": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The reference of the deployment. When provided, must match the following\nrules:\n  - be unique across deployment references in the project\n  - 3 to 100 characters (included)\n  - only lowercase letters, numbers, \"-\"\" and \"/\"\n  - not follow the deployment name format [a-z]+-[a-z]+-[0-9]+ (e.g.\n    \"happy-capybara-123\")\n  - not start with \"local-\"\"\n  - not be one of the following reserved keywords: \"prod\", \"dev\",\n    \"cloud\", \"local\", \"default\", \"name\", \"new\", \"existing\",\n    \"deployment\", \"preview\""
+          },
+          "sendLogsToClient": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to send function logs to the client. If set to `null`, the\nsetting is reset to the deployment-type default (true for dev/preview,\nfalse for prod). If set to `true` or `false`, the setting is explicitly\noverridden."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PreviewDeploymentIdentifier": {
+        "type": "string"
+      },
+      "ProjectId": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0
+      },
+      "ProjectName": {
+        "type": "string"
+      },
+      "ProjectSlug": {
+        "type": "string"
+      },
+      "ProposedTeamName": {
+        "type": "string"
+      },
+      "ReferralCode": {
+        "type": "string"
+      },
+      "RegionName": {
+        "type": "string",
+        "enum": [
+          "aws-us-east-1",
+          "aws-eu-west-1"
+        ]
+      },
+      "RequestDestination": {
+        "type": "string",
+        "enum": [
+          "convexCloud",
+          "convexSite"
+        ]
+      },
+      "Role": {
+        "type": "string",
+        "enum": [
+          "admin",
+          "developer"
+        ]
+      },
+      "TeamId": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0
+      },
+      "TeamMember": {
+        "type": "object",
+        "required": [
+          "id",
+          "email",
+          "role"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "The email of the team member"
+          },
+          "id": {
+            "$ref": "#/components/schemas/MemberId"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name of the team member"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The role of the team member"
+          }
+        }
+      },
+      "TeamName": {
+        "type": "string"
+      },
+      "TeamResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "suspended",
+          "referralCode"
+        ],
+        "properties": {
+          "creator": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MemberId"
+              }
+            ]
+          },
+          "defaultRegion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RegionName"
+              }
+            ]
+          },
+          "id": {
+            "$ref": "#/components/schemas/TeamId"
+          },
+          "managedBy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ManagedBy"
+              }
+            ]
+          },
+          "managedByUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "$ref": "#/components/schemas/TeamName"
+          },
+          "referralCode": {
+            "$ref": "#/components/schemas/ReferralCode"
+          },
+          "referredBy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TeamId"
+              }
+            ]
+          },
+          "slug": {
+            "$ref": "#/components/schemas/TeamSlug"
+          },
+          "ssoLoginId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "suspended": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TeamSlug": {
+        "type": "string"
+      }
+    },
+    "securitySchemes": {
+      "OAuth Project Token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Obtained through a [Convex OAuth application](https://docs.convex.dev/management-api)."
+      },
+      "OAuth Team Token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Obtained through a [Convex OAuth application](https://docs.convex.dev/management-api)."
+      },
+      "PAT": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "PAT",
+        "description": "Personal access token created in the Convex dashboard under user settings."
+      },
+      "Team Token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Created in the dashboard under team settings for any team you can manage."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Projects",
+      "description": "Create, list, and manage projects"
+    },
+    {
+      "name": "Deployments",
+      "description": "Create, list, and manage deployments"
+    },
+    {
+      "name": "Deploy Keys",
+      "description": "Create, list, and delete deploy keys"
+    },
+    {
+      "name": "Custom Domains",
+      "description": "Create, list, and delete custom domains"
+    },
+    {
+      "name": "Teams",
+      "description": "List and manage team members"
+    },
+    {
+      "name": "Access Tokens",
+      "description": "Inspect authentication token details"
+    }
+  ]
+}
