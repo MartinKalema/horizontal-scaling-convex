@@ -977,6 +977,7 @@ impl<RT: Runtime> Database<RT> {
         retention_rate_limiter: Arc<RateLimiter<RT>>,
         deleted_tablet_sender: mpsc::Sender<TabletId>,
         distributed_log: Arc<dyn crate::commit_delta::DistributedLog>,
+        replica_mode: bool,
     ) -> anyhow::Result<Self> {
         let _load_database_timer = metrics::load_database_timer();
 
@@ -1020,6 +1021,11 @@ impl<RT: Runtime> Database<RT> {
             ..
         } = db_snapshot;
 
+        let snapshot_for_dummy = if replica_mode {
+            Some(snapshot.clone())
+        } else {
+            None
+        };
         let snapshot_manager = SnapshotManager::new(*ts, snapshot);
         let (snapshot_reader, snapshot_writer) = new_split_rw_lock(snapshot_manager);
 
@@ -1036,16 +1042,45 @@ impl<RT: Runtime> Database<RT> {
         let persistence_reader = persistence.reader();
         let (log_owner, log_reader, log_writer) = new_write_log(*ts);
         let subscriptions = SubscriptionsWorker::start(log_owner, runtime.clone());
-        let committer = Committer::start(
-            log_writer,
-            snapshot_writer,
-            persistence,
-            runtime.clone(),
-            retention_manager.clone(),
-            shutdown,
-            virtual_system_mapping.clone(),
-            distributed_log,
-        );
+        let committer = if replica_mode {
+            // In replica mode, give the snapshot writer and log writer to the
+            // ReplicaSnapshotUpdater instead of the Committer.
+            let _replica_updater = crate::replica::ReplicaSnapshotUpdater::start(
+                runtime.clone(),
+                distributed_log.clone(),
+                snapshot_writer,
+                log_writer,
+                *ts,
+            );
+            // Create a dummy Committer that will never receive writes.
+            // We need one because Database expects a CommitterClient.
+            let (_, _, dummy_log_writer) = new_write_log(*ts);
+            let dummy_snapshot = snapshot_for_dummy.expect("snapshot_for_dummy must be Some in replica mode");
+            let dummy_snapshot_manager = SnapshotManager::new(*ts, dummy_snapshot);
+            let (_, dummy_snapshot_writer) = new_split_rw_lock(dummy_snapshot_manager);
+            tracing::info!("Database loading in replica mode — tailing distributed log from ts={ts}");
+            Committer::start(
+                dummy_log_writer,
+                dummy_snapshot_writer,
+                persistence,
+                runtime.clone(),
+                retention_manager.clone(),
+                shutdown,
+                virtual_system_mapping.clone(),
+                Arc::new(crate::commit_delta::NoopDistributedLog),
+            )
+        } else {
+            Committer::start(
+                log_writer,
+                snapshot_writer,
+                persistence,
+                runtime.clone(),
+                retention_manager.clone(),
+                shutdown,
+                virtual_system_mapping.clone(),
+                distributed_log,
+            )
+        };
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
         let by_id_indexes_snapshot_cache =
