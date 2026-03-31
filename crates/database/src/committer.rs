@@ -868,6 +868,12 @@ impl<RT: Runtime> Committer<RT> {
         // Write transaction state at the commit ts to the document store.
         metrics::commit_rows(ordered_updates.len() as u64);
 
+        // Extract document updates for replication before consuming ordered_updates.
+        let document_updates: Vec<_> = ordered_updates
+            .iter()
+            .map(|(_, update)| update.unpack())
+            .collect();
+
         let timer = metrics::pending_writes_to_write_log_timer();
         // See the comment in `overlaps_index_keys` for why it’s safe
         // to use indexes from the current snapshot.
@@ -894,6 +900,7 @@ impl<RT: Runtime> Committer<RT> {
         let delta = CommitDelta {
             ts: commit_ts,
             document_writes,
+            document_updates,
             index_writes,
             write_source,
             write_bytes,
