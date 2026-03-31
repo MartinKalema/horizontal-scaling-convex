@@ -166,6 +166,27 @@ pub fn index_keys_from_full_documents(
     )
 }
 
+/// Converts a slice of [`DocumentUpdate`]s to [`OrderedIndexKeyWrites`] for
+/// use by the write log on Replica nodes.
+pub fn index_keys_from_document_updates(
+    updates: &[DocumentUpdate],
+    index_registry: &IndexRegistry,
+) -> OrderedIndexKeyWrites {
+    WithHeapSize::from(
+        updates
+            .iter()
+            .map(|update| {
+                let packed = PackedDocumentUpdate::pack(update);
+                (
+                    update.id,
+                    DocumentIndexKeysUpdate::from_document_update(&packed, index_registry),
+                    packed.new_document,
+                )
+            })
+            .collect_vec(),
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteSource(pub(crate) Option<Cow<'static, str>>);
 impl WriteSource {

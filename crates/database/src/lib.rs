@@ -14,6 +14,7 @@ mod bootstrap_model;
 pub mod commit_delta;
 mod committer;
 mod database;
+pub mod replica;
 mod database_index_workers;
 mod execution_size;
 mod metrics;
