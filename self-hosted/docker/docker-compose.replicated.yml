@@ -20,26 +20,28 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: convex_self_hosted
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     healthcheck:
       test: pg_isready -U postgres
       interval: 5s
       start_period: 10s
 
   nats:
-    image: nats:latest
-    command: ["--jetstream", "--store_dir", "/data"]
+    image: nats:alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
     ports:
       - "4222:4222"   # Client connections
       - "8222:8222"   # Monitoring
     volumes:
       - natsdata:/data
     healthcheck:
-      test: ["CMD", "nats-server", "--signal", "ldm"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
       interval: 5s
       start_period: 5s
+      retries: 3
 
   primary:
     image: ghcr.io/get-convex/convex-backend:latest
@@ -56,6 +58,7 @@ services:
       - CONVEX_SITE_ORIGIN=http://127.0.0.1:3211
       - RUST_LOG=info
       - DISABLE_BEACON=true
+      - INSTANCE_NAME=convex-primary
       - REPLICATION_MODE=primary
       - NATS_URL=nats://nats:4222
       - GRPC_PORT=50051
@@ -85,6 +88,7 @@ services:
       - CONVEX_SITE_ORIGIN=http://127.0.0.1:3221
       - RUST_LOG=info
       - DISABLE_BEACON=true
+      - INSTANCE_NAME=convex-replica
       - REPLICATION_MODE=replica
       - NATS_URL=nats://nats:4222
       - PRIMARY_GRPC_URL=http://primary:50051
