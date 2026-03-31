@@ -98,6 +98,7 @@ impl<RT: Runtime> DbFixtures<RT> {
             Arc::new(new_unlimited_rate_limiter(rt.clone())),
             deleted_tablet_sender,
             Arc::new(crate::commit_delta::NoopDistributedLog),
+            false,
         )
         .await?;
         db.set_search_storage(search_storage.clone());

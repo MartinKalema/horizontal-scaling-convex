@@ -183,6 +183,7 @@ pub async fn make_app(
         )),
         deleted_tablet_sender,
         distributed_log,
+        config.replication_mode == "replica",
     )
     .await?;
     initialize_application_system_tables(&database).await?;

@@ -219,6 +219,7 @@ impl<RT: Runtime> ApplicationTestExt<RT> for Application<RT> {
             Arc::new(new_unlimited_rate_limiter(rt.clone())),
             deleted_tablet_sender,
             Arc::new(database::commit_delta::NoopDistributedLog),
+            false,
         )
         .await?;
         initialize_application_system_tables(&database).await?;

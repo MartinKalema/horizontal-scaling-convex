@@ -68,31 +68,33 @@ services:
       interval: 5s
       start_period: 10s
 
-  # Replica is commented out until we wire replication into the binary.
-  # When ready, it will consume deltas from NATS and serve read-only queries.
-  #
-  # replica:
-  #   image: ghcr.io/get-convex/convex-backend:latest
-  #   stop_grace_period: 10s
-  #   stop_signal: SIGINT
-  #   ports:
-  #     - "3220:3210"
-  #     - "3221:3211"
-  #   environment:
-  #     - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
-  #     - DO_NOT_REQUIRE_SSL=1
-  #     - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3220
-  #     - CONVEX_SITE_ORIGIN=http://127.0.0.1:3221
-  #     - RUST_LOG=info
-  #     - DISABLE_BEACON=true
-  #     - REPLICATION_MODE=replica
-  #     - NATS_URL=nats://nats:4222
-  #     - PRIMARY_URL=http://primary:3210
-  #   depends_on:
-  #     primary:
-  #       condition: service_healthy
-  #     nats:
-  #       condition: service_healthy
+  replica:
+    image: ghcr.io/get-convex/convex-backend:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "3220:3210"
+      - "3221:3211"
+    volumes:
+      - replica-data:/convex/data
+    environment:
+      - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
+      - DO_NOT_REQUIRE_SSL=1
+      - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3220
+      - CONVEX_SITE_ORIGIN=http://127.0.0.1:3221
+      - RUST_LOG=info
+      - DISABLE_BEACON=true
+      - REPLICATION_MODE=replica
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      primary:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: curl -f http://localhost:3210/version
+      interval: 5s
+      start_period: 10s
 
   dashboard:
     image: ghcr.io/get-convex/convex-dashboard:latest
@@ -109,3 +111,4 @@ services:
 volumes:
   pgdata:
   natsdata:
+  replica-data:

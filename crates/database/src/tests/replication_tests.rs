@@ -40,6 +40,7 @@ async fn test_primary_commit_publishes_delta(rt: TestRuntime) -> anyhow::Result<
         Arc::new(new_unlimited_rate_limiter(rt.clone())),
         deleted_tablet_sender,
         distributed_log.clone(),
+        false,
     )
     .await?;
     primary.set_search_storage(Arc::new(LocalDirStorage::new(rt.clone())?));
