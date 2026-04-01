@@ -51,6 +51,9 @@ services:
       - "3210:3210"
       - "3211:3211"
       - "50051:50051"
+    volumes:
+      - primary-data:/convex/data
+      - shared-storage:/convex/data/storage
     environment:
       - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
       - DO_NOT_REQUIRE_SSL=1
@@ -81,6 +84,7 @@ services:
       - "3221:3211"
     volumes:
       - replica-data:/convex/data
+      - shared-storage:/convex/data/storage
     environment:
       - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
       - DO_NOT_REQUIRE_SSL=1
@@ -117,4 +121,6 @@ services:
 volumes:
   pgdata:
   natsdata:
+  primary-data:
   replica-data:
+  shared-storage:
