@@ -38,15 +38,22 @@ use crate::{
 };
 
 const STREAM_NAME: &str = "CONVEX_COMMITS";
-const SUBJECT: &str = "convex.commits";
+/// Base subject for commit deltas. In single-partition mode, publishes to
+/// "convex.commits". In partitioned mode, publishes to "convex.commits.{partition_id}".
+/// The stream subscribes to "convex.commits.>" to capture all partitions.
+const SUBJECT_BASE: &str = "convex.commits";
 
 /// Configuration for connecting to NATS.
 #[derive(Clone, Debug)]
 pub struct NatsConfig {
     pub url: String,
-    /// Consumer name for this node. Each Replica needs a unique consumer name
-    /// so NATS delivers all messages to each Replica independently.
+    /// Consumer name for this node. Each node needs a unique consumer name
+    /// so NATS delivers all messages to each node independently.
     pub consumer_name: Option<String>,
+    /// Partition ID for this node's publish subject.
+    /// None = single-partition mode (publishes to "convex.commits").
+    /// Some(id) = partitioned mode (publishes to "convex.commits.{id}").
+    pub partition_id: Option<u32>,
 }
 
 /// NATS JetStream implementation of [`DistributedLog`].
@@ -54,6 +61,8 @@ pub struct NatsDistributedLog {
     jetstream: jetstream::Context,
     stream: JsStream,
     consumer_name: String,
+    /// Subject this node publishes to.
+    publish_subject: String,
 }
 
 impl NatsDistributedLog {
@@ -71,10 +80,16 @@ impl NatsDistributedLog {
         // Create the stream using create_stream (not get_or_create_stream)
         // to ensure it exists with our exact configuration.
         // If it already exists with matching config, this is a no-op.
+        // Stream subjects: use wildcard "convex.commits.>" to capture all
+        // partitions. Also include bare "convex.commits" for backward compat
+        // with single-partition mode.
         let stream = jetstream
             .get_or_create_stream(jetstream::stream::Config {
                 name: STREAM_NAME.to_string(),
-                subjects: vec![SUBJECT.to_string()],
+                subjects: vec![
+                    format!("{SUBJECT_BASE}"),
+                    format!("{SUBJECT_BASE}.>"),
+                ],
                 retention: jetstream::stream::RetentionPolicy::Limits,
                 max_age: std::time::Duration::from_secs(86400),
                 storage: jetstream::stream::StorageType::File,
@@ -86,17 +101,22 @@ impl NatsDistributedLog {
         // Verify the stream is accessible.
         let mut stream = stream;
         let info = stream.info().await.context("Failed to get stream info")?;
-        let consumer_name = config.consumer_name.unwrap_or_else(|| "convex-replica".to_string());
+        let consumer_name = config.consumer_name.unwrap_or_else(|| "convex-node".to_string());
+        let publish_subject = match config.partition_id {
+            Some(id) => format!("{SUBJECT_BASE}.{id}"),
+            None => SUBJECT_BASE.to_string(),
+        };
         tracing::info!(
-            "Connected to NATS JetStream at {}. Stream '{}': {} messages, {} bytes. Consumer: {}",
+            "Connected to NATS JetStream at {}. Stream '{}': {} messages, {} bytes. Consumer: {}, Publish subject: {}",
             config.url,
             STREAM_NAME,
             info.state.messages,
             info.state.bytes,
             consumer_name,
+            publish_subject,
         );
 
-        Ok(Self { jetstream, stream, consumer_name })
+        Ok(Self { jetstream, stream, consumer_name, publish_subject })
     }
 }
 
@@ -196,7 +216,7 @@ impl DistributedLog for NatsDistributedLog {
         // - Second .await waits for the server acknowledgment
         let ack = self
             .jetstream
-            .publish(SUBJECT, payload.into())
+            .publish(self.publish_subject.clone(), payload.into())
             .await
             .context("Failed to send publish to NATS")?
             .await
