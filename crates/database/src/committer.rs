@@ -1081,6 +1081,20 @@ impl<RT: Runtime> Committer<RT> {
             })
         })?;
 
+        // Phase 3b: Advance max_repeatable_ts in persistence so reads
+        // at the new timestamp are valid.
+        common::runtime::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                self.persistence
+                    .write_persistence_global(
+                        common::persistence::PersistenceGlobalKey::MaxRepeatableTimestamp,
+                        serde_json::Value::from(u64::from(commit_ts)),
+                    )
+                    .await
+            })
+        })?;
+
         // Phase 4: Update write log for subscription invalidation.
         let writes = crate::write_log::index_keys_from_document_updates(
             &all_remapped_updates,
@@ -1088,9 +1102,10 @@ impl<RT: Runtime> Committer<RT> {
         );
         self.log.append(commit_ts, writes, delta.write_source);
 
-        // Phase 5: Push updated snapshot.
+        // Phase 5: Push updated snapshot and advance repeatable timestamp.
         let mut sm = self.snapshot_manager.write();
         sm.push(commit_ts, snapshot, delta.write_bytes);
+        let _ = sm.bump_persisted_max_repeatable_ts(commit_ts);
 
         let skipped = delta.document_updates.len() - all_remapped_updates.len();
         tracing::info!(
