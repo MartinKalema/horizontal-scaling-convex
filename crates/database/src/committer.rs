@@ -208,6 +208,10 @@ pub struct Committer<RT: Runtime> {
     // Distributed log for replication. Publishes CommitDeltas after each commit
     // so Replica nodes can update their state.
     distributed_log: Arc<dyn DistributedLog>,
+
+    // Partition map for write routing. Determines which tables this node owns.
+    // None means single-partition mode (owns everything).
+    partition_map: Option<crate::partition::PartitionMap>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -220,6 +224,7 @@ impl<RT: Runtime> Committer<RT> {
         shutdown: ShutdownSignal,
         virtual_system_mapping: VirtualSystemMapping,
         distributed_log: Arc<dyn DistributedLog>,
+        partition_map: Option<crate::partition::PartitionMap>,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
         let conflict_checker = PendingWrites::new();
@@ -237,6 +242,7 @@ impl<RT: Runtime> Committer<RT> {
             virtual_system_mapping,
             user_documents_size_gauge: user_documents_size_subgauge(),
             distributed_log,
+            partition_map,
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -707,6 +713,26 @@ impl<RT: Runtime> Committer<RT> {
         transaction: FinalTransaction,
         write_source: WriteSource,
     ) -> anyhow::Result<ValidatedCommit> {
+        // Partition ownership check: if partitioning is enabled, verify
+        // that all writes target tables owned by this node's partition.
+        if let Some(ref partition_map) = self.partition_map {
+            for write in transaction.writes.coalesced_writes() {
+                let tablet_id = write.id.tablet_id;
+                if let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) {
+                    if !partition_map.is_local(&table_name) {
+                        let partition = partition_map.partition_for_table(&table_name);
+                        anyhow::bail!(
+                            "Write to table '{}' rejected: owned by {}, not this node ({}). \
+                             Route this mutation to the correct partition owner.",
+                            table_name,
+                            partition,
+                            partition_map.local_partition(),
+                        );
+                    }
+                }
+            }
+        }
+
         let commit_ts = self.next_commit_ts()?;
         let timer = metrics::commit_is_stale_timer();
         if let Some(conflicting_read) = self.commit_has_conflict(
