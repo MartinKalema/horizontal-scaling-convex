@@ -132,10 +132,14 @@ struct DeltaEnvelope {
     /// Used by Replicas to remap document IDs to their own local TabletIds.
     #[serde(default)]
     tablet_mapping: Vec<(String, String)>, // (hex TabletId, table name string)
+    /// Name of the node that published this delta.
+    /// Consumers skip deltas from their own node to avoid double-applying.
+    #[serde(default)]
+    source_node: String,
 }
 
 impl DeltaEnvelope {
-    fn from_delta(delta: &CommitDelta) -> anyhow::Result<Self> {
+    fn from_delta(delta: &CommitDelta, source_node: &str) -> anyhow::Result<Self> {
         let document_updates_proto = delta
             .document_updates
             .iter()
@@ -157,6 +161,7 @@ impl DeltaEnvelope {
             write_bytes: delta.write_bytes,
             document_updates_proto,
             tablet_mapping,
+            source_node: source_node.to_string(),
         })
     }
 
@@ -205,7 +210,7 @@ impl DistributedLog for NatsDistributedLog {
         let ts = u64::from(delta.ts);
         let num_updates = delta.document_updates.len();
 
-        let envelope = DeltaEnvelope::from_delta(&delta)?;
+        let envelope = DeltaEnvelope::from_delta(&delta, &self.consumer_name)?;
         let payload =
             serde_json::to_vec(&envelope).context("Failed to serialize CommitDelta")?;
         let payload_size = payload.len();
@@ -267,7 +272,10 @@ impl DistributedLog for NatsDistributedLog {
             from_ts_u64,
         );
 
-        let stream = messages.filter_map(move |msg_result| async move {
+        let self_node_name = consumer_name.clone();
+        let stream = messages.filter_map(move |msg_result| {
+            let node_name = self_node_name.clone();
+            async move {
             match msg_result {
                 Ok(msg) => {
                     if let Err(e) = msg.ack().await {
@@ -285,9 +293,18 @@ impl DistributedLog for NatsDistributedLog {
                     if envelope.ts <= from_ts_u64 {
                         return None;
                     }
+                    // Skip deltas published by this node to avoid double-applying.
+                    if !envelope.source_node.is_empty() && envelope.source_node == node_name {
+                        tracing::debug!(
+                            "Skipping self-published delta at ts={}",
+                            envelope.ts,
+                        );
+                        return None;
+                    }
                     tracing::debug!(
-                        "Received commit delta from NATS: ts={}",
+                        "Received commit delta from NATS: ts={}, source={}",
                         envelope.ts,
+                        envelope.source_node,
                     );
                     Some(envelope.to_delta())
                 },
@@ -296,7 +313,7 @@ impl DistributedLog for NatsDistributedLog {
                     Some(Err(anyhow::anyhow!("NATS message error: {e}")))
                 },
             }
-        });
+        }});
 
         Ok(Box::pin(stream))
     }
