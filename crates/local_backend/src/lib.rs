@@ -169,6 +169,7 @@ pub async fn make_app(
             let nats_config = database::nats_distributed_log::NatsConfig {
                 url: nats_url.clone(),
                 consumer_name: Some(config.name()),
+                partition_id: None, // TODO: set from partition config
             };
             Arc::new(
                 database::nats_distributed_log::NatsDistributedLog::connect(nats_config).await?,
@@ -336,7 +337,7 @@ pub async fn make_app(
             let consumer_name = config.name();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
                 let consumer_nats = match database::nats_distributed_log::NatsDistributedLog::connect(
-                    database::nats_distributed_log::NatsConfig { url: nats_url, consumer_name: Some(consumer_name) },
+                    database::nats_distributed_log::NatsConfig { url: nats_url, consumer_name: Some(consumer_name), partition_id: None },
                 ).await {
                     Ok(n) => Arc::new(n),
                     Err(e) => {
