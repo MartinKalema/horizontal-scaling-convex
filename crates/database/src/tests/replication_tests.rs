@@ -41,6 +41,7 @@ async fn test_primary_commit_publishes_delta(rt: TestRuntime) -> anyhow::Result<
         deleted_tablet_sender,
         distributed_log.clone(),
         false,
+        None,
     )
     .await?;
     primary.set_search_storage(Arc::new(LocalDirStorage::new(rt.clone())?));

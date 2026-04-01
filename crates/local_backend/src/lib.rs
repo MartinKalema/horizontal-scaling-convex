@@ -169,7 +169,7 @@ pub async fn make_app(
             let nats_config = database::nats_distributed_log::NatsConfig {
                 url: nats_url.clone(),
                 consumer_name: Some(config.name()),
-                partition_id: None, // TODO: set from partition config
+                partition_id: config.partition_id,
             };
             Arc::new(
                 database::nats_distributed_log::NatsDistributedLog::connect(nats_config).await?,
@@ -192,6 +192,15 @@ pub async fn make_app(
         deleted_tablet_sender,
         distributed_log.clone(),
         config.replication_mode == "replica",
+        config.partition_id.map(|id| {
+            let partition_map_str = config.partition_map.as_deref().unwrap_or("");
+            let num_partitions = config.num_partitions.unwrap_or(1);
+            database::partition::PartitionMap::from_config(
+                partition_map_str,
+                database::partition::PartitionId(id),
+                num_partitions,
+            )
+        }),
     )
     .await?;
     initialize_application_system_tables(&database).await?;
