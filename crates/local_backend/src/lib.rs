@@ -196,7 +196,7 @@ pub async fn make_app(
     let application_storage = if config.replication_mode == "replica" {
         // Replica uses local storage — doesn't write storage config to DB.
         let (storage, search_storage) =
-            application::ApplicationStorage::new_local(runtime.clone(), "convex_local_storage")?;
+            application::ApplicationStorage::new_local(runtime.clone(), "/convex/data/storage")?;
         database.set_search_storage(search_storage);
         storage
     } else {
