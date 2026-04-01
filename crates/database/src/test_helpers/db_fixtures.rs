@@ -100,6 +100,7 @@ impl<RT: Runtime> DbFixtures<RT> {
             Arc::new(crate::commit_delta::NoopDistributedLog),
             false,
             None,
+            None,
         )
         .await?;
         db.set_search_storage(search_storage.clone());

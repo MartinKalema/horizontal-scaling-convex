@@ -39,8 +39,9 @@ use crate::{
 
 const STREAM_NAME: &str = "CONVEX_COMMITS";
 /// Base subject for commit deltas. In single-partition mode, publishes to
-/// "convex.commits". In partitioned mode, publishes to "convex.commits.{partition_id}".
-/// The stream subscribes to "convex.commits.>" to capture all partitions.
+/// "convex.commits". In partitioned mode, publishes to
+/// "convex.commits.{partition_id}". The stream subscribes to "convex.commits.>"
+/// to capture all partitions.
 const SUBJECT_BASE: &str = "convex.commits";
 
 /// Configuration for connecting to NATS.
@@ -86,10 +87,7 @@ impl NatsDistributedLog {
         let stream = jetstream
             .get_or_create_stream(jetstream::stream::Config {
                 name: STREAM_NAME.to_string(),
-                subjects: vec![
-                    format!("{SUBJECT_BASE}"),
-                    format!("{SUBJECT_BASE}.>"),
-                ],
+                subjects: vec![format!("{SUBJECT_BASE}"), format!("{SUBJECT_BASE}.>")],
                 retention: jetstream::stream::RetentionPolicy::Limits,
                 max_age: std::time::Duration::from_secs(86400),
                 storage: jetstream::stream::StorageType::File,
@@ -101,13 +99,16 @@ impl NatsDistributedLog {
         // Verify the stream is accessible.
         let mut stream = stream;
         let info = stream.info().await.context("Failed to get stream info")?;
-        let consumer_name = config.consumer_name.unwrap_or_else(|| "convex-node".to_string());
+        let consumer_name = config
+            .consumer_name
+            .unwrap_or_else(|| "convex-node".to_string());
         let publish_subject = match config.partition_id {
             Some(id) => format!("{SUBJECT_BASE}.{id}"),
             None => SUBJECT_BASE.to_string(),
         };
         tracing::info!(
-            "Connected to NATS JetStream at {}. Stream '{}': {} messages, {} bytes. Consumer: {}, Publish subject: {}",
+            "Connected to NATS JetStream at {}. Stream '{}': {} messages, {} bytes. Consumer: {}, \
+             Publish subject: {}",
             config.url,
             STREAM_NAME,
             info.state.messages,
@@ -116,7 +117,12 @@ impl NatsDistributedLog {
             publish_subject,
         );
 
-        Ok(Self { jetstream, stream, consumer_name, publish_subject })
+        Ok(Self {
+            jetstream,
+            stream,
+            consumer_name,
+            publish_subject,
+        })
     }
 }
 
@@ -152,7 +158,7 @@ impl DeltaEnvelope {
         let tablet_mapping = delta
             .tablet_id_to_table_name
             .iter()
-            .map(|(id, name)| (hex::encode(id.0.0), name.to_string()))
+            .map(|(id, name)| (hex::encode(id.0 .0), name.to_string()))
             .collect();
 
         Ok(Self {
@@ -211,8 +217,7 @@ impl DistributedLog for NatsDistributedLog {
         let num_updates = delta.document_updates.len();
 
         let envelope = DeltaEnvelope::from_delta(&delta, &self.consumer_name)?;
-        let payload =
-            serde_json::to_vec(&envelope).context("Failed to serialize CommitDelta")?;
+        let payload = serde_json::to_vec(&envelope).context("Failed to serialize CommitDelta")?;
         let payload_size = payload.len();
 
         // Publish and wait for acknowledgment from NATS server.
@@ -276,44 +281,42 @@ impl DistributedLog for NatsDistributedLog {
         let stream = messages.filter_map(move |msg_result| {
             let node_name = self_node_name.clone();
             async move {
-            match msg_result {
-                Ok(msg) => {
-                    if let Err(e) = msg.ack().await {
-                        tracing::warn!("Failed to ack NATS message: {e:?}");
-                    }
-                    let envelope: DeltaEnvelope = match serde_json::from_slice(&msg.payload) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            tracing::error!("Failed to deserialize delta from NATS: {e}");
-                            return Some(Err(anyhow::anyhow!(
-                                "Failed to deserialize delta: {e}"
-                            )));
-                        },
-                    };
-                    if envelope.ts <= from_ts_u64 {
-                        return None;
-                    }
-                    // Skip deltas published by this node to avoid double-applying.
-                    if !envelope.source_node.is_empty() && envelope.source_node == node_name {
+                match msg_result {
+                    Ok(msg) => {
+                        if let Err(e) = msg.ack().await {
+                            tracing::warn!("Failed to ack NATS message: {e:?}");
+                        }
+                        let envelope: DeltaEnvelope = match serde_json::from_slice(&msg.payload) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::error!("Failed to deserialize delta from NATS: {e}");
+                                return Some(Err(anyhow::anyhow!(
+                                    "Failed to deserialize delta: {e}"
+                                )));
+                            },
+                        };
+                        if envelope.ts <= from_ts_u64 {
+                            return None;
+                        }
+                        // Skip deltas published by this node to avoid double-applying.
+                        if !envelope.source_node.is_empty() && envelope.source_node == node_name {
+                            tracing::debug!("Skipping self-published delta at ts={}", envelope.ts,);
+                            return None;
+                        }
                         tracing::debug!(
-                            "Skipping self-published delta at ts={}",
+                            "Received commit delta from NATS: ts={}, source={}",
                             envelope.ts,
+                            envelope.source_node,
                         );
-                        return None;
-                    }
-                    tracing::debug!(
-                        "Received commit delta from NATS: ts={}, source={}",
-                        envelope.ts,
-                        envelope.source_node,
-                    );
-                    Some(envelope.to_delta())
-                },
-                Err(e) => {
-                    tracing::error!("NATS message error: {e}");
-                    Some(Err(anyhow::anyhow!("NATS message error: {e}")))
-                },
+                        Some(envelope.to_delta())
+                    },
+                    Err(e) => {
+                        tracing::error!("NATS message error: {e}");
+                        Some(Err(anyhow::anyhow!("NATS message error: {e}")))
+                    },
+                }
             }
-        }});
+        });
 
         Ok(Box::pin(stream))
     }

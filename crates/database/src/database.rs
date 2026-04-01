@@ -979,6 +979,7 @@ impl<RT: Runtime> Database<RT> {
         distributed_log: Arc<dyn crate::commit_delta::DistributedLog>,
         replica_mode: bool,
         partition_map: Option<crate::partition::PartitionMap>,
+        timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
     ) -> anyhow::Result<Self> {
         let _load_database_timer = metrics::load_database_timer();
 
@@ -1054,8 +1055,12 @@ impl<RT: Runtime> Database<RT> {
         // In replica mode, we use NoopDistributedLog for the Committer since
         // the Replica should not re-publish deltas it receives.
         let committer_distributed_log = if replica_mode {
-            tracing::info!("Database loading in replica mode — Committer will handle local initialization, then tail distributed log from ts={ts}");
-            Arc::new(crate::commit_delta::NoopDistributedLog) as Arc<dyn crate::commit_delta::DistributedLog>
+            tracing::info!(
+                "Database loading in replica mode — Committer will handle local initialization, \
+                 then tail distributed log from ts={ts}"
+            );
+            Arc::new(crate::commit_delta::NoopDistributedLog)
+                as Arc<dyn crate::commit_delta::DistributedLog>
         } else {
             distributed_log.clone()
         };
@@ -1069,6 +1074,7 @@ impl<RT: Runtime> Database<RT> {
             virtual_system_mapping.clone(),
             committer_distributed_log,
             partition_map,
+            timestamp_oracle,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
@@ -1159,8 +1165,9 @@ impl<RT: Runtime> Database<RT> {
     /// See PersistenceReader.load_documents_from_table for performance caveats!
     ///
     /// rate_limiter must be based on rows per second.
-    /// Get a clone of the CommitterClient for sending messages to the Committer.
-    /// Used by the ReplicaDeltaConsumer to feed deltas through the apply loop.
+    /// Get a clone of the CommitterClient for sending messages to the
+    /// Committer. Used by the ReplicaDeltaConsumer to feed deltas through
+    /// the apply loop.
     pub fn committer_client(&self) -> CommitterClient {
         self.committer.clone()
     }

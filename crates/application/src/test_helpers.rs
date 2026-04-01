@@ -221,6 +221,7 @@ impl<RT: Runtime> ApplicationTestExt<RT> for Application<RT> {
             Arc::new(database::commit_delta::NoopDistributedLog),
             false,
             None,
+            None,
         )
         .await?;
         initialize_application_system_tables(&database).await?;
