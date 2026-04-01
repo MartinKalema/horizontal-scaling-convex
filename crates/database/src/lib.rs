@@ -17,6 +17,7 @@ pub mod commit_delta;
 mod committer;
 mod database;
 pub mod nats_distributed_log;
+pub mod partition;
 pub mod replica;
 pub mod snapshot_checkpointer;
 pub mod timestamp_oracle;
