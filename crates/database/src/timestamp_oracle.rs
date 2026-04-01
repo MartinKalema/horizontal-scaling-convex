@@ -18,8 +18,8 @@
 //!
 //! - [`LocalTimestampOracle`]: Wraps the existing Committer logic for
 //!   single-node deployments. No behavior change.
-//! - [`BatchTimestampOracle`]: Reserves batches from NATS KV for
-//!   multi-node deployments.
+//! - [`BatchTimestampOracle`]: Reserves batches from NATS KV for multi-node
+//!   deployments.
 
 use std::sync::Arc;
 
@@ -133,10 +133,7 @@ const DEFAULT_BATCH_SIZE: u64 = 1000;
 
 impl BatchTimestampOracle {
     /// Connect to NATS and initialize the KV bucket for timestamp allocation.
-    pub async fn connect(
-        nats_url: &str,
-        batch_size: Option<u64>,
-    ) -> anyhow::Result<Self> {
+    pub async fn connect(nats_url: &str, batch_size: Option<u64>) -> anyhow::Result<Self> {
         // Reuse the crypto provider if already installed.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -163,7 +160,10 @@ impl BatchTimestampOracle {
             .as_nanos() as u64;
 
         // Try to create the key. If it already exists, that's fine.
-        match kv.create(TSO_COUNTER_KEY, initial_ts.to_be_bytes().to_vec().into()).await {
+        match kv
+            .create(TSO_COUNTER_KEY, initial_ts.to_be_bytes().to_vec().into())
+            .await
+        {
             Ok(_) => tracing::info!("TSO: Initialized counter at {initial_ts}"),
             Err(_) => tracing::info!("TSO: Counter already exists"),
         }
@@ -204,8 +204,11 @@ impl BatchTimestampOracle {
                 .context("TSO: Counter key not found")?;
 
             let current_value = u64::from_be_bytes(
-                entry.value.as_ref().try_into()
-                    .context("TSO: Invalid counter value")?
+                entry
+                    .value
+                    .as_ref()
+                    .try_into()
+                    .context("TSO: Invalid counter value")?,
             );
 
             let new_lower = current_value;
@@ -214,7 +217,10 @@ impl BatchTimestampOracle {
 
             // Atomic compare-and-swap: only succeeds if no other node
             // modified the counter since we read it.
-            match kv.update(TSO_COUNTER_KEY, new_value.into(), entry.revision).await {
+            match kv
+                .update(TSO_COUNTER_KEY, new_value.into(), entry.revision)
+                .await
+            {
                 Ok(_) => {
                     tracing::info!(
                         "TSO: Reserved batch [{new_lower}, {new_upper}) on attempt {attempt}"
@@ -267,8 +273,11 @@ impl TimestampOracle for BatchTimestampOracle {
         match kv.entry(TSO_MAX_COMMITTED_KEY).await? {
             Some(entry) => {
                 let ts = u64::from_be_bytes(
-                    entry.value.as_ref().try_into()
-                        .context("TSO: Invalid max_committed value")?
+                    entry
+                        .value
+                        .as_ref()
+                        .try_into()
+                        .context("TSO: Invalid max_committed value")?,
                 );
                 Timestamp::try_from(ts)
             },

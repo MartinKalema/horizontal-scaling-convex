@@ -212,6 +212,12 @@ pub struct Committer<RT: Runtime> {
     // Partition map for write routing. Determines which tables this node owns.
     // None means single-partition mode (owns everything).
     partition_map: Option<crate::partition::PartitionMap>,
+
+    // Global timestamp oracle for multi-node deployments (TiDB PD pattern).
+    // When set, next_commit_ts() draws from the TSO instead of the local clock,
+    // ensuring globally unique timestamps across all nodes.
+    // None means single-node mode (local clock, existing behavior).
+    timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -225,6 +231,7 @@ impl<RT: Runtime> Committer<RT> {
         virtual_system_mapping: VirtualSystemMapping,
         distributed_log: Arc<dyn DistributedLog>,
         partition_map: Option<crate::partition::PartitionMap>,
+        timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
         let conflict_checker = PendingWrites::new();
@@ -243,6 +250,7 @@ impl<RT: Runtime> Committer<RT> {
             user_documents_size_gauge: user_documents_size_subgauge(),
             distributed_log,
             partition_map,
+            timestamp_oracle,
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -322,7 +330,9 @@ impl<RT: Runtime> Committer<RT> {
                             let publish_commit_span = committer_span.as_ref().map(|root| Span::enter_with_parents("publish_commit", [root, &parent_span])).unwrap_or_else(|| parent_span);
                             let _guard = publish_commit_span.set_local_parent();
                             let commit_ts = pending_write.must_commit_ts();
-                            self.publish_commit(pending_write, write_bytes, document_writes, index_writes);
+                            self.publish_commit(
+                                pending_write, write_bytes, document_writes, index_writes,
+                            );
                             let _ = result.send(Ok(commit_ts));
 
                             // When we next get free cycles and there is no ongoing bump,
@@ -728,8 +738,8 @@ impl<RT: Runtime> Committer<RT> {
                     if !partition_map.is_local(&table_name) {
                         let partition = partition_map.partition_for_table(&table_name);
                         anyhow::bail!(
-                            "Write to table '{}' rejected: owned by {}, not this node ({}). \
-                             Route this mutation to the correct partition owner.",
+                            "Write to table '{}' rejected: owned by {}, not this node ({}). Route \
+                             this mutation to the correct partition owner.",
                             table_name,
                             partition,
                             partition_map.local_partition(),
@@ -754,18 +764,23 @@ impl<RT: Runtime> Committer<RT> {
             let begin_ts = *transaction.begin_timestamp;
             if latest_replicated_ts < begin_ts {
                 // Check if any reads are from remote partitions.
-                let has_remote_reads = transaction.reads.read_set().iter_indexed().any(|(index_name, _)| {
-                    let tablet_id = index_name.table();
-                    if let Ok(name) = transaction.table_mapping.tablet_name(*tablet_id) {
-                        !partition_map.is_local(&name)
-                    } else {
-                        false
-                    }
-                });
+                let has_remote_reads =
+                    transaction
+                        .reads
+                        .read_set()
+                        .iter_indexed()
+                        .any(|(index_name, _)| {
+                            let tablet_id = index_name.table();
+                            if let Ok(name) = transaction.table_mapping.tablet_name(*tablet_id) {
+                                !partition_map.is_local(&name)
+                            } else {
+                                false
+                            }
+                        });
                 if has_remote_reads {
                     tracing::warn!(
-                        "Cross-partition OCC: local replica behind (latest={}, begin={}). \
-                         Remote reads may miss conflicts. Proceeding with best-effort validation.",
+                        "Cross-partition OCC: local replica behind (latest={}, begin={}). Remote \
+                         reads may miss conflicts. Proceeding with best-effort validation.",
                         latest_replicated_ts,
                         begin_ts,
                     );
@@ -1031,16 +1046,27 @@ impl<RT: Runtime> Committer<RT> {
         };
         use value::ResolvedDocumentId;
 
-        let commit_ts = delta.ts;
+        // Use next_commit_ts() instead of the remote delta's timestamp.
+        // Even with a shared TSO, the receiving node may have already advanced
+        // past the remote timestamp (e.g., during init or from its own commits).
+        // The write log requires strictly increasing timestamps, so we must
+        // assign a locally-valid timestamp — same as how CockroachDB's apply
+        // loop assigns a local HLC timestamp when applying Raft proposals.
+        let remote_ts = delta.ts;
+        let commit_ts = self.next_commit_ts()?;
         tracing::info!(
-            "Applying replica delta: ts={}, {} document updates, {} tablet mappings",
+            "Applying replica delta: remote_ts={}, local_ts={}, {} document updates, {} tablet \
+             mappings",
+            u64::from(remote_ts),
             u64::from(commit_ts),
             delta.document_updates.len(),
             delta.tablet_id_to_table_name.len(),
         );
 
         // Helper: build remap from current snapshot state.
-        let build_remap = |snapshot: &Snapshot, tablet_map: &BTreeMap<value::TabletId, value::TableName>| -> BTreeMap<value::TabletId, value::TabletId> {
+        let build_remap = |snapshot: &Snapshot,
+                           tablet_map: &BTreeMap<value::TabletId, value::TableName>|
+         -> BTreeMap<value::TabletId, value::TabletId> {
             let mapping = snapshot.table_registry.table_mapping();
             let mut remap = BTreeMap::new();
             for (primary_id, name) in tablet_map {
@@ -1055,19 +1081,80 @@ impl<RT: Runtime> Committer<RT> {
             remap
         };
 
-        // Separate _tables updates from other updates.
-        // _tables updates create new tables and must be applied first.
+        // Classify each update as user-relevant or node-local.
+        //
+        // Like CockroachDB's separation of system descriptors (global) from
+        // node-local operational state: metadata that describes user tables
+        // must replicate globally, but each node's operational state is local.
+        //
+        // Categories:
+        //   1. _tables entries for user tables → Phase 1 (table creation)
+        //   2. _index entries for user tables → Phase 2 (index creation)
+        //   3. User table document data → Phase 2 (data replication)
+        //   4. Everything else (node-local system data) → SKIP
+        //
+        // The key insight: we classify by what the data DESCRIBES, not by
+        // which system table it's stored in. An _index entry creating
+        // "projects.by_id" is user table metadata even though _index is a
+        // system table.
+        use common::bootstrap_model::index::INDEX_TABLE;
+
         let tables_table_name: &value::TableName = &TABLES_TABLE;
+        let index_table_name: &value::TableName = &INDEX_TABLE;
         let mut tables_updates = Vec::new();
         let mut other_updates = Vec::new();
+        let mut skipped_system = 0usize;
+
         for update in &delta.document_updates {
             let primary_tablet = update.id.tablet_id;
             let table_name = delta.tablet_id_to_table_name.get(&primary_tablet);
+
             if table_name.map(|n| n == tables_table_name).unwrap_or(false) {
+                // _tables entry: kept for Phase 1 (user table creation).
+                // System table entries will be skipped in Phase 1 by the
+                // table_exists check.
                 tables_updates.push(update);
-            } else {
+            } else if table_name.map(|n| n == index_table_name).unwrap_or(false) {
+                // _index entry: check if it describes a user table index.
+                // Parse the table_id field from the document and check if
+                // it maps to a user table in the delta's tablet mapping.
+                let is_user_index = update.new_document.as_ref().map_or(false, |doc| {
+                    doc.value()
+                        .0
+                        .get(&"table_id".parse::<common::types::FieldName>().unwrap())
+                        .and_then(|v| {
+                            if let value::ConvexValue::String(s) = v {
+                                let tid: Result<value::TabletId, _> = s.parse();
+                                tid.ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .map_or(false, |tid| {
+                            delta
+                                .tablet_id_to_table_name
+                                .get(&tid)
+                                .map_or(false, |name| !name.is_system())
+                        })
+                });
+                if is_user_index {
+                    other_updates.push(update);
+                } else {
+                    skipped_system += 1;
+                }
+            } else if table_name.map(|n| !n.is_system()).unwrap_or(false) {
+                // User table data: replicate.
                 other_updates.push(update);
+            } else {
+                // Node-local system data: skip.
+                skipped_system += 1;
             }
+        }
+        if skipped_system > 0 {
+            tracing::debug!(
+                "Filtered {} node-local system updates from delta",
+                skipped_system,
+            );
         }
 
         let mut snapshot = self.snapshot_manager.read().latest_snapshot();
@@ -1075,20 +1162,116 @@ impl<RT: Runtime> Committer<RT> {
         let mut all_index_updates = Vec::new();
 
         // Phase 1: Apply _tables updates (creates new tables).
+        //
+        // Each node assigns table numbers independently (like CockroachDB's
+        // non-transactional descriptor ID allocator or TiDB's PD global ID).
+        // When replicating a _tables entry from another node, the remote
+        // table number may collide with a different local table. We reassign
+        // the table number to a locally-unique value, preserving only the
+        // table name and TabletId (derived from developer_id) for remapping.
         if !tables_updates.is_empty() {
+            use common::document::CreationTime;
+            use value::{
+                ConvexObject,
+                TableNamespace,
+                TableNumber,
+            };
+
             let remap = build_remap(&snapshot, &delta.tablet_id_to_table_name);
+            let mapping = snapshot.table_registry.table_mapping();
+
+            // Find the next available user table number by scanning local tables.
+            // User table numbers start above NUM_RESERVED_SYSTEM_TABLE_NUMBERS (10000).
+            let max_local_number: u32 = mapping
+                .iter()
+                .map(|(_, _, num, _)| u32::from(num))
+                .max()
+                .unwrap_or(10000);
+            let mut next_number = max_local_number + 1;
+
             for update in &tables_updates {
                 let primary_tablet = update.id.tablet_id;
                 let local_tablet = match remap.get(&primary_tablet) {
                     Some(t) => *t,
                     None => continue,
                 };
-                let remapped = DocumentUpdate {
-                    id: ResolvedDocumentId { tablet_id: local_tablet, developer_id: update.id.developer_id },
-                    old_document: update.old_document.as_ref().map(|d| d.to_remapped(local_tablet)),
-                    new_document: update.new_document.as_ref().map(|d| d.to_remapped(local_tablet)),
+
+                // Parse the TableMetadata to check if the table already exists
+                // locally and to reassign the table number if needed.
+                let new_doc = match &update.new_document {
+                    Some(d) => d,
+                    None => {
+                        // Deletion — remap and apply directly.
+                        let remapped = DocumentUpdate {
+                            id: ResolvedDocumentId {
+                                tablet_id: local_tablet,
+                                developer_id: update.id.developer_id,
+                            },
+                            old_document: update
+                                .old_document
+                                .as_ref()
+                                .map(|d| d.to_remapped(local_tablet)),
+                            new_document: None,
+                        };
+                        let (idx_updates, ..) = snapshot.update(&remapped, commit_ts)?;
+                        all_index_updates.extend(idx_updates);
+                        all_remapped_updates.push(remapped);
+                        continue;
+                    },
                 };
-                let (idx_updates, _, _) = snapshot.update(&remapped, commit_ts)?;
+
+                let metadata: TableMetadata = new_doc.value().0.clone().try_into()?;
+
+                // If the table already exists locally by name, skip this update.
+                // Each node may have independently created the same table.
+                if snapshot
+                    .table_registry
+                    .table_exists(metadata.namespace, &metadata.name)
+                {
+                    tracing::debug!(
+                        "Skipping _tables update for '{}': already exists locally",
+                        metadata.name,
+                    );
+                    continue;
+                }
+
+                // Reassign the table number to avoid collisions with local tables.
+                // This is the same pattern as CockroachDB's descriptor ID allocator:
+                // each node picks the next available number locally.
+                let local_number = TableNumber::try_from(next_number)?;
+                next_number += 1;
+                let local_metadata = TableMetadata::new_with_state(
+                    metadata.namespace,
+                    metadata.name.clone(),
+                    local_number,
+                    metadata.state,
+                );
+                let local_value: ConvexObject = local_metadata.try_into()?;
+
+                tracing::info!(
+                    "Creating replicated table '{}' with local number {} (remote was {})",
+                    metadata.name,
+                    u32::from(local_number),
+                    u32::from(metadata.number),
+                );
+
+                // Build a new ResolvedDocument with the remapped tablet ID and
+                // the locally-assigned table number.
+                let remapped_id = ResolvedDocumentId {
+                    tablet_id: local_tablet,
+                    developer_id: update.id.developer_id,
+                };
+                let remapped_doc =
+                    ResolvedDocument::new(remapped_id, new_doc.creation_time(), local_value)?;
+                let remapped = DocumentUpdate {
+                    id: remapped_id,
+                    old_document: update
+                        .old_document
+                        .as_ref()
+                        .map(|d| d.to_remapped(local_tablet)),
+                    new_document: Some(remapped_doc),
+                };
+                let (idx_updates, ..) = snapshot.update(&remapped, commit_ts)?;
                 all_index_updates.extend(idx_updates);
                 all_remapped_updates.push(remapped);
             }
@@ -1112,11 +1295,20 @@ impl<RT: Runtime> Committer<RT> {
                 },
             };
             let remapped = DocumentUpdate {
-                id: ResolvedDocumentId { tablet_id: local_tablet, developer_id: update.id.developer_id },
-                old_document: update.old_document.as_ref().map(|d| d.to_remapped(local_tablet)),
-                new_document: update.new_document.as_ref().map(|d| d.to_remapped(local_tablet)),
+                id: ResolvedDocumentId {
+                    tablet_id: local_tablet,
+                    developer_id: update.id.developer_id,
+                },
+                old_document: update
+                    .old_document
+                    .as_ref()
+                    .map(|d| d.to_remapped(local_tablet)),
+                new_document: update
+                    .new_document
+                    .as_ref()
+                    .map(|d| d.to_remapped(local_tablet)),
             };
-            let (idx_updates, _, _) = snapshot.update(&remapped, commit_ts)?;
+            let (idx_updates, ..) = snapshot.update(&remapped, commit_ts)?;
             all_index_updates.extend(idx_updates);
             all_remapped_updates.push(remapped);
         }
@@ -1127,10 +1319,7 @@ impl<RT: Runtime> Committer<RT> {
             .iter()
             .map(|update| DocumentLogEntry {
                 ts: commit_ts,
-                id: value::InternalDocumentId::new(
-                    update.id.tablet_id,
-                    update.id.internal_id(),
-                ),
+                id: value::InternalDocumentId::new(update.id.tablet_id, update.id.internal_id()),
                 value: update.new_document.clone(),
                 prev_ts: None,
             })
@@ -1435,6 +1624,29 @@ impl<RT: Runtime> Committer<RT> {
 
     fn next_commit_ts(&mut self) -> anyhow::Result<Timestamp> {
         let _timer = next_commit_ts_seconds();
+
+        // When a global TSO is configured (TiDB PD pattern), draw timestamps
+        // from it instead of the local clock. This ensures globally unique,
+        // monotonically increasing timestamps across all nodes in the cluster.
+        // The BatchTimestampOracle's fast path is a local mutex increment
+        // (zero network calls), so block_in_place is safe here.
+        if let Some(ref tso) = self.timestamp_oracle {
+            let tso = tso.clone();
+            let ts = block_in_place(|| {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(tso.next_ts())
+            })?;
+            // Still enforce local monotonicity against snapshot and last_assigned.
+            let latest_ts = self.snapshot_manager.read().latest_ts();
+            let max = cmp::max(
+                ts,
+                cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
+            );
+            self.last_assigned_ts = max;
+            return Ok(max);
+        }
+
+        // Single-node mode: existing behavior (local clock + monotonic counter).
         let latest_ts = self.snapshot_manager.read().latest_ts();
         let max = cmp::max(
             latest_ts.succ()?,
