@@ -1039,6 +1039,29 @@ impl<RT: Runtime> Committer<RT> {
             delta.tablet_id_to_table_name.len(),
         );
 
+        // Filter out system table updates. Each node manages its own system
+        // tables independently — only user table data should be replicated.
+        let tablet_map = delta.tablet_id_to_table_name.clone();
+        let original_count = delta.document_updates.len();
+        let mut delta = delta;
+        delta.document_updates.retain(|update| {
+            let tablet_id = update.id.tablet_id;
+            match tablet_map.get(&tablet_id) {
+                Some(name) if name.is_system() => false,
+                _ => true,
+            }
+        });
+        if delta.document_updates.len() < original_count {
+            tracing::debug!(
+                "Filtered {} system table updates from delta",
+                original_count - delta.document_updates.len(),
+            );
+        }
+        if delta.document_updates.is_empty() {
+            tracing::debug!("Delta at ts={} has no user table updates, skipping", u64::from(commit_ts));
+            return Ok(commit_ts);
+        }
+
         // Helper: build remap from current snapshot state.
         let build_remap = |snapshot: &Snapshot, tablet_map: &BTreeMap<value::TabletId, value::TableName>| -> BTreeMap<value::TabletId, value::TabletId> {
             let mapping = snapshot.table_registry.table_mapping();
