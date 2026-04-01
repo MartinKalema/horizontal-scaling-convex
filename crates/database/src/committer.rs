@@ -896,9 +896,21 @@ impl<RT: Runtime> Committer<RT> {
                 .set(table_summaries.user_docs_size as i64);
         }
 
+        // Build TabletId → TableName mapping for Replica ID remapping.
+        let table_mapping = new_snapshot.table_registry.table_mapping().clone();
+
         // Publish the new version of our database metadata and the index.
         let mut snapshot_manager = self.snapshot_manager.write();
         snapshot_manager.push(commit_ts, new_snapshot, write_bytes);
+        let mut tablet_id_to_table_name = std::collections::BTreeMap::new();
+        for update in &document_updates {
+            let tablet_id = update.id.tablet_id;
+            if !tablet_id_to_table_name.contains_key(&tablet_id) {
+                if let Ok(name) = table_mapping.tablet_name(tablet_id) {
+                    tablet_id_to_table_name.insert(tablet_id, name);
+                }
+            }
+        }
 
         // Publish delta to distributed log for Replica consumption.
         let delta = CommitDelta {
@@ -908,6 +920,7 @@ impl<RT: Runtime> Committer<RT> {
             index_writes,
             write_source,
             write_bytes,
+            tablet_id_to_table_name,
         };
         let distributed_log = self.distributed_log.clone();
         let delta_ts = commit_ts;
@@ -927,28 +940,99 @@ impl<RT: Runtime> Committer<RT> {
     /// This is the Replica equivalent of publish_commit — it updates the
     /// SnapshotManager and WriteLog without writing to persistence (the
     /// Primary already persisted the data).
+    ///
+    /// The delta's document IDs contain the Primary's TabletIds. We remap
+    /// them to the Replica's local TabletIds using the table name mapping
+    /// carried in the delta.
     fn apply_replica_delta(&mut self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
+        use std::collections::BTreeMap;
+
+        use common::document::DocumentUpdate;
+        use value::ResolvedDocumentId;
+
         let commit_ts = delta.ts;
         tracing::info!(
-            "Applying replica delta: ts={}, {} document updates",
+            "Applying replica delta: ts={}, {} document updates, {} tablet mappings",
             u64::from(commit_ts),
-            delta.document_updates.len()
+            delta.document_updates.len(),
+            delta.tablet_id_to_table_name.len(),
         );
 
-        // Apply each document update to the snapshot.
+        // Build remapping: Primary TabletId → Replica TabletId.
+        let local_snapshot = self.snapshot_manager.read().latest_snapshot();
+        let local_mapping = local_snapshot.table_registry.table_mapping();
+        let local_name_to_tablet = |name: value::TableName| -> anyhow::Result<value::TabletId> {
+            // Try all namespaces to find the table.
+            for ns in local_mapping.namespaces_for_name(&name) {
+                let ns_mapping = local_mapping.namespace(ns);
+                if let Ok(id) = ns_mapping.name_to_tablet()(name.clone()) {
+                    return Ok(id);
+                }
+            }
+            anyhow::bail!("Table {} not found in any namespace", name)
+        };
+        let mut remap: BTreeMap<value::TabletId, value::TabletId> = BTreeMap::new();
+        for (primary_tablet_id, table_name) in &delta.tablet_id_to_table_name {
+            if let Ok(local_tablet_id) = local_name_to_tablet(table_name.clone()) {
+                remap.insert(*primary_tablet_id, local_tablet_id);
+                tracing::debug!(
+                    "Tablet remap: {:?} ({}) → {:?}",
+                    primary_tablet_id,
+                    table_name,
+                    local_tablet_id
+                );
+            } else {
+                tracing::warn!(
+                    "Table '{}' (Primary TabletId {:?}) not found on Replica — skipping",
+                    table_name,
+                    primary_tablet_id
+                );
+            }
+        }
+        drop(local_snapshot);
+
+        // Remap document updates and apply.
         let mut snapshot = self.snapshot_manager.read().latest_snapshot();
+        let mut remapped_updates = Vec::new();
         for update in &delta.document_updates {
+            let primary_tablet = update.id.tablet_id;
+            let local_tablet = match remap.get(&primary_tablet) {
+                Some(t) => *t,
+                None => {
+                    tracing::debug!(
+                        "Skipping update for unmapped TabletId {}",
+                        primary_tablet
+                    );
+                    continue;
+                },
+            };
+
+            // Remap the document ID.
+            let remapped_id = ResolvedDocumentId {
+                tablet_id: local_tablet,
+                developer_id: update.id.developer_id,
+            };
+            let remapped_update = DocumentUpdate {
+                id: remapped_id,
+                old_document: update.old_document.as_ref().map(|doc| {
+                    doc.to_remapped(local_tablet)
+                }),
+                new_document: update.new_document.as_ref().map(|doc| {
+                    doc.to_remapped(local_tablet)
+                }),
+            };
             snapshot
-                .update(update, commit_ts)
+                .update(&remapped_update, commit_ts)
                 .with_context(|| format!(
-                    "Failed to apply replica delta update at ts={}",
+                    "Failed to apply remapped replica delta at ts={}",
                     u64::from(commit_ts)
                 ))?;
+            remapped_updates.push(remapped_update);
         }
 
-        // Convert document updates to write log entries.
+        // Convert remapped document updates to write log entries.
         let writes = crate::write_log::index_keys_from_document_updates(
-            &delta.document_updates,
+            &remapped_updates,
             &snapshot.index_registry,
         );
         self.log.append(commit_ts, writes, delta.write_source);
@@ -956,6 +1040,13 @@ impl<RT: Runtime> Committer<RT> {
         // Push the updated snapshot.
         let mut sm = self.snapshot_manager.write();
         sm.push(commit_ts, snapshot, delta.write_bytes);
+
+        tracing::info!(
+            "Applied replica delta at ts={}: {} updates remapped, {} skipped",
+            u64::from(commit_ts),
+            remapped_updates.len(),
+            delta.document_updates.len() - remapped_updates.len(),
+        );
 
         Ok(commit_ts)
     }

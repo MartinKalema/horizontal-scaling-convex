@@ -24,6 +24,10 @@ use futures::{
     StreamExt,
 };
 use prost::Message;
+use value::{
+    TableName,
+    TabletId,
+};
 
 use crate::{
     commit_delta::{
@@ -98,6 +102,10 @@ struct DeltaEnvelope {
     write_bytes: u64,
     /// DocumentUpdates encoded as proto bytes.
     document_updates_proto: Vec<Vec<u8>>,
+    /// Mapping from Primary's TabletId (16 bytes, hex-encoded) to table name.
+    /// Used by Replicas to remap document IDs to their own local TabletIds.
+    #[serde(default)]
+    tablet_mapping: Vec<(String, String)>, // (hex TabletId, table name string)
 }
 
 impl DeltaEnvelope {
@@ -111,11 +119,18 @@ impl DeltaEnvelope {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        let tablet_mapping = delta
+            .tablet_id_to_table_name
+            .iter()
+            .map(|(id, name)| (hex::encode(id.0.0), name.to_string()))
+            .collect();
+
         Ok(Self {
             ts: u64::from(delta.ts),
             write_source: delta.write_source.as_str().map(|s| s.to_string()),
             write_bytes: delta.write_bytes,
             document_updates_proto,
+            tablet_mapping,
         })
     }
 
@@ -139,6 +154,21 @@ impl DeltaEnvelope {
                 None => WriteSource::unknown(),
             },
             write_bytes: self.write_bytes,
+            tablet_id_to_table_name: self
+                .tablet_mapping
+                .into_iter()
+                .filter_map(|(id_hex, name_str)| {
+                    let bytes = hex::decode(&id_hex).ok()?;
+                    if bytes.len() != 16 {
+                        return None;
+                    }
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(&bytes);
+                    let tablet_id = TabletId(value::InternalId(arr));
+                    let name: TableName = name_str.parse().ok()?;
+                    Some((tablet_id, name))
+                })
+                .collect(),
         })
     }
 }

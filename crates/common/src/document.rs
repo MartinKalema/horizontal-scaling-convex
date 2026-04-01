@@ -507,6 +507,16 @@ impl ResolvedDocument {
         IndexKey::new_allow_missing(values, self.developer_id())
     }
 
+    /// Create a copy of this document with a different TabletId.
+    /// Used by Replicas to remap documents from the Primary's TabletId
+    /// to the Replica's local TabletId for the same table.
+    pub fn to_remapped(&self, new_tablet_id: TabletId) -> Self {
+        Self {
+            tablet_id: new_tablet_id,
+            document: self.document.clone(),
+        }
+    }
+
     /// Recreate a `Document` from an already-written value to the database.
     /// This method assumes that system-provided fields, like `_id`, have
     /// already been inserted into `value`.

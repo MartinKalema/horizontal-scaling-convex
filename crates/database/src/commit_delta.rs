@@ -5,7 +5,10 @@
 //! This module also defines the [`DistributedLog`] trait — the abstraction over
 //! whatever transport carries deltas between nodes.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use common::{
@@ -17,6 +20,10 @@ use common::{
     types::Timestamp,
 };
 use futures::stream::BoxStream;
+use value::{
+    TableName,
+    TabletId,
+};
 
 use crate::write_log::WriteSource;
 
@@ -49,6 +56,11 @@ pub struct CommitDelta {
 
     /// Total bytes written to persistence.
     pub write_bytes: u64,
+
+    /// Mapping from the Primary's TabletIds to table names.
+    /// Replicas use this to remap document IDs to their own local TabletIds
+    /// since each database instance generates unique TabletIds.
+    pub tablet_id_to_table_name: BTreeMap<TabletId, TableName>,
 }
 
 /// Abstraction over the transport that carries [`CommitDelta`]s between

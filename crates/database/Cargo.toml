@@ -51,6 +51,7 @@ fivetran_source = { workspace = true }
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
 governor = { workspace = true }
+hex = { workspace = true }
 hashlink = { workspace = true }
 imbl = { workspace = true }
 indexing = { workspace = true }
