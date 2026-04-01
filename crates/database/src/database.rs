@@ -1067,6 +1067,7 @@ impl<RT: Runtime> Database<RT> {
             shutdown,
             virtual_system_mapping.clone(),
             committer_distributed_log,
+            None, // partition_map: None = single-partition mode
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
