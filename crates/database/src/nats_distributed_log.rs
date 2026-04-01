@@ -44,12 +44,16 @@ const SUBJECT: &str = "convex.commits";
 #[derive(Clone, Debug)]
 pub struct NatsConfig {
     pub url: String,
+    /// Consumer name for this node. Each Replica needs a unique consumer name
+    /// so NATS delivers all messages to each Replica independently.
+    pub consumer_name: Option<String>,
 }
 
 /// NATS JetStream implementation of [`DistributedLog`].
 pub struct NatsDistributedLog {
     jetstream: jetstream::Context,
     stream: JsStream,
+    consumer_name: String,
 }
 
 impl NatsDistributedLog {
@@ -82,15 +86,17 @@ impl NatsDistributedLog {
         // Verify the stream is accessible.
         let mut stream = stream;
         let info = stream.info().await.context("Failed to get stream info")?;
+        let consumer_name = config.consumer_name.unwrap_or_else(|| "convex-replica".to_string());
         tracing::info!(
-            "Connected to NATS JetStream at {}. Stream '{}': {} messages, {} bytes",
+            "Connected to NATS JetStream at {}. Stream '{}': {} messages, {} bytes. Consumer: {}",
             config.url,
             STREAM_NAME,
             info.state.messages,
             info.state.bytes,
+            consumer_name,
         );
 
-        Ok(Self { jetstream, stream })
+        Ok(Self { jetstream, stream, consumer_name })
     }
 }
 
@@ -213,12 +219,13 @@ impl DistributedLog for NatsDistributedLog {
         // Create a durable consumer so it survives reconnections.
         // DeliverPolicy::All replays all messages from the stream beginning,
         // and we filter out messages at or before from_ts ourselves.
+        let consumer_name = self.consumer_name.clone();
         let consumer: PullConsumer = self
             .stream
             .get_or_create_consumer(
-                "convex-replica",
+                &consumer_name,
                 jetstream::consumer::pull::Config {
-                    durable_name: Some("convex-replica".to_string()),
+                    durable_name: Some(consumer_name.clone()),
                     deliver_policy: jetstream::consumer::DeliverPolicy::All,
                     ack_policy: jetstream::consumer::AckPolicy::Explicit,
                     ..Default::default()
@@ -234,8 +241,9 @@ impl DistributedLog for NatsDistributedLog {
             .context("Failed to start consuming NATS messages")?;
 
         tracing::info!(
-            "Subscribed to NATS stream '{}' with durable consumer 'convex-replica', from_ts={}",
+            "Subscribed to NATS stream '{}' with durable consumer '{}', from_ts={}",
             STREAM_NAME,
+            consumer_name,
             from_ts_u64,
         );
 

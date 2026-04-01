@@ -168,6 +168,7 @@ pub async fn make_app(
         if let Some(nats_url) = &config.nats_url {
             let nats_config = database::nats_distributed_log::NatsConfig {
                 url: nats_url.clone(),
+                consumer_name: Some(config.name()),
             };
             Arc::new(
                 database::nats_distributed_log::NatsDistributedLog::connect(nats_config).await?,
@@ -328,9 +329,10 @@ pub async fn make_app(
             let nats_url = nats_url.clone();
             let committer = database.committer_client();
             let from_ts = *database.now_ts_for_reads();
+            let consumer_name = config.name();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
                 let consumer_nats = match database::nats_distributed_log::NatsDistributedLog::connect(
-                    database::nats_distributed_log::NatsConfig { url: nats_url },
+                    database::nats_distributed_log::NatsConfig { url: nats_url, consumer_name: Some(consumer_name) },
                 ).await {
                     Ok(n) => Arc::new(n),
                     Err(e) => {

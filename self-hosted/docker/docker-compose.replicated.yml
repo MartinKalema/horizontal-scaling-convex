@@ -106,6 +106,37 @@ services:
       interval: 5s
       start_period: 10s
 
+  replica2:
+    image: convex-backend-replicated:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "3230:3210"
+      - "3231:3211"
+    volumes:
+      - replica2-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
+      - DO_NOT_REQUIRE_SSL=1
+      - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3230
+      - CONVEX_SITE_ORIGIN=http://127.0.0.1:3231
+      - RUST_LOG=info
+      - DISABLE_BEACON=true
+      - INSTANCE_NAME=convex-replica2
+      - REPLICATION_MODE=replica
+      - NATS_URL=nats://nats:4222
+      - PRIMARY_GRPC_URL=http://primary:50051
+    depends_on:
+      primary:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: curl -f http://localhost:3210/version
+      interval: 5s
+      start_period: 10s
+
   dashboard:
     image: ghcr.io/get-convex/convex-dashboard:latest
     stop_grace_period: 10s
@@ -123,4 +154,5 @@ volumes:
   natsdata:
   primary-data:
   replica-data:
+  replica2-data:
   shared-storage:
