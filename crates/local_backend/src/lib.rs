@@ -335,10 +335,13 @@ pub async fn make_app(
         runtime.spawn_background("beacon_worker", beacon_future);
     }
 
-    // Start the ReplicaDeltaConsumer on Replica to tail NATS and apply deltas.
+    // Start the ReplicaDeltaConsumer to tail NATS and apply deltas from other nodes.
+    // Runs on:
+    //   - Replicas (REPLICATION_MODE=replica): consumes Primary's deltas
+    //   - Partitioned writers (PARTITION_ID set): consumes other partitions' deltas
     // Creates a fresh NATS connection dedicated to the consumer.
-    // Uses spawn_background so the task outlives make_app scope.
-    if config.replication_mode == "replica" {
+    let needs_delta_consumer = config.replication_mode == "replica" || config.partition_id.is_some();
+    if needs_delta_consumer {
         if let Some(nats_url) = &config.nats_url {
             let nats_url = nats_url.clone();
             let committer = database.committer_client();
