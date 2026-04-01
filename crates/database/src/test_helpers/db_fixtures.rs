@@ -99,6 +99,7 @@ impl<RT: Runtime> DbFixtures<RT> {
             deleted_tablet_sender,
             Arc::new(crate::commit_delta::NoopDistributedLog),
             false,
+            None,
         )
         .await?;
         db.set_search_storage(search_storage.clone());

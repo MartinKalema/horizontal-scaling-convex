@@ -154,6 +154,23 @@ pub struct LocalConfig {
     #[clap(long, env = "PRIMARY_GRPC_URL")]
     pub primary_grpc_url: Option<String>,
 
+    /// Partition ID for this node. Each node owns a partition.
+    /// Used with PARTITION_MAP to enable partitioned write scaling.
+    /// Example: 0, 1, 2
+    #[clap(long, env = "PARTITION_ID")]
+    pub partition_id: Option<u32>,
+
+    /// Partition map: table-to-partition assignment.
+    /// Format: "messages=1,users=1,projects=2,tasks=2"
+    /// Tables not listed default to partition 0.
+    /// System tables always on partition 0.
+    #[clap(long, env = "PARTITION_MAP")]
+    pub partition_map: Option<String>,
+
+    /// Total number of partitions in the cluster.
+    #[clap(long, env = "NUM_PARTITIONS")]
+    pub num_partitions: Option<u32>,
+
     /// Storage directory for the Replica to read shared files (modules, etc.).
     /// Should point to a path shared with the Primary's storage.
     /// Required in replica mode.

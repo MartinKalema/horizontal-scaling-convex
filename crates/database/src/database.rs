@@ -978,6 +978,7 @@ impl<RT: Runtime> Database<RT> {
         deleted_tablet_sender: mpsc::Sender<TabletId>,
         distributed_log: Arc<dyn crate::commit_delta::DistributedLog>,
         replica_mode: bool,
+        partition_map: Option<crate::partition::PartitionMap>,
     ) -> anyhow::Result<Self> {
         let _load_database_timer = metrics::load_database_timer();
 
@@ -1067,7 +1068,7 @@ impl<RT: Runtime> Database<RT> {
             shutdown,
             virtual_system_mapping.clone(),
             committer_distributed_log,
-            None, // partition_map: None = single-partition mode
+            partition_map,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
