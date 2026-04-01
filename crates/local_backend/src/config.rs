@@ -153,6 +153,19 @@ pub struct LocalConfig {
     /// Example: http://primary:50051
     #[clap(long, env = "PRIMARY_GRPC_URL")]
     pub primary_grpc_url: Option<String>,
+
+    /// Storage directory for the Replica to read shared files (modules, etc.).
+    /// Should point to a path shared with the Primary's storage.
+    /// Required in replica mode.
+    /// Example: /convex/data/storage
+    #[clap(long, env = "REPLICA_STORAGE_PATH")]
+    pub replica_storage_path: Option<String>,
+
+    /// Storage directory for checkpoint files.
+    /// Required in primary mode when NATS_URL is set.
+    /// Example: /convex/data/checkpoints
+    #[clap(long, env = "CHECKPOINT_STORAGE_PATH")]
+    pub checkpoint_storage_path: Option<String>,
 }
 
 impl fmt::Debug for LocalConfig {

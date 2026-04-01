@@ -196,8 +196,10 @@ pub async fn make_app(
     initialize_application_system_tables(&database).await?;
     let application_storage = if config.replication_mode == "replica" {
         // Replica uses local storage — doesn't write storage config to DB.
+        let replica_path = config.replica_storage_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("REPLICA_STORAGE_PATH is required in replica mode"))?;
         let (storage, search_storage) =
-            application::ApplicationStorage::new_local(runtime.clone(), "/convex/data/storage")?;
+            application::ApplicationStorage::new_local(runtime.clone(), replica_path)?;
         database.set_search_storage(search_storage);
         storage
     } else {
@@ -221,10 +223,12 @@ pub async fn make_app(
 
     // Start the SnapshotCheckpointer on the Primary when NATS is configured.
     if config.replication_mode == "primary" && config.nats_url.is_some() {
+        let checkpoint_path = config.checkpoint_storage_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CHECKPOINT_STORAGE_PATH is required in primary mode with NATS_URL"))?;
         let checkpoint_storage: Arc<dyn Storage> = Arc::new(
             LocalDirStorage::for_use_case(
                 runtime.clone(),
-                "convex_local_storage",
+                checkpoint_path,
                 StorageUseCase::Checkpoints,
             )?,
         );

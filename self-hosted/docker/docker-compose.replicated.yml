@@ -65,6 +65,7 @@ services:
       - REPLICATION_MODE=primary
       - NATS_URL=nats://nats:4222
       - GRPC_PORT=50051
+      - CHECKPOINT_STORAGE_PATH=/convex/data/checkpoints
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,6 +97,7 @@ services:
       - REPLICATION_MODE=replica
       - NATS_URL=nats://nats:4222
       - PRIMARY_GRPC_URL=http://primary:50051
+      - REPLICA_STORAGE_PATH=/convex/data/storage
     depends_on:
       primary:
         condition: service_healthy
@@ -127,6 +129,7 @@ services:
       - REPLICATION_MODE=replica
       - NATS_URL=nats://nats:4222
       - PRIMARY_GRPC_URL=http://primary:50051
+      - REPLICA_STORAGE_PATH=/convex/data/storage
     depends_on:
       primary:
         condition: service_healthy
