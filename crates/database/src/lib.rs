@@ -19,6 +19,7 @@ mod database;
 pub mod nats_distributed_log;
 pub mod replica;
 pub mod snapshot_checkpointer;
+pub mod timestamp_oracle;
 mod database_index_workers;
 mod execution_size;
 mod metrics;
