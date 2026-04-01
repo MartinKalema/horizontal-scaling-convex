@@ -937,17 +937,28 @@ impl<RT: Runtime> Committer<RT> {
     }
 
     /// Apply a replicated delta from the Primary to this Replica's state.
-    /// This is the Replica equivalent of publish_commit — it updates the
-    /// SnapshotManager and WriteLog without writing to persistence (the
-    /// Primary already persisted the data).
     ///
-    /// The delta's document IDs contain the Primary's TabletIds. We remap
-    /// them to the Replica's local TabletIds using the table name mapping
-    /// carried in the delta.
+    /// This is the Replica's apply path — equivalent to the Primary's
+    /// validate_commit + write_to_persistence + publish_commit, but for
+    /// deltas received from NATS instead of local transactions.
+    ///
+    /// Steps:
+    /// 1. Apply `_tables` updates first (creates new tables on Replica)
+    /// 2. Rebuild TabletId remapping after table creation
+    /// 3. Apply remaining document updates with remapped IDs
+    /// 4. Write to Replica's persistence (so function runner can read modules)
+    /// 5. Update SnapshotManager and WriteLog
     fn apply_replica_delta(&mut self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
         use std::collections::BTreeMap;
 
-        use common::document::DocumentUpdate;
+        use common::{
+            bootstrap_model::tables::TABLES_TABLE,
+            document::DocumentUpdate,
+            persistence::{
+                ConflictStrategy,
+                DocumentLogEntry,
+            },
+        };
         use value::ResolvedDocumentId;
 
         let commit_ts = delta.ts;
@@ -958,94 +969,136 @@ impl<RT: Runtime> Committer<RT> {
             delta.tablet_id_to_table_name.len(),
         );
 
-        // Build remapping: Primary TabletId → Replica TabletId.
-        let local_snapshot = self.snapshot_manager.read().latest_snapshot();
-        let local_mapping = local_snapshot.table_registry.table_mapping();
-        let local_name_to_tablet = |name: value::TableName| -> anyhow::Result<value::TabletId> {
-            // Try all namespaces to find the table.
-            for ns in local_mapping.namespaces_for_name(&name) {
-                let ns_mapping = local_mapping.namespace(ns);
-                if let Ok(id) = ns_mapping.name_to_tablet()(name.clone()) {
-                    return Ok(id);
+        // Helper: build remap from current snapshot state.
+        let build_remap = |snapshot: &Snapshot, tablet_map: &BTreeMap<value::TabletId, value::TableName>| -> BTreeMap<value::TabletId, value::TabletId> {
+            let mapping = snapshot.table_registry.table_mapping();
+            let mut remap = BTreeMap::new();
+            for (primary_id, name) in tablet_map {
+                for ns in mapping.namespaces_for_name(name) {
+                    let ns_mapping = mapping.namespace(ns);
+                    if let Ok(local_id) = ns_mapping.name_to_tablet()(name.clone()) {
+                        remap.insert(*primary_id, local_id);
+                        break;
+                    }
                 }
             }
-            anyhow::bail!("Table {} not found in any namespace", name)
+            remap
         };
-        let mut remap: BTreeMap<value::TabletId, value::TabletId> = BTreeMap::new();
-        for (primary_tablet_id, table_name) in &delta.tablet_id_to_table_name {
-            if let Ok(local_tablet_id) = local_name_to_tablet(table_name.clone()) {
-                remap.insert(*primary_tablet_id, local_tablet_id);
-                tracing::debug!(
-                    "Tablet remap: {:?} ({}) → {:?}",
-                    primary_tablet_id,
-                    table_name,
-                    local_tablet_id
-                );
+
+        // Separate _tables updates from other updates.
+        // _tables updates create new tables and must be applied first.
+        let tables_table_name: &value::TableName = &TABLES_TABLE;
+        let mut tables_updates = Vec::new();
+        let mut other_updates = Vec::new();
+        for update in &delta.document_updates {
+            let primary_tablet = update.id.tablet_id;
+            let table_name = delta.tablet_id_to_table_name.get(&primary_tablet);
+            if table_name.map(|n| n == tables_table_name).unwrap_or(false) {
+                tables_updates.push(update);
             } else {
-                tracing::warn!(
-                    "Table '{}' (Primary TabletId {:?}) not found on Replica — skipping",
-                    table_name,
-                    primary_tablet_id
-                );
+                other_updates.push(update);
             }
         }
-        drop(local_snapshot);
 
-        // Remap document updates and apply.
         let mut snapshot = self.snapshot_manager.read().latest_snapshot();
-        let mut remapped_updates = Vec::new();
-        for update in &delta.document_updates {
+        let mut all_remapped_updates = Vec::new();
+        let mut all_index_updates = Vec::new();
+
+        // Phase 1: Apply _tables updates (creates new tables).
+        if !tables_updates.is_empty() {
+            let remap = build_remap(&snapshot, &delta.tablet_id_to_table_name);
+            for update in &tables_updates {
+                let primary_tablet = update.id.tablet_id;
+                let local_tablet = match remap.get(&primary_tablet) {
+                    Some(t) => *t,
+                    None => continue,
+                };
+                let remapped = DocumentUpdate {
+                    id: ResolvedDocumentId { tablet_id: local_tablet, developer_id: update.id.developer_id },
+                    old_document: update.old_document.as_ref().map(|d| d.to_remapped(local_tablet)),
+                    new_document: update.new_document.as_ref().map(|d| d.to_remapped(local_tablet)),
+                };
+                let (idx_updates, _, _) = snapshot.update(&remapped, commit_ts)?;
+                all_index_updates.extend(idx_updates);
+                all_remapped_updates.push(remapped);
+            }
+            tracing::debug!("Applied {} _tables updates", tables_updates.len());
+        }
+
+        // Phase 2: Rebuild remap after table creation, apply remaining updates.
+        let remap = build_remap(&snapshot, &delta.tablet_id_to_table_name);
+        for update in &other_updates {
             let primary_tablet = update.id.tablet_id;
             let local_tablet = match remap.get(&primary_tablet) {
                 Some(t) => *t,
                 None => {
+                    let table_name = delta.tablet_id_to_table_name.get(&primary_tablet);
                     tracing::debug!(
-                        "Skipping update for unmapped TabletId {}",
-                        primary_tablet
+                        "Skipping update for unmapped table {:?} (TabletId {:?})",
+                        table_name,
+                        primary_tablet,
                     );
                     continue;
                 },
             };
-
-            // Remap the document ID.
-            let remapped_id = ResolvedDocumentId {
-                tablet_id: local_tablet,
-                developer_id: update.id.developer_id,
+            let remapped = DocumentUpdate {
+                id: ResolvedDocumentId { tablet_id: local_tablet, developer_id: update.id.developer_id },
+                old_document: update.old_document.as_ref().map(|d| d.to_remapped(local_tablet)),
+                new_document: update.new_document.as_ref().map(|d| d.to_remapped(local_tablet)),
             };
-            let remapped_update = DocumentUpdate {
-                id: remapped_id,
-                old_document: update.old_document.as_ref().map(|doc| {
-                    doc.to_remapped(local_tablet)
-                }),
-                new_document: update.new_document.as_ref().map(|doc| {
-                    doc.to_remapped(local_tablet)
-                }),
-            };
-            snapshot
-                .update(&remapped_update, commit_ts)
-                .with_context(|| format!(
-                    "Failed to apply remapped replica delta at ts={}",
-                    u64::from(commit_ts)
-                ))?;
-            remapped_updates.push(remapped_update);
+            let (idx_updates, _, _) = snapshot.update(&remapped, commit_ts)?;
+            all_index_updates.extend(idx_updates);
+            all_remapped_updates.push(remapped);
         }
 
-        // Convert remapped document updates to write log entries.
+        // Phase 3: Write to Replica's persistence.
+        // This ensures the function runner can load modules from persistence.
+        let document_writes: Vec<DocumentLogEntry> = all_remapped_updates
+            .iter()
+            .map(|update| DocumentLogEntry {
+                ts: commit_ts,
+                id: value::InternalDocumentId::new(
+                    update.id.tablet_id,
+                    update.id.internal_id(),
+                ),
+                value: update.new_document.clone(),
+                prev_ts: None,
+            })
+            .collect();
+        let index_writes: Vec<PersistenceIndexEntry> = all_index_updates
+            .iter()
+            .map(|update| PersistenceIndexEntry::from_index_update(commit_ts, update))
+            .collect();
+
+        // Write synchronously using block_in_place since we're in the
+        // Committer's sync context.
+        common::runtime::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                self.persistence
+                    .write(&document_writes, &index_writes, ConflictStrategy::Overwrite)
+                    .await
+            })
+        })?;
+
+        // Phase 4: Update write log for subscription invalidation.
         let writes = crate::write_log::index_keys_from_document_updates(
-            &remapped_updates,
+            &all_remapped_updates,
             &snapshot.index_registry,
         );
         self.log.append(commit_ts, writes, delta.write_source);
 
-        // Push the updated snapshot.
+        // Phase 5: Push updated snapshot.
         let mut sm = self.snapshot_manager.write();
         sm.push(commit_ts, snapshot, delta.write_bytes);
 
+        let skipped = delta.document_updates.len() - all_remapped_updates.len();
         tracing::info!(
-            "Applied replica delta at ts={}: {} updates remapped, {} skipped",
+            "Applied replica delta at ts={}: {} updates applied, {} skipped, {} persistence writes",
             u64::from(commit_ts),
-            remapped_updates.len(),
-            delta.document_updates.len() - remapped_updates.len(),
+            all_remapped_updates.len(),
+            skipped,
+            document_writes.len(),
         );
 
         Ok(commit_ts)
