@@ -19,11 +19,12 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: convex_self_hosted
+      CONVEX_INSTANCES: convex-primary,convex-replica,convex-replica2
     ports:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+      - ./init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
     healthcheck:
       test: pg_isready -U postgres
       interval: 5s
