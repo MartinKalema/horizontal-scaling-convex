@@ -714,11 +714,17 @@ impl<RT: Runtime> Committer<RT> {
         write_source: WriteSource,
     ) -> anyhow::Result<ValidatedCommit> {
         // Partition ownership check: if partitioning is enabled, verify
-        // that all writes target tables owned by this node's partition.
+        // that all writes to USER tables target tables owned by this node.
+        // System tables (starting with _) are exempt — every node writes
+        // to its own system tables during initialization and operation.
         if let Some(ref partition_map) = self.partition_map {
             for write in transaction.writes.coalesced_writes() {
                 let tablet_id = write.id.tablet_id;
                 if let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) {
+                    // Skip system tables — every node manages its own.
+                    if table_name.is_system() {
+                        continue;
+                    }
                     if !partition_map.is_local(&table_name) {
                         let partition = partition_map.partition_for_table(&table_name);
                         anyhow::bail!(
