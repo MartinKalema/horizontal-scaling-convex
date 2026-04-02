@@ -68,11 +68,7 @@ impl PartitionMap {
     ///
     /// Tables not listed default to partition 0.
     /// System tables (starting with `_`) are always partition 0 regardless.
-    pub fn from_config(
-        config: &str,
-        local_partition: PartitionId,
-        num_partitions: u32,
-    ) -> Self {
+    pub fn from_config(config: &str, local_partition: PartitionId, num_partitions: u32) -> Self {
         let mut assignments = BTreeMap::new();
         if !config.is_empty() {
             for pair in config.split(',') {
@@ -176,11 +172,8 @@ mod tests {
 
     #[test]
     fn test_multi_partition() {
-        let map = PartitionMap::from_config(
-            "messages=1,users=1,projects=2,tasks=2",
-            PartitionId(1),
-            3,
-        );
+        let map =
+            PartitionMap::from_config("messages=1,users=1,projects=2,tasks=2", PartitionId(1), 3);
 
         // Assigned tables.
         assert_eq!(

@@ -45,10 +45,7 @@ pub struct MutationForwarderService {
 
 impl MutationForwarderService {
     pub fn new(api: Arc<dyn ApplicationApi>, instance_name: String) -> Self {
-        Self {
-            api,
-            instance_name,
-        }
+        Self { api, instance_name }
     }
 
     pub fn into_server(self) -> TonicMutationForwarderServer<Self> {
