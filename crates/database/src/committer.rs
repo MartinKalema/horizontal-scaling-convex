@@ -156,6 +156,16 @@ use crate::{
 const INITIAL_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
 
+/// State held for a 2PC-prepared transaction awaiting commit/rollback.
+struct PreparedTransaction {
+    pending_write: PendingWriteHandle,
+    commit_ts: Timestamp,
+    write_bytes: u64,
+    document_writes: Arc<Vec<DocumentLogEntry>>,
+    index_writes: Arc<Vec<PersistenceIndexEntry>>,
+    write_source: WriteSource,
+}
+
 enum PersistenceWrite {
     Commit {
         pending_write: PendingWriteHandle,
@@ -218,6 +228,12 @@ pub struct Committer<RT: Runtime> {
     // ensuring globally unique timestamps across all nodes.
     // None means single-node mode (local clock, existing behavior).
     timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
+
+    // 2PC prepared transactions awaiting CommitPrepared or RollbackPrepared.
+    // Keyed by TwoPhaseTransactionId, storing the PendingWriteHandle and
+    // metadata needed to finalize the commit. (Vitess redo log pattern)
+    prepared_transactions:
+        std::collections::HashMap<crate::two_phase::TwoPhaseTransactionId, PreparedTransaction>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -237,6 +253,7 @@ impl<RT: Runtime> Committer<RT> {
         let conflict_checker = PendingWrites::new();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
         let snapshot_reader = snapshot_manager.reader();
+        let client_partition_map = partition_map.clone();
         let committer = Self {
             pending_writes: conflict_checker,
             log,
@@ -251,6 +268,7 @@ impl<RT: Runtime> Committer<RT> {
             distributed_log,
             partition_map,
             timestamp_oracle,
+            prepared_transactions: std::collections::HashMap::new(),
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -267,6 +285,7 @@ impl<RT: Runtime> Committer<RT> {
             persistence_reader,
             retention_validator,
             snapshot_reader,
+            partition_map: client_partition_map,
         }
     }
 
@@ -442,7 +461,30 @@ impl<RT: Runtime> Committer<RT> {
                         }) => {
                             let response = self.load_indexes_into_memory(tables).await;
                             let _ = result.send(response);
-                        }
+                        },
+                        Some(CommitterMessage::Prepare {
+                            transaction_id,
+                            transaction,
+                            write_source,
+                            result,
+                        }) => {
+                            let r = self.handle_prepare(transaction_id, transaction, write_source);
+                            let _ = result.send(r);
+                        },
+                        Some(CommitterMessage::CommitPrepared {
+                            transaction_id,
+                            result,
+                        }) => {
+                            let r = self.handle_commit_prepared(transaction_id);
+                            let _ = result.send(r);
+                        },
+                        Some(CommitterMessage::RollbackPrepared {
+                            transaction_id,
+                            result,
+                        }) => {
+                            let r = self.handle_rollback_prepared(transaction_id);
+                            let _ = result.send(r);
+                        },
                     }
                 },
             }
@@ -1378,6 +1420,180 @@ impl<RT: Runtime> Committer<RT> {
         Ok(commit_ts)
     }
 
+    // ========== 2PC Handlers (Vitess prepare/commit/rollback pattern) ==========
+
+    /// Prepare phase: validate OCC, assign timestamp, stage writes.
+    /// Does NOT publish — the transaction is held in prepared_transactions
+    /// until CommitPrepared or RollbackPrepared arrives.
+    fn handle_prepare(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: FinalTransaction,
+        write_source: WriteSource,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        tracing::info!(
+            "2PC Prepare: txn={}, {} writes",
+            transaction_id,
+            transaction.writes.coalesced_writes().count(),
+        );
+
+        // Skip partition ownership check — the coordinator already routed
+        // the correct subset of writes to this partition. Run the rest of
+        // validation (OCC conflict check, compute writes).
+        let commit_ts = self.next_commit_ts()?;
+        let timer = metrics::commit_is_stale_timer();
+        if let Some(conflicting_read) = self.commit_has_conflict(
+            transaction.reads.read_set(),
+            *transaction.begin_timestamp,
+            commit_ts,
+        )? {
+            anyhow::bail!(conflicting_read.into_error(&transaction.table_mapping, &write_source));
+        }
+        timer.finish();
+
+        let updates: Vec<_> = transaction.writes.coalesced_writes().collect();
+        let mut ordered_updates = updates;
+        ordered_updates.sort_by_key(|update| {
+            table_dependency_sort_key(
+                BootstrapTableIds::new(&transaction.table_mapping),
+                InternalDocumentId::from(update.id),
+                update.new_document.as_ref(),
+            )
+        });
+
+        let (document_writes, index_writes, snapshot) =
+            self.compute_writes(commit_ts, &ordered_updates)?;
+
+        let pending_write = self.pending_writes.push_back(
+            commit_ts,
+            ordered_updates
+                .into_iter()
+                .map(|update| (update.id, PackedDocumentUpdate::pack(update)))
+                .collect(),
+            write_source.clone(),
+            snapshot,
+        );
+
+        // Build persistence entries.
+        let mut write_bytes: u64 = 0;
+        let doc_entries: Vec<DocumentLogEntry> = document_writes
+            .into_iter()
+            .map(|w| {
+                let entry = DocumentLogEntry {
+                    ts: w.commit_ts,
+                    id: w.id,
+                    value: w.write,
+                    prev_ts: w.prev_ts,
+                };
+                write_bytes += entry.size();
+                entry
+            })
+            .collect();
+        let idx_entries: Vec<PersistenceIndexEntry> = index_writes
+            .into_iter()
+            .map(|(ts, update)| {
+                let entry = PersistenceIndexEntry::from_index_update(ts, &update);
+                write_bytes += entry.size();
+                entry
+            })
+            .collect();
+
+        // Store in prepared_transactions map for later commit/rollback.
+        self.prepared_transactions.insert(
+            transaction_id.clone(),
+            PreparedTransaction {
+                pending_write,
+                commit_ts,
+                write_bytes,
+                document_writes: Arc::new(doc_entries),
+                index_writes: Arc::new(idx_entries),
+                write_source,
+            },
+        );
+
+        tracing::info!(
+            "2PC Prepared: txn={}, ts={}",
+            transaction_id,
+            u64::from(commit_ts),
+        );
+
+        Ok(crate::two_phase::PrepareResult {
+            prepare_ts: commit_ts,
+        })
+    }
+
+    /// Commit a previously prepared transaction: write to persistence,
+    /// publish to snapshot manager and write log, publish delta to NATS.
+    fn handle_commit_prepared(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<Timestamp> {
+        let prepared = self
+            .prepared_transactions
+            .remove(&transaction_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("2PC CommitPrepared: unknown transaction {}", transaction_id)
+            })?;
+
+        tracing::info!(
+            "2PC CommitPrepared: txn={}, ts={}",
+            transaction_id,
+            u64::from(prepared.commit_ts),
+        );
+
+        // Write to persistence (same as normal commit path).
+        block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                self.persistence
+                    .write(
+                        &prepared.document_writes,
+                        &prepared.index_writes,
+                        ConflictStrategy::Error,
+                    )
+                    .await
+            })
+        })?;
+
+        // Publish commit — makes writes visible to reads.
+        self.publish_commit(
+            prepared.pending_write,
+            prepared.write_bytes,
+            prepared.document_writes,
+            prepared.index_writes,
+        );
+
+        Ok(prepared.commit_ts)
+    }
+
+    /// Rollback a previously prepared transaction: remove from PendingWrites.
+    fn handle_rollback_prepared(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        let prepared = self
+            .prepared_transactions
+            .remove(&transaction_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "2PC RollbackPrepared: unknown transaction {}",
+                    transaction_id
+                )
+            })?;
+
+        tracing::info!(
+            "2PC RollbackPrepared: txn={}, ts={}",
+            transaction_id,
+            u64::from(prepared.commit_ts),
+        );
+
+        // Remove from PendingWrites so it no longer blocks conflicting
+        // transactions. We pop it and discard.
+        self.pending_writes.pop_first(prepared.pending_write);
+
+        Ok(())
+    }
+
     #[fastrace::trace]
     /// Returns a future to add to the pending_writes queue, if the commit
     /// should be written.
@@ -1690,6 +1906,7 @@ pub struct CommitterClient {
     persistence_reader: Arc<dyn PersistenceReader>,
     retention_validator: Arc<dyn RetentionValidator>,
     snapshot_reader: Reader<SnapshotManager>,
+    partition_map: Option<crate::partition::PartitionMap>,
 }
 
 impl CommitterClient {
@@ -1781,6 +1998,27 @@ impl CommitterClient {
         let latest_snapshot = self.snapshot_reader.lock().latest_snapshot();
         transaction.validate_memory_index_sizes(&latest_snapshot)?;
 
+        // Classify: single-partition (fast path) vs cross-partition (2PC).
+        // TiDB 1PC optimization: skip 2PC when all writes target one partition.
+        if let Some(ref partition_map) = self.partition_map {
+            let classification =
+                crate::two_phase_coordinator::classify_transaction(&transaction, partition_map);
+            if let crate::two_phase_coordinator::TransactionClassification::CrossPartition {
+                ..
+            } = classification
+            {
+                tracing::info!("Cross-partition transaction detected, using 2PC coordinator");
+                return crate::two_phase_coordinator::coordinate_two_phase_commit(
+                    self,
+                    transaction,
+                    write_source,
+                    partition_map,
+                )
+                .await;
+            }
+        }
+
+        // Single-partition fast path (existing behavior).
         let queue_timer = metrics::commit_queue_timer();
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::Commit {
@@ -1805,6 +2043,62 @@ impl CommitterClient {
 
     pub fn shutdown(&self) {
         self.handle.lock().shutdown();
+    }
+
+    /// 2PC Prepare: validate and stage writes for a cross-partition
+    /// transaction.
+    pub async fn prepare(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: FinalTransaction,
+        write_source: WriteSource,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::Prepare {
+            transaction_id,
+            transaction,
+            write_source,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
+    /// 2PC CommitPrepared: finalize a prepared transaction.
+    pub async fn commit_prepared(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<Timestamp> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::CommitPrepared {
+            transaction_id,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
+    /// 2PC RollbackPrepared: abort a prepared transaction.
+    pub async fn rollback_prepared(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::RollbackPrepared {
+            transaction_id,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -1904,6 +2198,27 @@ enum CommitterMessage {
         result: oneshot::Sender<anyhow::Result<()>>,
     },
     FinishTableSummaryBootstrap {
+        result: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// 2PC Prepare: validate OCC and stage writes for this partition's portion
+    /// of a cross-partition transaction. Does NOT publish — waits for
+    /// CommitPrepared or RollbackPrepared. (Vitess prepare pattern)
+    Prepare {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: FinalTransaction,
+        write_source: WriteSource,
+        result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
+    },
+    /// 2PC CommitPrepared: finalize a previously prepared transaction.
+    /// Writes to persistence, publishes commit, deletes redo log.
+    CommitPrepared {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+    },
+    /// 2PC RollbackPrepared: abort a previously prepared transaction.
+    /// Removes from PendingWrites, deletes redo log.
+    RollbackPrepared {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
         result: oneshot::Sender<anyhow::Result<()>>,
     },
 }

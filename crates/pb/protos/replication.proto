@@ -61,3 +61,45 @@ message MutationError {
   // Log lines captured during execution.
   repeated string log_lines = 3;
 }
+
+// Two-Phase Commit service for cross-partition writes (Vitess 2PC pattern).
+// Each partitioned node runs this service. The coordinator sends Prepare
+// to remote partitions, then CommitPrepared or RollbackPrepared.
+service TwoPhaseCommitService {
+  rpc Prepare(TwoPcPrepareRequest) returns (TwoPcPrepareResponse);
+  rpc CommitPrepared(TwoPcCommitRequest) returns (TwoPcCommitResponse);
+  rpc RollbackPrepared(TwoPcRollbackRequest) returns (TwoPcRollbackResponse);
+}
+
+message TwoPcPrepareRequest {
+  // Globally unique 2PC transaction ID.
+  string transaction_id = 1;
+
+  // Serialized FinalTransaction (the partition's subset of writes).
+  // Encoded as the full transaction — the receiving Committer validates
+  // and stages only the writes for its partition.
+  bytes serialized_transaction = 2;
+
+  // Write source for logging.
+  string write_source = 3;
+}
+
+message TwoPcPrepareResponse {
+  // The prepare timestamp assigned by the participant's TSO.
+  uint64 prepare_ts = 1;
+}
+
+message TwoPcCommitRequest {
+  string transaction_id = 1;
+}
+
+message TwoPcCommitResponse {
+  uint64 commit_ts = 1;
+}
+
+message TwoPcRollbackRequest {
+  string transaction_id = 1;
+}
+
+message TwoPcRollbackResponse {
+}

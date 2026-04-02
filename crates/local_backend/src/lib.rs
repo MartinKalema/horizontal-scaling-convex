@@ -114,6 +114,7 @@ pub mod streaming_import;
 pub mod subs;
 #[cfg(test)]
 mod test_helpers;
+pub mod two_phase_service;
 
 pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 
@@ -429,6 +430,18 @@ pub async fn make_app(
                 }
             });
             tracing::info!("Started ReplicaDeltaConsumer for replication");
+        }
+    }
+
+    // Start the 2PC Transaction Watcher for crash recovery.
+    if config.partition_id.is_some() {
+        if let Some(nats_url) = &config.nats_url {
+            database::two_phase_watcher::start(
+                runtime.clone(),
+                database.committer_client(),
+                nats_url.clone(),
+            );
+            tracing::info!("Started 2PC Transaction Watcher");
         }
     }
 
