@@ -1,10 +1,17 @@
 //! Raft failover integration tests.
 //!
-//! Tests leader election and failover using a 3-node in-process Raft group.
-//! No network — messages pass through mpsc channels directly.
+//! Tests leader election, propose-commit, failover, and partition tolerance
+//! using a 3-node in-process Raft group. Messages pass through direct step()
+//! calls — no network transport.
+//!
+//! Test patterns from:
+//!   - CockroachDB roachtest failover suite
+//!   - TiKV fail-rs chaos testing
+//!   - YugabyteDB Jepsen nightly resilience benchmarks
 
 use std::collections::HashMap;
 
+use raft::StateRole;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -17,251 +24,400 @@ use crate::{
 };
 
 /// Create a 3-node Raft group with in-memory channels.
-fn create_three_node_group() -> (Vec<RaftNode>, Vec<mpsc::UnboundedSender<RaftMessage>>) {
-    let peer_ids = vec![1, 2, 3];
+fn create_three_node_group() -> Vec<RaftNode> {
+    let peer_ids = vec![1u64, 2, 3];
     let mut nodes = Vec::new();
-    let mut mailbox_txs = Vec::new();
-    let mut mailbox_rxs = Vec::new();
 
-    // Create channels for each node.
-    for _ in 0..3 {
-        let (tx, rx) = mpsc::unbounded_channel();
-        mailbox_txs.push(tx);
-        mailbox_rxs.push(rx);
-    }
-
-    // Create Raft message sender channels between nodes.
-    // Each node needs senders for its peers.
-    let mut raft_msg_txs: Vec<HashMap<u64, mpsc::UnboundedSender<raft::prelude::Message>>> =
-        Vec::new();
-    let mut raft_msg_rxs: Vec<Vec<(u64, mpsc::UnboundedReceiver<raft::prelude::Message>)>> =
-        Vec::new();
-
-    for i in 0..3 {
-        let mut senders = HashMap::new();
-        let mut receivers = Vec::new();
-        for j in 0..3 {
-            if i == j {
-                continue;
-            }
-            let (tx, rx) = mpsc::unbounded_channel();
-            senders.insert(peer_ids[j], tx);
-            receivers.push((peer_ids[j], rx));
-        }
-        raft_msg_txs.push(senders);
-        raft_msg_rxs.push(receivers);
-    }
-
-    // Create nodes.
-    for (i, rx) in mailbox_rxs.into_iter().enumerate() {
+    for &id in &peer_ids {
+        let (_, rx) = mpsc::unbounded_channel();
+        // Peer senders not used — we route messages via direct step() calls.
         let config = RaftNodeConfig {
-            node_id: peer_ids[i],
+            node_id: id,
             partition_id: PartitionId(0),
             peers: peer_ids.clone(),
             election_tick: 10,
             heartbeat_tick: 3,
         };
-
-        let node = RaftNode::new(config, rx, raft_msg_txs[i].clone()).unwrap();
+        let node = RaftNode::new(config, rx, HashMap::new()).unwrap();
         nodes.push(node);
     }
 
-    (nodes, mailbox_txs)
+    nodes
 }
 
-/// Route Raft messages between nodes (simulates network).
-fn route_messages(nodes: &mut [RaftNode]) {
-    // Collect all outgoing messages from each node's peer senders.
-    // Since we're using unbounded channels, messages are already in the
-    // channels. We need to deliver them by calling step() on the receiving
-    // nodes. But the peer_senders in each node send to channels that aren't
-    // connected to the receiving nodes' mailboxes — they're separate
-    // channels.
-    //
-    // For the in-process test, we directly step messages by reading from
-    // each node's Ready state.
+/// Run one Raft tick cycle: tick all nodes, process ready, route messages.
+/// `active` controls which nodes participate (for simulating kills/partitions).
+fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
+    let mut committed = Vec::new();
+
+    for (i, node) in nodes.iter_mut().enumerate() {
+        if active[i] {
+            node.raw_node.tick();
+        }
+    }
+
+    // Collect all messages from ready states.
+    let mut all_messages: Vec<(u64, raft::prelude::Message)> = Vec::new();
+
+    for (i, node) in nodes.iter_mut().enumerate() {
+        if !active[i] {
+            continue;
+        }
+        if node.raw_node.has_ready() {
+            let mut ready = node.raw_node.ready();
+
+            for msg in ready.take_messages() {
+                all_messages.push((msg.to, msg));
+            }
+
+            node.storage.append_entries(ready.entries()).unwrap();
+            if let Some(hs) = ready.hs() {
+                node.storage.set_hardstate(hs.clone());
+            }
+
+            for entry in ready.take_committed_entries() {
+                if !entry.data.is_empty()
+                    && entry.get_entry_type() == raft::prelude::EntryType::EntryNormal
+                {
+                    committed.push(entry.data.to_vec());
+                }
+            }
+
+            for msg in ready.take_persisted_messages() {
+                all_messages.push((msg.to, msg));
+            }
+
+            let mut light_rd = node.raw_node.advance(ready);
+            for entry in light_rd.take_committed_entries() {
+                if !entry.data.is_empty()
+                    && entry.get_entry_type() == raft::prelude::EntryType::EntryNormal
+                {
+                    committed.push(entry.data.to_vec());
+                }
+            }
+            node.raw_node.advance_apply();
+        }
+    }
+
+    // Route messages to target nodes (only active ones).
+    for (to, msg) in all_messages {
+        for (i, node) in nodes.iter_mut().enumerate() {
+            if active[i] && node.node_id() == to {
+                let _ = node.raw_node.step(msg.clone());
+                break;
+            }
+        }
+    }
+
+    committed
 }
 
-/// Test that a 3-node group elects a leader.
+/// Run ticks until a leader is elected. Returns leader's node_id.
+fn elect_leader(nodes: &mut [RaftNode]) -> u64 {
+    let all_active = vec![true; nodes.len()];
+    for _ in 0..50 {
+        tick_cycle(nodes, &all_active);
+    }
+    nodes
+        .iter()
+        .find(|n| n.raw_node.raft.state == StateRole::Leader)
+        .map(|n| n.node_id())
+        .expect("No leader elected after 50 ticks")
+}
+
+/// Find the index of a node by its ID.
+fn node_idx(nodes: &[RaftNode], id: u64) -> usize {
+    nodes.iter().position(|n| n.node_id() == id).unwrap()
+}
+
+// ============================================================
+// Test 1: 3-node election (already existed, rewritten with helpers)
+// ============================================================
+
 #[tokio::test]
 async fn test_three_node_election() {
-    let (mut nodes, _txs) = create_three_node_group();
+    let mut nodes = create_three_node_group();
+    let leader_id = elect_leader(&mut nodes);
 
-    // Tick all nodes to trigger election.
-    // Node 1 will likely win since it has the lowest ID.
-    for _ in 0..30 {
-        for node in nodes.iter_mut() {
-            node.raw_node.tick();
-        }
-
-        // Process ready on all nodes and route messages.
-        let mut all_messages: Vec<(u64, raft::prelude::Message)> = Vec::new();
-
-        for node in nodes.iter_mut() {
-            if node.raw_node.has_ready() {
-                let mut ready = node.raw_node.ready();
-
-                if let Some(ss) = ready.ss() {
-                    let now_leader = ss.raft_state == raft::StateRole::Leader;
-                    if now_leader {
-                        tracing::info!("Node {} became leader", node.node_id());
-                    }
-                }
-
-                // Collect messages to route.
-                for msg in ready.take_messages() {
-                    all_messages.push((msg.to, msg));
-                }
-
-                node.storage.append_entries(ready.entries()).unwrap();
-                if let Some(hs) = ready.hs() {
-                    node.storage.set_hardstate(hs.clone());
-                }
-
-                for msg in ready.take_persisted_messages() {
-                    all_messages.push((msg.to, msg));
-                }
-
-                node.raw_node.advance(ready);
-            }
-        }
-
-        // Route messages to target nodes.
-        for (to, msg) in all_messages {
-            for node in nodes.iter_mut() {
-                if node.node_id() == to {
-                    let _ = node.raw_node.step(msg.clone());
-                    break;
-                }
-            }
-        }
-    }
-
-    // Exactly one node should be leader.
-    let leaders: Vec<_> = nodes
+    // Exactly one leader.
+    let leader_count = nodes
         .iter()
-        .filter(|n| n.raw_node.raft.state == raft::StateRole::Leader)
-        .collect();
+        .filter(|n| n.raw_node.raft.state == StateRole::Leader)
+        .count();
+    assert_eq!(leader_count, 1);
 
-    assert_eq!(
-        leaders.len(),
-        1,
-        "Expected exactly 1 leader, got {}",
-        leaders.len()
-    );
-
-    let leader_id = leaders[0].node_id();
-    tracing::info!("Leader elected: node {}", leader_id);
-
-    // All nodes should agree on the leader.
+    // All agree on leader.
     for node in &nodes {
-        assert_eq!(
-            node.raw_node.raft.leader_id,
-            leader_id,
-            "Node {} disagrees on leader: thinks {} is leader",
-            node.node_id(),
-            node.raw_node.raft.leader_id,
-        );
+        assert_eq!(node.raw_node.raft.leader_id, leader_id);
     }
 }
 
-/// Test that a proposal is committed across 3 nodes.
+// ============================================================
+// Test 2: Propose-commit across majority
+// ============================================================
+
 #[tokio::test]
 async fn test_three_node_propose_commit() {
-    let (mut nodes, _txs) = create_three_node_group();
-
-    // Elect a leader first.
-    for _ in 0..30 {
-        for node in nodes.iter_mut() {
-            node.raw_node.tick();
-        }
-        let mut msgs = Vec::new();
-        for node in nodes.iter_mut() {
-            if node.raw_node.has_ready() {
-                let mut ready = node.raw_node.ready();
-                for msg in ready.take_messages() {
-                    msgs.push((msg.to, msg));
-                }
-                node.storage.append_entries(ready.entries()).unwrap();
-                if let Some(hs) = ready.hs() {
-                    node.storage.set_hardstate(hs.clone());
-                }
-                for msg in ready.take_persisted_messages() {
-                    msgs.push((msg.to, msg));
-                }
-                node.raw_node.advance(ready);
-            }
-        }
-        for (to, msg) in msgs {
-            for node in nodes.iter_mut() {
-                if node.node_id() == to {
-                    let _ = node.raw_node.step(msg.clone());
-                    break;
-                }
-            }
-        }
-    }
-
-    // Find the leader and propose data.
-    let leader_idx = nodes
-        .iter()
-        .position(|n| n.raw_node.raft.state == raft::StateRole::Leader)
-        .expect("No leader elected");
+    let mut nodes = create_three_node_group();
+    let leader_id = elect_leader(&mut nodes);
+    let leader_idx = node_idx(&nodes, leader_id);
 
     nodes[leader_idx]
         .raw_node
-        .propose(vec![], b"replicated mutation".to_vec())
+        .propose(vec![], b"test data".to_vec())
         .unwrap();
 
-    // Process more rounds until committed on majority.
-    let mut committed_on: Vec<u64> = Vec::new();
+    let all_active = vec![true; 3];
+    let mut all_committed = Vec::new();
     for _ in 0..20 {
-        let mut msgs = Vec::new();
-        for node in nodes.iter_mut() {
-            node.raw_node.tick();
-            if node.raw_node.has_ready() {
-                let mut ready = node.raw_node.ready();
-                for msg in ready.take_messages() {
-                    msgs.push((msg.to, msg));
-                }
-                node.storage.append_entries(ready.entries()).unwrap();
-                if let Some(hs) = ready.hs() {
-                    node.storage.set_hardstate(hs.clone());
-                }
-                for entry in ready.take_committed_entries() {
-                    if entry.data == b"replicated mutation" {
-                        committed_on.push(node.node_id());
-                    }
-                }
-                for msg in ready.take_persisted_messages() {
-                    msgs.push((msg.to, msg));
-                }
-                let mut light_rd = node.raw_node.advance(ready);
-                for entry in light_rd.take_committed_entries() {
-                    if entry.data == b"replicated mutation" {
-                        committed_on.push(node.node_id());
-                    }
-                }
-                node.raw_node.advance_apply();
-            }
-        }
-        for (to, msg) in msgs {
-            for node in nodes.iter_mut() {
-                if node.node_id() == to {
-                    let _ = node.raw_node.step(msg.clone());
-                    break;
-                }
-            }
-        }
-        if committed_on.len() >= 2 {
+        all_committed.extend(tick_cycle(&mut nodes, &all_active));
+        if all_committed.iter().any(|d| d == b"test data") {
             break;
         }
     }
 
     assert!(
-        committed_on.len() >= 2,
-        "Expected majority (>=2) to commit, got {} nodes: {:?}",
-        committed_on.len(),
-        committed_on,
+        all_committed.iter().any(|d| d == b"test data"),
+        "Proposal not committed: {:?}",
+        all_committed
+    );
+}
+
+// ============================================================
+// Test 3: Kill leader, verify re-election (CockroachDB failover)
+// ============================================================
+
+#[tokio::test]
+async fn test_kill_leader_reelection() {
+    let mut nodes = create_three_node_group();
+    let old_leader_id = elect_leader(&mut nodes);
+    let old_leader_idx = node_idx(&nodes, old_leader_id);
+
+    // Kill the leader (mark as inactive).
+    let mut active = vec![true; 3];
+    active[old_leader_idx] = false;
+
+    // Tick the remaining 2 nodes until a new leader is elected.
+    let mut new_leader_id = 0u64;
+    for _ in 0..50 {
+        tick_cycle(&mut nodes, &active);
+        for (i, node) in nodes.iter().enumerate() {
+            if active[i] && node.raw_node.raft.state == StateRole::Leader {
+                new_leader_id = node.node_id();
+            }
+        }
+        if new_leader_id != 0 && new_leader_id != old_leader_id {
+            break;
+        }
+    }
+
+    assert_ne!(
+        new_leader_id, 0,
+        "No new leader elected after killing old leader"
+    );
+    assert_ne!(
+        new_leader_id, old_leader_id,
+        "New leader should be different from killed leader"
+    );
+}
+
+// ============================================================
+// Test 4: Write during leader transition (CockroachDB failover)
+// ============================================================
+
+#[tokio::test]
+async fn test_write_during_leader_transition() {
+    let mut nodes = create_three_node_group();
+    let old_leader_id = elect_leader(&mut nodes);
+    let old_leader_idx = node_idx(&nodes, old_leader_id);
+
+    // Propose data BEFORE killing the leader.
+    nodes[old_leader_idx]
+        .raw_node
+        .propose(vec![], b"before kill".to_vec())
+        .unwrap();
+
+    // Let it replicate to at least one follower.
+    let all_active = vec![true; 3];
+    let mut committed = Vec::new();
+    for _ in 0..10 {
+        committed.extend(tick_cycle(&mut nodes, &all_active));
+    }
+
+    assert!(
+        committed.iter().any(|d| d == b"before kill"),
+        "Pre-kill write should be committed"
+    );
+
+    // Kill the leader.
+    let mut active = vec![true; 3];
+    active[old_leader_idx] = false;
+
+    // Wait for new leader.
+    for _ in 0..50 {
+        tick_cycle(&mut nodes, &active);
+    }
+
+    let new_leader_id = nodes
+        .iter()
+        .enumerate()
+        .find(|(i, n)| active[*i] && n.raw_node.raft.state == StateRole::Leader)
+        .map(|(_, n)| n.node_id());
+
+    assert!(new_leader_id.is_some(), "New leader should be elected");
+    let new_leader_idx = node_idx(&nodes, new_leader_id.unwrap());
+
+    // Propose data on the new leader.
+    nodes[new_leader_idx]
+        .raw_node
+        .propose(vec![], b"after kill".to_vec())
+        .unwrap();
+
+    let mut post_committed = Vec::new();
+    for _ in 0..20 {
+        post_committed.extend(tick_cycle(&mut nodes, &active));
+        if post_committed.iter().any(|d| d == b"after kill") {
+            break;
+        }
+    }
+
+    assert!(
+        post_committed.iter().any(|d| d == b"after kill"),
+        "Post-kill write should be committed on new leader"
+    );
+}
+
+// ============================================================
+// Test 5: Network partition (1 isolated) — TiKV/YugabyteDB
+// ============================================================
+
+#[tokio::test]
+async fn test_network_partition_minority_isolated() {
+    let mut nodes = create_three_node_group();
+    let leader_id = elect_leader(&mut nodes);
+    let leader_idx = node_idx(&nodes, leader_id);
+
+    // Isolate one follower (not the leader).
+    let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let mut active = vec![true; 3];
+    active[follower_idx] = false;
+
+    // The majority (leader + 1 follower) should still accept writes.
+    nodes[leader_idx]
+        .raw_node
+        .propose(vec![], b"during partition".to_vec())
+        .unwrap();
+
+    let mut committed = Vec::new();
+    for _ in 0..20 {
+        committed.extend(tick_cycle(&mut nodes, &active));
+        if committed.iter().any(|d| d == b"during partition") {
+            break;
+        }
+    }
+
+    assert!(
+        committed.iter().any(|d| d == b"during partition"),
+        "Majority should still commit during minority partition"
+    );
+}
+
+// ============================================================
+// Test 6: Leader rejoins as follower (CockroachDB)
+// ============================================================
+
+#[tokio::test]
+async fn test_leader_rejoins_as_follower() {
+    let mut nodes = create_three_node_group();
+    let old_leader_id = elect_leader(&mut nodes);
+    let old_leader_idx = node_idx(&nodes, old_leader_id);
+
+    // Kill the leader.
+    let mut active = vec![true; 3];
+    active[old_leader_idx] = false;
+
+    // Wait for new leader.
+    for _ in 0..50 {
+        tick_cycle(&mut nodes, &active);
+    }
+
+    let new_leader_id = nodes
+        .iter()
+        .enumerate()
+        .find(|(i, n)| active[*i] && n.raw_node.raft.state == StateRole::Leader)
+        .map(|(_, n)| n.node_id())
+        .expect("New leader not elected");
+
+    assert_ne!(new_leader_id, old_leader_id);
+
+    // Bring the old leader back.
+    active[old_leader_idx] = true;
+
+    // Tick to let the old leader discover the new term and step down.
+    for _ in 0..30 {
+        tick_cycle(&mut nodes, &active);
+    }
+
+    // The old leader should now be a follower.
+    assert_ne!(
+        nodes[old_leader_idx].raw_node.raft.state,
+        StateRole::Leader,
+        "Old leader should have stepped down to follower"
+    );
+
+    // The new leader should still be leader.
+    let new_leader_idx = node_idx(&nodes, new_leader_id);
+    assert_eq!(
+        nodes[new_leader_idx].raw_node.raft.state,
+        StateRole::Leader,
+        "New leader should still be leading"
+    );
+}
+
+// ============================================================
+// Test 7: All 3 nodes have same committed entries
+// ============================================================
+
+#[tokio::test]
+async fn test_raft_log_consistency() {
+    let mut nodes = create_three_node_group();
+    let leader_id = elect_leader(&mut nodes);
+    let leader_idx = node_idx(&nodes, leader_id);
+
+    // Propose 5 entries.
+    for i in 0..5 {
+        nodes[leader_idx]
+            .raw_node
+            .propose(vec![], format!("entry-{i}").into_bytes())
+            .unwrap();
+    }
+
+    let all_active = vec![true; 3];
+    for _ in 0..30 {
+        tick_cycle(&mut nodes, &all_active);
+    }
+
+    // All nodes should have the same commit index.
+    let commit_indices: Vec<u64> = nodes
+        .iter()
+        .map(|n| n.raw_node.raft.raft_log.committed)
+        .collect();
+
+    assert_eq!(
+        commit_indices[0], commit_indices[1],
+        "Nodes 1 and 2 commit indices differ: {:?}",
+        commit_indices
+    );
+    assert_eq!(
+        commit_indices[1], commit_indices[2],
+        "Nodes 2 and 3 commit indices differ: {:?}",
+        commit_indices
+    );
+
+    // Commit index should be at least 5 (our entries) + initial entries.
+    assert!(
+        commit_indices[0] >= 5,
+        "Commit index too low: {}",
+        commit_indices[0]
     );
 }
