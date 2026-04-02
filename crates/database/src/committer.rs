@@ -1088,14 +1088,25 @@ impl<RT: Runtime> Committer<RT> {
         };
         use value::ResolvedDocumentId;
 
-        // Use next_commit_ts() instead of the remote delta's timestamp.
-        // Even with a shared TSO, the receiving node may have already advanced
-        // past the remote timestamp (e.g., during init or from its own commits).
-        // The write log requires strictly increasing timestamps, so we must
-        // assign a locally-valid timestamp — same as how CockroachDB's apply
-        // loop assigns a local HLC timestamp when applying Raft proposals.
+        // Assign a locally-valid timestamp for the replica delta WITHOUT
+        // consuming TSO batch entries and WITHOUT using the system clock.
+        //
+        // Why no TSO: the TSO batch is reserved for local commits (writes
+        // that originate on this node). TiDB's followers apply with the
+        // leader's commitTS, not a new TSO value.
+        //
+        // Why no system clock: the system clock may have advanced far beyond
+        // the TSO batch range. Including it would poison last_assigned_ts to
+        // a value above the TSO range, causing all subsequent next_commit_ts()
+        // calls to skip the TSO value and use last_assigned_ts + 1 instead,
+        // eventually colliding with max_repeatable_ts bumps.
+        //
+        // The correct approach (CockroachDB pattern): use only the monotonic
+        // counters that stay in the same domain as next_commit_ts().
         let remote_ts = delta.ts;
-        let commit_ts = self.next_commit_ts()?;
+        let latest_ts = self.snapshot_manager.read().latest_ts();
+        let commit_ts = cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?);
+        self.last_assigned_ts = commit_ts;
         tracing::info!(
             "Applying replica delta: remote_ts={}, local_ts={}, {} document updates, {} tablet \
              mappings",
@@ -1403,10 +1414,26 @@ impl<RT: Runtime> Committer<RT> {
         );
         self.log.append(commit_ts, writes, delta.write_source);
 
-        // Phase 5: Push updated snapshot and advance repeatable timestamp.
+        // Phase 5: Push updated snapshot.
+        //
+        // Do NOT call bump_persisted_max_repeatable_ts here. That timestamp
+        // is advanced by the async bump_max_repeatable_ts flow (via
+        // persistence_writes FuturesOrdered). Calling it here would race:
+        // the async bump assigns timestamp N, then a delta pushes N+1 and
+        // bumps persisted_max_repeatable_ts to N+1, then the async bump's
+        // publish_max_repeatable_ts(N) fails the ensure!(N >= N+1) check.
+        //
+        // CockroachDB solves the same problem by separating the closed
+        // timestamp (side transport) from write application (Raft transport)
+        // so they never interleave. TiKV derives resolved-ts from the apply
+        // state rather than an async timer.
+        //
+        // Our approach: let the existing bump timer handle repeatable
+        // timestamp advancement. The snapshot push makes the data readable;
+        // the bump timer will advance the repeatable timestamp on its
+        // next cycle.
         let mut sm = self.snapshot_manager.write();
         sm.push(commit_ts, snapshot, delta.write_bytes);
-        let _ = sm.bump_persisted_max_repeatable_ts(commit_ts);
 
         let skipped = delta.document_updates.len() - all_remapped_updates.len();
         tracing::info!(
