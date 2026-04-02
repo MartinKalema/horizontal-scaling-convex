@@ -14,6 +14,10 @@
 #   7. Node Restart Recovery (TiDB kill -9 / CockroachDB nemesis)
 #   8. Idempotent Re-Run (CockroachDB workload check)
 #   9. Two-Phase Commit Cross-Partition (Vitess 2PC)
+#  10. Rapid-Fire Writes Under Load (Jepsen stress)
+#  11. Write-Then-Immediate-Read Consistency (stale read detection)
+#  12. Double Node Restart (crash recovery stress)
+#  13. Invariant Preservation Under Full Load (final workload check)
 #
 # Prerequisites:
 #   docker compose -f docker-compose.partitioned.yml up
@@ -575,6 +579,177 @@ DELTA_T=$((POST_T_A - PRE_2PC_T))
 [ "$DELTA_M" -eq "$DELTA_T" ] \
     && pass "2PC invariant: msgs and tasks incremented equally (+$DELTA_M)" \
     || fail "2PC invariant violated" "msgs +$DELTA_M vs tasks +$DELTA_T"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 10: Rapid-Fire Writes Under Load (Jepsen Stress Pattern)${NC}"
+# ============================================================
+# CockroachDB Jepsen found timestamp collision bugs at ~20 txns/sec after
+# minutes of sustained load. TiDB Jepsen found lost updates under concurrent
+# retries. We push 50 rapid writes per node concurrently.
+
+STRESS_PRE=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+STRESS_PRE_M=$(jval messages "$STRESS_PRE")
+STRESS_PRE_T=$(jval tasks "$STRESS_PRE")
+
+STRESS_N=50
+
+(for i in $(seq 1 $STRESS_N); do
+    mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
+        "{\"text\":\"stress-$i\",\"author\":\"stress\",\"channel\":\"load\"}" > /dev/null
+done) &
+SA=$!
+
+(for i in $(seq 1 $STRESS_N); do
+    mutate "$NODE_B_URL" "$NODE_B_KEY" "messages:createTask" \
+        "{\"title\":\"stress-$i\",\"assignee\":\"stress\",\"project\":\"load\",\"status\":\"done\"}" > /dev/null
+done) &
+SB=$!
+
+wait $SA
+wait $SB
+
+# Verify both nodes are still alive (Jepsen found crashes at this point).
+curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 \
+    && pass "Node A survived stress test ($STRESS_N rapid writes)" \
+    || fail "Node A crashed under stress"
+
+curl -sf "$NODE_B_URL/version" > /dev/null 2>&1 \
+    && pass "Node B survived stress test ($STRESS_N rapid writes)" \
+    || fail "Node B crashed under stress"
+
+sleep 5
+
+STRESS_POST_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+STRESS_POST_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+
+STRESS_POST_AM=$(jval messages "$STRESS_POST_A"); STRESS_POST_AT=$(jval tasks "$STRESS_POST_A")
+STRESS_POST_BM=$(jval messages "$STRESS_POST_B"); STRESS_POST_BT=$(jval tasks "$STRESS_POST_B")
+
+STRESS_DM=$((STRESS_POST_AM - STRESS_PRE_M))
+STRESS_DT=$((STRESS_POST_AT - STRESS_PRE_T))
+
+# No writes lost (TiDB lost update bug pattern).
+[ "$STRESS_DM" -eq "$STRESS_N" ] \
+    && pass "No lost writes: msgs +$STRESS_DM (expected +$STRESS_N)" \
+    || fail "Lost writes detected" "msgs +$STRESS_DM, expected +$STRESS_N"
+
+[ "$STRESS_DT" -eq "$STRESS_N" ] \
+    && pass "No lost writes: tasks +$STRESS_DT (expected +$STRESS_N)" \
+    || fail "Lost writes detected" "tasks +$STRESS_DT, expected +$STRESS_N"
+
+# Both nodes converged (no stale reads).
+[ "$STRESS_POST_AM" -eq "$STRESS_POST_BM" ] && [ "$STRESS_POST_AT" -eq "$STRESS_POST_BT" ] \
+    && pass "Nodes converged after stress test" \
+    || fail "Nodes diverged after stress" "A: $STRESS_POST_AM,$STRESS_POST_AT vs B: $STRESS_POST_BM,$STRESS_POST_BT"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 11: Write-Then-Immediate-Read Consistency (Stale Read Detection)${NC}"
+# ============================================================
+# TiDB Jepsen found stale reads where a client writes and then immediately
+# reads back but gets old data. We write to Node A and immediately read
+# from Node A (same node, should always be consistent).
+
+for i in $(seq 1 5); do
+    mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
+        "{\"text\":\"read-after-write-$i\",\"author\":\"rar\",\"channel\":\"test\"}" > /dev/null
+done
+
+RAR_RESULT=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+RAR_M=$(jval messages "$RAR_RESULT")
+EXPECTED_RAR=$((STRESS_POST_AM + 5))
+
+[ "$RAR_M" -eq "$EXPECTED_RAR" ] \
+    && pass "Read-after-write consistent: msgs=$RAR_M (expected $EXPECTED_RAR)" \
+    || fail "Stale read on same node" "msgs=$RAR_M, expected $EXPECTED_RAR"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 12: Double Node Restart (Crash Recovery Stress)${NC}"
+# ============================================================
+# CockroachDB nemesis kills nodes multiple times in succession.
+# Verify the system recovers from a double restart.
+
+PRE_DOUBLE=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_DOUBLE_M=$(jval messages "$PRE_DOUBLE")
+
+echo "  First restart of Node B..."
+docker restart docker-node-b-1 > /dev/null 2>&1
+
+# Write during first restart.
+mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
+    '{"text":"during-restart-1","author":"chaos","channel":"test"}' > /dev/null
+
+echo "  Waiting for recovery..."
+for attempt in $(seq 1 30); do
+    curl -sf "http://127.0.0.1:3220/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+
+echo "  Second restart of Node B..."
+docker restart docker-node-b-1 > /dev/null 2>&1
+
+# Write during second restart.
+mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
+    '{"text":"during-restart-2","author":"chaos","channel":"test"}' > /dev/null
+
+echo "  Waiting for recovery..."
+for attempt in $(seq 1 30); do
+    curl -sf "http://127.0.0.1:3220/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+
+NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
+
+sleep 4
+
+POST_DOUBLE_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_DOUBLE_BM=$(jval messages "$POST_DOUBLE_B")
+
+EXPECTED_DOUBLE=$((PRE_DOUBLE_M + 2))
+[ "$POST_DOUBLE_BM" -ge "$EXPECTED_DOUBLE" ] \
+    && pass "Node B recovered after double restart: msgs=$POST_DOUBLE_BM (>=$EXPECTED_DOUBLE)" \
+    || fail "Node B missing data after double restart" "msgs=$POST_DOUBLE_BM, expected >=$EXPECTED_DOUBLE"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 13: Invariant Preservation Under Full Load (CockroachDB workload check)${NC}"
+# ============================================================
+# After all the stress and chaos, run the bank invariant check again.
+# The total budget should still be exactly what we deposited.
+
+FINAL_BUDGET_A=$(jtotal "$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:totalBudget")")
+FINAL_BUDGET_B=$(jtotal "$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:totalBudget")")
+
+[ "$FINAL_BUDGET_A" -eq "$FINAL_BUDGET_B" ] \
+    && pass "Budget invariant preserved after all tests: \$$FINAL_BUDGET_A" \
+    || fail "Budget invariant violated after chaos" "A=\$$FINAL_BUDGET_A vs B=\$$FINAL_BUDGET_B"
+
+FINAL_COMP_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:totalCompensation")
+FINAL_COMP_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:totalCompensation")
+
+FINAL_TOTAL_A=$(python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']['total']))" <<< "$FINAL_COMP_A")
+FINAL_TOTAL_B=$(python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']['total']))" <<< "$FINAL_COMP_B")
+
+[ "$FINAL_TOTAL_A" -eq "$FINAL_TOTAL_B" ] \
+    && pass "Cross-table invariant preserved after all tests: \$$FINAL_TOTAL_A" \
+    || fail "Cross-table invariant violated" "A=\$$FINAL_TOTAL_A vs B=\$$FINAL_TOTAL_B"
+
+# Final convergence check — every table count must match.
+FINAL_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+FINAL_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+
+FINAL_AM=$(jval messages "$FINAL_A"); FINAL_AU=$(jval users "$FINAL_A")
+FINAL_AP=$(jval projects "$FINAL_A"); FINAL_AT=$(jval tasks "$FINAL_A")
+FINAL_BM=$(jval messages "$FINAL_B"); FINAL_BU=$(jval users "$FINAL_B")
+FINAL_BP=$(jval projects "$FINAL_B"); FINAL_BT=$(jval tasks "$FINAL_B")
+
+[ "$FINAL_AM" -eq "$FINAL_BM" ] && [ "$FINAL_AU" -eq "$FINAL_BU" ] && \
+[ "$FINAL_AP" -eq "$FINAL_BP" ] && [ "$FINAL_AT" -eq "$FINAL_BT" ] \
+    && pass "Final convergence: all tables match (msgs=$FINAL_AM users=$FINAL_AU proj=$FINAL_AP tasks=$FINAL_AT)" \
+    || fail "Final divergence" "A: $FINAL_AM,$FINAL_AU,$FINAL_AP,$FINAL_AT vs B: $FINAL_BM,$FINAL_BU,$FINAL_BP,$FINAL_BT"
 
 # ============================================================
 echo ""

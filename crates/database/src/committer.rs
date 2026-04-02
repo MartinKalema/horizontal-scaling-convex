@@ -183,6 +183,21 @@ enum PersistenceWrite {
         result: oneshot::Sender<Timestamp>,
         commit_id: usize,
     },
+    /// Replica delta persistence write. Goes through the same ordered pipeline
+    /// as local commits and max_repeatable_ts bumps, ensuring all write log
+    /// appends are serialized. This is the Raft pattern: all writes — local
+    /// and replicated — flow through one sequential log.
+    ReplicaDelta {
+        commit_ts: Timestamp,
+        snapshot: Snapshot,
+        document_writes: Vec<DocumentLogEntry>,
+        index_writes: Vec<PersistenceIndexEntry>,
+        remapped_updates: Vec<common::document::DocumentUpdate>,
+        write_source: WriteSource,
+        write_bytes: u64,
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        commit_id: usize,
+    },
 }
 
 impl PersistenceWrite {
@@ -190,6 +205,7 @@ impl PersistenceWrite {
         match self {
             Self::Commit { commit_id, .. } => *commit_id,
             Self::MaxRepeatableTimestamp { commit_id, .. } => *commit_id,
+            Self::ReplicaDelta { commit_id, .. } => *commit_id,
         }
     }
 }
@@ -376,6 +392,26 @@ impl<RT: Runtime> Committer<RT> {
                             );
                             let _ = result.send(new_max_repeatable);
                             drop(timer);
+                        },
+                        PersistenceWrite::ReplicaDelta {
+                            commit_ts,
+                            snapshot,
+                            remapped_updates,
+                            write_source,
+                            write_bytes,
+                            result,
+                            ..
+                        } => {
+                            // Publish replica delta — same position in the
+                            // pipeline as local commits (Raft pattern).
+                            let writes = crate::write_log::index_keys_from_document_updates(
+                                &remapped_updates,
+                                &snapshot.index_registry,
+                            );
+                            self.log.append(commit_ts, writes, write_source);
+                            let mut sm = self.snapshot_manager.write();
+                            sm.push(commit_ts, snapshot, write_bytes);
+                            let _ = result.send(Ok(commit_ts));
                         },
                     }
                     // Report the trace if it is longer than the threshold
@@ -1366,8 +1402,19 @@ impl<RT: Runtime> Committer<RT> {
             all_remapped_updates.push(remapped);
         }
 
-        // Phase 3: Write to Replica's persistence.
-        // This ensures the function runner can load modules from persistence.
+        // Phase 3: Push persistence write + publish to the ordered pipeline.
+        //
+        // This is the Raft pattern: ALL writes (local commits, max_repeatable
+        // bumps, AND replica deltas) flow through the same persistence_writes
+        // FuturesOrdered queue. The publish handler (write log append +
+        // snapshot push) only runs when the persistence write completes and
+        // it's the next in the queue. This prevents interleaving between
+        // async local commits and synchronous delta applies — the exact bug
+        // that caused timestamp ordering violations.
+        //
+        // CockroachDB, TiDB, YugabyteDB, and Spanner all do this: both
+        // local proposals and replicated entries flow through one sequential
+        // Raft log before being applied to the state machine.
         let document_writes: Vec<DocumentLogEntry> = all_remapped_updates
             .iter()
             .map(|update| DocumentLogEntry {
@@ -1382,66 +1429,53 @@ impl<RT: Runtime> Committer<RT> {
             .map(|update| PersistenceIndexEntry::from_index_update(commit_ts, update))
             .collect();
 
-        // Write synchronously using block_in_place since we're in the
-        // Committer's sync context.
-        common::runtime::block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                self.persistence
-                    .write(&document_writes, &index_writes, ConflictStrategy::Overwrite)
-                    .await
-            })
-        })?;
+        let num_doc_writes = document_writes.len();
+        let num_remapped = all_remapped_updates.len();
+        let skipped = delta.document_updates.len() - num_remapped;
 
-        // Phase 3b: Advance max_repeatable_ts in persistence so reads
-        // at the new timestamp are valid.
-        common::runtime::block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                self.persistence
+        let persistence = self.persistence.clone();
+        let (tx, _rx) = oneshot::channel();
+        let commit_id_val = 0usize; // Replica deltas don't participate in tracing.
+
+        self.persistence_writes.push_back({
+            let doc_writes = document_writes.clone();
+            let idx_writes = index_writes.clone();
+            async move {
+                // Write to persistence (so function runner can load modules).
+                persistence
+                    .write(&doc_writes, &idx_writes, ConflictStrategy::Overwrite)
+                    .await?;
+
+                // Advance max_repeatable_ts in persistence.
+                persistence
                     .write_persistence_global(
-                        common::persistence::PersistenceGlobalKey::MaxRepeatableTimestamp,
+                        PersistenceGlobalKey::MaxRepeatableTimestamp,
                         serde_json::Value::from(u64::from(commit_ts)),
                     )
-                    .await
-            })
-        })?;
+                    .await?;
 
-        // Phase 4: Update write log for subscription invalidation.
-        let writes = crate::write_log::index_keys_from_document_updates(
-            &all_remapped_updates,
-            &snapshot.index_registry,
-        );
-        self.log.append(commit_ts, writes, delta.write_source);
+                Ok(PersistenceWrite::ReplicaDelta {
+                    commit_ts,
+                    snapshot,
+                    document_writes: document_writes.clone(),
+                    index_writes: index_writes.clone(),
+                    remapped_updates: all_remapped_updates,
+                    write_source: delta.write_source,
+                    write_bytes: delta.write_bytes,
+                    result: tx,
+                    commit_id: commit_id_val,
+                })
+            }
+            .boxed()
+        });
 
-        // Phase 5: Push updated snapshot.
-        //
-        // Do NOT call bump_persisted_max_repeatable_ts here. That timestamp
-        // is advanced by the async bump_max_repeatable_ts flow (via
-        // persistence_writes FuturesOrdered). Calling it here would race:
-        // the async bump assigns timestamp N, then a delta pushes N+1 and
-        // bumps persisted_max_repeatable_ts to N+1, then the async bump's
-        // publish_max_repeatable_ts(N) fails the ensure!(N >= N+1) check.
-        //
-        // CockroachDB solves the same problem by separating the closed
-        // timestamp (side transport) from write application (Raft transport)
-        // so they never interleave. TiKV derives resolved-ts from the apply
-        // state rather than an async timer.
-        //
-        // Our approach: let the existing bump timer handle repeatable
-        // timestamp advancement. The snapshot push makes the data readable;
-        // the bump timer will advance the repeatable timestamp on its
-        // next cycle.
-        let mut sm = self.snapshot_manager.write();
-        sm.push(commit_ts, snapshot, delta.write_bytes);
-
-        let skipped = delta.document_updates.len() - all_remapped_updates.len();
         tracing::info!(
-            "Applied replica delta at ts={}: {} updates applied, {} skipped, {} persistence writes",
+            "Queued replica delta for publish: ts={}, {} updates, {} skipped, {} persistence \
+             writes",
             u64::from(commit_ts),
-            all_remapped_updates.len(),
+            num_remapped,
             skipped,
-            document_writes.len(),
+            num_doc_writes,
         );
 
         Ok(commit_ts)
