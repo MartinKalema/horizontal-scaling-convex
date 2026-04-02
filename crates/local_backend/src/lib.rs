@@ -128,6 +128,10 @@ pub struct LocalAppState {
     pub instance_name: String,
     pub application: Application<ProdRuntime>,
     pub zombify_rx: async_broadcast::Receiver<()>,
+    /// Raft partition mailbox for receiving Raft messages from peers.
+    /// None if Raft is not enabled.
+    pub raft_mailbox_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<database::raft_node::RaftMessage>>,
 }
 
 impl LocalAppState {
@@ -445,12 +449,91 @@ pub async fn make_app(
         }
     }
 
+    let mut raft_mailbox_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<database::raft_node::RaftMessage>,
+    > = None;
+
+    // Start the Raft consensus node for this partition if configured.
+    // When RAFT_NODE_ID and RAFT_PEERS are set, this node joins a Raft group
+    // for its partition. Leadership changes activate/deactivate the Committer.
+    if let (Some(raft_node_id), Some(raft_peers_str)) =
+        (config.raft_node_id, config.raft_peers.as_deref())
+    {
+        use database::{
+            raft_node::RaftNodeConfig,
+            raft_partition::RaftPartitionManager,
+            raft_transport,
+        };
+
+        let partition_id = database::partition::PartitionId(config.partition_id.unwrap_or(0));
+
+        // Parse peer addresses: "1=host:port,2=host:port,3=host:port"
+        let mut peer_addresses = std::collections::HashMap::new();
+        let mut peer_ids = Vec::new();
+        for pair in raft_peers_str.split(',') {
+            let pair = pair.trim();
+            if let Some((id_str, addr)) = pair.split_once('=') {
+                if let Ok(id) = id_str.trim().parse::<u64>() {
+                    peer_addresses.insert(id, addr.trim().to_string());
+                    peer_ids.push(id);
+                }
+            }
+        }
+
+        let raft_config = RaftNodeConfig {
+            node_id: raft_node_id,
+            partition_id,
+            peers: peer_ids,
+            election_tick: 10, // 1 second
+            heartbeat_tick: 3, // 300ms
+        };
+
+        // Create transport channels for peer communication.
+        let (peer_senders, transport_clients) =
+            raft_transport::create_transport(&peer_addresses, raft_node_id);
+
+        let mut manager = RaftPartitionManager::new(raft_config, peer_senders)?;
+        let raft_state = manager.state();
+        let mb_tx = manager.mailbox_tx();
+        raft_mailbox_tx = Some(mb_tx);
+
+        // Start the Raft node in a background task.
+        if let Some(mut node) = manager.take_node() {
+            let committer = database.committer_client();
+            runtime.spawn_background("raft_node", async move {
+                node.run(|data| {
+                    // Committed Raft entry → apply to Committer.
+                    // For now, log the entry. Full integration will execute
+                    // the mutation via the Committer.
+                    tracing::info!("Raft committed entry: {} bytes", data.len(),);
+                    Ok(())
+                })
+                .await;
+            });
+        }
+
+        // Start transport clients for each peer.
+        for client in transport_clients {
+            runtime.spawn_background("raft_transport_client", async move {
+                client.run().await;
+            });
+        }
+
+        tracing::info!(
+            "Started Raft node {} for partition {} with {} peers",
+            raft_node_id,
+            partition_id,
+            peer_addresses.len(),
+        );
+    }
+
     let app_state = LocalAppState {
         origin,
         site_origin: config.convex_site_url()?,
         instance_name,
         application,
         zombify_rx,
+        raft_mailbox_tx,
     };
 
     Ok(app_state)

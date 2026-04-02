@@ -71,8 +71,13 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 runtime = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }
+prost-011 = { package = "prost", version = "0.11" }
+raft = { workspace = true }
+raft-proto = { workspace = true }
 search = { workspace = true }
 serde = { workspace = true }
+slog = { workspace = true }
+slog-stdlog = { workspace = true }
 serde_json = { workspace = true }
 shape_inference = { workspace = true }
 short_future = { workspace = true }
@@ -81,6 +86,7 @@ storage = { workspace = true }
 sync_types = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
 uuid = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

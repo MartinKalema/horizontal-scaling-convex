@@ -177,6 +177,19 @@ pub struct LocalConfig {
     #[clap(long, env = "NODE_ADDRESSES")]
     pub node_addresses: Option<String>,
 
+    /// Raft node ID for this node. Each node in a Raft group must have
+    /// a unique ID. When set, enables Raft consensus for the partition.
+    /// Example: "1"
+    #[clap(long, env = "RAFT_NODE_ID")]
+    pub raft_node_id: Option<u64>,
+
+    /// Raft peer addresses for intra-partition replication.
+    /// Format: "1=host:port,2=host:port,3=host:port"
+    /// All nodes in the same partition's Raft group.
+    /// Example: "1=node-a:50061,2=node-c:50061,3=node-d:50061"
+    #[clap(long, env = "RAFT_PEERS")]
+    pub raft_peers: Option<String>,
+
     /// Storage directory for the Replica to read shared files (modules, etc.).
     /// Should point to a path shared with the Primary's storage.
     /// Required in replica mode.
