@@ -104,7 +104,7 @@ impl Default for LeadershipCallbacks {
 /// A running Raft consensus node for one partition.
 pub struct RaftNode {
     /// The raft-rs RawNode.
-    raw_node: RawNode<ConvexRaftStorage>,
+    pub(crate) raw_node: RawNode<ConvexRaftStorage>,
     /// Storage backend.
     storage: ConvexRaftStorage,
     /// Pending proposals waiting for commit (index → callback).
@@ -367,8 +367,8 @@ impl RaftNode {
 
     /// Process one Ready cycle manually (for testing without the full run
     /// loop). Returns committed entry data.
-    #[cfg(test)]
-    fn process_ready_test(&mut self) -> Vec<Vec<u8>> {
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn process_ready_test(&mut self) -> Vec<Vec<u8>> {
         let mut committed = Vec::new();
         if !self.raw_node.has_ready() {
             return committed;

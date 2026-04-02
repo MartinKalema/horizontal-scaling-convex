@@ -26,6 +26,7 @@ pub mod persistence_helpers;
 mod preloaded;
 pub mod query;
 pub mod raft_node;
+pub mod raft_partition;
 pub mod raft_state_machine;
 pub mod raft_storage;
 pub mod raft_transport;
