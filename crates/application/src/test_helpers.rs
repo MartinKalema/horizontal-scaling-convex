@@ -222,6 +222,7 @@ impl<RT: Runtime> ApplicationTestExt<RT> for Application<RT> {
             false,
             None,
             None,
+            None,
         )
         .await?;
         initialize_application_system_tables(&database).await?;

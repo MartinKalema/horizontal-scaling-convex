@@ -101,6 +101,7 @@ impl<RT: Runtime> DbFixtures<RT> {
             false,
             None,
             None,
+            None,
         )
         .await?;
         db.set_search_storage(search_storage.clone());

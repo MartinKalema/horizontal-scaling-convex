@@ -225,6 +225,7 @@ pub async fn make_app(
             )
         }),
         timestamp_oracle,
+        None, // raft_state: set after Raft node starts, not during Database::load
     )
     .await?;
     initialize_application_system_tables(&database).await?;

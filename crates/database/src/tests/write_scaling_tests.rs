@@ -52,6 +52,7 @@ async fn create_node(
         false,
         partition_map,
         None,
+        None,
     )
     .await?;
     db.set_search_storage(Arc::new(LocalDirStorage::new(rt.clone())?));
