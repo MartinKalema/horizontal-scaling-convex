@@ -980,6 +980,7 @@ impl<RT: Runtime> Database<RT> {
         replica_mode: bool,
         partition_map: Option<crate::partition::PartitionMap>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
+        raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> anyhow::Result<Self> {
         let _load_database_timer = metrics::load_database_timer();
 
@@ -1075,6 +1076,7 @@ impl<RT: Runtime> Database<RT> {
             committer_distributed_log,
             partition_map,
             timestamp_oracle,
+            raft_state,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");

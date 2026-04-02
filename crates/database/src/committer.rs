@@ -250,6 +250,11 @@ pub struct Committer<RT: Runtime> {
     // metadata needed to finalize the commit. (Vitess redo log pattern)
     prepared_transactions:
         std::collections::HashMap<crate::two_phase::TwoPhaseTransactionId, PreparedTransaction>,
+
+    // Raft partition state for leadership checking.
+    // When set, the Committer rejects writes if this node is not the Raft leader.
+    // None means no Raft (existing behavior — always accept writes).
+    raft_state: Option<crate::raft_partition::RaftPartitionState>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -264,6 +269,7 @@ impl<RT: Runtime> Committer<RT> {
         distributed_log: Arc<dyn DistributedLog>,
         partition_map: Option<crate::partition::PartitionMap>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
+        raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
         let conflict_checker = PendingWrites::new();
@@ -285,6 +291,7 @@ impl<RT: Runtime> Committer<RT> {
             partition_map,
             timestamp_oracle,
             prepared_transactions: std::collections::HashMap::new(),
+            raft_state,
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -801,6 +808,22 @@ impl<RT: Runtime> Committer<RT> {
         transaction: FinalTransaction,
         write_source: WriteSource,
     ) -> anyhow::Result<ValidatedCommit> {
+        // Raft leadership check: if Raft is configured and this node is
+        // not the leader, reject writes. Clients should forward to the
+        // current leader. This is TiKV's pattern — only the Raft leader
+        // runs the Apply Worker.
+        if let Some(ref raft) = self.raft_state {
+            if !raft.is_leader() {
+                let leader = raft.leader_id();
+                anyhow::bail!(
+                    "Not the Raft leader for partition {}. Current leader: node {}. Forward this \
+                     mutation to the leader.",
+                    raft.partition_id(),
+                    leader,
+                );
+            }
+        }
+
         // Partition ownership check: if partitioning is enabled, verify
         // that all writes to USER tables target tables owned by this node.
         // System tables (starting with _) are exempt — every node writes
