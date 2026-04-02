@@ -106,7 +106,7 @@ pub struct RaftNode {
     /// The raft-rs RawNode.
     pub(crate) raw_node: RawNode<ConvexRaftStorage>,
     /// Storage backend.
-    storage: ConvexRaftStorage,
+    pub(crate) storage: ConvexRaftStorage,
     /// Pending proposals waiting for commit (index → callback).
     pending_proposals: HashMap<u64, tokio::sync::oneshot::Sender<bool>>,
     /// Channel for receiving messages.
