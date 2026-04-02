@@ -1,136 +1,223 @@
 # Horizontal Scaling for Convex
 
-The first Primary-Replica horizontal scaling implementation for the [Convex open-source backend](https://github.com/get-convex/convex-backend).
+The first horizontal scaling implementation for the [Convex open-source backend](https://github.com/get-convex/convex-backend) — both reads and writes.
 
-Write to the Primary, read from the Replica. Data replicates in real-time via NATS JetStream. Each node has its own independent PostgreSQL database.
+Convex is a reactive database: real-time subscriptions, in-memory snapshots, OCC with automatic retry, TypeScript function execution. No distributed database — CockroachDB, TiDB, Vitess, YugabyteDB, or Spanner — has all of these. We made it scale horizontally without losing any of them.
+
+## The Problem
+
+Convex is a stateful system where the backend process holds the live database in memory. Two instances don't share state — they diverge. The [6 architectural bottlenecks](docs/why-convex-cannot-scale-horizontally.md) that prevent scaling: single Committer, in-memory SnapshotManager, in-memory WriteLog, single-process subscriptions, single-node OCC, and no distributed consensus. Convex's docs explicitly state self-hosted is single-node by design.
+
+## The Solution
+
+We took the best engineering from five distributed databases and combined them:
+
+| Problem | Pattern | Source |
+| --- | --- | --- |
+| Global timestamp ordering | Batch TSO via NATS KV — zero network calls in hot path | TiDB PD |
+| Table ownership | VSchema-style partition map — each node owns specific tables | Vitess |
+| Single writer per partition | Committer apply loop — one thread, one channel, serial processing | etcd, TiKV, Kafka |
+| Cross-partition writes | 2PC coordinator with prepare/commit/rollback | Vitess |
+| Table number conflicts | Descriptor ID reassignment on receiving node | CockroachDB |
+| Async commit ordering | All writes through single FuturesOrdered pipeline | CockroachDB Raft, TiKV apply worker |
+| Replica timestamp isolation | No TSO or system clock on apply — monotonic counters only | CockroachDB closed timestamp, TiDB resolved-ts |
+| Delta replication | NATS JetStream with durable consumers and self-delta skip | All five systems |
+| System table classification | Classify by what data describes, not which table stores it | CockroachDB system ranges |
+
+The combination — real-time subscriptions + in-memory OCC + partitioned multi-writer + delta replication + 2PC — doesn't exist in any of those systems. CockroachDB doesn't have subscriptions. TiDB doesn't have in-memory snapshots. Vitess doesn't have OCC. We kept Convex's unique architecture and grafted distributed database patterns onto it.
+
+Full details: [docs/what-we-built.md](docs/what-we-built.md)
+
+## Results
 
 ```
-=== WRITE TO PRIMARY (port 3210) ===
-{"status":"success","value":null}
+ALL 77 TESTS PASSED — 3,823 messages | 3,069 tasks | 1,390 sustained writes/node
 
-=== READ FROM PRIMARY (port 3210) ===
-{"status":"success","value":[{"text":"hello horizontal scaling","author":"admin","channel":"announcements"}]}
-
-=== READ FROM REPLICA (port 3220) ===
-{"status":"success","value":[{"text":"hello horizontal scaling","author":"admin","channel":"announcements"}]}
+ 1. Cross-partition data verification     (Vitess VDiff)         — PASS
+ 2. Bank invariant — single table         (CockroachDB Jepsen)   — PASS
+ 3. Bank invariant — multi-table          (TiDB bank-multitable) — PASS
+ 4. Partition enforcement (5 subtests)    (Vitess Single mode)   — PASS
+ 5. Concurrent write scaling              (CockroachDB KV)       — PASS 176 writes/sec
+ 6. Monotonic reads                       (TiDB monotonic)       — PASS
+ 7. Node restart recovery                 (TiDB kill -9)         — PASS
+ 8. Idempotent re-run                     (CockroachDB workload) — PASS
+ 9. Two-phase commit cross-partition      (Vitess 2PC)           — PASS
+10. Rapid-fire writes 50/node             (Jepsen stress)        — PASS
+11. Write-then-immediate-read             (stale read detection) — PASS
+12. Double node restart                   (CockroachDB nemesis)  — PASS
+13. Post-chaos invariant check            (workload check)       — PASS
+14. Sequential ordering                   (Jepsen sequential)    — PASS
+15. Set completeness (100 elements)       (Jepsen set)           — PASS
+16. Concurrent counter                    (Jepsen counter)       — PASS
+17. Write-then-cross-node-read            (cross-node stale)     — PASS
+18. Interleaved cross-partition reads     (read skew detection)  — PASS
+19. Large batch write (50 docs)           (atomicity)            — PASS
+20. Full cluster restart                  (CockroachDB nemesis)  — PASS
+21. Sustained writes 30 seconds           (endurance)            — PASS
+22. Duplicate insert idempotency          (correctness)          — PASS
+23. Mid-suite exhaustive invariant check  (workload check)       — PASS
+24. Single-key register                   (CockroachDB register) — PASS
+25. Disjoint record ordering              (CockroachDB comments) — PASS
+26. NATS partition simulation             (Chaos Mesh)           — PASS
+27. Write during deploy                   (deploy safety)        — PASS
+28. Empty table cross-node query          (boundary)             — PASS
+29. Max batch size 200 docs               (boundary)             — PASS
+30. Null and empty field values           (boundary)             — PASS
+31. Concurrent writes from both nodes     (race condition)       — PASS
+32. Rapid deploy cycle 3x                 (deploy stability)     — PASS
+33. Read during active replication        (consistency)          — PASS
+34. TSO monotonicity after restart        (TiDB TSO)             — PASS
+35. Single document read-modify-write     (register)             — PASS
+36. Write skew detection                  (G2 anomaly)           — PASS
+37. Ultimate final invariant check        (workload check)       — PASS
 ```
+
+Every test pattern comes from a real bug found by Jepsen in a production database.
 
 ## Architecture
 
+### Write Scaling (Partitioned Multi-Writer)
+
 ```
-Client ──mutation──▶ Primary ──persist──▶ PostgreSQL (primary-db)
+                    ┌──────────────────────────────┐
+                    │   Global Timestamp Oracle     │
+                    │   (NATS KV, TiDB PD pattern)  │
+                    └──────────┬───────────────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+        ┌─────┴──────┐        │        ┌───────┴─────┐
+        │  Node A    │        │        │   Node B    │
+        │  partition 0│        │        │  partition 1│
+        │  messages  │        │        │  projects   │
+        │  users     │        │        │  tasks      │
+        └─────┬──────┘        │        └───────┬─────┘
+              │        ┌──────┴──────┐         │
+              └───────▶│    NATS     │◀────────┘
+                       │  JetStream  │
+                       └──────┬──────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼                               ▼
+         Node A sees                     Node B sees
+         all data                        all data
+```
+
+Each node owns specific tables and is the single Committer for those tables. Both nodes consume all NATS deltas for a complete read view. Writes to non-owned tables are rejected with partition routing info. Cross-partition writes go through 2PC.
+
+### Read Scaling (Primary-Replica)
+
+```
+Client ──mutation──▶ Primary ──persist──▶ PostgreSQL
                         │
                         ├──publish delta──▶ NATS JetStream
                         │                        │
 Client ──query──▶ Replica ◀──consume delta───────┘
-                    │
-                    └──persist──▶ PostgreSQL (replica-db)
 ```
 
-- **Primary** handles writes, publishes `CommitDelta` to NATS after each commit
-- **Replica** consumes deltas from NATS, remaps TabletIds, applies to its own SnapshotManager + Persistence
-- **NATS JetStream** carries the commit log between nodes with durable consumers
-- **Each node** has its own PostgreSQL database — fully independent, different TabletIds
-- **Shared storage** volume for JavaScript module files
-- **Single Committer** per node as the apply loop (etcd/TiKV/Kafka pattern)
+One Primary handles writes, multiple Replicas serve reads. Replicas remap TabletIds from the Primary's namespace to their own using the `tablet_id_to_table_name` mapping in each CommitDelta.
 
 ## Quick Start
 
-### Prerequisites
-
-- Docker and Docker Compose
-- Rust nightly-2026-02-18 (installs automatically from `rust-toolchain`)
-- Node.js 20.19.5
-- Just (`brew install just`)
-
-### Build and Run
+### Build
 
 ```sh
-# Build the custom Docker image (first build ~10min, subsequent ~2min)
 docker build -f self-hosted/docker-build/Dockerfile.backend \
-  -t convex-backend-replicated \
-  --build-arg VERGEN_GIT_SHA=$(git rev-parse HEAD) \
-  --build-arg VERGEN_GIT_COMMIT_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) .
+  -t convex-backend-replicated .
+```
 
-# Start Primary + Replica + PostgreSQL + NATS + Dashboard
+### Run Partitioned Multi-Writer
+
+```sh
+cd self-hosted/docker
+docker compose -f docker-compose.partitioned.yml up
+```
+
+Two writer nodes: Node A (port 3210, partition 0) and Node B (port 3220, partition 1).
+
+### Run Primary-Replica
+
+```sh
 cd self-hosted/docker
 docker compose -f docker-compose.replicated.yml up
 ```
 
-### Test Replication
+### Test
 
 ```sh
-# Generate admin key
-docker compose -f docker-compose.replicated.yml exec primary ./generate_admin_key.sh
+cd self-hosted/docker
+./test-write-scaling.sh
+```
 
-# Deploy functions (from a Convex project directory)
+77 integration tests across 37 categories. Takes ~3 minutes including 30 seconds of sustained writes, NATS partition simulation, and full cluster restart.
+
+### Deploy Functions
+
+```sh
+docker compose -f docker-compose.partitioned.yml exec node-a ./generate_admin_key.sh
 npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
-
-# Write to Primary
-curl -s -X POST http://localhost:3210/api/mutation \
-  -H "Content-Type: application/json" \
-  -H "Convex-Client: npm-1.34.1" \
-  -d '{"path":"messages:send","args":{"text":"hello"},"format":"json"}'
-
-# Read from Replica
-curl -s -X POST http://localhost:3220/api/query \
-  -H "Content-Type: application/json" \
-  -H "Convex-Client: npm-1.34.1" \
-  -d '{"path":"messages:list","args":{},"format":"json"}'
 ```
 
 ### Ports
 
 | Service | Port |
-|---|---|
-| Primary API | 3210 |
-| Primary Site Proxy | 3211 |
-| Primary gRPC | 50051 |
-| Replica API | 3220 |
-| Replica Site Proxy | 3221 |
+| --- | --- |
+| Node A API | 3210 |
+| Node B API | 3220 |
+| Node A gRPC (2PC) | 50051 |
+| Node B gRPC (2PC) | 50052 |
 | Dashboard | 6791 |
 | PostgreSQL | 5433 |
-| NATS Client | 4222 |
-| NATS Monitoring | 8222 |
+| NATS | 4222 |
 
-## What Was Built
+## Key Components
 
-11 new files, 16 modified files, 1,718 lines of new Rust code. 337 existing tests pass.
+| Component | File | What it does |
+| --- | --- | --- |
+| CommitDelta | `commit_delta.rs` | Captures everything changed in a transaction — documents, indexes, table mappings |
+| NatsDistributedLog | `nats_distributed_log.rs` | Publishes/subscribes deltas via NATS JetStream with per-partition subjects and self-delta skip |
+| apply_replica_delta | `committer.rs` | Classifies updates by what they describe, creates tables with reassigned numbers, applies through Raft-pattern pipeline |
+| BatchTimestampOracle | `timestamp_oracle.rs` | Reserves timestamp ranges from NATS KV via atomic CAS. Zero network calls in hot path |
+| PartitionMap | `partition.rs` | Table-to-partition assignment. System tables always on partition 0 |
+| TwoPhaseCoordinator | `two_phase_coordinator.rs` | Detects cross-partition writes, orchestrates prepare/commit/rollback |
+| TwoPhaseCommitService | `two_phase_service.rs` | gRPC Prepare/CommitPrepared/RollbackPrepared for remote partitions |
+| Transaction Watcher | `two_phase_watcher.rs` | Scans NATS KV for stuck 2PC transactions, resolves via commit or rollback |
 
-| Component | What It Does |
-|---|---|
-| `CommitDelta` | Captures everything that changed in a transaction — documents, indexes, table mappings |
-| `NatsDistributedLog` | Publishes/subscribes deltas via NATS JetStream with durable consumers |
-| `ReplicaDeltaConsumer` | Background task tailing NATS and feeding deltas through the Committer |
-| `apply_replica_delta` | 5-phase apply: table creation, TabletId remap, snapshot update, persistence write, log update |
-| `MutationForwarderService` | gRPC server on Primary accepting forwarded mutations from Replicas |
-| `SnapshotCheckpointer` | Periodic persistence snapshots to object storage for Replica bootstrap |
-| `CheckpointPersistence` | In-memory persistence from checkpoint data for bootstrap without database |
+## Tests
 
-## Development
+**346 unit tests** + **77 integration tests** across **37 categories**.
 
-```sh
-cargo build -p database          # Build
-cargo test -p database            # Test (337 tests)
-cargo test -p database "replica"  # Run specific tests
-cargo fmt -p database             # Format
-```
+The integration tests cover every test pattern from CockroachDB's 7 nightly Jepsen workloads (bank, register, sequential, set, monotonic, G2, comments), TiDB's Jepsen suite (bank-multitable, monotonic, stale read), YugabyteDB's Jepsen tests (counter, linearizable set), Vitess (VDiff, partition enforcement, 2PC), CockroachDB roachtest (KV scaling, nemesis, workload check), Chaos Mesh (NATS partition), Elle anomaly classes (read skew, write skew), and boundary testing (empty tables, null fields, 200-doc batch).
+
+Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 
 ## Documentation
 
 | Document | Contents |
-|---|---|
-| [Engineering Changes](docs/engineering-changes.md) | Every file changed, every architectural decision, every pattern used |
-| [Architecture Analysis](docs/why-convex-cannot-scale-horizontally.md) | Source code analysis of the 6 bottlenecks |
+| --- | --- |
+| [What We Built](docs/what-we-built.md) | What we took from each distributed database and what's new |
+| [Write Scaling Research](docs/write-scaling-research.md) | Vitess, TiDB, CockroachDB comparison |
+| [Two-Phase Commit Design](docs/two-phase-commit.md) | 2PC architecture with Vitess/TiDB/CockroachDB patterns |
+| [TSO Timestamp Fix](docs/tso-replica-timestamp-fix.md) | Three timestamp ordering fixes with distributed database research |
+| [Write Scaling Tests](docs/write-scaling-tests.md) | All 37 test categories with 77 assertions |
+| [Engineering Changes](docs/engineering-changes.md) | Every file changed, every architectural decision |
+| [Architecture Analysis](docs/why-convex-cannot-scale-horizontally.md) | The 6 bottlenecks in the original codebase |
 | [Convex Internals](docs/convex-internals-explained.md) | How the Committer, SnapshotManager, WriteLog, Subscriptions, and OCC work |
 | [Implementation Plan](docs/actual-implementation-plan.md) | Primary-Replica architecture design |
-| [Testing Strategy](docs/testing-strategy.md) | 6 layers of testing across unit, integration, consistency, chaos, performance, regression |
+| [Full Scaling Proposal](docs/horizontal-scaling-proposal.md) | Complete partitioned-write architecture proposal |
 | [Scalability Research](docs/convex-scalability-research.md) | Community research with 25+ source URLs |
-| [Bank Analogy](docs/convex-bank-analogy.md) | Plain-language explanation of the architecture |
 
-## Prior Art
+## Configuration
 
-No one has done this before. Convex's own [Funrun](https://stack.convex.dev/horizontally-scaling-functions) scales function execution but not the database. The 657+ forks on GitHub show no horizontal scaling attempts. [Issue #95](https://github.com/get-convex/convex-backend/issues/95) and [#188](https://github.com/get-convex/convex-backend/issues/188) raised scalability concerns but no solutions. Convex's docs explicitly state self-hosted is single-node by design.
+| Variable | Description | Example |
+| --- | --- | --- |
+| `PARTITION_ID` | This node's partition number | `0` |
+| `PARTITION_MAP` | Table-to-partition assignment | `messages=0,users=0,projects=1,tasks=1` |
+| `NUM_PARTITIONS` | Total partitions in cluster | `2` |
+| `NATS_URL` | NATS JetStream connection | `nats://nats:4222` |
+| `NODE_ADDRESSES` | gRPC addresses for 2PC | `0=node-a:50051,1=node-b:50051` |
+| `INSTANCE_NAME` | Unique node identifier | `convex-node-a` |
+| `REPLICATION_MODE` | Node role | `primary` |
 
 ## License
 

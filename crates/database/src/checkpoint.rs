@@ -8,7 +8,8 @@
 //! Postgres.
 //!
 //! After bootstrap, the Replica tails NATS from the checkpoint timestamp for
-//! live delta replication. The Replica never connects to the Primary's database.
+//! live delta replication. The Replica never connects to the Primary's
+//! database.
 
 use std::{
     collections::BTreeMap,

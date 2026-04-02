@@ -29,7 +29,6 @@ use storage::{
     Storage,
     Upload,
 };
-
 use value::{
     InternalDocumentId,
     TabletId,
@@ -82,12 +81,8 @@ impl SnapshotCheckpointer {
         storage: Arc<dyn Storage>,
     ) -> anyhow::Result<()> {
         loop {
-            match Self::write_checkpoint(
-                &persistence_reader,
-                retention_validator.clone(),
-                &storage,
-            )
-            .await
+            match Self::write_checkpoint(&persistence_reader, retention_validator.clone(), &storage)
+                .await
             {
                 Ok(ts) => {
                     tracing::info!("Wrote checkpoint at ts={ts}");
@@ -112,12 +107,8 @@ impl SnapshotCheckpointer {
             .context("No data in persistence")?;
 
         // Create the checkpoint.
-        let checkpoint = create_checkpoint(
-            persistence_reader.as_ref(),
-            max_ts,
-            retention_validator,
-        )
-        .await?;
+        let checkpoint =
+            create_checkpoint(persistence_reader.as_ref(), max_ts, retention_validator).await?;
 
         let ts = checkpoint.timestamp;
         let num_docs = checkpoint.documents.len();
@@ -205,9 +196,7 @@ mod checkpoint_proto {
     }
 }
 
-fn checkpoint_to_proto(
-    data: &CheckpointData,
-) -> anyhow::Result<checkpoint_proto::CheckpointData> {
+fn checkpoint_to_proto(data: &CheckpointData) -> anyhow::Result<checkpoint_proto::CheckpointData> {
     let documents = data
         .documents
         .iter()

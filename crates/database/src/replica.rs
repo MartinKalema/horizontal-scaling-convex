@@ -20,7 +20,8 @@ use crate::{
 };
 
 /// Consumes [`CommitDelta`]s from a [`DistributedLog`] and feeds them
-/// through the Committer's apply loop via `CommitterClient::apply_replica_delta`.
+/// through the Committer's apply loop via
+/// `CommitterClient::apply_replica_delta`.
 ///
 /// This is the Replica's replication consumer. It runs as a background task
 /// after the Replica has finished local initialization.
