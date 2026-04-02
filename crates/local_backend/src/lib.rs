@@ -14,6 +14,11 @@ use ::authentication::{
     access_token_auth::NullAccessTokenAuth,
     application_auth::ApplicationAuth,
 };
+use ::storage::{
+    LocalDirStorage,
+    Storage,
+    StorageUseCase,
+};
 use application::{
     self,
     api::ApplicationApi,
@@ -58,11 +63,6 @@ use function_runner::{
     FunctionRunner,
 };
 use governor::Quota;
-use ::storage::{
-    LocalDirStorage,
-    Storage,
-    StorageUseCase,
-};
 use http_client::CachedHttpClient;
 use indexing::index_cache::SharedIndexCache;
 use model::{
@@ -98,11 +98,11 @@ pub mod environment_variables;
 pub mod http_actions;
 pub mod log_sinks;
 pub mod logs;
+pub mod mutation_forwarder;
 pub mod node_action_callbacks;
 pub mod parse;
 pub mod proxy;
 pub mod public_api;
-pub mod mutation_forwarder;
 pub mod router;
 pub mod scheduling;
 pub mod schema;
@@ -114,6 +114,7 @@ pub mod streaming_import;
 pub mod subs;
 #[cfg(test)]
 mod test_helpers;
+pub mod two_phase_service;
 
 pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 
@@ -164,18 +165,37 @@ pub async fn make_app(
     let (deleted_tablet_sender, deleted_tablet_receiver) = tokio::sync::mpsc::channel(100);
     let usage_event_logger = Arc::new(NoOpUsageEventLogger);
     // Set up distributed log based on replication mode.
-    let distributed_log: Arc<dyn database::commit_delta::DistributedLog> =
-        if let Some(nats_url) = &config.nats_url {
-            let nats_config = database::nats_distributed_log::NatsConfig {
-                url: nats_url.clone(),
-                consumer_name: Some(config.name()),
-            };
-            Arc::new(
-                database::nats_distributed_log::NatsDistributedLog::connect(nats_config).await?,
-            )
-        } else {
-            Arc::new(database::commit_delta::NoopDistributedLog)
+    let distributed_log: Arc<dyn database::commit_delta::DistributedLog> = if let Some(nats_url) =
+        &config.nats_url
+    {
+        let nats_config = database::nats_distributed_log::NatsConfig {
+            url: nats_url.clone(),
+            consumer_name: Some(config.name()),
+            partition_id: config.partition_id,
         };
+        Arc::new(database::nats_distributed_log::NatsDistributedLog::connect(nats_config).await?)
+    } else {
+        Arc::new(database::commit_delta::NoopDistributedLog)
+    };
+
+    // Set up the global Timestamp Oracle (TSO) for multi-node deployments.
+    // Like TiDB's PD, this ensures globally unique timestamps across nodes.
+    // In single-node mode, None falls back to the local clock.
+    let timestamp_oracle: Option<Arc<dyn database::timestamp_oracle::TimestampOracle>> = if config
+        .partition_id
+        .is_some()
+    {
+        if let Some(nats_url) = &config.nats_url {
+            let tso =
+                database::timestamp_oracle::BatchTimestampOracle::connect(nats_url, None).await?;
+            tracing::info!("Using BatchTimestampOracle (TiDB PD pattern) for global timestamps");
+            Some(Arc::new(tso))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let database = Database::load(
         persistence.clone(),
@@ -191,12 +211,24 @@ pub async fn make_app(
         deleted_tablet_sender,
         distributed_log.clone(),
         config.replication_mode == "replica",
+        config.partition_id.map(|id| {
+            let partition_map_str = config.partition_map.as_deref().unwrap_or("");
+            let num_partitions = config.num_partitions.unwrap_or(1);
+            database::partition::PartitionMap::from_config(
+                partition_map_str,
+                database::partition::PartitionId(id),
+                num_partitions,
+            )
+        }),
+        timestamp_oracle,
     )
     .await?;
     initialize_application_system_tables(&database).await?;
     let application_storage = if config.replication_mode == "replica" {
         // Replica uses local storage — doesn't write storage config to DB.
-        let replica_path = config.replica_storage_path.as_ref()
+        let replica_path = config
+            .replica_storage_path
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("REPLICA_STORAGE_PATH is required in replica mode"))?;
         let (storage, search_storage) =
             application::ApplicationStorage::new_local(runtime.clone(), replica_path)?;
@@ -223,15 +255,14 @@ pub async fn make_app(
 
     // Start the SnapshotCheckpointer on the Primary when NATS is configured.
     if config.replication_mode == "primary" && config.nats_url.is_some() {
-        let checkpoint_path = config.checkpoint_storage_path.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("CHECKPOINT_STORAGE_PATH is required in primary mode with NATS_URL"))?;
-        let checkpoint_storage: Arc<dyn Storage> = Arc::new(
-            LocalDirStorage::for_use_case(
-                runtime.clone(),
-                checkpoint_path,
-                StorageUseCase::Checkpoints,
-            )?,
-        );
+        let checkpoint_path = config.checkpoint_storage_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("CHECKPOINT_STORAGE_PATH is required in primary mode with NATS_URL")
+        })?;
+        let checkpoint_storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            checkpoint_path,
+            StorageUseCase::Checkpoints,
+        )?);
         let _checkpointer = database::snapshot_checkpointer::SnapshotCheckpointer::start(
             runtime.clone(),
             persistence.reader(),
@@ -325,26 +356,50 @@ pub async fn make_app(
         runtime.spawn_background("beacon_worker", beacon_future);
     }
 
-    // Start the ReplicaDeltaConsumer on Replica to tail NATS and apply deltas.
+    // Start the ReplicaDeltaConsumer to tail NATS and apply deltas from other
+    // nodes. Runs on:
+    //   - Replicas (REPLICATION_MODE=replica): consumes Primary's deltas
+    //   - Partitioned writers (PARTITION_ID set): consumes other partitions' deltas
     // Creates a fresh NATS connection dedicated to the consumer.
-    // Uses spawn_background so the task outlives make_app scope.
-    if config.replication_mode == "replica" {
+    let needs_delta_consumer =
+        config.replication_mode == "replica" || config.partition_id.is_some();
+    if needs_delta_consumer {
         if let Some(nats_url) = &config.nats_url {
             let nats_url = nats_url.clone();
             let committer = database.committer_client();
-            let from_ts = *database.now_ts_for_reads();
+            // In partitioned mode, start consuming from the beginning of the
+            // stream. Each node has its own database with independent timestamps,
+            // so we can't use the local database timestamp as a lower bound.
+            // The self-delta skip (source_node filter) prevents double-applying.
+            // In replica mode, use the local timestamp since the replica loaded
+            // from the same persistence as the primary.
+            let from_ts = if config.partition_id.is_some() {
+                common::types::Timestamp::MIN
+            } else {
+                *database.now_ts_for_reads()
+            };
             let consumer_name = config.name();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
-                let consumer_nats = match database::nats_distributed_log::NatsDistributedLog::connect(
-                    database::nats_distributed_log::NatsConfig { url: nats_url, consumer_name: Some(consumer_name) },
-                ).await {
-                    Ok(n) => Arc::new(n),
-                    Err(e) => {
-                        tracing::error!("Failed to connect NATS for ReplicaDeltaConsumer: {e:#}");
-                        return;
-                    },
-                };
-                let consumer_nats_dyn: Arc<dyn database::commit_delta::DistributedLog> = consumer_nats;
+                let consumer_nats =
+                    match database::nats_distributed_log::NatsDistributedLog::connect(
+                        database::nats_distributed_log::NatsConfig {
+                            url: nats_url,
+                            consumer_name: Some(consumer_name),
+                            partition_id: None,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(n) => Arc::new(n),
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to connect NATS for ReplicaDeltaConsumer: {e:#}"
+                            );
+                            return;
+                        },
+                    };
+                let consumer_nats_dyn: Arc<dyn database::commit_delta::DistributedLog> =
+                    consumer_nats;
                 tracing::info!("ReplicaDeltaConsumer subscribing to NATS...");
                 match consumer_nats_dyn.subscribe(from_ts.into()).await {
                     Ok(mut stream) => {
@@ -355,8 +410,15 @@ pub async fn make_app(
                                     let ts = delta.ts;
                                     let n = delta.document_updates.len();
                                     match committer.apply_replica_delta(delta).await {
-                                        Ok(_) => tracing::info!("Applied replica delta: ts={}, {} updates", u64::from(ts), n),
-                                        Err(e) => tracing::error!("Failed to apply delta at ts={}: {e:#}", u64::from(ts)),
+                                        Ok(_) => tracing::info!(
+                                            "Applied replica delta: ts={}, {} updates",
+                                            u64::from(ts),
+                                            n
+                                        ),
+                                        Err(e) => tracing::error!(
+                                            "Failed to apply delta at ts={}: {e:#}",
+                                            u64::from(ts)
+                                        ),
                                     }
                                 },
                                 Err(e) => tracing::error!("Error reading NATS delta: {e:#}"),
@@ -368,6 +430,18 @@ pub async fn make_app(
                 }
             });
             tracing::info!("Started ReplicaDeltaConsumer for replication");
+        }
+    }
+
+    // Start the 2PC Transaction Watcher for crash recovery.
+    if config.partition_id.is_some() {
+        if let Some(nats_url) = &config.nats_url {
+            database::two_phase_watcher::start(
+                runtime.clone(),
+                database.committer_client(),
+                nats_url.clone(),
+            );
+            tracing::info!("Started 2PC Transaction Watcher");
         }
     }
 

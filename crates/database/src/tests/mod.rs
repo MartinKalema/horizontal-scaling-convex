@@ -137,6 +137,7 @@ mod search_index_backfill_tests;
 mod streaming_export_tests;
 mod usage_tracking;
 mod vector_tests;
+mod write_scaling_tests;
 
 mod apply_function_runner_tx;
 pub mod text_test_utils;

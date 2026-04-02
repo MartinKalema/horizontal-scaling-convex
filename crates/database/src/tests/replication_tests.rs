@@ -41,6 +41,8 @@ async fn test_primary_commit_publishes_delta(rt: TestRuntime) -> anyhow::Result<
         deleted_tablet_sender,
         distributed_log.clone(),
         false,
+        None,
+        None,
     )
     .await?;
     primary.set_search_storage(Arc::new(LocalDirStorage::new(rt.clone())?));
@@ -66,11 +68,9 @@ async fn test_primary_commit_publishes_delta(rt: TestRuntime) -> anyhow::Result<
     );
 
     // Find a delta that contains our document update (new_document is Some).
-    let has_doc_update = deltas.iter().any(|d| {
-        d.document_updates
-            .iter()
-            .any(|u| u.new_document.is_some())
-    });
+    let has_doc_update = deltas
+        .iter()
+        .any(|d| d.document_updates.iter().any(|u| u.new_document.is_some()));
     assert!(has_doc_update, "Expected a delta with a document insert");
 
     Ok(())

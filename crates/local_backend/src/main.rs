@@ -28,6 +28,7 @@ use local_backend::{
     mutation_forwarder::MutationForwarderService,
     proxy::dev_site_proxy,
     router::router,
+    two_phase_service,
     HttpActionRouteMapper,
     MAX_CONCURRENT_REQUESTS,
 };
@@ -135,23 +136,27 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     )
     .await?;
 
-    // Start gRPC mutation forwarding server on the Primary.
+    // Start gRPC services (mutation forwarder + 2PC).
     if config.replication_mode == "primary" && config.nats_url.is_some() {
         let grpc_addr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
         let api: std::sync::Arc<dyn application::api::ApplicationApi> =
             std::sync::Arc::new(st.application.clone());
         let forwarder = MutationForwarderService::new(api, st.instance_name.clone());
+        let two_pc = two_phase_service::TwoPhaseCommitGrpcService::new(
+            st.application.database().committer_client(),
+        );
         let mut grpc_shutdown_rx = shutdown_rx.clone();
-        runtime.spawn_background("grpc_mutation_forwarder", async move {
-            tracing::info!("Starting gRPC mutation forwarder on {grpc_addr}");
+        runtime.spawn_background("grpc_services", async move {
+            tracing::info!("Starting gRPC services on {grpc_addr}");
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(forwarder.into_server())
+                .add_service(two_pc.into_server())
                 .serve_with_shutdown(grpc_addr, async move {
                     let _ = grpc_shutdown_rx.recv().await;
                 })
                 .await
             {
-                tracing::error!("gRPC mutation forwarder failed: {e}");
+                tracing::error!("gRPC services failed: {e}");
             }
         });
     }

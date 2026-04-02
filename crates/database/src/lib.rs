@@ -16,20 +16,21 @@ pub mod commit_client;
 pub mod commit_delta;
 mod committer;
 mod database;
-pub mod nats_distributed_log;
-pub mod replica;
-pub mod snapshot_checkpointer;
 mod database_index_workers;
 mod execution_size;
 mod metrics;
+pub mod nats_distributed_log;
+pub mod partition;
 pub mod patch;
 pub mod persistence_helpers;
 mod preloaded;
 pub mod query;
 pub mod reads;
+pub mod replica;
 mod retention;
 mod search_index_bootstrap;
 mod search_index_workers;
+pub mod snapshot_checkpointer;
 mod snapshot_manager;
 mod stack_traces;
 pub mod streaming_export_selection;
@@ -39,10 +40,14 @@ pub mod system_tables;
 mod table_registry;
 pub mod table_summary;
 mod table_usage;
+pub mod timestamp_oracle;
 mod token;
 mod transaction;
 mod transaction_id_generator;
 mod transaction_index;
+pub mod two_phase;
+pub mod two_phase_coordinator;
+pub mod two_phase_watcher;
 pub mod vector_index_worker;
 mod virtual_tables;
 mod write_limits;
@@ -61,7 +66,10 @@ pub mod test_helpers;
 #[cfg(test)]
 pub mod tests;
 pub mod text_index_worker;
-pub use committer::table_dependency_sort_key;
+pub use committer::{
+    table_dependency_sort_key,
+    CommitterClient,
+};
 pub use component_registry::ComponentRegistry;
 pub use database_index_workers::{
     index_writer::{

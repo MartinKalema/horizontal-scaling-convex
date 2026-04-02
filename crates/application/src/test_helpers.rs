@@ -220,6 +220,8 @@ impl<RT: Runtime> ApplicationTestExt<RT> for Application<RT> {
             deleted_tablet_sender,
             Arc::new(database::commit_delta::NoopDistributedLog),
             false,
+            None,
+            None,
         )
         .await?;
         initialize_application_system_tables(&database).await?;

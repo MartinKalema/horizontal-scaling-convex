@@ -1,17 +1,14 @@
-# Primary-Replica setup for horizontal scaling demo.
+# Partitioned multi-writer deployment for horizontal write scaling.
+#
+# Two writer nodes, each owning a partition of tables:
+#   - Node A (partition 0): owns system tables + messages, users
+#   - Node B (partition 1): owns projects, tasks
+#
+# Both nodes consume all deltas from NATS for full read view.
+# Writes to non-owned tables are rejected with a routing error.
 #
 # Usage:
-#   docker compose -f docker-compose.replicated.yml up
-#
-# Architecture:
-#   - PostgreSQL: shared persistence layer
-#   - NATS: distributed log (JetStream) for commit delta replication
-#   - Primary: single writer, publishes deltas to NATS
-#   - Replica: read-only, consumes deltas from NATS, serves queries
-#
-# This is a demonstration setup. In production you would run Primary and
-# Replica(s) on separate machines, potentially with a load balancer routing
-# mutations to Primary and queries to Replicas.
+#   docker compose -f docker-compose.partitioned.yml up
 
 services:
   postgres:
@@ -19,7 +16,7 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: convex_self_hosted
-      CONVEX_INSTANCES: convex-primary,convex-replica,convex-replica2
+      CONVEX_INSTANCES: convex-node-a,convex-node-b
     ports:
       - "5433:5432"
     volumes:
@@ -34,8 +31,8 @@ services:
     image: nats:alpine
     command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
     ports:
-      - "4222:4222"   # Client connections
-      - "8222:8222"   # Monitoring
+      - "4222:4222"
+      - "8222:8222"
     volumes:
       - natsdata:/data
     healthcheck:
@@ -44,7 +41,7 @@ services:
       start_period: 5s
       retries: 3
 
-  primary:
+  node-a:
     image: convex-backend-replicated:latest
     stop_grace_period: 10s
     stop_signal: SIGINT
@@ -53,7 +50,7 @@ services:
       - "3211:3211"
       - "50051:50051"
     volumes:
-      - primary-data:/convex/data
+      - node-a-data:/convex/data
       - shared-storage:/convex/data/storage
     environment:
       - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
@@ -62,11 +59,15 @@ services:
       - CONVEX_SITE_ORIGIN=http://127.0.0.1:3211
       - RUST_LOG=info
       - DISABLE_BEACON=true
-      - INSTANCE_NAME=convex-primary
+      - INSTANCE_NAME=convex-node-a
       - REPLICATION_MODE=primary
       - NATS_URL=nats://nats:4222
       - GRPC_PORT=50051
       - CHECKPOINT_STORAGE_PATH=/convex/data/checkpoints
+      # Partition config: Node A owns partition 0 (system tables + messages, users)
+      - PARTITION_ID=0
+      - PARTITION_MAP=messages=0,users=0,projects=1,tasks=1
+      - NUM_PARTITIONS=2
     depends_on:
       postgres:
         condition: service_healthy
@@ -77,15 +78,16 @@ services:
       interval: 5s
       start_period: 10s
 
-  replica:
+  node-b:
     image: convex-backend-replicated:latest
     stop_grace_period: 10s
     stop_signal: SIGINT
     ports:
       - "3220:3210"
       - "3221:3211"
+      - "50052:50051"
     volumes:
-      - replica-data:/convex/data
+      - node-b-data:/convex/data
       - shared-storage:/convex/data/storage
     environment:
       - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
@@ -94,45 +96,18 @@ services:
       - CONVEX_SITE_ORIGIN=http://127.0.0.1:3221
       - RUST_LOG=info
       - DISABLE_BEACON=true
-      - INSTANCE_NAME=convex-replica
-      - REPLICATION_MODE=replica
+      - INSTANCE_NAME=convex-node-b
+      - REPLICATION_MODE=primary
       - NATS_URL=nats://nats:4222
-      - PRIMARY_GRPC_URL=http://primary:50051
+      - GRPC_PORT=50051
+      - CHECKPOINT_STORAGE_PATH=/convex/data/checkpoints
       - REPLICA_STORAGE_PATH=/convex/data/storage
+      # Partition config: Node B owns partition 1 (projects, tasks)
+      - PARTITION_ID=1
+      - PARTITION_MAP=messages=0,users=0,projects=1,tasks=1
+      - NUM_PARTITIONS=2
     depends_on:
-      primary:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
-    healthcheck:
-      test: curl -f http://localhost:3210/version
-      interval: 5s
-      start_period: 10s
-
-  replica2:
-    image: convex-backend-replicated:latest
-    stop_grace_period: 10s
-    stop_signal: SIGINT
-    ports:
-      - "3230:3210"
-      - "3231:3211"
-    volumes:
-      - replica2-data:/convex/data
-      - shared-storage:/convex/data/storage
-    environment:
-      - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
-      - DO_NOT_REQUIRE_SSL=1
-      - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3230
-      - CONVEX_SITE_ORIGIN=http://127.0.0.1:3231
-      - RUST_LOG=info
-      - DISABLE_BEACON=true
-      - INSTANCE_NAME=convex-replica2
-      - REPLICATION_MODE=replica
-      - NATS_URL=nats://nats:4222
-      - PRIMARY_GRPC_URL=http://primary:50051
-      - REPLICA_STORAGE_PATH=/convex/data/storage
-    depends_on:
-      primary:
+      node-a:
         condition: service_healthy
       nats:
         condition: service_healthy
@@ -150,13 +125,12 @@ services:
     environment:
       - NEXT_PUBLIC_DEPLOYMENT_URL=http://127.0.0.1:3210
     depends_on:
-      primary:
+      node-a:
         condition: service_healthy
 
 volumes:
   pgdata:
   natsdata:
-  primary-data:
-  replica-data:
-  replica2-data:
+  node-a-data:
+  node-b-data:
   shared-storage:
