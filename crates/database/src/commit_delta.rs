@@ -111,8 +111,10 @@ pub mod testing {
     use futures::stream::BoxStream;
     use parking_lot::Mutex;
     use tokio::sync::broadcast;
-    use tokio_stream::wrappers::BroadcastStream;
-    use tokio_stream::StreamExt;
+    use tokio_stream::{
+        wrappers::BroadcastStream,
+        StreamExt,
+    };
 
     use super::{
         CommitDelta,
@@ -162,8 +164,8 @@ pub mod testing {
                 .collect();
 
             let receiver = self.sender.subscribe();
-            let broadcast_stream = BroadcastStream::new(receiver)
-                .filter_map(move |result| match result {
+            let broadcast_stream =
+                BroadcastStream::new(receiver).filter_map(move |result| match result {
                     Ok(delta) if delta.ts > from_ts => Some(Ok(delta)),
                     Ok(_) => None,
                     Err(e) => Some(Err(anyhow::anyhow!("broadcast lag: {e}"))),
