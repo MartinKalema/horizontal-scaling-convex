@@ -2,9 +2,33 @@
 
 The first horizontal scaling implementation for the [Convex open-source backend](https://github.com/get-convex/convex-backend) — both reads and writes.
 
-## What This Does
+Convex is a reactive database: real-time subscriptions, in-memory snapshots, OCC with automatic retry, TypeScript function execution. No distributed database — CockroachDB, TiDB, Vitess, YugabyteDB, or Spanner — has all of these. We made it scale horizontally without losing any of them.
 
-Two independent Convex nodes, each owning a partition of tables, writing in parallel, replicating to each other in real-time via NATS JetStream. A global Timestamp Oracle (TiDB PD pattern) ensures ordering. Two-phase commit handles cross-partition writes.
+## The Problem
+
+Convex is a stateful system where the backend process holds the live database in memory. Two instances don't share state — they diverge. The [6 architectural bottlenecks](docs/why-convex-cannot-scale-horizontally.md) that prevent scaling: single Committer, in-memory SnapshotManager, in-memory WriteLog, single-process subscriptions, single-node OCC, and no distributed consensus. Convex's docs explicitly state self-hosted is single-node by design.
+
+## The Solution
+
+We took the best engineering from five distributed databases and combined them:
+
+| Problem | Pattern | Source |
+| --- | --- | --- |
+| Global timestamp ordering | Batch TSO via NATS KV — zero network calls in hot path | TiDB PD |
+| Table ownership | VSchema-style partition map — each node owns specific tables | Vitess |
+| Single writer per partition | Committer apply loop — one thread, one channel, serial processing | etcd, TiKV, Kafka |
+| Cross-partition writes | 2PC coordinator with prepare/commit/rollback | Vitess |
+| Table number conflicts | Descriptor ID reassignment on receiving node | CockroachDB |
+| Async commit ordering | All writes through single FuturesOrdered pipeline | CockroachDB Raft, TiKV apply worker |
+| Replica timestamp isolation | No TSO or system clock on apply — monotonic counters only | CockroachDB closed timestamp, TiDB resolved-ts |
+| Delta replication | NATS JetStream with durable consumers and self-delta skip | All five systems |
+| System table classification | Classify by what data describes, not which table stores it | CockroachDB system ranges |
+
+The combination — real-time subscriptions + in-memory OCC + partitioned multi-writer + delta replication + 2PC — doesn't exist in any of those systems. CockroachDB doesn't have subscriptions. TiDB doesn't have in-memory snapshots. Vitess doesn't have OCC. We kept Convex's unique architecture and grafted distributed database patterns onto it.
+
+Full details: [docs/what-we-built.md](docs/what-we-built.md)
+
+## Results
 
 ```
 ALL 77 TESTS PASSED — 3,823 messages | 3,069 tasks | 1,390 sustained writes/node
@@ -48,6 +72,8 @@ ALL 77 TESTS PASSED — 3,823 messages | 3,069 tasks | 1,390 sustained writes/no
 37. Ultimate final invariant check        (workload check)       — PASS
 ```
 
+Every test pattern comes from a real bug found by Jepsen in a production database.
+
 ## Architecture
 
 ### Write Scaling (Partitioned Multi-Writer)
@@ -77,6 +103,8 @@ ALL 77 TESTS PASSED — 3,823 messages | 3,069 tasks | 1,390 sustained writes/no
          all data                        all data
 ```
 
+Each node owns specific tables and is the single Committer for those tables. Both nodes consume all NATS deltas for a complete read view. Writes to non-owned tables are rejected with partition routing info. Cross-partition writes go through 2PC.
+
 ### Read Scaling (Primary-Replica)
 
 ```
@@ -87,12 +115,9 @@ Client ──mutation──▶ Primary ──persist──▶ PostgreSQL
 Client ──query──▶ Replica ◀──consume delta───────┘
 ```
 
+One Primary handles writes, multiple Replicas serve reads. Replicas remap TabletIds from the Primary's namespace to their own using the `tablet_id_to_table_name` mapping in each CommitDelta.
+
 ## Quick Start
-
-### Prerequisites
-
-- Docker and Docker Compose
-- Node.js 20+
 
 ### Build
 
@@ -101,23 +126,21 @@ docker build -f self-hosted/docker-build/Dockerfile.backend \
   -t convex-backend-replicated .
 ```
 
-### Run Partitioned Multi-Writer (Write Scaling)
+### Run Partitioned Multi-Writer
 
 ```sh
 cd self-hosted/docker
 docker compose -f docker-compose.partitioned.yml up
 ```
 
-Two writer nodes start: Node A (port 3210, partition 0: messages, users) and Node B (port 3220, partition 1: projects, tasks). Both see all data.
+Two writer nodes: Node A (port 3210, partition 0) and Node B (port 3220, partition 1).
 
-### Run Primary-Replica (Read Scaling)
+### Run Primary-Replica
 
 ```sh
 cd self-hosted/docker
 docker compose -f docker-compose.replicated.yml up
 ```
-
-One Primary (port 3210) handles writes, one Replica (port 3220) serves reads.
 
 ### Test
 
@@ -126,15 +149,12 @@ cd self-hosted/docker
 ./test-write-scaling.sh
 ```
 
-Runs all 77 integration tests (37 categories) against the live partitioned deployment.
+77 integration tests across 37 categories. Takes ~3 minutes including 30 seconds of sustained writes, NATS partition simulation, and full cluster restart.
 
 ### Deploy Functions
 
 ```sh
-# Generate admin key
 docker compose -f docker-compose.partitioned.yml exec node-a ./generate_admin_key.sh
-
-# Deploy
 npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 ```
 
@@ -150,68 +170,24 @@ npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 | PostgreSQL | 5433 |
 | NATS | 4222 |
 
-## How It Works
+## Key Components
 
-### Core Patterns (from distributed database research)
-
-| Pattern | Inspired by | What it does |
+| Component | File | What it does |
 | --- | --- | --- |
-| Table-level partitioning | Vitess VSchema | Each node owns specific tables, rejects writes to others |
-| Global Timestamp Oracle | TiDB PD | Both nodes draw globally unique timestamps from shared NATS KV counter via atomic CAS |
-| Single Committer per node | etcd, TiKV, Kafka | Serial apply loop preserves single-writer guarantee per partition |
-| Delta replication via log | All three | NATS JetStream carries CommitDeltas between nodes with durable consumers |
-| TabletId remapping | Custom | Each database has unique internal IDs; deltas carry table_id_to_table_name mapping for cross-database remapping |
-| Table number reassignment | CockroachDB descriptor ID | Remote _tables entries get locally-unique table numbers to avoid collisions |
-| System table classification | Custom | Updates classified by what they describe, not which system table stores them |
-| Two-phase commit | Vitess 2PC | Coordinator detects cross-partition writes, orchestrates prepare/commit/rollback |
-| Replica timestamp isolation | CockroachDB closed timestamp, TiDB resolved-ts | Replica delta apply uses monotonic counters only — no TSO, no system clock |
-
-### Key Components
-
-| Component | File | Description |
-| --- | --- | --- |
-| CommitDelta | `commit_delta.rs` | Captures everything changed in a transaction |
-| NatsDistributedLog | `nats_distributed_log.rs` | Publish/subscribe deltas via NATS JetStream |
-| apply_replica_delta | `committer.rs` | 5-phase delta apply with table creation, remapping, persistence |
-| BatchTimestampOracle | `timestamp_oracle.rs` | Global TSO via NATS KV with batch allocation |
-| PartitionMap | `partition.rs` | Table-to-partition assignment, ownership checking |
-| TwoPhaseCoordinator | `two_phase_coordinator.rs` | Detects and orchestrates cross-partition 2PC |
-| TwoPhaseCommitService | `two_phase_service.rs` | gRPC server/client for remote 2PC |
-| Transaction Watcher | `two_phase_watcher.rs` | Background crash recovery for stuck 2PC transactions |
+| CommitDelta | `commit_delta.rs` | Captures everything changed in a transaction — documents, indexes, table mappings |
+| NatsDistributedLog | `nats_distributed_log.rs` | Publishes/subscribes deltas via NATS JetStream with per-partition subjects and self-delta skip |
+| apply_replica_delta | `committer.rs` | Classifies updates by what they describe, creates tables with reassigned numbers, applies through Raft-pattern pipeline |
+| BatchTimestampOracle | `timestamp_oracle.rs` | Reserves timestamp ranges from NATS KV via atomic CAS. Zero network calls in hot path |
+| PartitionMap | `partition.rs` | Table-to-partition assignment. System tables always on partition 0 |
+| TwoPhaseCoordinator | `two_phase_coordinator.rs` | Detects cross-partition writes, orchestrates prepare/commit/rollback |
+| TwoPhaseCommitService | `two_phase_service.rs` | gRPC Prepare/CommitPrepared/RollbackPrepared for remote partitions |
+| Transaction Watcher | `two_phase_watcher.rs` | Scans NATS KV for stuck 2PC transactions, resolves via commit or rollback |
 
 ## Tests
 
-### Unit Tests
+**346 unit tests** + **77 integration tests** across **37 categories**.
 
-```sh
-cargo test -p database   # 346 tests
-```
-
-### Integration Tests (77 assertions across 37 categories)
-
-```sh
-cd self-hosted/docker && ./test-write-scaling.sh
-```
-
-**Correctness (Jepsen patterns):** Tests 1-3, 14-16, 22 — bank invariants, sequential ordering, set completeness, concurrent counter, duplicate handling
-
-**Register and document ops:** Tests 24, 35-36 — single-key linearizability, read-modify-write, write skew (G2 anomaly)
-
-**Partition enforcement:** Test 4 — wrong-partition writes rejected, no phantom data
-
-**Scaling:** Tests 5, 10, 21 — concurrent writes, 50/node burst, 30-second sustained (1,390 writes/node)
-
-**Consistency:** Tests 6, 11, 17-18, 33 — monotonic reads, same-node and cross-node stale read detection, read skew, reads during replication
-
-**2PC and atomicity:** Tests 9, 19, 29 — cross-partition atomic writes, 50-doc and 200-doc batch atomicity
-
-**Chaos and recovery:** Tests 7, 12, 20, 26, 34 — single/double/full restart, NATS partition, TSO monotonicity after crash
-
-**Deploy safety:** Tests 25, 27, 32 — write during deploy, rapid 3x deploy cycle, disjoint record ordering
-
-**Boundary:** Tests 28, 30-31 — empty table queries, null/empty fields, concurrent writes from both nodes
-
-**Invariants:** Tests 8, 13, 23, 37 — idempotent re-run, post-chaos check, mid-suite check, ultimate final check after all 36 tests
+The integration tests cover every test pattern from CockroachDB's 7 nightly Jepsen workloads (bank, register, sequential, set, monotonic, G2, comments), TiDB's Jepsen suite (bank-multitable, monotonic, stale read), YugabyteDB's Jepsen tests (counter, linearizable set), Vitess (VDiff, partition enforcement, 2PC), CockroachDB roachtest (KV scaling, nemesis, workload check), Chaos Mesh (NATS partition), Elle anomaly classes (read skew, write skew), and boundary testing (empty tables, null fields, 200-doc batch).
 
 Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 
@@ -219,10 +195,11 @@ Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 
 | Document | Contents |
 | --- | --- |
-| [Write Scaling Research](docs/write-scaling-research.md) | Vitess, TiDB, CockroachDB comparison and what we took from each |
-| [Two-Phase Commit Design](docs/two-phase-commit.md) | 2PC architecture, Vitess/TiDB/CockroachDB patterns |
+| [What We Built](docs/what-we-built.md) | What we took from each distributed database and what's new |
+| [Write Scaling Research](docs/write-scaling-research.md) | Vitess, TiDB, CockroachDB comparison |
+| [Two-Phase Commit Design](docs/two-phase-commit.md) | 2PC architecture with Vitess/TiDB/CockroachDB patterns |
 | [TSO Timestamp Fix](docs/tso-replica-timestamp-fix.md) | Three timestamp ordering fixes with distributed database research |
-| [Write Scaling Tests](docs/write-scaling-tests.md) | All 9 test categories with sources |
+| [Write Scaling Tests](docs/write-scaling-tests.md) | All 37 test categories with 77 assertions |
 | [Engineering Changes](docs/engineering-changes.md) | Every file changed, every architectural decision |
 | [Architecture Analysis](docs/why-convex-cannot-scale-horizontally.md) | The 6 bottlenecks in the original codebase |
 | [Convex Internals](docs/convex-internals-explained.md) | How the Committer, SnapshotManager, WriteLog, Subscriptions, and OCC work |
@@ -231,8 +208,6 @@ Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 | [Scalability Research](docs/convex-scalability-research.md) | Community research with 25+ source URLs |
 
 ## Configuration
-
-### Partitioned Mode Environment Variables
 
 | Variable | Description | Example |
 | --- | --- | --- |
