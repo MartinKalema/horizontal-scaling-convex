@@ -196,7 +196,11 @@ serde = { version = "1", features = [ "derive" ] }
 serde_bytes = "0.11.14"
 serde_json = { version = "1", features = [ "float_roundtrip", "preserve_order", "raw_value", "unbounded_depth" ] }
 serde_with = "3.16.1"
+raft = { version = "0.7.0", default-features = false, features = [ "prost-codec", "default-logger" ] }
+raft-proto = { version = "0.7.0", default-features = false, features = [ "prost-codec" ] }
 sha1 = { version = "0.10.5", features = [ "oid" ] }
+slog = "2.7"
+slog-stdlog = "2.0"
 sha2 = { version = "0.10.8" }
 shape_inference = { path = "crates/shape_inference" }
 short_future = { version = "0.1.1" }

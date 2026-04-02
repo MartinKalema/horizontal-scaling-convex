@@ -103,3 +103,23 @@ message TwoPcRollbackRequest {
 
 message TwoPcRollbackResponse {
 }
+
+// Raft consensus transport service (tikv/raft-rs pattern).
+// Each node in a Raft group runs this service. The leader sends
+// AppendEntries and heartbeats; followers send RequestVote during elections.
+// This replaces NATS for intra-partition replication.
+service RaftTransportService {
+  // Send a batch of Raft messages to a peer node.
+  // Batching multiple messages per RPC reduces network overhead — this is
+  // the same optimization TiKV uses with its Raft transport.
+  rpc SendMessages(RaftMessageBatch) returns (RaftMessageResponse);
+}
+
+message RaftMessageBatch {
+  // One or more Raft protocol messages (AppendEntries, Vote, Heartbeat, etc.)
+  // Serialized as raft-rs protobuf Message.
+  repeated bytes messages = 1;
+}
+
+message RaftMessageResponse {
+}
