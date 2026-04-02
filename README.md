@@ -7,17 +7,31 @@ The first horizontal scaling implementation for the [Convex open-source backend]
 Two independent Convex nodes, each owning a partition of tables, writing in parallel, replicating to each other in real-time via NATS JetStream. A global Timestamp Oracle (TiDB PD pattern) ensures ordering. Two-phase commit handles cross-partition writes.
 
 ```
-ALL 25 TESTS PASSED
+ALL 56 TESTS PASSED — 2,365 messages | 1,814 tasks | 1,440 sustained writes/node
 
  1. Cross-partition data verification     (Vitess VDiff)         — PASS
  2. Bank invariant — single table         (CockroachDB Jepsen)   — PASS
  3. Bank invariant — multi-table          (TiDB bank-multitable) — PASS
  4. Partition enforcement (5 subtests)    (Vitess Single mode)   — PASS
- 5. Concurrent write scaling              (CockroachDB KV)       — PASS 175 writes/sec
+ 5. Concurrent write scaling              (CockroachDB KV)       — PASS 171 writes/sec
  6. Monotonic reads                       (TiDB monotonic)       — PASS
  7. Node restart recovery                 (TiDB kill -9)         — PASS
  8. Idempotent re-run                     (CockroachDB workload) — PASS
  9. Two-phase commit cross-partition      (Vitess 2PC)           — PASS
+10. Rapid-fire writes 50/node             (Jepsen stress)        — PASS
+11. Write-then-immediate-read             (stale read detection) — PASS
+12. Double node restart                   (CockroachDB nemesis)  — PASS
+13. Post-chaos invariant check            (workload check)       — PASS
+14. Sequential ordering                   (Jepsen sequential)    — PASS
+15. Set completeness (100 elements)       (Jepsen set)           — PASS
+16. Concurrent counter                    (Jepsen counter)       — PASS
+17. Write-then-cross-node-read            (cross-node stale)     — PASS
+18. Interleaved cross-partition reads     (read skew detection)  — PASS
+19. Large batch write (50 docs)           (atomicity)            — PASS
+20. Full cluster restart                  (CockroachDB nemesis)  — PASS
+21. Sustained writes 30 seconds           (endurance)            — PASS
+22. Duplicate insert idempotency          (correctness)          — PASS
+23. Final exhaustive invariant check      (workload check)       — PASS
 ```
 
 ## Architecture
@@ -98,7 +112,7 @@ cd self-hosted/docker
 ./test-write-scaling.sh
 ```
 
-Runs all 25 integration tests (9 categories) against the live partitioned deployment.
+Runs all 56 integration tests (23 categories) against the live partitioned deployment.
 
 ### Deploy Functions
 
@@ -159,23 +173,69 @@ npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 cargo test -p database   # 346 tests
 ```
 
-### Integration Tests (25 assertions across 9 categories)
+### Integration Tests (56 assertions across 23 categories)
 
 ```sh
 cd self-hosted/docker && ./test-write-scaling.sh
 ```
 
-| # | Test | Source | What it proves |
+**Correctness (Jepsen patterns):**
+
+| # | Test | Source | What it catches |
 | --- | --- | --- | --- |
-| 1 | Cross-partition data verification | Vitess VDiff | Both nodes see all data from both partitions |
-| 2 | Bank invariant — single table | CockroachDB Jepsen bank | Numeric totals preserved across replication |
-| 3 | Bank invariant — multi-table | TiDB bank-multitable | Cross-table invariants hold across partitions |
-| 4 | Partition enforcement | Vitess Single mode | Wrong-partition writes rejected, no phantom data |
-| 5 | Concurrent write scaling | CockroachDB KV | Parallel writes with zero data loss |
-| 6 | Monotonic reads | TiDB monotonic | Values never go backward |
-| 7 | Node restart recovery | TiDB kill -9 / CockroachDB nemesis | Recovers after crash, sees writes from downtime |
-| 8 | Idempotent re-run | CockroachDB workload check | No corruption from repeated operations |
-| 9 | Two-phase commit | Vitess 2PC | Atomic writes to tables on different partitions |
+| 1 | Cross-partition data verification | Vitess VDiff | Replication fails to propagate data |
+| 2 | Bank invariant — single table | CockroachDB Jepsen bank | Numeric totals violated by replication |
+| 3 | Bank invariant — multi-table | TiDB bank-multitable | Cross-table invariants broken |
+| 14 | Sequential ordering | Jepsen sequential | Writes visible out of order |
+| 15 | Set completeness (100 elements) | Jepsen set | Lost inserts |
+| 16 | Concurrent counter | Jepsen counter / YugabyteDB | Phantom counts or lost increments |
+| 22 | Duplicate insert idempotency | Custom | Deduplication or corruption |
+
+**Partition enforcement:**
+
+| # | Test | Source | What it catches |
+| --- | --- | --- | --- |
+| 4 | Partition enforcement (5 subtests) | Vitess Single mode | Wrong-partition writes accepted |
+
+**Scaling and performance:**
+
+| # | Test | Source | What it catches |
+| --- | --- | --- | --- |
+| 5 | Concurrent write scaling | CockroachDB KV | Data loss under parallel writes |
+| 10 | Rapid-fire writes (50/node) | Jepsen stress | Crashes under burst load |
+| 21 | Sustained writes (30 seconds) | CockroachDB endurance | Replication lag, data loss under sustained load |
+
+**Consistency:**
+
+| # | Test | Source | What it catches |
+| --- | --- | --- | --- |
+| 6 | Monotonic reads | TiDB monotonic | Values going backward |
+| 11 | Write-then-immediate-read | TiDB Jepsen stale read | Stale read on same node |
+| 17 | Write-then-cross-node-read | TiDB Jepsen stale read | Cross-node stale read |
+| 18 | Interleaved cross-partition reads | Read skew detection | Inconsistent snapshots |
+
+**Two-phase commit and atomicity:**
+
+| # | Test | Source | What it catches |
+| --- | --- | --- | --- |
+| 9 | Cross-partition atomic write | Vitess 2PC | Partial commits |
+| 19 | Large batch write (50 docs) | Custom | Partial batch |
+
+**Chaos and recovery:**
+
+| # | Test | Source | What it catches |
+| --- | --- | --- | --- |
+| 7 | Single node restart | TiDB kill -9 | Data loss after restart |
+| 12 | Double node restart | CockroachDB nemesis | Corruption from rapid restarts |
+| 20 | Full cluster restart | CockroachDB nemesis | Data loss when all nodes down |
+
+**Invariant preservation:**
+
+| # | Test | Source | What it catches |
+| --- | --- | --- | --- |
+| 8 | Idempotent re-run | CockroachDB workload check | Corruption from repeated ops |
+| 13 | Post-chaos invariant check | CockroachDB workload check | Invariants broken by stress |
+| 23 | Final exhaustive invariant check | CockroachDB workload check | Any violation after all 22 tests |
 
 ## Documentation
 
