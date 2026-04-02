@@ -13,6 +13,7 @@
 #   6. Monotonic Reads (TiDB monotonic)
 #   7. Node Restart Recovery (TiDB kill -9 / CockroachDB nemesis)
 #   8. Idempotent Re-Run (CockroachDB workload check)
+#   9. Two-Phase Commit Cross-Partition (Vitess 2PC)
 #
 # Prerequisites:
 #   docker compose -f docker-compose.partitioned.yml up
@@ -101,6 +102,16 @@ export const createTask = mutation({
   args: { title: v.string(), assignee: v.string(), project: v.string(), status: v.string() },
   handler: async (ctx, args) => {
     return await ctx.db.insert("tasks", { ...args, createdAt: Date.now() });
+  },
+});
+
+// Cross-partition mutation: writes to both messages (partition 0) and tasks (partition 1).
+// This triggers 2PC when partitioning is enabled.
+export const crossPartitionWrite = mutation({
+  args: { text: v.string(), taskTitle: v.string() },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("messages", { text: args.text, author: "2pc", channel: "cross", timestamp: Date.now() });
+    await ctx.db.insert("tasks", { title: args.taskTitle, assignee: "2pc", project: "cross", status: "done", createdAt: Date.now() });
   },
 });
 
@@ -511,6 +522,59 @@ EXPECTED_IDEM=$((SNAP_AM + 2))
 [ "$CHECK_AM" -eq "$CHECK_BM" ] \
     && pass "Both nodes still converged (msgs=$CHECK_AM)" \
     || fail "Nodes diverged after re-run" "A=$CHECK_AM vs B=$CHECK_BM"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 9: Two-Phase Commit Cross-Partition (Vitess 2PC)${NC}"
+# ============================================================
+
+# Capture pre-2PC state.
+PRE_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_2PC_M=$(jval messages "$PRE_2PC")
+PRE_2PC_T=$(jval tasks "$PRE_2PC")
+
+# 9a: Atomic cross-partition write (Vitess atomic commit pattern).
+# A single mutation writes to messages (partition 0) AND tasks (partition 1).
+# With 2PC, both should be committed atomically.
+R=$(mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+    '{"text":"2pc-msg-1","taskTitle":"2pc-task-1"}' 2>&1)
+if echo "$R" | grep -q "success"; then
+    pass "Cross-partition mutation accepted (2PC coordinator)"
+else
+    fail "Cross-partition mutation rejected" "$R"
+fi
+
+# 9b: Write a second cross-partition mutation.
+mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+    '{"text":"2pc-msg-2","taskTitle":"2pc-task-2"}' > /dev/null 2>&1
+
+sleep 4
+
+# 9c: Verify both partitions received the data (Vitess VDiff + CockroachDB cross-range).
+POST_2PC_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+
+POST_M_A=$(jval messages "$POST_2PC_A"); POST_T_A=$(jval tasks "$POST_2PC_A")
+POST_M_B=$(jval messages "$POST_2PC_B"); POST_T_B=$(jval tasks "$POST_2PC_B")
+
+DELTA_M=$((POST_M_A - PRE_2PC_M))
+DELTA_T=$((POST_T_A - PRE_2PC_T))
+
+# Both messages and tasks should have increased by 2.
+[ "$DELTA_M" -eq 2 ] && [ "$DELTA_T" -eq 2 ] \
+    && pass "Node A: 2PC writes visible (msgs +$DELTA_M, tasks +$DELTA_T)" \
+    || fail "Node A: 2PC data missing" "msgs +$DELTA_M tasks +$DELTA_T, expected +2 +2"
+
+# 9d: Cross-node visibility — Node B also sees the 2PC writes.
+[ "$POST_M_A" -eq "$POST_M_B" ] && [ "$POST_T_A" -eq "$POST_T_B" ] \
+    && pass "Both nodes see 2PC data (msgs=$POST_M_A, tasks=$POST_T_A)" \
+    || fail "Nodes diverged after 2PC" "A: $POST_M_A,$POST_T_A vs B: $POST_M_B,$POST_T_B"
+
+# 9e: Invariant check — 2PC didn't create phantom data (TiDB bank pattern).
+# Each crossPartitionWrite creates exactly 1 message + 1 task. Total delta must be equal.
+[ "$DELTA_M" -eq "$DELTA_T" ] \
+    && pass "2PC invariant: msgs and tasks incremented equally (+$DELTA_M)" \
+    || fail "2PC invariant violated" "msgs +$DELTA_M vs tasks +$DELTA_T"
 
 # ============================================================
 echo ""

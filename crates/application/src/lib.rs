@@ -551,11 +551,31 @@ impl ApplicationStorage {
         runtime: RT,
         dir: &str,
     ) -> anyhow::Result<(Self, Arc<dyn Storage>)> {
-        let files = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::Files)?) as Arc<dyn Storage>;
-        let modules = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::Modules)?) as Arc<dyn Storage>;
-        let search = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::SearchIndexes)?) as Arc<dyn Storage>;
-        let exports = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::Exports)?) as Arc<dyn Storage>;
-        let snapshot_imports = Arc::new(LocalDirStorage::for_use_case(runtime.clone(), dir, StorageUseCase::SnapshotImports)?) as Arc<dyn Storage>;
+        let files = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            dir,
+            StorageUseCase::Files,
+        )?) as Arc<dyn Storage>;
+        let modules = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            dir,
+            StorageUseCase::Modules,
+        )?) as Arc<dyn Storage>;
+        let search = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            dir,
+            StorageUseCase::SearchIndexes,
+        )?) as Arc<dyn Storage>;
+        let exports = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            dir,
+            StorageUseCase::Exports,
+        )?) as Arc<dyn Storage>;
+        let snapshot_imports = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            dir,
+            StorageUseCase::SnapshotImports,
+        )?) as Arc<dyn Storage>;
         let storage = Self {
             files_storage: files,
             modules_storage: modules,
@@ -928,6 +948,10 @@ impl<RT: Runtime> Application<RT> {
 
     pub fn now_ts_for_reads(&self) -> RepeatableTimestamp {
         self.database.now_ts_for_reads()
+    }
+
+    pub fn database(&self) -> &Database<RT> {
+        &self.database
     }
 
     pub fn instance_name(&self) -> String {

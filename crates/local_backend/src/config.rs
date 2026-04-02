@@ -171,6 +171,12 @@ pub struct LocalConfig {
     #[clap(long, env = "NUM_PARTITIONS")]
     pub num_partitions: Option<u32>,
 
+    /// Node addresses for 2PC gRPC communication between partitions.
+    /// Format: "0=host:port,1=host:port"
+    /// Example: "0=node-a:50051,1=node-b:50051"
+    #[clap(long, env = "NODE_ADDRESSES")]
+    pub node_addresses: Option<String>,
+
     /// Storage directory for the Replica to read shared files (modules, etc.).
     /// Should point to a path shared with the Primary's storage.
     /// Required in replica mode.
