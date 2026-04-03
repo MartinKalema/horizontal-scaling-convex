@@ -211,19 +211,40 @@ docker compose --profile cluster exec node-p0a ./generate_admin_key.sh
 npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 ```
 
-### Ports (Raft Mode)
+### Resource Requirements
 
-| Service | Port |
-| --- | --- |
-| Node A API | 3210 |
-| Node B API | 3220 |
-| Node C API | 3230 |
-| Node A gRPC (Raft + 2PC) | 50051 |
-| Node B gRPC (Raft + 2PC) | 50052 |
-| Node C gRPC (Raft + 2PC) | 50053 |
-| Dashboard | 6791 |
-| PostgreSQL | 5433 |
-| NATS | 4222 |
+Per-node requirements, following the format used by CockroachDB, YugabyteDB, and etcd.
+
+| | Dev/Test | Production |
+| --- | --- | --- |
+| **CPU** | 2 vCPUs | 4+ vCPUs |
+| **RAM** | 2 GB | 8+ GB |
+| **Storage** | 10 GB (HDD ok) | 50+ GB SSD |
+| **Network** | 100 Mbps | 1 Gbps |
+
+**Total cluster resources:**
+
+| Profile | Nodes | Min CPU | Min RAM | Min Storage |
+| --- | --- | --- | --- | --- |
+| `single` | 1 backend + postgres + NATS | 4 vCPUs | 4 GB | 20 GB |
+| `cluster` | 6 backends + postgres + NATS | 16 vCPUs | 16 GB | 80 GB |
+
+Observed idle memory usage per backend node: ~20 MB. Under load with in-memory snapshots: scales with dataset size (similar to CockroachDB's range cache).
+
+### Ports
+
+| Service | Single | Cluster |
+| --- | --- | --- |
+| Partition 0 node A API | 3210 | 3210 |
+| Partition 0 node B API | — | 3220 |
+| Partition 0 node C API | — | 3230 |
+| Partition 1 node A API | — | 3310 |
+| Partition 1 node B API | — | 3320 |
+| Partition 1 node C API | — | 3330 |
+| gRPC (Raft + 2PC) | 50051 | 50051–50063 |
+| Dashboard | 6791 | 6791 |
+| PostgreSQL | 5433 | 5433 |
+| NATS | 4222 | 4222 |
 
 ## Key Components
 
