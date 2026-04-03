@@ -107,7 +107,6 @@ ALL 77 TESTS PASSED — 3,823 messages | 3,069 tasks | 1,390 sustained writes/no
 ```
 
 Every test pattern comes from a real bug found by Jepsen in a production database.
-```
 
 ## Architecture
 
