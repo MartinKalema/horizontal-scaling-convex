@@ -9,7 +9,10 @@
 //!   - TiKV fail-rs chaos testing
 //!   - YugabyteDB Jepsen nightly resilience benchmarks
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+};
 
 use raft::StateRole;
 use tokio::sync::mpsc;
@@ -21,16 +24,23 @@ use crate::{
         RaftNode,
         RaftNodeConfig,
     },
+    raft_storage::ConvexRaftStorage,
 };
 
-/// Create a 3-node Raft group with in-memory channels.
+fn test_engine() -> Arc<raft_engine::Engine> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.into_path();
+    ConvexRaftStorage::open_engine(path.to_str().unwrap()).unwrap()
+}
+
+/// Create a 3-node Raft group with persistent storage.
 fn create_three_node_group() -> Vec<RaftNode> {
     let peer_ids = vec![1u64, 2, 3];
     let mut nodes = Vec::new();
 
     for &id in &peer_ids {
+        let engine = test_engine();
         let (_, rx) = mpsc::unbounded_channel();
-        // Peer senders not used — we route messages via direct step() calls.
         let config = RaftNodeConfig {
             node_id: id,
             partition_id: PartitionId(0),
@@ -38,7 +48,7 @@ fn create_three_node_group() -> Vec<RaftNode> {
             election_tick: 10,
             heartbeat_tick: 3,
         };
-        let node = RaftNode::new(config, rx, HashMap::new()).unwrap();
+        let node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
         nodes.push(node);
     }
 
@@ -72,7 +82,7 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
 
             node.storage.append_entries(ready.entries()).unwrap();
             if let Some(hs) = ready.hs() {
-                node.storage.set_hardstate(hs.clone());
+                node.storage.set_hardstate(hs).unwrap();
             }
 
             for entry in ready.take_committed_entries() {

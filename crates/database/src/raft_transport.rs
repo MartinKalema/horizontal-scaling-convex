@@ -28,19 +28,17 @@ use crate::raft_node::RaftMessage;
 
 /// Encode a raft-rs Message to bytes for transport.
 ///
-/// raft-rs uses prost 0.11 internally, so we use raft-proto's prost
-/// re-export for encode/decode to avoid version mismatches.
+/// With protobuf-codec, raft-rs types implement protobuf::Message directly.
+/// This is the same serialization TiKV uses — no prost version mismatch.
 pub fn encode_raft_message(msg: &Message) -> Vec<u8> {
-    use prost_011::Message as ProstMsg;
-    let mut buf = Vec::with_capacity(ProstMsg::encoded_len(msg));
-    ProstMsg::encode(msg, &mut buf).expect("Raft message encoding failed");
-    buf
+    use protobuf::Message as ProtoMsg;
+    msg.write_to_bytes().expect("Raft message encoding failed")
 }
 
 /// Decode bytes back to a raft-rs Message.
 pub fn decode_raft_message(data: &[u8]) -> anyhow::Result<Message> {
-    use prost_011::Message as ProstMsg;
-    <Message as ProstMsg>::decode(data).context("Failed to decode Raft message")
+    use protobuf::Message as ProtoMsg;
+    Message::parse_from_bytes(data).context("Failed to decode Raft message")
 }
 
 /// Client for sending Raft messages to a remote node.
@@ -233,21 +231,21 @@ mod tests {
     #[test]
     fn test_encode_decode_roundtrip() {
         let mut msg = Message::default();
-        msg.msg_type = raft::prelude::MessageType::MsgAppend as i32;
-        msg.to = 2;
-        msg.from = 1;
-        msg.term = 5;
-        msg.log_term = 4;
-        msg.index = 10;
+        msg.set_msg_type(raft::prelude::MessageType::MsgAppend);
+        msg.set_to(2);
+        msg.set_from(1);
+        msg.set_term(5);
+        msg.set_log_term(4);
+        msg.set_index(10);
 
         let encoded = encode_raft_message(&msg);
         let decoded = decode_raft_message(&encoded).unwrap();
 
-        assert_eq!(decoded.to, 2);
-        assert_eq!(decoded.from, 1);
-        assert_eq!(decoded.term, 5);
-        assert_eq!(decoded.log_term, 4);
-        assert_eq!(decoded.index, 10);
+        assert_eq!(decoded.get_to(), 2);
+        assert_eq!(decoded.get_from(), 1);
+        assert_eq!(decoded.get_term(), 5);
+        assert_eq!(decoded.get_log_term(), 4);
+        assert_eq!(decoded.get_index(), 10);
     }
 
     #[test]
