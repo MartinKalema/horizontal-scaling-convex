@@ -54,7 +54,6 @@ services:
       - "3210:3210"
       - "3211:3211"
       - "50051:50051"
-      - "50061:50061"
     volumes:
       - node-a-data:/convex/data
       - shared-storage:/convex/data/storage
@@ -76,7 +75,7 @@ services:
       - NUM_PARTITIONS=1
       # Raft config: 3-node group for partition 0
       - RAFT_NODE_ID=1
-      - RAFT_PEERS=1=node-a:50061,2=node-b:50061,3=node-c:50061
+      - RAFT_PEERS=1=http://node-a:50051,2=http://node-b:50051,3=http://node-c:50051
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,7 +118,7 @@ services:
       - NUM_PARTITIONS=1
       # Raft config
       - RAFT_NODE_ID=2
-      - RAFT_PEERS=1=node-a:50061,2=node-b:50061,3=node-c:50061
+      - RAFT_PEERS=1=http://node-a:50051,2=http://node-b:50051,3=http://node-c:50051
     depends_on:
       node-a:
         condition: service_healthy
@@ -162,7 +161,7 @@ services:
       - NUM_PARTITIONS=1
       # Raft config
       - RAFT_NODE_ID=3
-      - RAFT_PEERS=1=node-a:50061,2=node-b:50061,3=node-c:50061
+      - RAFT_PEERS=1=http://node-a:50051,2=http://node-b:50051,3=http://node-c:50051
     depends_on:
       node-b:
         condition: service_healthy
