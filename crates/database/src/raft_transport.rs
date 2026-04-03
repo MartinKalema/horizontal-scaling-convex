@@ -64,24 +64,45 @@ impl RaftTransportClient {
 
     /// Run the transport client loop. Collects messages and sends them
     /// in batches via gRPC.
+    /// Run the transport client loop.
+    ///
+    /// Follows TiKV's RaftClient pattern:
+    /// - Exponential backoff on connection failure (1s → 2s → 4s, capped at
+    ///   30s)
+    /// - Never exits permanently — retries indefinitely
+    /// - Messages queue in the channel while disconnected
+    /// - Reports reconnection status via tracing
+    ///
+    /// etcd uses a similar pattern with rate-limited retries and dual
+    /// stream/pipeline fallback. CockroachDB uses exponential backoff
+    /// with connection pooling.
     pub async fn run(mut self) {
         use pb::replication::{
             raft_transport_service_client::RaftTransportServiceClient,
             RaftMessageBatch,
         };
 
-        let mut client = match RaftTransportServiceClient::connect(self.address.clone()).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(
-                    "Raft transport: failed to connect to {}: {e:#}",
-                    self.address
-                );
-                return;
-            },
-        };
+        let mut backoff = std::time::Duration::from_secs(1);
+        let max_backoff = std::time::Duration::from_secs(30);
 
-        tracing::info!("Raft transport: connected to {}", self.address);
+        // Connect with exponential backoff retry (TiKV pattern).
+        // Nodes start at different times — the transport must wait for
+        // peers to become available without exiting.
+        let mut client;
+        loop {
+            match RaftTransportServiceClient::connect(self.address.clone()).await {
+                Ok(c) => {
+                    tracing::info!("Raft transport: connected to {}", self.address);
+                    client = c;
+                    backoff = std::time::Duration::from_secs(1);
+                    break;
+                },
+                Err(_) => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                },
+            }
+        }
 
         loop {
             // Wait for at least one message.
@@ -93,7 +114,8 @@ impl RaftTransportClient {
                 },
             };
 
-            // Collect all available messages into a batch.
+            // Collect all available messages into a batch (TiKV batches
+            // messages per RPC to reduce network overhead).
             let mut batch = vec![encode_raft_message(&msg)];
             while let Ok(msg) = self.outgoing_rx.try_recv() {
                 batch.push(encode_raft_message(&msg));
@@ -103,19 +125,24 @@ impl RaftTransportClient {
 
             if let Err(e) = client.send_messages(request).await {
                 tracing::warn!(
-                    "Raft transport: failed to send batch to {}: {e}",
+                    "Raft transport: send to {} failed: {e}, reconnecting...",
                     self.address
                 );
-                // Reconnect on next iteration.
-                match RaftTransportServiceClient::connect(self.address.clone()).await {
-                    Ok(c) => client = c,
-                    Err(e) => {
-                        tracing::error!(
-                            "Raft transport: reconnect to {} failed: {e:#}",
-                            self.address
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    },
+                // Reconnect with exponential backoff (TiKV/CockroachDB pattern).
+                backoff = std::time::Duration::from_secs(1);
+                loop {
+                    match RaftTransportServiceClient::connect(self.address.clone()).await {
+                        Ok(c) => {
+                            client = c;
+                            tracing::info!("Raft transport: reconnected to {}", self.address);
+                            backoff = std::time::Duration::from_secs(1);
+                            break;
+                        },
+                        Err(_) => {
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                        },
+                    }
                 }
             }
         }
