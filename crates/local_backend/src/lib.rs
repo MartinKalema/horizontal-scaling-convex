@@ -463,6 +463,7 @@ pub async fn make_app(
         use database::{
             raft_node::RaftNodeConfig,
             raft_partition::RaftPartitionManager,
+            raft_storage::ConvexRaftStorage,
             raft_transport,
         };
 
@@ -489,11 +490,18 @@ pub async fn make_app(
             heartbeat_tick: 3, // 300ms
         };
 
+        // Open raft-engine for persistent Raft log storage (TiKV pattern).
+        // One engine per node, shared across all partitions. Data survives
+        // restarts — this prevents the "to_commit X out of range" panic
+        // that MemStorage caused.
+        let raft_engine_path = "/convex/data/raft-engine";
+        let raft_engine = ConvexRaftStorage::open_engine(raft_engine_path)?;
+
         // Create transport channels for peer communication.
         let (peer_senders, transport_clients) =
             raft_transport::create_transport(&peer_addresses, raft_node_id);
 
-        let mut manager = RaftPartitionManager::new(raft_config, peer_senders)?;
+        let mut manager = RaftPartitionManager::new(raft_config, raft_engine, peer_senders)?;
         let raft_state = manager.state();
         let mb_tx = manager.mailbox_tx();
         raft_mailbox_tx = Some(mb_tx);

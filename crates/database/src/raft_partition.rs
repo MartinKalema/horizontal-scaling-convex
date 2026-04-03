@@ -111,14 +111,15 @@ pub struct RaftPartitionManager {
 }
 
 impl RaftPartitionManager {
-    /// Create a new Raft partition manager.
+    /// Create a new Raft partition manager with persistent storage.
     pub fn new(
         config: RaftNodeConfig,
+        engine: Arc<raft_engine::Engine>,
         peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
     ) -> anyhow::Result<Self> {
         let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel();
 
-        let mut node = RaftNode::new(config.clone(), mailbox_rx, peer_senders)?;
+        let mut node = RaftNode::new(config.clone(), engine, mailbox_rx, peer_senders)?;
 
         let is_leader = Arc::new(AtomicBool::new(false));
         let leader_id = Arc::new(AtomicU64::new(0));
@@ -183,6 +184,13 @@ impl RaftPartitionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft_storage::ConvexRaftStorage;
+
+    fn test_engine() -> Arc<raft_engine::Engine> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.into_path();
+        ConvexRaftStorage::open_engine(path.to_str().unwrap()).unwrap()
+    }
 
     #[test]
     fn test_partition_state_defaults() {
@@ -193,7 +201,7 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = RaftPartitionManager::new(config, HashMap::new()).unwrap();
+        let manager = RaftPartitionManager::new(config, test_engine(), HashMap::new()).unwrap();
         let state = manager.state();
 
         assert!(!state.is_leader());
@@ -211,7 +219,7 @@ mod tests {
             heartbeat_tick: 3,
         };
 
-        let mut manager = RaftPartitionManager::new(config, HashMap::new()).unwrap();
+        let mut manager = RaftPartitionManager::new(config, test_engine(), HashMap::new()).unwrap();
         let state = manager.state();
 
         assert!(!state.is_leader());
@@ -236,7 +244,7 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = RaftPartitionManager::new(config, HashMap::new()).unwrap();
+        let manager = RaftPartitionManager::new(config, test_engine(), HashMap::new()).unwrap();
         let state = manager.state();
 
         // Should be able to send without error (node exists).

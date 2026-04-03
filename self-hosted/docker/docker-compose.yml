@@ -15,6 +15,7 @@
 
 x-backend-common: &backend-common
   image: ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest
+  pull_policy: always
   stop_grace_period: 10s
   stop_signal: SIGINT
   healthcheck:

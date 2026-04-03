@@ -71,8 +71,9 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 runtime = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }
-prost-011 = { package = "prost", version = "0.11" }
+protobuf = "2"
 raft = { workspace = true }
+raft-engine = { workspace = true }
 raft-proto = { workspace = true }
 search = { workspace = true }
 serde = { workspace = true }

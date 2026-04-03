@@ -15,6 +15,7 @@
 
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{
         Duration,
         Instant,
@@ -123,14 +124,31 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-    /// Create a new Raft node.
+    /// Create a new Raft node with persistent storage.
+    ///
+    /// The `engine` is a shared raft-engine instance (one per node, all
+    /// partitions share it). On first boot, the storage is initialized
+    /// with the given peers. On restart, existing state is loaded from
+    /// raft-engine — this is what prevents the "to_commit X is out of
+    /// range [last_index 0]" panic that MemStorage caused.
     pub fn new(
         config: RaftNodeConfig,
+        engine: Arc<raft_engine::Engine>,
         mailbox: mpsc::UnboundedReceiver<RaftMessage>,
         peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
     ) -> anyhow::Result<Self> {
-        let storage =
-            ConvexRaftStorage::new(config.partition_id, config.node_id, config.peers.clone());
+        let storage = ConvexRaftStorage::new(
+            config.partition_id,
+            engine,
+            config.node_id,
+            config.peers.clone(),
+        )?;
+
+        // On restart, pick up where we left off (applied index from
+        // the persisted hard state's commit). This prevents raft-rs
+        // from re-applying already-committed entries.
+        let initial_state = storage.initial_state().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let applied = initial_state.hard_state.get_commit();
 
         let raft_config = Config {
             id: config.node_id,
@@ -138,7 +156,7 @@ impl RaftNode {
             heartbeat_tick: config.heartbeat_tick,
             max_size_per_msg: 1024 * 1024,
             max_inflight_msgs: 256,
-            applied: 0,
+            applied,
             check_quorum: true,
             pre_vote: true,
             ..Default::default()
@@ -247,22 +265,21 @@ impl RaftNode {
                     }
                 }
 
-                // 2. Apply snapshot if present.
-                if *ready.snapshot() != Snapshot::default() {
-                    let snapshot = ready.snapshot().clone();
-                    if let Err(e) = self.storage.apply_snapshot(snapshot) {
-                        tracing::error!("Failed to apply snapshot: {e}");
-                    }
-                }
+                // 2. Snapshot transfer not yet implemented.
+                // Nodes that fall too far behind must re-bootstrap.
 
-                // 3. Persist log entries.
-                if let Err(e) = self.storage.append_entries(ready.entries()) {
-                    tracing::error!("Failed to append entries: {e}");
-                }
-
-                // 4. Persist hard state.
+                // 3+4. Persist log entries + hard state atomically.
+                // TiKV WriteBatch pattern: entries and hard state go in one
+                // atomic write to raft-engine for crash consistency.
                 if let Some(hs) = ready.hs() {
-                    self.storage.set_hardstate(hs.clone());
+                    if let Err(e) = self
+                        .storage
+                        .append_entries_and_hardstate(ready.entries(), hs)
+                    {
+                        tracing::error!("Failed to persist entries+hardstate: {e}");
+                    }
+                } else if let Err(e) = self.storage.append_entries(ready.entries()) {
+                    tracing::error!("Failed to persist entries: {e}");
                 }
 
                 // 5. Send persisted messages.
@@ -307,11 +324,13 @@ impl RaftNode {
                 // 7. Advance the Raft state.
                 let mut light_rd = self.raw_node.advance(ready);
 
-                // Update commit index.
+                // Update commit index in persisted hard state.
                 if let Some(commit) = light_rd.commit_index() {
-                    let mut hs = self.storage.hard_state();
-                    hs.commit = commit;
-                    self.storage.set_hardstate(hs);
+                    let mut hs = self.storage.hard_state().unwrap_or_default();
+                    hs.set_commit(commit);
+                    if let Err(e) = self.storage.set_hardstate(&hs) {
+                        tracing::error!("Failed to persist commit index: {e}");
+                    }
                 }
 
                 // Send any remaining messages.
@@ -389,7 +408,7 @@ impl RaftNode {
 
         self.storage.append_entries(ready.entries()).unwrap();
         if let Some(hs) = ready.hs() {
-            self.storage.set_hardstate(hs.clone());
+            self.storage.set_hardstate(hs).unwrap();
         }
         for entry in ready.take_committed_entries() {
             if !entry.data.is_empty() {
@@ -410,6 +429,14 @@ impl RaftNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft_storage::ConvexRaftStorage;
+
+    fn test_engine() -> Arc<raft_engine::Engine> {
+        let dir = tempfile::tempdir().unwrap();
+        // Leak the tempdir so it lives for the test duration.
+        let path = dir.into_path();
+        ConvexRaftStorage::open_engine(path.to_str().unwrap()).unwrap()
+    }
 
     #[tokio::test]
     async fn test_single_node_election() {
@@ -421,8 +448,9 @@ mod tests {
             heartbeat_tick: 3,
         };
 
+        let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
 
         // Tick enough times to trigger election.
         for _ in 0..20 {
@@ -443,8 +471,9 @@ mod tests {
             heartbeat_tick: 3,
         };
 
+        let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
 
         // Become leader first.
         for _ in 0..20 {
@@ -485,8 +514,9 @@ mod tests {
             heartbeat_tick: 3,
         };
 
+        let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
 
         let became_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let became_leader_clone = became_leader.clone();
