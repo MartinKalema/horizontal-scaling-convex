@@ -1,68 +1,293 @@
-services:
-  backend:
-    # Change this to :${REV} if you want to pin to a specific version
-    image: ghcr.io/get-convex/convex-backend:latest
-    stop_grace_period: 10s
-    stop_signal: SIGINT
-    ports:
-      - "${PORT:-3210}:3210"
-      - "${SITE_PROXY_PORT:-3211}:3211"
-    volumes:
-      - data:/convex/data
-    environment:
-      - ACTIONS_USER_TIMEOUT_SECS
-      - APPLICATION_MAX_CONCURRENT_MUTATIONS=${APPLICATION_MAX_CONCURRENT_MUTATIONS:-16}
-      - APPLICATION_MAX_CONCURRENT_NODE_ACTIONS=${APPLICATION_MAX_CONCURRENT_NODE_ACTIONS:-16}
-      - APPLICATION_MAX_CONCURRENT_QUERIES=${APPLICATION_MAX_CONCURRENT_QUERIES:-16}
-      - APPLICATION_MAX_CONCURRENT_V8_ACTIONS=${APPLICATION_MAX_CONCURRENT_V8_ACTIONS:-16}
-      - AWS_ACCESS_KEY_ID
-      - AWS_REGION
-      - AWS_S3_DISABLE_CHECKSUMS
-      - AWS_S3_DISABLE_SSE
-      - AWS_S3_FORCE_PATH_STYLE
-      - AWS_SECRET_ACCESS_KEY
-      - AWS_SESSION_TOKEN
-      - CONVEX_CLOUD_ORIGIN=${CONVEX_CLOUD_ORIGIN:-http://127.0.0.1:${PORT:-3210}}
-      - CONVEX_RELEASE_VERSION_DEV
-      - CONVEX_SITE_ORIGIN=${CONVEX_SITE_ORIGIN:-http://127.0.0.1:${SITE_PROXY_PORT:-3211}}
-      - DATABASE_URL
-      - DISABLE_BEACON
-      - DISABLE_METRICS_ENDPOINT=${DISABLE_METRICS_ENDPOINT:-true} # Enable if you want prometheus compatible /metrics endpoint
-      - DOCUMENT_RETENTION_DELAY=${DOCUMENT_RETENTION_DELAY:-172800} # Lower default document retention to 2 days
-      - DO_NOT_REQUIRE_SSL
-      - HTTP_SERVER_TIMEOUT_SECONDS
-      - INSTANCE_NAME
-      - INSTANCE_SECRET
-      - MYSQL_URL
-      - POSTGRES_URL
-      - REDACT_LOGS_TO_CLIENT
-      - RUST_BACKTRACE
-      - RUST_LOG=${RUST_LOG:-info}
-      - S3_ENDPOINT_URL
-      - S3_STORAGE_EXPORTS_BUCKET
-      - S3_STORAGE_FILES_BUCKET
-      - S3_STORAGE_MODULES_BUCKET
-      - S3_STORAGE_SEARCH_BUCKET
-      - S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET
+# Unified Docker Compose for Convex horizontal scaling.
+#
+# Two deployment modes — same pattern as CockroachDB, etcd, and YugabyteDB.
+# Raft consensus is always on. Single-node is a Raft group of 1.
+#
+# Usage:
+#   docker compose --profile single up    # 1 node (dev/test)
+#   docker compose --profile cluster up   # 6 nodes (read + write scaling + HA)
+#
+# Profiles are mutually exclusive — run one at a time.
+# Cluster mode: 2 partitions × 3 Raft nodes. Each partition has its own
+# leader with automatic failover. All nodes serve reads via NATS replication.
 
+# ── YAML Anchors (shared config, DRY) ─────────────────────────────
+
+x-backend-common: &backend-common
+  image: ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest
+  stop_grace_period: 10s
+  stop_signal: SIGINT
+  healthcheck:
+    test: curl -f http://localhost:3210/version
+    interval: 5s
+    start_period: 10s
+
+x-node-env-common: &node-env-common
+  POSTGRES_URL: postgresql://postgres:postgres@postgres:5432
+  DO_NOT_REQUIRE_SSL: "1"
+  RUST_LOG: info
+  DISABLE_BEACON: "true"
+  NATS_URL: nats://nats:4222
+  GRPC_PORT: "50051"
+  CHECKPOINT_STORAGE_PATH: /convex/data/checkpoints
+  REPLICATION_MODE: primary
+
+# ── Infrastructure ─────────────────────────────────────────────────
+
+services:
+  postgres:
+    image: postgres:17
+    profiles: [single, cluster]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: convex_self_hosted
+      CONVEX_INSTANCES: convex-node-0,convex-node-p0a,convex-node-p0b,convex-node-p0c,convex-node-p1a,convex-node-p1b,convex-node-p1c
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
     healthcheck:
-      test: curl -f http://localhost:3210/version
+      test: pg_isready -U postgres
       interval: 5s
       start_period: 10s
 
-  dashboard:
-    # Change this to :${REV} if you want to pin to a specific version
-    image: ghcr.io/get-convex/convex-dashboard:latest
-    stop_grace_period: 10s
-    stop_signal: SIGINT
+  nats:
+    image: nats:alpine
+    profiles: [single, cluster]
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
     ports:
-      - "${DASHBOARD_PORT:-6791}:6791"
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      start_period: 5s
+      retries: 3
+
+  # ── Single Node (Raft group of 1) ─────────────────────────────
+
+  node-0:
+    <<: *backend-common
+    profiles: [single]
+    ports:
+      - "3210:3210"
+      - "3211:3211"
+      - "50051:50051"
+    volumes:
+      - node-0-data:/convex/data
     environment:
-      - NEXT_PUBLIC_DEPLOYMENT_URL=${NEXT_PUBLIC_DEPLOYMENT_URL:-http://127.0.0.1:${PORT:-3210}}
-      - NEXT_PUBLIC_LOAD_MONACO_INTERNALLY
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-0
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
+      PARTITION_ID: "0"
+      NUM_PARTITIONS: "1"
+      RAFT_NODE_ID: "1"
+      RAFT_PEERS: 1=http://node-0:50051
     depends_on:
-      backend:
+      postgres:
+        condition: service_healthy
+      nats:
         condition: service_healthy
 
+  # ── Cluster (2 partitions × 3 Raft nodes) ─────────────────────
+  #
+  # Partition 0: messages, users (Raft group: p0a, p0b, p0c)
+  # Partition 1: projects, tasks (Raft group: p1a, p1b, p1c)
+  #
+  # Each partition elects its own leader. All 6 nodes serve reads.
+  # Kill any node — its Raft group elects a new leader in ~1 second.
+
+  # ── Partition 0 (messages, users) ──────────────────────────────
+
+  node-p0a:
+    <<: *backend-common
+    profiles: [cluster]
+    ports:
+      - "3210:3210"
+      - "3211:3211"
+      - "50051:50051"
+    volumes:
+      - node-p0a-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-p0a
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
+      PARTITION_ID: "0"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "2"
+      RAFT_NODE_ID: "1"
+      RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  node-p0b:
+    <<: *backend-common
+    profiles: [cluster]
+    ports:
+      - "3220:3210"
+      - "3221:3211"
+      - "50052:50051"
+    volumes:
+      - node-p0b-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-p0b
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3220
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3221
+      PARTITION_ID: "0"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "2"
+      RAFT_NODE_ID: "2"
+      RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      node-p0a:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  node-p0c:
+    <<: *backend-common
+    profiles: [cluster]
+    ports:
+      - "3230:3210"
+      - "3231:3211"
+      - "50053:50051"
+    volumes:
+      - node-p0c-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-p0c
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3230
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3231
+      PARTITION_ID: "0"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "2"
+      RAFT_NODE_ID: "3"
+      RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      node-p0b:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # ── Partition 1 (projects, tasks) ──────────────────────────────
+
+  node-p1a:
+    <<: *backend-common
+    profiles: [cluster]
+    ports:
+      - "3310:3210"
+      - "3311:3211"
+      - "50061:50051"
+    volumes:
+      - node-p1a-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-p1a
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3310
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3311
+      PARTITION_ID: "1"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "2"
+      RAFT_NODE_ID: "1"
+      RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
+    depends_on:
+      node-p0c:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  node-p1b:
+    <<: *backend-common
+    profiles: [cluster]
+    ports:
+      - "3320:3210"
+      - "3321:3211"
+      - "50062:50051"
+    volumes:
+      - node-p1b-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-p1b
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3320
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3321
+      PARTITION_ID: "1"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "2"
+      RAFT_NODE_ID: "2"
+      RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      node-p1a:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  node-p1c:
+    <<: *backend-common
+    profiles: [cluster]
+    ports:
+      - "3330:3210"
+      - "3331:3211"
+      - "50063:50051"
+    volumes:
+      - node-p1c-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-p1c
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3330
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3331
+      PARTITION_ID: "1"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "2"
+      RAFT_NODE_ID: "3"
+      RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      node-p1b:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # ── Dashboard ──────────────────────────────────────────────────
+
+  dashboard:
+    image: ghcr.io/get-convex/convex-dashboard:latest
+    profiles: [single, cluster]
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    restart: unless-stopped
+    ports:
+      - "6791:6791"
+    environment:
+      - NEXT_PUBLIC_DEPLOYMENT_URL=http://127.0.0.1:3210
+
+# ── Volumes ──────────────────────────────────────────────────────
+
 volumes:
-  data:
+  pgdata:
+  natsdata:
+  node-0-data:
+  node-p0a-data:
+  node-p0b-data:
+  node-p0c-data:
+  node-p1a-data:
+  node-p1b-data:
+  node-p1c-data:
+  shared-storage:

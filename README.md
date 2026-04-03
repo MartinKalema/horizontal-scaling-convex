@@ -176,37 +176,21 @@ One Primary handles writes, multiple Replicas serve reads. Replicas remap Tablet
 
 ## Quick Start
 
-### Build
+One Docker Compose file, two profiles — same as CockroachDB, etcd, and YugabyteDB. Raft consensus is always on (single-node is a Raft group of 1).
 
-```sh
-docker build -f self-hosted/docker-build/Dockerfile.backend \
-  -t convex-backend-replicated .
-```
-
-### Run Raft Consensus (3-Node Automatic Failover)
+### Run
 
 ```sh
 cd self-hosted/docker
-docker compose -f docker-compose.raft.yml up
+
+# 1 node (dev/test)
+docker compose --profile single up
+
+# 6 nodes — 2 partitions × 3 Raft nodes (read + write scaling + HA)
+docker compose --profile cluster up
 ```
 
-Three Raft nodes: Node A (port 3210, id=1), Node B (port 3220, id=2), Node C (port 3230, id=3). Leader elected automatically. Kill any node — writes resume on the new leader within ~1 second.
-
-### Run Partitioned Multi-Writer
-
-```sh
-cd self-hosted/docker
-docker compose -f docker-compose.partitioned.yml up
-```
-
-Two writer nodes: Node A (port 3210, partition 0) and Node B (port 3220, partition 1).
-
-### Run Primary-Replica
-
-```sh
-cd self-hosted/docker
-docker compose -f docker-compose.replicated.yml up
-```
+Images are published to `ghcr.io/martinkalema/convex-horizontal-scaling` — no local build needed.
 
 ### Test
 
@@ -223,7 +207,7 @@ cd self-hosted/docker
 ### Deploy Functions
 
 ```sh
-docker compose -f docker-compose.partitioned.yml exec node-a ./generate_admin_key.sh
+docker compose --profile cluster exec node-p0a ./generate_admin_key.sh
 npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 ```
 
