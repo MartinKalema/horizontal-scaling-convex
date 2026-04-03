@@ -616,7 +616,7 @@ mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
 # Wait for Node B to come back healthy
 echo "  Waiting for Node B to recover..."
 for attempt in $(seq 1 30); do
-    if curl -sf "http://127.0.0.1:3220/version" > /dev/null 2>&1; then
+    if curl -sf "http://127.0.0.1:3310/version" > /dev/null 2>&1; then
         break
     fi
     sleep 1
@@ -834,7 +834,7 @@ mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
 
 echo "  Waiting for recovery..."
 for attempt in $(seq 1 30); do
-    curl -sf "http://127.0.0.1:3220/version" > /dev/null 2>&1 && break
+    curl -sf "http://127.0.0.1:3310/version" > /dev/null 2>&1 && break
     sleep 1
 done
 
@@ -847,7 +847,7 @@ mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
 
 echo "  Waiting for recovery..."
 for attempt in $(seq 1 30); do
-    curl -sf "http://127.0.0.1:3220/version" > /dev/null 2>&1 && break
+    curl -sf "http://127.0.0.1:3310/version" > /dev/null 2>&1 && break
     sleep 1
 done
 
