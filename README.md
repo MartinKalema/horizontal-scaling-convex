@@ -197,11 +197,9 @@ Images are published to `ghcr.io/martinkalema/convex-horizontal-scaling` — no 
 ```sh
 cd self-hosted/docker
 
-# Raft failover tests (10 tests — election, failover, rejoin)
-./test-raft-failover.sh
-
-# Write scaling tests (77 tests — Jepsen workloads, 2PC, chaos)
-./test-write-scaling.sh
+./test.sh              # All tests (87 tests — scaling + failover)
+./test.sh scaling      # Write scaling only (77 tests)
+./test.sh failover     # Raft failover only (10 tests)
 ```
 
 ### Deploy Functions
