@@ -136,16 +136,16 @@ Each partition is a 3-node Raft group. The leader runs the Committer. If the lea
 ### Write Scaling (Partitioned Multi-Writer)
 
 ```
-                    ┌──────────────────────────────┐
-                    │   Global Timestamp Oracle     │
-                    │   (NATS KV, TiDB PD pattern)  │
-                    └──────────┬───────────────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              │                │                │
+                    ┌─────────────────────────────┐
+                    │  Global Timestamp Oracle    │
+                    │  (NATS KV, TiDB PD pattern) │
+                    └─────────┬───────────────────┘
+                              │
+              ┌───────────────┼────────────────┐
+              │               │                │
         ┌─────┴──────┐        │        ┌───────┴─────┐
         │  Node A    │        │        │   Node B    │
-        │  partition 0│        │        │  partition 1│
+        │ partition 0│        │        │  partition 1│
         │  messages  │        │        │  projects   │
         │  users     │        │        │  tasks      │
         └─────┬──────┘        │        └───────┬─────┘
