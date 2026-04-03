@@ -1219,15 +1219,29 @@ impl<RT: Runtime> Committer<RT> {
 
         // Classify each update as user-relevant or node-local.
         //
-        // Like CockroachDB's separation of system descriptors (global) from
-        // node-local operational state: metadata that describes user tables
-        // must replicate globally, but each node's operational state is local.
+        // CockroachDB GLOBAL table locality pattern: system tables are split
+        // into two categories (see pkg/sql/catalog/systemschema/system.go):
         //
-        // Categories:
+        //   GLOBAL (replicated via Raft to all nodes):
+        //     system.descriptor, system.namespace, system.users, system.zones,
+        //     system.settings, system.role_members — schema and auth metadata
+        //     needed by every node to serve queries.
+        //
+        //   NODE-LOCAL (per-range operational state):
+        //     system.lease, system.sqlliveness, system.jobs,
+        //     system.statement_statistics — ephemeral per-node state.
+        //
+        // YugabyteDB uses a dedicated system catalog tablet (Raft-replicated)
+        // for pg_class, pg_attribute, pg_proc (stored procedures/functions).
+        // TiDB stores all metadata in TiKV (Raft-replicated) with schema
+        // version polling via tidb_schema_lease.
+        //
+        // Categories for Convex:
         //   1. _tables entries for user tables → Phase 1 (table creation)
         //   2. _index entries for user tables → Phase 2 (index creation)
         //   3. User table document data → Phase 2 (data replication)
-        //   4. Everything else (node-local system data) → SKIP
+        //   4. GLOBAL deployment tables → Phase 2 (function/schema replication)
+        //   5. Everything else (node-local system data) → SKIP
         //
         // The key insight: we classify by what the data DESCRIBES, not by
         // which system table it's stored in. An _index entry creating
@@ -1237,6 +1251,27 @@ impl<RT: Runtime> Committer<RT> {
 
         let tables_table_name: &value::TableName = &TABLES_TABLE;
         let index_table_name: &value::TableName = &INDEX_TABLE;
+
+        // GLOBAL deployment system tables (CockroachDB GLOBAL locality pattern).
+        //
+        // These tables contain deployment state that every node needs to serve
+        // queries and mutations — function code, runtime config, and bundled
+        // source. Without these, followers can't execute user functions after
+        // a deploy to the leader.
+        //
+        // Equivalent to CockroachDB's system.descriptor (schema definitions),
+        // YugabyteDB's pg_proc (stored procedures), and TiDB's mysql.tidb
+        // (DDL schema state).
+        let global_deployment_tables: &[&str] = &[
+            "_modules",          // JavaScript/TypeScript function source code
+            "_udf_config",       // UDF runtime configuration
+            "_source_packages",  // Bundled source packages
+        ];
+        let is_global_deployment_table = |name: &value::TableName| -> bool {
+            let name_str = name.to_string();
+            global_deployment_tables.iter().any(|&t| name_str == t)
+        };
+
         let mut tables_updates = Vec::new();
         let mut other_updates = Vec::new();
         let mut skipped_system = 0usize;
@@ -1251,10 +1286,9 @@ impl<RT: Runtime> Committer<RT> {
                 // table_exists check.
                 tables_updates.push(update);
             } else if table_name.map(|n| n == index_table_name).unwrap_or(false) {
-                // _index entry: check if it describes a user table index.
-                // Parse the table_id field from the document and check if
-                // it maps to a user table in the delta's tablet mapping.
-                let is_user_index = update.new_document.as_ref().map_or(false, |doc| {
+                // _index entry: check if it describes a user table index
+                // or a GLOBAL deployment table index.
+                let is_replicated_index = update.new_document.as_ref().map_or(false, |doc| {
                     doc.value()
                         .0
                         .get(&"table_id".parse::<common::types::FieldName>().unwrap())
@@ -1270,16 +1304,26 @@ impl<RT: Runtime> Committer<RT> {
                             delta
                                 .tablet_id_to_table_name
                                 .get(&tid)
-                                .map_or(false, |name| !name.is_system())
+                                .map_or(false, |name| {
+                                    !name.is_system() || is_global_deployment_table(name)
+                                })
                         })
                 });
-                if is_user_index {
+                if is_replicated_index {
                     other_updates.push(update);
                 } else {
                     skipped_system += 1;
                 }
             } else if table_name.map(|n| !n.is_system()).unwrap_or(false) {
                 // User table data: replicate.
+                other_updates.push(update);
+            } else if table_name
+                .map(|n| is_global_deployment_table(n))
+                .unwrap_or(false)
+            {
+                // GLOBAL deployment system table: replicate.
+                // These contain function code and config needed by every node
+                // to execute queries and mutations (CockroachDB GLOBAL pattern).
                 other_updates.push(update);
             } else {
                 // Node-local system data: skip.
