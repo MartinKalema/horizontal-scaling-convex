@@ -49,7 +49,7 @@ echo -e "${BOLD}Preflight checks${NC}"
 for name in docker-node-p0a-1 docker-node-p0b-1 docker-node-p0c-1; do
     if ! docker inspect "$name" > /dev/null 2>&1; then
         echo -e "${RED}Container $name not running. Start:${NC}"
-        echo "  docker compose -f docker-compose.raft.yml up"
+        echo "  docker compose --profile cluster up"
         exit 1
     fi
 done

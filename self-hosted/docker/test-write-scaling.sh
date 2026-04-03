@@ -316,6 +316,14 @@ export const readTwoKeys = query({
     return { a: a?.text ?? null, b: b?.text ?? null };
   },
 });
+
+// Simple message count (used by failover tests).
+export const count = query({
+  handler: async (ctx) => {
+    const msgs = await ctx.db.query("messages").collect();
+    return msgs.length;
+  },
+});
 TSEOF
 
 echo "  Deploying functions..."
