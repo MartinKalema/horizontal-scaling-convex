@@ -1,0 +1,194 @@
+# Raft consensus deployment for automatic failover.
+#
+# 3 nodes per partition with tikv/raft-rs consensus:
+#   - Partition 0 (messages, users): node-a (id=1), node-b (id=2), node-c (id=3)
+#   - Cross-partition replication still uses NATS JetStream
+#
+# When the Raft leader dies, a follower is elected within ~1 second
+# and starts accepting writes. No manual intervention needed.
+#
+# Usage:
+#   docker compose -f docker-compose.raft.yml up
+#
+# Test failover:
+#   docker kill docker-node-a-1    # kill the likely leader
+#   # writes should resume on node-b or node-c within seconds
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: convex_self_hosted
+      CONVEX_INSTANCES: convex-node-a,convex-node-b,convex-node-c
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 5s
+      start_period: 10s
+
+  nats:
+    image: nats:alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      start_period: 5s
+      retries: 3
+
+  # Raft node 1 (likely initial leader — lowest ID)
+  node-a:
+    image: convex-backend-replicated:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "3210:3210"
+      - "3211:3211"
+      - "50051:50051"
+      - "50061:50061"
+    volumes:
+      - node-a-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
+      - DO_NOT_REQUIRE_SSL=1
+      - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3210
+      - CONVEX_SITE_ORIGIN=http://127.0.0.1:3211
+      - RUST_LOG=info
+      - DISABLE_BEACON=true
+      - INSTANCE_NAME=convex-node-a
+      - REPLICATION_MODE=primary
+      - NATS_URL=nats://nats:4222
+      - GRPC_PORT=50051
+      - CHECKPOINT_STORAGE_PATH=/convex/data/checkpoints
+      # Partition config
+      - PARTITION_ID=0
+      - PARTITION_MAP=messages=0,users=0,projects=1,tasks=1
+      - NUM_PARTITIONS=1
+      # Raft config: 3-node group for partition 0
+      - RAFT_NODE_ID=1
+      - RAFT_PEERS=1=node-a:50061,2=node-b:50061,3=node-c:50061
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: curl -f http://localhost:3210/version
+      interval: 5s
+      start_period: 10s
+
+  # Raft node 2 (follower, becomes leader if node-a dies)
+  node-b:
+    image: convex-backend-replicated:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "3220:3210"
+      - "3221:3211"
+      - "50052:50051"
+      - "50062:50061"
+    volumes:
+      - node-b-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
+      - DO_NOT_REQUIRE_SSL=1
+      - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3220
+      - CONVEX_SITE_ORIGIN=http://127.0.0.1:3221
+      - RUST_LOG=info
+      - DISABLE_BEACON=true
+      - INSTANCE_NAME=convex-node-b
+      - REPLICATION_MODE=primary
+      - NATS_URL=nats://nats:4222
+      - GRPC_PORT=50051
+      - CHECKPOINT_STORAGE_PATH=/convex/data/checkpoints
+      - REPLICA_STORAGE_PATH=/convex/data/storage
+      # Partition config (same partition as node-a — Raft replicas)
+      - PARTITION_ID=0
+      - PARTITION_MAP=messages=0,users=0,projects=1,tasks=1
+      - NUM_PARTITIONS=1
+      # Raft config
+      - RAFT_NODE_ID=2
+      - RAFT_PEERS=1=node-a:50061,2=node-b:50061,3=node-c:50061
+    depends_on:
+      node-a:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: curl -f http://localhost:3210/version
+      interval: 5s
+      start_period: 10s
+
+  # Raft node 3 (follower, becomes leader if both node-a and node-b die)
+  node-c:
+    image: convex-backend-replicated:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "3230:3210"
+      - "3231:3211"
+      - "50053:50051"
+      - "50063:50061"
+    volumes:
+      - node-c-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432
+      - DO_NOT_REQUIRE_SSL=1
+      - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3230
+      - CONVEX_SITE_ORIGIN=http://127.0.0.1:3231
+      - RUST_LOG=info
+      - DISABLE_BEACON=true
+      - INSTANCE_NAME=convex-node-c
+      - REPLICATION_MODE=primary
+      - NATS_URL=nats://nats:4222
+      - GRPC_PORT=50051
+      - CHECKPOINT_STORAGE_PATH=/convex/data/checkpoints
+      - REPLICA_STORAGE_PATH=/convex/data/storage
+      # Partition config (same partition as node-a — Raft replicas)
+      - PARTITION_ID=0
+      - PARTITION_MAP=messages=0,users=0,projects=1,tasks=1
+      - NUM_PARTITIONS=1
+      # Raft config
+      - RAFT_NODE_ID=3
+      - RAFT_PEERS=1=node-a:50061,2=node-b:50061,3=node-c:50061
+    depends_on:
+      node-b:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: curl -f http://localhost:3210/version
+      interval: 5s
+      start_period: 10s
+
+  dashboard:
+    image: ghcr.io/get-convex/convex-dashboard:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "6791:6791"
+    environment:
+      - NEXT_PUBLIC_DEPLOYMENT_URL=http://127.0.0.1:3210
+    depends_on:
+      node-a:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  natsdata:
+  node-a-data:
+  node-b-data:
+  node-c-data:
+  shared-storage:
