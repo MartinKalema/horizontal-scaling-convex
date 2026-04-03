@@ -499,14 +499,42 @@ pub async fn make_app(
         raft_mailbox_tx = Some(mb_tx);
 
         // Start the Raft node in a background task.
+        // TiKV Apply Worker pattern: committed Raft entries are applied
+        // to the state machine. On the leader, on_committed is a no-op
+        // (already applied locally). On followers, on_committed deserializes
+        // the CommitDelta and applies it via apply_replica_delta.
         if let Some(mut node) = manager.take_node() {
             let committer = database.committer_client();
+            let raft_state_for_apply = raft_state.clone();
             runtime.spawn_background("raft_node", async move {
                 node.run(|data| {
-                    // Committed Raft entry → apply to Committer.
-                    // For now, log the entry. Full integration will execute
-                    // the mutation via the Committer.
-                    tracing::info!("Raft committed entry: {} bytes", data.len(),);
+                    // Deserialize the CommitDelta from the Raft entry.
+                    let envelope: database::nats_distributed_log::DeltaEnvelope =
+                        serde_json::from_slice(data).map_err(|e| {
+                            anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
+                        })?;
+                    let delta = envelope.to_delta()?;
+
+                    // Leader already applied locally — skip.
+                    // Followers apply via the Committer (same path as NATS).
+                    if !raft_state_for_apply.is_leader() {
+                        tracing::info!(
+                            "Raft follower applying committed delta: ts={}",
+                            u64::from(delta.ts),
+                        );
+                        // apply_replica_delta is async — use block_in_place
+                        // since we're in the Raft loop's sync callback.
+                        let committer = committer.clone();
+                        common::runtime::block_in_place(|| {
+                            let rt = tokio::runtime::Handle::current();
+                            rt.block_on(async {
+                                if let Err(e) = committer.apply_replica_delta(delta).await {
+                                    tracing::error!("Raft follower apply failed: {e:#}");
+                                }
+                            })
+                        });
+                    }
+
                     Ok(())
                 })
                 .await;

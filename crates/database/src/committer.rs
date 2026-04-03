@@ -1098,7 +1098,7 @@ impl<RT: Runtime> Committer<RT> {
             }
         }
 
-        // Publish delta to distributed log for Replica consumption.
+        // Publish delta to distributed log for cross-partition Replica consumption.
         let delta = CommitDelta {
             ts: commit_ts,
             document_writes,
@@ -1108,6 +1108,30 @@ impl<RT: Runtime> Committer<RT> {
             write_bytes,
             tablet_id_to_table_name,
         };
+
+        // Propose delta to Raft for intra-partition replication (if Raft enabled).
+        // TiKV pattern: leader proposes pre-computed writes to Raft after local commit.
+        // Followers receive the committed entry and apply via apply_replica_delta.
+        if let Some(ref raft) = self.raft_state {
+            if raft.is_leader() {
+                let envelope = crate::nats_distributed_log::DeltaEnvelope::from_delta(
+                    &delta,
+                    &format!("raft-leader"),
+                );
+                if let Ok(envelope) = envelope {
+                    if let Ok(data) = serde_json::to_vec(&envelope) {
+                        let (tx, _rx) = tokio::sync::oneshot::channel();
+                        let _ = raft.send(crate::raft_node::RaftMessage::Propose(
+                            crate::raft_node::RaftProposal {
+                                data,
+                                result_tx: tx,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
         let distributed_log = self.distributed_log.clone();
         let delta_ts = commit_ts;
         tokio_spawn("publish_commit_delta", async move {

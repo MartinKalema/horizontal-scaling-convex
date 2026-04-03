@@ -126,9 +126,11 @@ impl NatsDistributedLog {
     }
 }
 
-/// Serializable envelope for transporting CommitDelta over NATS.
+/// Serializable envelope for transporting CommitDelta over NATS and Raft.
+/// Used by both NatsDistributedLog and the Raft state machine to serialize
+/// deltas for transport between nodes.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct DeltaEnvelope {
+pub struct DeltaEnvelope {
     ts: u64,
     write_source: Option<String>,
     write_bytes: u64,
@@ -145,7 +147,7 @@ struct DeltaEnvelope {
 }
 
 impl DeltaEnvelope {
-    fn from_delta(delta: &CommitDelta, source_node: &str) -> anyhow::Result<Self> {
+    pub fn from_delta(delta: &CommitDelta, source_node: &str) -> anyhow::Result<Self> {
         let document_updates_proto = delta
             .document_updates
             .iter()
@@ -171,7 +173,7 @@ impl DeltaEnvelope {
         })
     }
 
-    fn to_delta(self) -> anyhow::Result<CommitDelta> {
+    pub fn to_delta(self) -> anyhow::Result<CommitDelta> {
         let document_updates = self
             .document_updates_proto
             .into_iter()
