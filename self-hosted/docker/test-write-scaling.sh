@@ -52,7 +52,7 @@
 set -euo pipefail
 
 NODE_A_URL="http://127.0.0.1:3210"
-NODE_B_URL="http://127.0.0.1:3220"
+NODE_B_URL="http://127.0.0.1:3310"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
