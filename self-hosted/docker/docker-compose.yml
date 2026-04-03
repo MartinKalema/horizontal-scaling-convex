@@ -1,7 +1,81 @@
+# Unified Docker Compose for Convex horizontal scaling.
+#
+# One file, four deployment modes via Docker Compose profiles
+# (same pattern as CockroachDB, etcd, and YugabyteDB quickstarts).
+#
+# Usage:
+#   docker compose --profile single up        # Vanilla single-node
+#   docker compose --profile replicated up    # Primary + 2 read replicas
+#   docker compose --profile partitioned up   # 2 partitioned writer nodes
+#   docker compose --profile ha up            # 3-node Raft consensus group
+#
+# Profiles are mutually exclusive — run one at a time.
+# Node counts follow the giants' Docker quickstart pattern:
+# fixed 3-node clusters for dev. Use Kubernetes for variable counts.
+
+# ── YAML Anchors (shared config, DRY) ─────────────────────────────
+
+x-backend-common: &backend-common
+  image: ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest
+  stop_grace_period: 10s
+  stop_signal: SIGINT
+  healthcheck:
+    test: curl -f http://localhost:3210/version
+    interval: 5s
+    start_period: 10s
+
+x-node-env-common: &node-env-common
+  POSTGRES_URL: postgresql://postgres:postgres@postgres:5432
+  DO_NOT_REQUIRE_SSL: "1"
+  RUST_LOG: info
+  DISABLE_BEACON: "true"
+  NATS_URL: nats://nats:4222
+  GRPC_PORT: "50051"
+  CHECKPOINT_STORAGE_PATH: /convex/data/checkpoints
+  REPLICATION_MODE: primary
+
+# ── Infrastructure ─────────────────────────────────────────────────
+
 services:
+  postgres:
+    image: postgres:17
+    profiles: [replicated, partitioned, ha]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: convex_self_hosted
+      # Superset: creates all databases regardless of profile.
+      # Unused databases cost nothing (~few KB metadata).
+      CONVEX_INSTANCES: convex-primary,convex-replica,convex-replica2,convex-node-a,convex-node-b,convex-node-c
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 5s
+      start_period: 10s
+
+  nats:
+    image: nats:alpine
+    profiles: [replicated, partitioned, ha]
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      start_period: 5s
+      retries: 3
+
+  # ── Single-Node Mode ───────────────────────────────────────────
+
   backend:
-    # Change this to :${REV} if you want to pin to a specific version
     image: ghcr.io/get-convex/convex-backend:latest
+    profiles: [single]
     stop_grace_period: 10s
     stop_signal: SIGINT
     ports:
@@ -27,8 +101,8 @@ services:
       - CONVEX_SITE_ORIGIN=${CONVEX_SITE_ORIGIN:-http://127.0.0.1:${SITE_PROXY_PORT:-3211}}
       - DATABASE_URL
       - DISABLE_BEACON
-      - DISABLE_METRICS_ENDPOINT=${DISABLE_METRICS_ENDPOINT:-true} # Enable if you want prometheus compatible /metrics endpoint
-      - DOCUMENT_RETENTION_DELAY=${DOCUMENT_RETENTION_DELAY:-172800} # Lower default document retention to 2 days
+      - DISABLE_METRICS_ENDPOINT=${DISABLE_METRICS_ENDPOINT:-true}
+      - DOCUMENT_RETENTION_DELAY=${DOCUMENT_RETENTION_DELAY:-172800}
       - DO_NOT_REQUIRE_SSL
       - HTTP_SERVER_TIMEOUT_SECONDS
       - INSTANCE_NAME
@@ -44,25 +118,244 @@ services:
       - S3_STORAGE_MODULES_BUCKET
       - S3_STORAGE_SEARCH_BUCKET
       - S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET
-
     healthcheck:
       test: curl -f http://localhost:3210/version
       interval: 5s
       start_period: 10s
 
-  dashboard:
-    # Change this to :${REV} if you want to pin to a specific version
-    image: ghcr.io/get-convex/convex-dashboard:latest
-    stop_grace_period: 10s
-    stop_signal: SIGINT
+  # ── Replicated Mode (Primary + 2 Read Replicas) ───────────────
+
+  primary:
+    <<: *backend-common
+    profiles: [replicated]
     ports:
-      - "${DASHBOARD_PORT:-6791}:6791"
+      - "3210:3210"
+      - "3211:3211"
+      - "50051:50051"
+    volumes:
+      - primary-data:/convex/data
+      - shared-storage:/convex/data/storage
     environment:
-      - NEXT_PUBLIC_DEPLOYMENT_URL=${NEXT_PUBLIC_DEPLOYMENT_URL:-http://127.0.0.1:${PORT:-3210}}
-      - NEXT_PUBLIC_LOAD_MONACO_INTERNALLY
+      <<: *node-env-common
+      INSTANCE_NAME: convex-primary
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
     depends_on:
-      backend:
+      postgres:
+        condition: service_healthy
+      nats:
         condition: service_healthy
 
+  replica:
+    <<: *backend-common
+    profiles: [replicated]
+    ports:
+      - "3220:3210"
+      - "3221:3211"
+    volumes:
+      - replica-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-replica
+      REPLICATION_MODE: replica
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3220
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3221
+      PRIMARY_GRPC_URL: http://primary:50051
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      primary:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  replica2:
+    <<: *backend-common
+    profiles: [replicated]
+    ports:
+      - "3230:3210"
+      - "3231:3211"
+    volumes:
+      - replica2-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-replica2
+      REPLICATION_MODE: replica
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3230
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3231
+      PRIMARY_GRPC_URL: http://primary:50051
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      primary:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # ── Partitioned Mode (2 Writer Nodes) ──────────────────────────
+
+  part-node-a:
+    <<: *backend-common
+    profiles: [partitioned]
+    ports:
+      - "3210:3210"
+      - "3211:3211"
+      - "50051:50051"
+    volumes:
+      - part-node-a-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-a
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
+      PARTITION_ID: "0"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  part-node-b:
+    <<: *backend-common
+    profiles: [partitioned]
+    ports:
+      - "3220:3210"
+      - "3221:3211"
+      - "50052:50051"
+    volumes:
+      - part-node-b-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-b
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3220
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3221
+      PARTITION_ID: "1"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "2"
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      part-node-a:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # ── HA Mode (3-Node Raft Consensus) ────────────────────────────
+
+  ha-node-a:
+    <<: *backend-common
+    profiles: [ha]
+    ports:
+      - "3210:3210"
+      - "3211:3211"
+      - "50051:50051"
+    volumes:
+      - ha-node-a-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-a
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
+      PARTITION_ID: "0"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "1"
+      RAFT_NODE_ID: "1"
+      RAFT_PEERS: 1=http://ha-node-a:50051,2=http://ha-node-b:50051,3=http://ha-node-c:50051
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  ha-node-b:
+    <<: *backend-common
+    profiles: [ha]
+    ports:
+      - "3220:3210"
+      - "3221:3211"
+      - "50052:50051"
+    volumes:
+      - ha-node-b-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-b
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3220
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3221
+      PARTITION_ID: "0"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "1"
+      RAFT_NODE_ID: "2"
+      RAFT_PEERS: 1=http://ha-node-a:50051,2=http://ha-node-b:50051,3=http://ha-node-c:50051
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      ha-node-a:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  ha-node-c:
+    <<: *backend-common
+    profiles: [ha]
+    ports:
+      - "3230:3210"
+      - "3231:3211"
+      - "50053:50051"
+    volumes:
+      - ha-node-c-data:/convex/data
+      - shared-storage:/convex/data/storage
+    environment:
+      <<: *node-env-common
+      INSTANCE_NAME: convex-node-c
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3230
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3231
+      PARTITION_ID: "0"
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      NUM_PARTITIONS: "1"
+      RAFT_NODE_ID: "3"
+      RAFT_PEERS: 1=http://ha-node-a:50051,2=http://ha-node-b:50051,3=http://ha-node-c:50051
+      REPLICA_STORAGE_PATH: /convex/data/storage
+    depends_on:
+      ha-node-b:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # ── Dashboard ──────────────────────────────────────────────────
+
+  dashboard:
+    image: ghcr.io/get-convex/convex-dashboard:latest
+    profiles: [single, replicated, partitioned, ha]
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    restart: unless-stopped
+    ports:
+      - "6791:6791"
+    environment:
+      - NEXT_PUBLIC_DEPLOYMENT_URL=http://127.0.0.1:3210
+
+# ── Volumes ──────────────────────────────────────────────────────
+
 volumes:
+  # Infrastructure
+  pgdata:
+  natsdata:
+  # Single mode
   data:
+  # Replicated mode
+  primary-data:
+  replica-data:
+  replica2-data:
+  # Partitioned mode
+  part-node-a-data:
+  part-node-b-data:
+  # HA mode
+  ha-node-a-data:
+  ha-node-b-data:
+  ha-node-c-data:
+  # Shared across multi-node modes
+  shared-storage:

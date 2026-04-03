@@ -176,6 +176,8 @@ One Primary handles writes, multiple Replicas serve reads. Replicas remap Tablet
 
 ## Quick Start
 
+One Docker Compose file, four deployment modes via profiles (same pattern as CockroachDB, etcd, and YugabyteDB Docker quickstarts).
+
 ### Build
 
 ```sh
@@ -183,29 +185,22 @@ docker build -f self-hosted/docker-build/Dockerfile.backend \
   -t convex-backend-replicated .
 ```
 
-### Run Raft Consensus (3-Node Automatic Failover)
+### Run
 
 ```sh
 cd self-hosted/docker
-docker compose -f docker-compose.raft.yml up
-```
 
-Three Raft nodes: Node A (port 3210, id=1), Node B (port 3220, id=2), Node C (port 3230, id=3). Leader elected automatically. Kill any node — writes resume on the new leader within ~1 second.
+# Single node (vanilla Convex)
+docker compose --profile single up
 
-### Run Partitioned Multi-Writer
+# Primary + 2 read replicas
+docker compose --profile replicated up
 
-```sh
-cd self-hosted/docker
-docker compose -f docker-compose.partitioned.yml up
-```
+# 2 partitioned writer nodes
+docker compose --profile partitioned up
 
-Two writer nodes: Node A (port 3210, partition 0) and Node B (port 3220, partition 1).
-
-### Run Primary-Replica
-
-```sh
-cd self-hosted/docker
-docker compose -f docker-compose.replicated.yml up
+# 3-node Raft consensus (automatic failover)
+docker compose --profile ha up
 ```
 
 ### Test
@@ -223,7 +218,7 @@ cd self-hosted/docker
 ### Deploy Functions
 
 ```sh
-docker compose -f docker-compose.partitioned.yml exec node-a ./generate_admin_key.sh
+docker compose --profile ha exec ha-node-a ./generate_admin_key.sh
 npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 ```
 

@@ -11,7 +11,7 @@
 #   - YugabyteDB Jepsen nightly resilience benchmarks
 #
 # Prerequisites:
-#   docker compose -f docker-compose.raft.yml up
+#   docker compose --profile ha up
 #
 # Usage:
 #   cd self-hosted/docker && ./test-raft-failover.sh
@@ -46,7 +46,7 @@ fail() {
 echo ""
 echo -e "${BOLD}Preflight checks${NC}"
 
-for name in docker-node-a-1 docker-node-b-1 docker-node-c-1; do
+for name in docker-ha-node-a-1 docker-ha-node-b-1 docker-ha-node-c-1; do
     if ! docker inspect "$name" > /dev/null 2>&1; then
         echo -e "${RED}Container $name not running. Start:${NC}"
         echo "  docker compose -f docker-compose.raft.yml up"
@@ -56,9 +56,9 @@ done
 echo "  All 3 Raft nodes running."
 
 # Generate admin keys for all nodes.
-KEY_A=$(docker exec docker-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
-KEY_B=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
-KEY_C=$(docker exec docker-node-c-1 ./generate_admin_key.sh 2>&1 | tail -1)
+KEY_A=$(docker exec docker-ha-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+KEY_B=$(docker exec docker-ha-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+KEY_C=$(docker exec docker-ha-node-c-1 ./generate_admin_key.sh 2>&1 | tail -1)
 echo "  Admin keys generated."
 
 # Deploy functions to Node A (leader deploys, followers replicate).
@@ -166,7 +166,7 @@ echo -e "${BOLD}Test 4: Kill Leader, Verify Failover${NC}"
 PRE_KILL=$CA
 
 echo "  Killing Node A (likely leader)..."
-docker kill docker-node-a-1 > /dev/null 2>&1
+docker kill docker-ha-node-a-1 > /dev/null 2>&1
 
 sleep 5
 
@@ -200,7 +200,7 @@ echo -e "${BOLD}Test 5: Restart Killed Node, Verify Rejoin${NC}"
 # ============================================================
 
 echo "  Restarting Node A..."
-docker start docker-node-a-1 > /dev/null 2>&1
+docker start docker-ha-node-a-1 > /dev/null 2>&1
 
 echo "  Waiting for recovery..."
 for attempt in $(seq 1 30); do
@@ -208,7 +208,7 @@ for attempt in $(seq 1 30); do
     sleep 1
 done
 
-KEY_A=$(docker exec docker-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+KEY_A=$(docker exec docker-ha-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$KEY_A" --url "$NODE_A_URL" > /dev/null 2>&1)
 
 sleep 4

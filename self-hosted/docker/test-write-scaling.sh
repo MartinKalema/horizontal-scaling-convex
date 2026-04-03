@@ -44,7 +44,7 @@
 #  37. Ultimate Final Invariant Check
 #
 # Prerequisites:
-#   docker compose -f docker-compose.partitioned.yml up
+#   docker compose --profile partitioned up
 #
 # Usage:
 #   cd self-hosted/docker && ./test-write-scaling.sh
@@ -79,17 +79,17 @@ fail() {
 echo ""
 echo -e "${BOLD}Preflight checks${NC}"
 
-for name in docker-node-a-1 docker-node-b-1; do
+for name in docker-part-node-a-1 docker-part-node-b-1; do
     if ! docker inspect "$name" > /dev/null 2>&1; then
         echo -e "${RED}Container $name not running. Start the deployment first:${NC}"
-        echo "  docker compose -f docker-compose.partitioned.yml up"
+        echo "  docker compose --profile partitioned up"
         exit 1
     fi
 done
 echo "  Containers running."
 
-NODE_A_KEY=$(docker exec docker-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
-NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY=$(docker exec docker-part-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY=$(docker exec docker-part-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
 echo "  Admin keys generated."
 
 # --- Deploy test functions ---
@@ -599,7 +599,7 @@ PRE_M=$(jval messages "$PRE")
 
 # Restart Node B
 echo "  Restarting Node B..."
-docker restart docker-node-b-1 > /dev/null 2>&1
+docker restart docker-part-node-b-1 > /dev/null 2>&1
 
 # Write to Node A while Node B is restarting
 mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
@@ -615,7 +615,7 @@ for attempt in $(seq 1 30); do
 done
 
 # Re-generate Node B key (may have changed on restart)
-NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY=$(docker exec docker-part-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
 
 # Re-deploy functions to Node B (modules are in-memory)
 echo "  Re-deploying functions to Node B..."
@@ -818,7 +818,7 @@ PRE_DOUBLE=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_DOUBLE_M=$(jval messages "$PRE_DOUBLE")
 
 echo "  First restart of Node B..."
-docker restart docker-node-b-1 > /dev/null 2>&1
+docker restart docker-part-node-b-1 > /dev/null 2>&1
 
 # Write during first restart.
 mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
@@ -831,7 +831,7 @@ for attempt in $(seq 1 30); do
 done
 
 echo "  Second restart of Node B..."
-docker restart docker-node-b-1 > /dev/null 2>&1
+docker restart docker-part-node-b-1 > /dev/null 2>&1
 
 # Write during second restart.
 mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
@@ -843,7 +843,7 @@ for attempt in $(seq 1 30); do
     sleep 1
 done
 
-NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY=$(docker exec docker-part-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
 
 sleep 4
@@ -1103,16 +1103,16 @@ PRE_KILL=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_KILL_M=$(jval messages "$PRE_KILL")
 
 echo "  Killing Node A..."
-docker stop docker-node-a-1 > /dev/null 2>&1
+docker stop docker-part-node-a-1 > /dev/null 2>&1
 sleep 2
 
 echo "  Killing Node B..."
-docker stop docker-node-b-1 > /dev/null 2>&1
+docker stop docker-part-node-b-1 > /dev/null 2>&1
 sleep 2
 
 echo "  Restarting both nodes..."
-docker start docker-node-a-1 > /dev/null 2>&1
-docker start docker-node-b-1 > /dev/null 2>&1
+docker start docker-part-node-a-1 > /dev/null 2>&1
+docker start docker-part-node-b-1 > /dev/null 2>&1
 
 echo "  Waiting for recovery..."
 for attempt in $(seq 1 60); do
@@ -1122,8 +1122,8 @@ for attempt in $(seq 1 60); do
     sleep 1
 done
 
-NODE_A_KEY=$(docker exec docker-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
-NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY=$(docker exec docker-part-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY=$(docker exec docker-part-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
 
@@ -1545,14 +1545,14 @@ echo -e "${BOLD}Test 34: Clock Monotonicity After Restart (TSO)${NC}"
 PRE_RESTART_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_RESTART_AM=$(jval messages "$PRE_RESTART_A")
 
-docker restart docker-node-a-1 > /dev/null 2>&1
+docker restart docker-part-node-a-1 > /dev/null 2>&1
 echo "  Waiting for Node A recovery..."
 for attempt in $(seq 1 30); do
     curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 && break
     sleep 1
 done
 
-NODE_A_KEY=$(docker exec docker-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY=$(docker exec docker-part-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
 
 # Write after restart — TSO must give a valid timestamp.
