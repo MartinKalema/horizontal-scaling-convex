@@ -281,6 +281,7 @@ Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 
 | Document | Contents |
 | --- | --- |
+| [Production Deployment](docs/production-deployment.md) | Kubernetes (GKE, EKS), bare VMs (EC2), load balancing, persistent storage, peer discovery |
 | [Raft Integration](docs/raft-integration.md) | tikv/raft-rs integration design — Raft loop, storage, transport, state machine, leader lifecycle |
 | [What We Built](docs/what-we-built.md) | What we took from each distributed database and what's new |
 | [Write Scaling Research](docs/write-scaling-research.md) | Vitess, TiDB, CockroachDB comparison |
