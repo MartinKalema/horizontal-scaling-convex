@@ -74,7 +74,7 @@ services:
   # ── Single-Node Mode ───────────────────────────────────────────
 
   backend:
-    image: ghcr.io/get-convex/convex-backend:latest
+    image: ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest
     profiles: [single]
     stop_grace_period: 10s
     stop_signal: SIGINT
