@@ -14,8 +14,9 @@ No single system we studied has all of these together:
 | TypeScript function execution | No | No | No | No | No | Yes |
 | Horizontal read scaling | Yes | Yes | Yes | Yes | Yes | Yes |
 | Horizontal write scaling | Yes | Yes | Yes | Yes | Yes | Yes |
+| Automatic leader failover (Raft) | Yes | Yes | No | Yes | Yes | Yes |
 
-We added the last two rows while keeping the first four — the things that make Convex unique.
+We added the last three rows while keeping the first four — the things that make Convex unique.
 
 ## What We Took from Each System
 
@@ -82,6 +83,16 @@ We added the last two rows while keeping the first four — the things that make
 **Their solution**: A single background thread processes all state machine updates sequentially. etcd's `commitC` channel, TiKV's Apply Worker, Kafka KRaft's state machine callback — all the same pattern. One inbox, one reader, serial processing.
 
 **What we built**: The Convex Committer already used this pattern for local commits. We extended it: replica deltas go through the same `mpsc` channel as local commits, processed by the same single-threaded `go()` loop. The `ApplyReplicaDelta` message variant sits alongside `Commit`, `BumpMaxRepeatableTs`, and the 2PC handlers — all serialized.
+
+### TiKV: raft-engine for Persistent Raft Log
+
+**Problem**: Raft log entries and hard state must survive node restarts. Without persistence, a restarted node has an empty log (`last_index=0`) but the cluster has moved forward (`commit_index=2`), causing a fatal panic: `"to_commit 2 is out of range [last_index 0]"`.
+
+**TiKV's solution**: TiKV moved from RocksDB to raft-engine as the default Raft log storage in v6.1. RocksDB's LSM-tree has up to 30x write amplification and compaction stalls — unnecessary for Raft logs which follow a FIFO pattern (append, read briefly, truncate). raft-engine is an append-only WAL with ~1x write amplification, no compaction, and atomic batch writes.
+
+**What we built**: `ConvexRaftStorage` in `raft_storage.rs` backed by raft-engine. Entries and hard state are written atomically in a single `LogBatch` (TiKV WriteBatch pattern). On restart, `initial_state()` loads the persisted hard state and `entries()` reads from the engine. The `applied` index is set from the persisted commit index so raft-rs picks up where it left off. One raft-engine instance per node, partitions isolated by `region_id`.
+
+**Source**: [TiKV raft-engine](https://github.com/tikv/raft-engine), [PingCAP Blog](https://www.pingcap.com/blog/raft-engine-a-log-structured-embedded-storage-engine-for-multi-raft-logs-in-tikv/)
 
 ## What's New: The Combination
 

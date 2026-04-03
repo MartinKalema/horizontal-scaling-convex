@@ -27,6 +27,7 @@ We took the best engineering from five distributed databases and combined them:
 | Raft transport | gRPC with batched messages and exponential backoff retry | TiKV RaftClient |
 | Leadership lifecycle | Committer starts on election, stops on demotion via SoftState | TiKV, CockroachDB |
 | Deployment state replication | GLOBAL table locality — `_modules`, `_udf_config`, `_source_packages` replicate to all nodes | CockroachDB GLOBAL tables, YugabyteDB system catalog |
+| Persistent Raft log | raft-engine — append-only WAL with ~1x write amplification, crash-safe atomic batches | TiKV raft-engine (replaced RocksDB in v6.1) |
 
 The combination — real-time subscriptions + in-memory OCC + partitioned multi-writer + delta replication + 2PC — doesn't exist in any of those systems. CockroachDB doesn't have subscriptions. TiDB doesn't have in-memory snapshots. Vitess doesn't have OCC. We kept Convex's unique architecture and grafted distributed database patterns onto it.
 
@@ -251,7 +252,7 @@ Observed idle memory usage per backend node: ~20 MB. Under load with in-memory s
 | RaftNode | `raft_node.rs` | Raft loop: tick, receive, propose, process Ready, advance. Leadership callbacks via SoftState |
 | RaftPartitionManager | `raft_partition.rs` | Wraps RaftNode, activates/deactivates Committer on leader election/demotion |
 | RaftTransport | `raft_transport.rs` | gRPC transport with batched messages, exponential backoff retry (TiKV RaftClient pattern) |
-| RaftStorage | `raft_storage.rs` | MemStorage wrapper with partition awareness for raft-rs |
+| RaftStorage | `raft_storage.rs` | Persistent Raft log backed by TiKV raft-engine — entries + hard state survive restarts |
 | RaftStateMachine | `raft_state_machine.rs` | Serialization format for Raft log entries, bridges committed entries to Committer |
 | CommitDelta | `commit_delta.rs` | Captures everything changed in a transaction — documents, indexes, table mappings |
 | NatsDistributedLog | `nats_distributed_log.rs` | Publishes/subscribes deltas via NATS JetStream with per-partition subjects and self-delta skip |

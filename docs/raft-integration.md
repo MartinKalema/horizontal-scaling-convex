@@ -83,7 +83,7 @@ loop {
 
 | raft-rs Component | Convex Component | Implementation |
 | --- | --- | --- |
-| `Storage` trait | `RaftLogStorage` | PostgreSQL-backed: entries, hard state, snapshots |
+| `Storage` trait | `ConvexRaftStorage` | TiKV raft-engine: persistent append-only WAL with ~1x write amplification |
 | State machine apply | `Committer::apply_raft_entry()` | Deserialize entry → execute mutation → commit |
 | `propose()` | Client mutation arrives | Serialize FinalTransaction → propose to Raft |
 | `Ready::messages` | `RaftTransport` | gRPC service: AppendEntries, Vote, InstallSnapshot |
@@ -112,7 +112,7 @@ After: Committer starts when this node becomes Raft leader for a partition. Stop
 | File | What it does |
 | --- | --- |
 | `crates/database/src/raft_node.rs` | Raft loop: tick, propose, on_ready, advance |
-| `crates/database/src/raft_storage.rs` | PostgreSQL-backed Storage trait implementation |
+| `crates/database/src/raft_storage.rs` | raft-engine backed Storage trait — persistent entries, hard state, conf state |
 | `crates/database/src/raft_transport.rs` | gRPC transport for Raft messages |
 | `crates/database/src/raft_state_machine.rs` | Bridges Raft committed entries to Committer |
 | `crates/pb/protos/raft_rpc.proto` | Protobuf: AppendEntries, Vote, InstallSnapshot RPCs |
@@ -128,7 +128,7 @@ After: Committer starts when this node becomes Raft leader for a partition. Stop
 
 ## Implementation Sequence
 
-1. **Raft Storage**: PostgreSQL-backed log and hard state persistence
+1. **Raft Storage**: raft-engine backed log and hard state persistence (TiKV pattern)
 2. **Raft Transport**: gRPC service for Raft message passing
 3. **Raft Node**: The loop that drives the consensus module
 4. **State Machine Bridge**: Connect committed entries to the Committer
