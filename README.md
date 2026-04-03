@@ -176,21 +176,18 @@ One Primary handles writes, multiple Replicas serve reads. Replicas remap Tablet
 
 ## Quick Start
 
-One Docker Compose file, three deployment modes via profiles. Raft consensus is always on — same as CockroachDB, etcd, and YugabyteDB (single-node is a Raft group of 1).
+One Docker Compose file, two profiles — same as CockroachDB, etcd, and YugabyteDB. Raft consensus is always on (single-node is a Raft group of 1).
 
 ### Run
 
 ```sh
 cd self-hosted/docker
 
-# 1 Raft node (dev/test)
+# 1 node (dev/test)
 docker compose --profile single up
 
-# 3 Raft nodes, 1 partition (read scaling + HA)
-docker compose --profile replicated up
-
-# 2 partitions × 3 Raft nodes (write scaling + HA)
-docker compose --profile partitioned up
+# 6 nodes — 2 partitions × 3 Raft nodes (read + write scaling + HA)
+docker compose --profile cluster up
 ```
 
 Images are published to `ghcr.io/martinkalema/convex-horizontal-scaling` — no local build needed.
@@ -210,7 +207,7 @@ cd self-hosted/docker
 ### Deploy Functions
 
 ```sh
-docker compose --profile replicated exec node-1a ./generate_admin_key.sh
+docker compose --profile cluster exec node-p0a ./generate_admin_key.sh
 npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 ```
 

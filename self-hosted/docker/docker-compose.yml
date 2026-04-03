@@ -1,17 +1,15 @@
 # Unified Docker Compose for Convex horizontal scaling.
 #
-# One file, three deployment modes via Docker Compose profiles.
-# Raft consensus is always on (same as CockroachDB, etcd, YugabyteDB).
-# Single-node is a Raft group of 1. Multi-node is a Raft group of 3.
+# Two deployment modes — same pattern as CockroachDB, etcd, and YugabyteDB.
+# Raft consensus is always on. Single-node is a Raft group of 1.
 #
 # Usage:
-#   docker compose --profile single up        # 1 Raft node (dev/test)
-#   docker compose --profile replicated up    # 3 Raft nodes, 1 partition (read scaling + HA)
-#   docker compose --profile partitioned up   # 2 partitions × 3 Raft nodes (write scaling + HA)
+#   docker compose --profile single up    # 1 node (dev/test)
+#   docker compose --profile cluster up   # 6 nodes (read + write scaling + HA)
 #
 # Profiles are mutually exclusive — run one at a time.
-# Node counts follow the giants' Docker quickstart pattern:
-# fixed 3-node Raft groups for dev. Use Kubernetes for variable counts.
+# Cluster mode: 2 partitions × 3 Raft nodes. Each partition has its own
+# leader with automatic failover. All nodes serve reads via NATS replication.
 
 # ── YAML Anchors (shared config, DRY) ─────────────────────────────
 
@@ -39,13 +37,11 @@ x-node-env-common: &node-env-common
 services:
   postgres:
     image: postgres:17
-    profiles: [single, replicated, partitioned]
+    profiles: [single, cluster]
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: convex_self_hosted
-      # Superset: creates all databases regardless of profile.
-      # Unused databases cost nothing (~few KB metadata).
-      CONVEX_INSTANCES: convex-node-0,convex-node-1a,convex-node-1b,convex-node-1c,convex-node-2a,convex-node-2b,convex-node-2c,convex-node-3a,convex-node-3b,convex-node-3c
+      CONVEX_INSTANCES: convex-node-0,convex-node-p0a,convex-node-p0b,convex-node-p0c,convex-node-p1a,convex-node-p1b,convex-node-p1c
     ports:
       - "5433:5432"
     volumes:
@@ -58,7 +54,7 @@ services:
 
   nats:
     image: nats:alpine
-    profiles: [single, replicated, partitioned]
+    profiles: [single, cluster]
     command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
     ports:
       - "4222:4222"
@@ -97,245 +93,174 @@ services:
       nats:
         condition: service_healthy
 
-  # ── Replicated (3 Raft nodes, 1 partition — read scaling + HA) ─
+  # ── Cluster (2 partitions × 3 Raft nodes) ─────────────────────
+  #
+  # Partition 0: messages, users (Raft group: p0a, p0b, p0c)
+  # Partition 1: projects, tasks (Raft group: p1a, p1b, p1c)
+  #
+  # Each partition elects its own leader. All 6 nodes serve reads.
+  # Kill any node — its Raft group elects a new leader in ~1 second.
 
-  node-1a:
+  # ── Partition 0 (messages, users) ──────────────────────────────
+
+  node-p0a:
     <<: *backend-common
-    profiles: [replicated]
+    profiles: [cluster]
     ports:
       - "3210:3210"
       - "3211:3211"
       - "50051:50051"
     volumes:
-      - node-1a-data:/convex/data
+      - node-p0a-data:/convex/data
       - shared-storage:/convex/data/storage
     environment:
       <<: *node-env-common
-      INSTANCE_NAME: convex-node-1a
-      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
-      CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
-      PARTITION_ID: "0"
-      NUM_PARTITIONS: "1"
-      RAFT_NODE_ID: "1"
-      RAFT_PEERS: 1=http://node-1a:50051,2=http://node-1b:50051,3=http://node-1c:50051
-    depends_on:
-      postgres:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
-
-  node-1b:
-    <<: *backend-common
-    profiles: [replicated]
-    ports:
-      - "3220:3210"
-      - "3221:3211"
-      - "50052:50051"
-    volumes:
-      - node-1b-data:/convex/data
-      - shared-storage:/convex/data/storage
-    environment:
-      <<: *node-env-common
-      INSTANCE_NAME: convex-node-1b
-      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3220
-      CONVEX_SITE_ORIGIN: http://127.0.0.1:3221
-      PARTITION_ID: "0"
-      NUM_PARTITIONS: "1"
-      RAFT_NODE_ID: "2"
-      RAFT_PEERS: 1=http://node-1a:50051,2=http://node-1b:50051,3=http://node-1c:50051
-      REPLICA_STORAGE_PATH: /convex/data/storage
-    depends_on:
-      node-1a:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
-
-  node-1c:
-    <<: *backend-common
-    profiles: [replicated]
-    ports:
-      - "3230:3210"
-      - "3231:3211"
-      - "50053:50051"
-    volumes:
-      - node-1c-data:/convex/data
-      - shared-storage:/convex/data/storage
-    environment:
-      <<: *node-env-common
-      INSTANCE_NAME: convex-node-1c
-      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3230
-      CONVEX_SITE_ORIGIN: http://127.0.0.1:3231
-      PARTITION_ID: "0"
-      NUM_PARTITIONS: "1"
-      RAFT_NODE_ID: "3"
-      RAFT_PEERS: 1=http://node-1a:50051,2=http://node-1b:50051,3=http://node-1c:50051
-      REPLICA_STORAGE_PATH: /convex/data/storage
-    depends_on:
-      node-1b:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
-
-  # ── Partitioned (2 partitions × 3 Raft nodes — write scaling + HA)
-
-  # Partition 0: messages, users (3-node Raft group)
-  node-2a:
-    <<: *backend-common
-    profiles: [partitioned]
-    ports:
-      - "3210:3210"
-      - "3211:3211"
-      - "50051:50051"
-    volumes:
-      - node-2a-data:/convex/data
-      - shared-storage:/convex/data/storage
-    environment:
-      <<: *node-env-common
-      INSTANCE_NAME: convex-node-2a
+      INSTANCE_NAME: convex-node-p0a
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       RAFT_NODE_ID: "1"
-      RAFT_PEERS: 1=http://node-2a:50051,2=http://node-2b:50051,3=http://node-2c:50051
+      RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_healthy
 
-  node-2b:
+  node-p0b:
     <<: *backend-common
-    profiles: [partitioned]
+    profiles: [cluster]
     ports:
       - "3220:3210"
       - "3221:3211"
       - "50052:50051"
     volumes:
-      - node-2b-data:/convex/data
+      - node-p0b-data:/convex/data
       - shared-storage:/convex/data/storage
     environment:
       <<: *node-env-common
-      INSTANCE_NAME: convex-node-2b
+      INSTANCE_NAME: convex-node-p0b
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3220
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3221
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       RAFT_NODE_ID: "2"
-      RAFT_PEERS: 1=http://node-2a:50051,2=http://node-2b:50051,3=http://node-2c:50051
+      RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
     depends_on:
-      node-2a:
+      node-p0a:
         condition: service_healthy
       nats:
         condition: service_healthy
 
-  node-2c:
+  node-p0c:
     <<: *backend-common
-    profiles: [partitioned]
+    profiles: [cluster]
     ports:
       - "3230:3210"
       - "3231:3211"
       - "50053:50051"
     volumes:
-      - node-2c-data:/convex/data
+      - node-p0c-data:/convex/data
       - shared-storage:/convex/data/storage
     environment:
       <<: *node-env-common
-      INSTANCE_NAME: convex-node-2c
+      INSTANCE_NAME: convex-node-p0c
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3230
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3231
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       RAFT_NODE_ID: "3"
-      RAFT_PEERS: 1=http://node-2a:50051,2=http://node-2b:50051,3=http://node-2c:50051
+      RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
     depends_on:
-      node-2b:
+      node-p0b:
         condition: service_healthy
       nats:
         condition: service_healthy
 
-  # Partition 1: projects, tasks (3-node Raft group)
-  node-3a:
+  # ── Partition 1 (projects, tasks) ──────────────────────────────
+
+  node-p1a:
     <<: *backend-common
-    profiles: [partitioned]
+    profiles: [cluster]
     ports:
       - "3310:3210"
       - "3311:3211"
       - "50061:50051"
     volumes:
-      - node-3a-data:/convex/data
+      - node-p1a-data:/convex/data
       - shared-storage:/convex/data/storage
     environment:
       <<: *node-env-common
-      INSTANCE_NAME: convex-node-3a
+      INSTANCE_NAME: convex-node-p1a
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3310
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3311
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       RAFT_NODE_ID: "1"
-      RAFT_PEERS: 1=http://node-3a:50051,2=http://node-3b:50051,3=http://node-3c:50051
+      RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
     depends_on:
-      node-2c:
+      node-p0c:
         condition: service_healthy
       nats:
         condition: service_healthy
 
-  node-3b:
+  node-p1b:
     <<: *backend-common
-    profiles: [partitioned]
+    profiles: [cluster]
     ports:
       - "3320:3210"
       - "3321:3211"
       - "50062:50051"
     volumes:
-      - node-3b-data:/convex/data
+      - node-p1b-data:/convex/data
       - shared-storage:/convex/data/storage
     environment:
       <<: *node-env-common
-      INSTANCE_NAME: convex-node-3b
+      INSTANCE_NAME: convex-node-p1b
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3320
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3321
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       RAFT_NODE_ID: "2"
-      RAFT_PEERS: 1=http://node-3a:50051,2=http://node-3b:50051,3=http://node-3c:50051
+      RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
     depends_on:
-      node-3a:
+      node-p1a:
         condition: service_healthy
       nats:
         condition: service_healthy
 
-  node-3c:
+  node-p1c:
     <<: *backend-common
-    profiles: [partitioned]
+    profiles: [cluster]
     ports:
       - "3330:3210"
       - "3331:3211"
       - "50063:50051"
     volumes:
-      - node-3c-data:/convex/data
+      - node-p1c-data:/convex/data
       - shared-storage:/convex/data/storage
     environment:
       <<: *node-env-common
-      INSTANCE_NAME: convex-node-3c
+      INSTANCE_NAME: convex-node-p1c
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3330
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3331
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       RAFT_NODE_ID: "3"
-      RAFT_PEERS: 1=http://node-3a:50051,2=http://node-3b:50051,3=http://node-3c:50051
+      RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
     depends_on:
-      node-3b:
+      node-p1b:
         condition: service_healthy
       nats:
         condition: service_healthy
@@ -344,7 +269,7 @@ services:
 
   dashboard:
     image: ghcr.io/get-convex/convex-dashboard:latest
-    profiles: [single, replicated, partitioned]
+    profiles: [single, cluster]
     stop_grace_period: 10s
     stop_signal: SIGINT
     restart: unless-stopped
@@ -356,22 +281,13 @@ services:
 # ── Volumes ──────────────────────────────────────────────────────
 
 volumes:
-  # Infrastructure
   pgdata:
   natsdata:
-  # Single mode (1 Raft node)
   node-0-data:
-  # Replicated mode (3 Raft nodes, 1 partition)
-  node-1a-data:
-  node-1b-data:
-  node-1c-data:
-  # Partitioned mode — partition 0 (3 Raft nodes)
-  node-2a-data:
-  node-2b-data:
-  node-2c-data:
-  # Partitioned mode — partition 1 (3 Raft nodes)
-  node-3a-data:
-  node-3b-data:
-  node-3c-data:
-  # Shared across multi-node modes
+  node-p0a-data:
+  node-p0b-data:
+  node-p0c-data:
+  node-p1a-data:
+  node-p1b-data:
+  node-p1c-data:
   shared-storage:
