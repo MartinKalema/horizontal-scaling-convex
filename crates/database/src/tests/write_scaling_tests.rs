@@ -5,30 +5,44 @@
 //! via self-hosted/docker/test-write-scaling.sh (CockroachDB roachtest
 //! pattern).
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use common::{
     assert_obj,
+    bootstrap_model::index::database_index::IndexedFields,
+    interval::Interval,
     runtime::{
         new_unlimited_rate_limiter,
         testing::TestRuntime,
     },
     shutdown::ShutdownSignal,
     testing::TestPersistence,
+    types::TabletIndexName,
 };
 use keybroker::Identity;
 use search::searcher::SearcherStub;
 use storage::LocalDirStorage;
-use value::TableName;
+use value::{
+    TableName,
+    TableNamespace,
+};
 
 use crate::{
-    commit_delta::testing::InMemoryDistributedLog,
+    commit_delta::{
+        testing::InMemoryDistributedLog,
+        CommitDelta,
+    },
     partition::{
         PartitionId,
         PartitionMap,
     },
+    two_phase::TwoPhaseTransactionId,
     Database,
     TestFacingModel,
+    WriteSource,
 };
 
 async fn create_node(
@@ -36,7 +50,21 @@ async fn create_node(
     distributed_log: Arc<InMemoryDistributedLog>,
     partition_map: Option<PartitionMap>,
 ) -> anyhow::Result<Database<TestRuntime>> {
-    let tp = Arc::new(TestPersistence::new());
+    create_node_with_persistence(
+        rt,
+        Arc::new(TestPersistence::new()),
+        distributed_log,
+        partition_map,
+    )
+    .await
+}
+
+async fn create_node_with_persistence(
+    rt: &TestRuntime,
+    tp: Arc<TestPersistence>,
+    distributed_log: Arc<InMemoryDistributedLog>,
+    partition_map: Option<PartitionMap>,
+) -> anyhow::Result<Database<TestRuntime>> {
     let searcher: Arc<dyn search::Searcher> = Arc::new(SearcherStub {});
     let (deleted_tablet_sender, _) = tokio::sync::mpsc::channel(100);
     let db = Database::load(
@@ -59,6 +87,10 @@ async fn create_node(
     let handle = db.start_search_and_vector_bootstrap();
     handle.join().await?;
     Ok(db)
+}
+
+fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
+    PartitionMap::from_config("messages=0,projects=1", local_partition, 2)
 }
 
 async fn insert_doc(
@@ -304,6 +336,269 @@ async fn test_bank_invariant(rt: TestRuntime) -> anyhow::Result<()> {
         "Expected at least {} deltas with document inserts, got {}",
         balances.len(),
         account_deltas.len(),
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cross_partition_prepare_waits_for_remote_frontier(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let initial_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(initial_delta)
+        .await?;
+
+    // Advance node A's snapshot without advancing partition 1's frontier.
+    insert_doc(&node_a, "messages", assert_obj!("text" => "lag-maker")).await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "prepared"))
+        .await?;
+    let mut final_tx = tx.finalize()?;
+    let remote_tablet = final_tx
+        .table_mapping
+        .namespace(TableNamespace::Global)
+        .name_to_tablet()("projects".parse()?)?;
+    final_tx.reads.record_indexed_derived(
+        TabletIndexName::by_id(remote_tablet),
+        IndexedFields::by_id(),
+        Interval::all(),
+    );
+
+    let committer = node_a.committer_for_test();
+    let prepare = tokio::spawn(async move {
+        committer
+            .prepare(
+                TwoPhaseTransactionId::new(),
+                final_tx,
+                WriteSource::new("cross_partition_wait_test"),
+            )
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !prepare.is_finished(),
+        "prepare should wait for the remote partition frontier to catch up",
+    );
+
+    let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(CommitDelta {
+            ts: heartbeat_ts,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("replication_frontier_heartbeat_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        })
+        .await?;
+
+    let prepare_result = tokio::time::timeout(Duration::from_secs(1), prepare).await??;
+    prepare_result?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_local_only_prepare_does_not_wait_for_remote_frontier(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let initial_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(initial_delta)
+        .await?;
+
+    // Advance node A's snapshot beyond partition 1's persisted frontier.
+    insert_doc(&node_a, "messages", assert_obj!("text" => "lag-maker")).await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "prepared"))
+        .await?;
+    let final_tx = tx.finalize()?;
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        node_a.committer_for_test().prepare(
+            TwoPhaseTransactionId::new(),
+            final_tx,
+            WriteSource::new("local_only_prepare_test"),
+        ),
+    )
+    .await?;
+    result?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_local_commit_waits_for_remote_frontier(rt: TestRuntime) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let initial_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(initial_delta)
+        .await?;
+
+    // Advance node A's local snapshot without advancing partition 1's frontier.
+    insert_doc(&node_a, "messages", assert_obj!("text" => "lag-maker")).await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "commit"))
+        .await?;
+    let remote_tablet = tx
+        .table_mapping()
+        .namespace(TableNamespace::Global)
+        .name_to_tablet()("projects".parse()?)?;
+    tx.reads.record_indexed_derived(
+        TabletIndexName::by_id(remote_tablet),
+        IndexedFields::by_id(),
+        Interval::all(),
+    );
+
+    let node_a_for_commit = node_a.clone();
+    let commit = tokio::spawn(async move { node_a_for_commit.commit(tx).await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !commit.is_finished(),
+        "commit should wait for the remote partition frontier to catch up",
+    );
+
+    let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(CommitDelta {
+            ts: heartbeat_ts,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("replication_frontier_heartbeat_commit_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        })
+        .await?;
+
+    let commit_result = tokio::time::timeout(Duration::from_secs(1), commit).await??;
+    commit_result?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_local_only_commit_does_not_wait_for_remote_frontier(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let initial_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(initial_delta)
+        .await?;
+
+    // Advance node A's snapshot beyond partition 1's persisted frontier.
+    insert_doc(&node_a, "messages", assert_obj!("text" => "lag-maker")).await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "commit"))
+        .await?;
+
+    let result = tokio::time::timeout(Duration::from_millis(250), node_a.commit(tx)).await?;
+    result?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_replication_frontier_persists_across_restart(rt: TestRuntime) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let tp = Arc::new(TestPersistence::new());
+    let node_a = create_node_with_persistence(
+        &rt,
+        tp.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+    )
+    .await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let initial_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(initial_delta)
+        .await?;
+
+    let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(CommitDelta {
+            ts: heartbeat_ts,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("replication_frontier_persist_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        })
+        .await?;
+
+    let persisted_frontier = node_a
+        .replication_frontier_for_test(PartitionId(1))
+        .expect("partition 1 frontier should be recorded");
+
+    let restarted =
+        create_node_with_persistence(&rt, tp, log, Some(partitioned_map(PartitionId(0)))).await?;
+    assert_eq!(
+        restarted.replication_frontier_for_test(PartitionId(1)),
+        Some(persisted_frontier),
     );
 
     Ok(())

@@ -1,6 +1,9 @@
 use std::{
     cmp,
-    collections::BTreeSet,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     ops::Bound,
     sync::Arc,
     time::Duration,
@@ -81,6 +84,7 @@ use errors::ErrorMetadata;
 use fastrace::prelude::*;
 use futures::{
     future::{
+        join_all,
         BoxFuture,
         Either,
     },
@@ -134,7 +138,10 @@ use crate::{
         stream_revision_pairs_for_indexes,
         BootstrappedSearchIndexes,
     },
-    snapshot_manager::SnapshotManager,
+    snapshot_manager::{
+        replication_frontiers_to_json,
+        SnapshotManager,
+    },
     table_summary::{
         self,
     },
@@ -195,6 +202,7 @@ enum PersistenceWrite {
         remapped_updates: Vec<common::document::DocumentUpdate>,
         write_source: WriteSource,
         write_bytes: u64,
+        source_partition: Option<crate::partition::PartitionId>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -211,6 +219,63 @@ impl PersistenceWrite {
 }
 
 pub const AFTER_PENDING_WRITE_SNAPSHOT: &str = "after_pending_write_snapshot";
+
+fn remote_read_partitions(
+    transaction: &FinalTransaction,
+    partition_map: &crate::partition::PartitionMap,
+) -> BTreeSet<crate::partition::PartitionId> {
+    let mut partitions = BTreeSet::new();
+    let mut visit_tablet = |tablet_id| {
+        if let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) {
+            if table_name.is_system() {
+                return;
+            }
+            let partition = partition_map.partition_for_table(&table_name);
+            if partition != partition_map.local_partition() {
+                partitions.insert(partition);
+            }
+        }
+    };
+
+    for (index_name, _) in transaction.reads.read_set().iter_indexed() {
+        visit_tablet(*index_name.table());
+    }
+    for (index_name, _) in transaction.reads.read_set().iter_search() {
+        visit_tablet(*index_name.table());
+    }
+    partitions
+}
+
+fn stale_replica_frontiers(
+    snapshot_manager: &SnapshotManager,
+    transaction: &FinalTransaction,
+    partition_map: &crate::partition::PartitionMap,
+) -> Vec<(crate::partition::PartitionId, Timestamp)> {
+    let begin_ts = *transaction.begin_timestamp;
+    remote_read_partitions(transaction, partition_map)
+        .into_iter()
+        .filter_map(|partition| {
+            let frontier = snapshot_manager
+                .replication_frontier(partition)
+                .unwrap_or(Timestamp::MIN);
+            (frontier < begin_ts).then_some((partition, frontier))
+        })
+        .collect()
+}
+
+fn has_nonlocal_user_writes(
+    transaction: &FinalTransaction,
+    partition_map: &crate::partition::PartitionMap,
+) -> bool {
+    transaction.writes.coalesced_writes().any(|write| {
+        transaction
+            .table_mapping
+            .tablet_name(write.id.tablet_id)
+            .ok()
+            .filter(|table_name| !table_name.is_system())
+            .is_some_and(|table_name| !partition_map.is_local(&table_name))
+    })
+}
 
 pub struct Committer<RT: Runtime> {
     // Internal staged commits for conflict checking.
@@ -406,6 +471,7 @@ impl<RT: Runtime> Committer<RT> {
                             remapped_updates,
                             write_source,
                             write_bytes,
+                            source_partition,
                             result,
                             ..
                         } => {
@@ -418,6 +484,9 @@ impl<RT: Runtime> Committer<RT> {
                             self.log.append(commit_ts, writes, write_source);
                             let mut sm = self.snapshot_manager.write();
                             sm.push(commit_ts, snapshot, write_bytes);
+                            if let Some(source_partition) = source_partition {
+                                sm.update_replication_frontier(source_partition, commit_ts)?;
+                            }
                             let _ = result.send(Ok(commit_ts));
                         },
                     }
@@ -789,14 +858,86 @@ impl<RT: Runtime> Committer<RT> {
         // Bump the latest snapshot in snapshot_manager so reads on this leader
         // can know this timestamp is repeatable.
         let mut snapshot_manager = self.snapshot_manager.write();
-        if snapshot_manager.bump_persisted_max_repeatable_ts(new_max_repeatable)? {
+        let advanced = snapshot_manager.bump_persisted_max_repeatable_ts(new_max_repeatable)?;
+        if advanced {
             self.log.append(
                 new_max_repeatable,
                 WithHeapSize::default(),
                 "publish_max_repeatable_ts".into(),
             );
         }
+        drop(snapshot_manager);
+        if advanced {
+            self.publish_replication_frontier_heartbeat(new_max_repeatable);
+        }
         Ok(())
+    }
+
+    fn publish_replication_frontier_heartbeat(&self, frontier_ts: Timestamp) {
+        let Some(partition_map) = self.partition_map.as_ref() else {
+            return;
+        };
+        if partition_map.num_partitions() <= 1 {
+            return;
+        }
+        if self
+            .raft_state
+            .as_ref()
+            .is_some_and(|raft_state| !raft_state.is_leader())
+        {
+            return;
+        }
+
+        let delta = CommitDelta {
+            ts: frontier_ts,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("replication_frontier_heartbeat"),
+            write_bytes: 0,
+            tablet_id_to_table_name: BTreeMap::new(),
+            source_partition: Some(partition_map.local_partition()),
+        };
+        let distributed_log = self.distributed_log.clone();
+        tokio_spawn("publish_replication_frontier_heartbeat", async move {
+            if let Err(e) = distributed_log.publish(delta).await {
+                tracing::error!(
+                    "Failed to publish replication frontier heartbeat at ts={}: {e:#}",
+                    u64::from(frontier_ts),
+                );
+            }
+        });
+    }
+
+    fn validate_remote_read_frontiers(
+        &self,
+        transaction: &FinalTransaction,
+        write_source: &WriteSource,
+    ) -> anyhow::Result<()> {
+        let Some(partition_map) = self.partition_map.as_ref() else {
+            return Ok(());
+        };
+
+        let begin_ts = *transaction.begin_timestamp;
+        let stale = {
+            let snapshot_manager = self.snapshot_manager.read();
+            stale_replica_frontiers(&snapshot_manager, transaction, partition_map)
+        };
+        if stale.is_empty() {
+            return Ok(());
+        }
+
+        let details = stale
+            .iter()
+            .map(|(partition, frontier)| format!("{partition}: frontier={frontier}"))
+            .join(", ");
+        let metadata = ErrorMetadata::system_occ(
+            Some(u64::from(begin_ts)),
+            write_source.as_str().map(|source| source.to_string()),
+        );
+        Err(anyhow::anyhow!(metadata).context(format!(
+            "Cross-partition OCC requires remote read frontiers >= {begin_ts}, but found {details}",
+        )))
     }
 
     /// First, check that it's valid to apply this transaction in-memory. If it
@@ -850,48 +991,7 @@ impl<RT: Runtime> Committer<RT> {
             }
         }
 
-        // Cross-partition OCC: if partitioning is enabled and this
-        // transaction reads from remote tables, verify the local replica
-        // of remote partitions is caught up to the transaction's begin
-        // timestamp. If not, the write log might be missing remote writes
-        // that conflict with this transaction's reads.
-        //
-        // The write log already contains entries from replicated deltas
-        // (applied via apply_replica_delta). We just need to ensure
-        // the replication has caught up far enough. The SnapshotManager's
-        // latest_ts reflects the latest applied delta.
-        if let Some(ref partition_map) = self.partition_map {
-            let latest_replicated_ts = *self.snapshot_manager.read().latest_ts();
-            let begin_ts = *transaction.begin_timestamp;
-            if latest_replicated_ts < begin_ts {
-                // Check if any reads are from remote partitions.
-                let has_remote_reads =
-                    transaction
-                        .reads
-                        .read_set()
-                        .iter_indexed()
-                        .any(|(index_name, _)| {
-                            let tablet_id = index_name.table();
-                            if let Ok(name) = transaction.table_mapping.tablet_name(*tablet_id) {
-                                !partition_map.is_local(&name)
-                            } else {
-                                false
-                            }
-                        });
-                if has_remote_reads {
-                    tracing::warn!(
-                        "Cross-partition OCC: local replica behind (latest={}, begin={}). Remote \
-                         reads may miss conflicts. Proceeding with best-effort validation.",
-                        latest_replicated_ts,
-                        begin_ts,
-                    );
-                    // In a production implementation, we would wait for the
-                    // replica to catch up or reject the transaction. For now,
-                    // we proceed with best-effort validation using whatever
-                    // data is in the write log.
-                }
-            }
-        }
+        self.validate_remote_read_frontiers(&transaction, &write_source)?;
 
         let commit_ts = self.next_commit_ts()?;
         let timer = metrics::commit_is_stale_timer();
@@ -1107,6 +1207,10 @@ impl<RT: Runtime> Committer<RT> {
             write_source,
             write_bytes,
             tablet_id_to_table_name,
+            source_partition: self
+                .partition_map
+                .as_ref()
+                .map(|partition_map| partition_map.local_partition()),
         };
 
         // Propose delta to Raft for intra-partition replication (if Raft enabled).
@@ -1263,9 +1367,9 @@ impl<RT: Runtime> Committer<RT> {
         // YugabyteDB's pg_proc (stored procedures), and TiDB's mysql.tidb
         // (DDL schema state).
         let global_deployment_tables: &[&str] = &[
-            "_modules",          // JavaScript/TypeScript function source code
-            "_udf_config",       // UDF runtime configuration
-            "_source_packages",  // Bundled source packages
+            "_modules",         // JavaScript/TypeScript function source code
+            "_udf_config",      // UDF runtime configuration
+            "_source_packages", // Bundled source packages
         ];
         let is_global_deployment_table = |name: &value::TableName| -> bool {
             let name_str = name.to_string();
@@ -1350,10 +1454,8 @@ impl<RT: Runtime> Committer<RT> {
         // the table number to a locally-unique value, preserving only the
         // table name and TabletId (derived from developer_id) for remapping.
         if !tables_updates.is_empty() {
-            use common::document::CreationTime;
             use value::{
                 ConvexObject,
-                TableNamespace,
                 TableNumber,
             };
 
@@ -1523,6 +1625,16 @@ impl<RT: Runtime> Committer<RT> {
         let num_doc_writes = document_writes.len();
         let num_remapped = all_remapped_updates.len();
         let skipped = delta.document_updates.len() - num_remapped;
+        let updated_replication_frontiers = delta.source_partition.map(|source_partition| {
+            let mut frontiers = self.snapshot_manager.read().replication_frontiers();
+            let should_update = frontiers
+                .get(&source_partition)
+                .is_none_or(|current| *current < commit_ts);
+            if should_update {
+                frontiers.insert(source_partition, commit_ts);
+            }
+            frontiers
+        });
 
         let persistence = self.persistence.clone();
         let (tx, _rx) = oneshot::channel();
@@ -1531,6 +1643,8 @@ impl<RT: Runtime> Committer<RT> {
         self.persistence_writes.push_back({
             let doc_writes = document_writes.clone();
             let idx_writes = index_writes.clone();
+            let replication_frontiers = updated_replication_frontiers.clone();
+            let source_partition = delta.source_partition;
             async move {
                 // Write to persistence (so function runner can load modules).
                 persistence
@@ -1545,6 +1659,15 @@ impl<RT: Runtime> Committer<RT> {
                     )
                     .await?;
 
+                if let Some(frontiers) = replication_frontiers {
+                    persistence
+                        .write_persistence_global(
+                            PersistenceGlobalKey::ReplicationFrontiers,
+                            replication_frontiers_to_json(&frontiers),
+                        )
+                        .await?;
+                }
+
                 Ok(PersistenceWrite::ReplicaDelta {
                     commit_ts,
                     snapshot,
@@ -1553,6 +1676,7 @@ impl<RT: Runtime> Committer<RT> {
                     remapped_updates: all_remapped_updates,
                     write_source: delta.write_source,
                     write_bytes: delta.write_bytes,
+                    source_partition,
                     result: tx,
                     commit_id: commit_id_val,
                 })
@@ -1592,6 +1716,7 @@ impl<RT: Runtime> Committer<RT> {
         // Skip partition ownership check — the coordinator already routed
         // the correct subset of writes to this partition. Run the rest of
         // validation (OCC conflict check, compute writes).
+        self.validate_remote_read_frontiers(&transaction, &write_source)?;
         let commit_ts = self.next_commit_ts()?;
         let timer = metrics::commit_is_stale_timer();
         if let Some(conflicting_read) = self.commit_has_conflict(
@@ -2124,6 +2249,48 @@ impl CommitterClient {
         self.persistence_reader.clone()
     }
 
+    async fn wait_for_remote_read_frontiers(
+        &self,
+        transaction: &FinalTransaction,
+    ) -> anyhow::Result<()> {
+        let Some(partition_map) = self.partition_map.as_ref() else {
+            return Ok(());
+        };
+
+        let required = remote_read_partitions(transaction, partition_map);
+        if required.is_empty() {
+            return Ok(());
+        }
+
+        let begin_ts = *transaction.begin_timestamp;
+        let waits: Vec<_> = {
+            let snapshot_reader = self.snapshot_reader.lock();
+            required
+                .iter()
+                .filter_map(|partition| {
+                    let frontier = snapshot_reader
+                        .replication_frontier(*partition)
+                        .unwrap_or(Timestamp::MIN);
+                    (frontier < begin_ts).then(|| {
+                        snapshot_reader.wait_for_replication_frontier(*partition, begin_ts)
+                    })
+                })
+                .collect()
+        };
+
+        if waits.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Waiting for remote read frontiers to reach begin_ts={} on partitions {:?}",
+            begin_ts,
+            required,
+        );
+        join_all(waits).await;
+        Ok(())
+    }
+
     pub fn commit<RT: Runtime>(
         &self,
         transaction: Transaction<RT>,
@@ -2143,6 +2310,13 @@ impl CommitterClient {
 
         // Finish reading everything from persistence.
         let transaction = transaction.finalize()?;
+        if !self
+            .partition_map
+            .as_ref()
+            .is_some_and(|partition_map| has_nonlocal_user_writes(&transaction, partition_map))
+        {
+            self.wait_for_remote_read_frontiers(&transaction).await?;
+        }
 
         // Note that we do a best effort validation for memory index sizes. We
         // use the latest snapshot instead of the transaction base snapshot. This
@@ -2205,6 +2379,7 @@ impl CommitterClient {
         transaction: FinalTransaction,
         write_source: WriteSource,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        self.wait_for_remote_read_frontiers(&transaction).await?;
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::Prepare {
             transaction_id,

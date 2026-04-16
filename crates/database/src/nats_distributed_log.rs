@@ -34,6 +34,7 @@ use crate::{
         CommitDelta,
         DistributedLog,
     },
+    partition::PartitionId,
     write_log::WriteSource,
 };
 
@@ -144,6 +145,9 @@ pub struct DeltaEnvelope {
     /// Consumers skip deltas from their own node to avoid double-applying.
     #[serde(default)]
     source_node: String,
+    /// Partition that originated this replication event.
+    #[serde(default)]
+    source_partition: Option<u32>,
 }
 
 impl DeltaEnvelope {
@@ -170,6 +174,7 @@ impl DeltaEnvelope {
             document_updates_proto,
             tablet_mapping,
             source_node: source_node.to_string(),
+            source_partition: delta.source_partition.map(|partition| partition.0),
         })
     }
 
@@ -208,6 +213,7 @@ impl DeltaEnvelope {
                     Some((tablet_id, name))
                 })
                 .collect(),
+            source_partition: self.source_partition.map(PartitionId),
         })
     }
 }

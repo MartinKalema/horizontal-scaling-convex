@@ -157,6 +157,11 @@ pub enum PersistenceGlobalKey {
     /// timestamp > this timestamp.
     MaxRepeatableTimestamp,
 
+    /// Latest locally-applied freshness frontier per source partition.
+    /// Used to prove that remote-partition reads were validated against a
+    /// replica that had caught up through the transaction's snapshot.
+    ReplicationFrontiers,
+
     /// Latest snapshot of all tables' summaries, cached to speed up startup.
     TableSummary,
 
@@ -186,6 +191,7 @@ impl From<PersistenceGlobalKey> for String {
                 "document_confirmed_deleted_ts".to_string()
             },
             PersistenceGlobalKey::MaxRepeatableTimestamp => "max_repeatable_ts".to_string(),
+            PersistenceGlobalKey::ReplicationFrontiers => "replication_frontiers_v1".to_string(),
             PersistenceGlobalKey::TableSummary => "table_summary_v2".to_string(),
             PersistenceGlobalKey::TablesByIdIndex => "tables_by_id".to_string(),
             PersistenceGlobalKey::IndexByIdIndex => "index_by_id".to_string(),
@@ -205,6 +211,7 @@ impl FromStr for PersistenceGlobalKey {
             "document_min_snapshot_ts" => Ok(Self::DocumentRetentionMinSnapshotTimestamp),
             "document_confirmed_deleted_ts" => Ok(Self::DocumentRetentionConfirmedDeletedTimestamp),
             "max_repeatable_ts" => Ok(Self::MaxRepeatableTimestamp),
+            "replication_frontiers_v1" => Ok(Self::ReplicationFrontiers),
             "table_summary_v2" => Ok(Self::TableSummary),
             "tables_by_id" => Ok(Self::TablesByIdIndex),
             "tables_table_id" => Ok(Self::TablesTabletId),
