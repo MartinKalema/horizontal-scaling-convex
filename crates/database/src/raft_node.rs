@@ -91,6 +91,9 @@ pub struct LeadershipCallbacks {
     /// Called when this node loses leadership (stepped down or partitioned).
     /// The Committer should stop accepting writes and drain pending proposals.
     pub on_lost_leadership: Box<dyn FnMut() + Send>,
+    /// Called whenever the known leader changes (including on other nodes).
+    /// Receives the new leader's node ID (0 if unknown).
+    pub on_leader_changed: Box<dyn FnMut(u64) + Send>,
 }
 
 impl Default for LeadershipCallbacks {
@@ -98,6 +101,7 @@ impl Default for LeadershipCallbacks {
         Self {
             on_became_leader: Box::new(|| {}),
             on_lost_leadership: Box::new(|| {}),
+            on_leader_changed: Box::new(|_| {}),
         }
     }
 }
@@ -232,6 +236,11 @@ impl RaftNode {
                 // SoftState is present in Ready only when it changes.
                 if let Some(ss) = ready.ss() {
                     let now_leader = ss.raft_state == StateRole::Leader;
+
+                    // Always propagate current leader ID — followers need
+                    // this to redirect write rejections to the correct node.
+                    (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
+
                     if now_leader && !self.is_leader_flag {
                         tracing::info!(
                             "Raft node {}: became LEADER for partition {}",
@@ -397,6 +406,7 @@ impl RaftNode {
         // Track leadership and fire callbacks.
         if let Some(ss) = ready.ss() {
             let now_leader = ss.raft_state == StateRole::Leader;
+            (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
             if now_leader && !self.is_leader_flag {
                 self.is_leader_flag = true;
                 (self.leadership_callbacks.on_became_leader)();
@@ -526,6 +536,7 @@ mod tests {
                 became_leader_clone.store(true, std::sync::atomic::Ordering::SeqCst);
             }),
             on_lost_leadership: Box::new(|| {}),
+            on_leader_changed: Box::new(|_| {}),
         });
 
         assert!(!became_leader.load(std::sync::atomic::Ordering::SeqCst));

@@ -148,6 +148,21 @@ impl RaftPartitionManager {
                     );
                 }
             }),
+            on_leader_changed: Box::new({
+                let leader_id_changed = leader_id.clone();
+                let partition_id_changed = partition_id;
+                move |new_leader_id| {
+                    let old = leader_id_changed.swap(new_leader_id, Ordering::SeqCst);
+                    if old != new_leader_id {
+                        tracing::info!(
+                            "Raft partition {}: leader changed from {} to {}",
+                            partition_id_changed,
+                            old,
+                            new_leader_id,
+                        );
+                    }
+                }
+            }),
         });
 
         let state = RaftPartitionState {
