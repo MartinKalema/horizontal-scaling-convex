@@ -126,7 +126,6 @@ impl RaftPartitionManager {
 
         // Set up leadership callbacks that update shared atomic state.
         let is_leader_cb = is_leader.clone();
-        let leader_id_cb = leader_id.clone();
         let partition_id = config.partition_id;
 
         node.set_leadership_callbacks(LeadershipCallbacks {
@@ -248,6 +247,11 @@ mod tests {
 
         // The shared state should now reflect leadership.
         assert!(state.is_leader());
+        assert_eq!(
+            state.leader_id(),
+            1,
+            "Shared state should expose the elected leader ID"
+        );
     }
 
     #[test]
