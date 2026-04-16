@@ -17,13 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use common::{
-    persistence::{
-        DocumentLogEntry,
-        PersistenceIndexEntry,
-    },
-    types::Timestamp,
-};
+use common::types::Timestamp;
 use serde::{
     Deserialize,
     Serialize,

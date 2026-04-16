@@ -20,7 +20,6 @@ use tokio::sync::mpsc;
 use crate::{
     partition::PartitionId,
     raft_node::{
-        RaftMessage,
         RaftNode,
         RaftNodeConfig,
     },

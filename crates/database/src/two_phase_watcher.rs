@@ -11,12 +11,8 @@
 //! Follows Vitess's watcher pattern:
 //! https://vitess.io/docs/22.0/reference/features/distributed-transaction/
 
-use std::{
-    sync::Arc,
-    time::Duration,
-};
+use std::time::Duration;
 
-use anyhow::Context;
 use common::runtime::Runtime;
 
 use crate::{
@@ -24,7 +20,6 @@ use crate::{
     two_phase::{
         TwoPhaseDecision,
         TwoPhaseTransactionId,
-        PREPARE_TIMEOUT_SECS,
         TWO_PHASE_KV_BUCKET,
         TWO_PHASE_KV_PREFIX,
     },

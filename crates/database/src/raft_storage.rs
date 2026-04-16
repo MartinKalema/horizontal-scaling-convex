@@ -91,7 +91,7 @@ impl ConvexRaftStorage {
     pub fn new(
         partition_id: PartitionId,
         engine: Arc<Engine>,
-        node_id: u64,
+        _node_id: u64,
         peers: Vec<u64>,
     ) -> anyhow::Result<Self> {
         let region_id = partition_id.0 as u64;
@@ -293,23 +293,19 @@ impl Storage for ConvexRaftStorage {
     }
 
     fn first_index(&self) -> RaftResult<u64> {
-        Ok(self
-            .engine
-            .first_index(self.region_id())
-            .unwrap_or(1))
+        Ok(self.engine.first_index(self.region_id()).unwrap_or(1))
     }
 
     fn last_index(&self) -> RaftResult<u64> {
-        Ok(self
-            .engine
-            .last_index(self.region_id())
-            .unwrap_or(0))
+        Ok(self.engine.last_index(self.region_id()).unwrap_or(0))
     }
 
     fn snapshot(&self, _request_index: u64, _to: u64) -> RaftResult<Snapshot> {
         // Snapshot transfer not yet implemented.
         // For now, nodes that fall too far behind must re-bootstrap.
-        Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+        Err(raft::Error::Store(
+            StorageError::SnapshotTemporarilyUnavailable,
+        ))
     }
 }
 
@@ -325,8 +321,7 @@ mod tests {
     #[test]
     fn test_create_storage() {
         let engine = test_engine();
-        let storage =
-            ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3]).unwrap();
+        let storage = ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3]).unwrap();
         assert_eq!(storage.partition_id(), PartitionId(0));
         assert!(storage.first_index().is_ok());
         assert!(storage.last_index().is_ok());
@@ -335,8 +330,7 @@ mod tests {
     #[test]
     fn test_append_and_read_entries() {
         let engine = test_engine();
-        let storage =
-            ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1]).unwrap();
+        let storage = ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1]).unwrap();
 
         let mut entry = Entry::default();
         entry.set_index(1);
@@ -354,8 +348,7 @@ mod tests {
     #[test]
     fn test_hardstate_persistence() {
         let engine = test_engine();
-        let storage =
-            ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1]).unwrap();
+        let storage = ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1]).unwrap();
 
         let mut hs = HardState::default();
         hs.set_term(5);
@@ -372,8 +365,7 @@ mod tests {
     #[test]
     fn test_initial_state_with_peers() {
         let engine = test_engine();
-        let storage =
-            ConvexRaftStorage::new(PartitionId(1), engine, 2, vec![1, 2, 3]).unwrap();
+        let storage = ConvexRaftStorage::new(PartitionId(1), engine, 2, vec![1, 2, 3]).unwrap();
         let state = storage.initial_state().unwrap();
         let voters = state.conf_state.get_voters().to_vec();
         assert_eq!(voters, vec![1, 2, 3]);
@@ -387,8 +379,7 @@ mod tests {
         // First boot: write entries and hard state.
         {
             let engine = ConvexRaftStorage::open_engine(path).unwrap();
-            let storage =
-                ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3]).unwrap();
+            let storage = ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3]).unwrap();
 
             let mut entry = Entry::default();
             entry.set_index(1);
@@ -400,17 +391,14 @@ mod tests {
             hs.set_vote(1);
             hs.set_commit(1);
 
-            storage
-                .append_entries_and_hardstate(&[entry], &hs)
-                .unwrap();
+            storage.append_entries_and_hardstate(&[entry], &hs).unwrap();
         }
         // Engine dropped, simulating restart.
 
         // Reopen: verify state survived.
         {
             let engine = ConvexRaftStorage::open_engine(path).unwrap();
-            let storage =
-                ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3]).unwrap();
+            let storage = ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3]).unwrap();
 
             // Hard state persisted.
             let state = storage.initial_state().unwrap();

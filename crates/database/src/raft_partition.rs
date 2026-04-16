@@ -137,6 +137,9 @@ impl RaftPartitionManager {
                     partition_id,
                 );
             }),
+            on_leader_changed: Box::new(move |new_leader_id| {
+                leader_id_cb.store(new_leader_id, Ordering::SeqCst);
+            }),
             on_lost_leadership: Box::new({
                 let is_leader_lost = is_leader.clone();
                 let partition_id_lost = partition_id;
@@ -233,6 +236,7 @@ mod tests {
 
         // The shared state should now reflect leadership.
         assert!(state.is_leader());
+        assert_eq!(state.leader_id(), 1);
     }
 
     #[test]

@@ -170,7 +170,6 @@ struct PreparedTransaction {
     write_bytes: u64,
     document_writes: Arc<Vec<DocumentLogEntry>>,
     index_writes: Arc<Vec<PersistenceIndexEntry>>,
-    write_source: WriteSource,
 }
 
 enum PersistenceWrite {
@@ -197,8 +196,6 @@ enum PersistenceWrite {
     ReplicaDelta {
         commit_ts: Timestamp,
         snapshot: Snapshot,
-        document_writes: Vec<DocumentLogEntry>,
-        index_writes: Vec<PersistenceIndexEntry>,
         remapped_updates: Vec<common::document::DocumentUpdate>,
         write_source: WriteSource,
         write_bytes: u64,
@@ -1671,8 +1668,6 @@ impl<RT: Runtime> Committer<RT> {
                 Ok(PersistenceWrite::ReplicaDelta {
                     commit_ts,
                     snapshot,
-                    document_writes: document_writes.clone(),
-                    index_writes: index_writes.clone(),
                     remapped_updates: all_remapped_updates,
                     write_source: delta.write_source,
                     write_bytes: delta.write_bytes,
@@ -1784,7 +1779,6 @@ impl<RT: Runtime> Committer<RT> {
                 write_bytes,
                 document_writes: Arc::new(doc_entries),
                 index_writes: Arc::new(idx_entries),
-                write_source,
             },
         );
 

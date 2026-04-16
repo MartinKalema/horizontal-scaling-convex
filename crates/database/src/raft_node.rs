@@ -88,6 +88,9 @@ pub struct LeadershipCallbacks {
     /// Called when this node becomes the Raft leader.
     /// The Committer should start accepting writes for this partition.
     pub on_became_leader: Box<dyn FnMut() + Send>,
+    /// Called whenever the Raft-reported leader changes.
+    /// Allows callers to publish the exact leader ID for routing.
+    pub on_leader_changed: Box<dyn FnMut(u64) + Send>,
     /// Called when this node loses leadership (stepped down or partitioned).
     /// The Committer should stop accepting writes and drain pending proposals.
     pub on_lost_leadership: Box<dyn FnMut() + Send>,
@@ -97,6 +100,7 @@ impl Default for LeadershipCallbacks {
     fn default() -> Self {
         Self {
             on_became_leader: Box::new(|| {}),
+            on_leader_changed: Box::new(|_| {}),
             on_lost_leadership: Box::new(|| {}),
         }
     }
@@ -147,7 +151,9 @@ impl RaftNode {
         // On restart, pick up where we left off (applied index from
         // the persisted hard state's commit). This prevents raft-rs
         // from re-applying already-committed entries.
-        let initial_state = storage.initial_state().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let initial_state = storage
+            .initial_state()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let applied = initial_state.hard_state.get_commit();
 
         let raft_config = Config {
@@ -231,6 +237,7 @@ impl RaftNode {
                 // Detect leadership changes (TiKV SoftState pattern).
                 // SoftState is present in Ready only when it changes.
                 if let Some(ss) = ready.ss() {
+                    (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
                     let now_leader = ss.raft_state == StateRole::Leader;
                     if now_leader && !self.is_leader_flag {
                         tracing::info!(
@@ -302,7 +309,9 @@ impl RaftNode {
                             // Configuration change — apply to Raft membership.
                             let cc = ConfChange::default();
                             if let Ok(cs) = self.raw_node.apply_conf_change(&cc) {
-                                self.storage.set_conf_state(cs);
+                                if let Err(e) = self.storage.set_conf_state(cs) {
+                                    tracing::error!("Failed to persist conf state: {e}");
+                                }
                             }
                         },
                         EntryType::EntryNormal => {
@@ -396,6 +405,7 @@ impl RaftNode {
 
         // Track leadership and fire callbacks.
         if let Some(ss) = ready.ss() {
+            (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
             let now_leader = ss.raft_state == StateRole::Leader;
             if now_leader && !self.is_leader_flag {
                 self.is_leader_flag = true;
@@ -520,10 +530,15 @@ mod tests {
 
         let became_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let became_leader_clone = became_leader.clone();
+        let leader_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let leader_id_clone = leader_id.clone();
 
         node.set_leadership_callbacks(LeadershipCallbacks {
             on_became_leader: Box::new(move || {
                 became_leader_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+            on_leader_changed: Box::new(move |new_leader_id| {
+                leader_id_clone.store(new_leader_id, std::sync::atomic::Ordering::SeqCst);
             }),
             on_lost_leadership: Box::new(|| {}),
         });
@@ -537,6 +552,7 @@ mod tests {
         node.process_ready_test();
 
         assert!(node.is_leader());
+        assert_eq!(leader_id.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             became_leader.load(std::sync::atomic::Ordering::SeqCst),
             "on_became_leader callback should have fired"
