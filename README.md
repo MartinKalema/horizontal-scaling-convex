@@ -203,6 +203,22 @@ cd self-hosted/docker
 ./test.sh failover     # Raft failover only (10 tests)
 ```
 
+### Formal Jepsen Harness
+
+This repository contains the backend fork, Docker cluster topology, and the
+Jepsen-inspired shell and integration tests under `self-hosted/docker/`.
+
+The dedicated formal Jepsen harness is under development and lives in a
+separate repository:
+
+- GitHub: `https://github.com/MartinKalema/convex-jepsen-tests`
+- Local working copy: `/Users/martin/Desktop/convex-jepsen-tests`
+
+That separate repository is where the Clojure Jepsen suite, reusable
+workloads, and fault injectors will evolve. This repository remains the home
+for the Convex backend implementation itself and its integration/chaos test
+scripts.
+
 ### Deploy Functions
 
 ```sh

@@ -2,6 +2,17 @@
 
 Based on how CockroachDB, TiDB, YugabyteDB, Google Spanner, and Vitess test their distributed read/write scaling.
 
+These tests are the Jepsen-inspired integration and chaos checks that live in
+this repository. The dedicated formal Jepsen harness for Convex is under
+development and lives in a separate repository:
+
+- GitHub: `https://github.com/MartinKalema/convex-jepsen-tests`
+- Local working copy: `/Users/martin/Desktop/convex-jepsen-tests`
+
+That split is intentional: this repository keeps the backend fork plus the
+shell-driven cluster tests, while the separate repository holds the Clojure
+Jepsen suite.
+
 ## Test Results
 
 ```
