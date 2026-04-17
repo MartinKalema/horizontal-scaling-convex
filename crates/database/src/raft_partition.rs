@@ -126,7 +126,6 @@ impl RaftPartitionManager {
 
         // Set up leadership callbacks that update shared atomic state.
         let is_leader_cb = is_leader.clone();
-        let leader_id_cb = leader_id.clone();
         let partition_id = config.partition_id;
 
         node.set_leadership_callbacks(LeadershipCallbacks {
@@ -137,9 +136,6 @@ impl RaftPartitionManager {
                     partition_id,
                 );
             }),
-            on_leader_changed: Box::new(move |new_leader_id| {
-                leader_id_cb.store(new_leader_id, Ordering::SeqCst);
-            }),
             on_lost_leadership: Box::new({
                 let is_leader_lost = is_leader.clone();
                 let partition_id_lost = partition_id;
@@ -149,6 +145,21 @@ impl RaftPartitionManager {
                         "Raft partition {}: Committer DEACTIVATED (lost leadership)",
                         partition_id_lost,
                     );
+                }
+            }),
+            on_leader_changed: Box::new({
+                let leader_id_changed = leader_id.clone();
+                let partition_id_changed = partition_id;
+                move |new_leader_id| {
+                    let old = leader_id_changed.swap(new_leader_id, Ordering::SeqCst);
+                    if old != new_leader_id {
+                        tracing::info!(
+                            "Raft partition {}: leader changed from {} to {}",
+                            partition_id_changed,
+                            old,
+                            new_leader_id,
+                        );
+                    }
                 }
             }),
         });
@@ -237,6 +248,7 @@ mod tests {
         // The shared state should now reflect leadership.
         assert!(state.is_leader());
         assert_eq!(state.leader_id(), 1);
+        assert_eq!(state.leader_id(), 1, "Shared state should expose the elected leader ID");
     }
 
     #[test]

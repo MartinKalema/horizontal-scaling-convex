@@ -88,20 +88,20 @@ pub struct LeadershipCallbacks {
     /// Called when this node becomes the Raft leader.
     /// The Committer should start accepting writes for this partition.
     pub on_became_leader: Box<dyn FnMut() + Send>,
-    /// Called whenever the Raft-reported leader changes.
-    /// Allows callers to publish the exact leader ID for routing.
-    pub on_leader_changed: Box<dyn FnMut(u64) + Send>,
     /// Called when this node loses leadership (stepped down or partitioned).
     /// The Committer should stop accepting writes and drain pending proposals.
     pub on_lost_leadership: Box<dyn FnMut() + Send>,
+    /// Called whenever the known leader changes (including on other nodes).
+    /// Receives the new leader's node ID (0 if unknown).
+    pub on_leader_changed: Box<dyn FnMut(u64) + Send>,
 }
 
 impl Default for LeadershipCallbacks {
     fn default() -> Self {
         Self {
             on_became_leader: Box::new(|| {}),
-            on_leader_changed: Box::new(|_| {}),
             on_lost_leadership: Box::new(|| {}),
+            on_leader_changed: Box::new(|_| {}),
         }
     }
 }
@@ -237,8 +237,12 @@ impl RaftNode {
                 // Detect leadership changes (TiKV SoftState pattern).
                 // SoftState is present in Ready only when it changes.
                 if let Some(ss) = ready.ss() {
-                    (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
                     let now_leader = ss.raft_state == StateRole::Leader;
+
+                    // Always propagate current leader ID — followers need
+                    // this to redirect write rejections to the correct node.
+                    (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
+
                     if now_leader && !self.is_leader_flag {
                         tracing::info!(
                             "Raft node {}: became LEADER for partition {}",
@@ -407,6 +411,7 @@ impl RaftNode {
         if let Some(ss) = ready.ss() {
             (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
             let now_leader = ss.raft_state == StateRole::Leader;
+            (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
             if now_leader && !self.is_leader_flag {
                 self.is_leader_flag = true;
                 (self.leadership_callbacks.on_became_leader)();
@@ -528,22 +533,26 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
 
+        let observed_leader_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed_leader_id_clone = observed_leader_id.clone();
         let became_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let became_leader_clone = became_leader.clone();
-        let leader_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let leader_id_clone = leader_id.clone();
 
         node.set_leadership_callbacks(LeadershipCallbacks {
             on_became_leader: Box::new(move || {
                 became_leader_clone.store(true, std::sync::atomic::Ordering::SeqCst);
             }),
-            on_leader_changed: Box::new(move |new_leader_id| {
-                leader_id_clone.store(new_leader_id, std::sync::atomic::Ordering::SeqCst);
+            on_leader_changed: Box::new(move |leader_id| {
+                observed_leader_id_clone.store(leader_id, std::sync::atomic::Ordering::SeqCst);
             }),
             on_lost_leadership: Box::new(|| {}),
         });
 
         assert!(!became_leader.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            observed_leader_id.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
 
         // Trigger election.
         for _ in 0..20 {
@@ -552,10 +561,14 @@ mod tests {
         node.process_ready_test();
 
         assert!(node.is_leader());
-        assert_eq!(leader_id.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             became_leader.load(std::sync::atomic::Ordering::SeqCst),
             "on_became_leader callback should have fired"
+        );
+        assert_eq!(
+            observed_leader_id.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "on_leader_changed should publish the elected leader ID"
         );
     }
 }
