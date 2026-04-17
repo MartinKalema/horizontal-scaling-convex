@@ -42,9 +42,6 @@ use crate::checkpoint::{
 /// How often the Primary writes a new checkpoint.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Well-known key for the latest checkpoint pointer.
-const LATEST_KEY: &str = "checkpoint-latest";
-
 /// Background task that periodically writes checkpoints to object storage.
 pub struct SnapshotCheckpointer {
     _handle: Box<dyn SpawnHandle>,
@@ -133,7 +130,7 @@ impl SnapshotCheckpointer {
         latest_upload
             .write(Bytes::from(checkpoint_key.into_bytes()))
             .await?;
-        latest_upload.complete().await?;
+        let _ = latest_upload.complete().await?;
 
         Ok(ts)
     }

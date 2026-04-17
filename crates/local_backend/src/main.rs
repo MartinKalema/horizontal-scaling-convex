@@ -136,7 +136,7 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     )
     .await?;
 
-    // Start gRPC services (mutation forwarder + 2PC).
+    // Start gRPC services (mutation forwarder + 2PC + Raft transport).
     if config.replication_mode == "primary" && config.nats_url.is_some() {
         let grpc_addr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
         let api: std::sync::Arc<dyn application::api::ApplicationApi> =
@@ -145,12 +145,25 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
         let two_pc = two_phase_service::TwoPhaseCommitGrpcService::new(
             st.application.database().committer_client(),
         );
+
+        // Add Raft transport server if Raft is enabled.
+        let raft_transport = st.raft_mailbox_tx.as_ref().map(|mailbox_tx| {
+            database::raft_transport::RaftTransportServer::new(mailbox_tx.clone())
+        });
+
         let mut grpc_shutdown_rx = shutdown_rx.clone();
         runtime.spawn_background("grpc_services", async move {
             tracing::info!("Starting gRPC services on {grpc_addr}");
-            if let Err(e) = tonic::transport::Server::builder()
+            let mut builder = tonic::transport::Server::builder()
                 .add_service(forwarder.into_server())
-                .add_service(two_pc.into_server())
+                .add_service(two_pc.into_server());
+
+            if let Some(raft) = raft_transport {
+                builder = builder.add_service(raft.into_service());
+                tracing::info!("Raft transport service registered on gRPC");
+            }
+
+            if let Err(e) = builder
                 .serve_with_shutdown(grpc_addr, async move {
                     let _ = grpc_shutdown_rx.recv().await;
                 })

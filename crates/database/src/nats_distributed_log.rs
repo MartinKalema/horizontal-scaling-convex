@@ -34,6 +34,7 @@ use crate::{
         CommitDelta,
         DistributedLog,
     },
+    partition::PartitionId,
     write_log::WriteSource,
 };
 
@@ -126,9 +127,11 @@ impl NatsDistributedLog {
     }
 }
 
-/// Serializable envelope for transporting CommitDelta over NATS.
+/// Serializable envelope for transporting CommitDelta over NATS and Raft.
+/// Used by both NatsDistributedLog and the Raft state machine to serialize
+/// deltas for transport between nodes.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct DeltaEnvelope {
+pub struct DeltaEnvelope {
     ts: u64,
     write_source: Option<String>,
     write_bytes: u64,
@@ -142,10 +145,13 @@ struct DeltaEnvelope {
     /// Consumers skip deltas from their own node to avoid double-applying.
     #[serde(default)]
     source_node: String,
+    /// Partition that originated this replication event.
+    #[serde(default)]
+    source_partition: Option<u32>,
 }
 
 impl DeltaEnvelope {
-    fn from_delta(delta: &CommitDelta, source_node: &str) -> anyhow::Result<Self> {
+    pub fn from_delta(delta: &CommitDelta, source_node: &str) -> anyhow::Result<Self> {
         let document_updates_proto = delta
             .document_updates
             .iter()
@@ -168,10 +174,11 @@ impl DeltaEnvelope {
             document_updates_proto,
             tablet_mapping,
             source_node: source_node.to_string(),
+            source_partition: delta.source_partition.map(|partition| partition.0),
         })
     }
 
-    fn to_delta(self) -> anyhow::Result<CommitDelta> {
+    pub fn to_delta(self) -> anyhow::Result<CommitDelta> {
         let document_updates = self
             .document_updates_proto
             .into_iter()
@@ -206,6 +213,7 @@ impl DeltaEnvelope {
                     Some((tablet_id, name))
                 })
                 .collect(),
+            source_partition: self.source_partition.map(PartitionId),
         })
     }
 }

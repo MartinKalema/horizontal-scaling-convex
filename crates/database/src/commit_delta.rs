@@ -25,7 +25,10 @@ use value::{
     TabletId,
 };
 
-use crate::write_log::WriteSource;
+use crate::{
+    partition::PartitionId,
+    write_log::WriteSource,
+};
 
 /// Everything that changed in a single committed transaction.
 ///
@@ -61,6 +64,13 @@ pub struct CommitDelta {
     /// Replicas use this to remap document IDs to their own local TabletIds
     /// since each database instance generates unique TabletIds.
     pub tablet_id_to_table_name: BTreeMap<TabletId, TableName>,
+
+    /// Partition that originated this replicated event.
+    ///
+    /// Used to advance per-partition freshness frontiers on replicas, so
+    /// remote reads can prove they were validated against a sufficiently
+    /// up-to-date replica state.
+    pub source_partition: Option<PartitionId>,
 }
 
 /// Abstraction over the transport that carries [`CommitDelta`]s between

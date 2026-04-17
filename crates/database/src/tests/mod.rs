@@ -131,6 +131,7 @@ use crate::{
 };
 
 mod committer_race_tests;
+mod raft_failover_tests;
 mod randomized_search_tests;
 mod replication_tests;
 mod search_index_backfill_tests;

@@ -21,8 +21,6 @@
 //! - [`BatchTimestampOracle`]: Reserves batches from NATS KV for multi-node
 //!   deployments.
 
-use std::sync::Arc;
-
 use anyhow::Context;
 use async_trait::async_trait;
 use common::{
@@ -191,7 +189,7 @@ impl BatchTimestampOracle {
     async fn reserve_batch(&self) -> anyhow::Result<(u64, u64)> {
         let jetstream = async_nats::jetstream::new(self.nats_client.clone());
         let kv = jetstream
-            .get_key_value("convex_tso")
+            .get_key_value(&self.kv_bucket)
             .await
             .context("TSO: Failed to get KV bucket")?;
 
@@ -266,7 +264,7 @@ impl TimestampOracle for BatchTimestampOracle {
         // Read from NATS KV for cross-node consistency.
         let jetstream = async_nats::jetstream::new(self.nats_client.clone());
         let kv = jetstream
-            .get_key_value("convex_tso")
+            .get_key_value(&self.kv_bucket)
             .await
             .context("TSO: Failed to get KV bucket")?;
 
@@ -299,7 +297,7 @@ impl TimestampOracle for BatchTimestampOracle {
         // Update NATS KV (best-effort, non-blocking for the commit path).
         let jetstream = async_nats::jetstream::new(self.nats_client.clone());
         let kv = jetstream
-            .get_key_value("convex_tso")
+            .get_key_value(&self.kv_bucket)
             .await
             .context("TSO: Failed to get KV bucket")?;
 

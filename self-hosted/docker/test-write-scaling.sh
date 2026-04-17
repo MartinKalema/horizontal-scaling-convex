@@ -44,7 +44,7 @@
 #  37. Ultimate Final Invariant Check
 #
 # Prerequisites:
-#   docker compose -f docker-compose.partitioned.yml up
+#   docker compose --profile cluster up
 #
 # Usage:
 #   cd self-hosted/docker && ./test-write-scaling.sh
@@ -52,7 +52,7 @@
 set -euo pipefail
 
 NODE_A_URL="http://127.0.0.1:3210"
-NODE_B_URL="http://127.0.0.1:3220"
+NODE_B_URL="http://127.0.0.1:3310"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -79,17 +79,17 @@ fail() {
 echo ""
 echo -e "${BOLD}Preflight checks${NC}"
 
-for name in docker-node-a-1 docker-node-b-1; do
+for name in docker-node-p0a-1 docker-node-p1a-1; do
     if ! docker inspect "$name" > /dev/null 2>&1; then
         echo -e "${RED}Container $name not running. Start the deployment first:${NC}"
-        echo "  docker compose -f docker-compose.partitioned.yml up"
+        echo "  docker compose --profile cluster up"
         exit 1
     fi
 done
 echo "  Containers running."
 
-NODE_A_KEY=$(docker exec docker-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
-NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 echo "  Admin keys generated."
 
 # --- Deploy test functions ---
@@ -314,6 +314,14 @@ export const readTwoKeys = query({
     const a = rows.find((r: any) => r.author === args.keyA && r.channel === "register-test");
     const b = rows.find((r: any) => r.author === args.keyB && r.channel === "register-test");
     return { a: a?.text ?? null, b: b?.text ?? null };
+  },
+});
+
+// Simple message count (used by failover tests).
+export const count = query({
+  handler: async (ctx) => {
+    const msgs = await ctx.db.query("messages").collect();
+    return msgs.length;
   },
 });
 TSEOF
@@ -599,7 +607,7 @@ PRE_M=$(jval messages "$PRE")
 
 # Restart Node B
 echo "  Restarting Node B..."
-docker restart docker-node-b-1 > /dev/null 2>&1
+docker restart docker-node-p1a-1 > /dev/null 2>&1
 
 # Write to Node A while Node B is restarting
 mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
@@ -608,14 +616,14 @@ mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
 # Wait for Node B to come back healthy
 echo "  Waiting for Node B to recover..."
 for attempt in $(seq 1 30); do
-    if curl -sf "http://127.0.0.1:3220/version" > /dev/null 2>&1; then
+    if curl -sf "http://127.0.0.1:3310/version" > /dev/null 2>&1; then
         break
     fi
     sleep 1
 done
 
 # Re-generate Node B key (may have changed on restart)
-NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 
 # Re-deploy functions to Node B (modules are in-memory)
 echo "  Re-deploying functions to Node B..."
@@ -818,7 +826,7 @@ PRE_DOUBLE=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_DOUBLE_M=$(jval messages "$PRE_DOUBLE")
 
 echo "  First restart of Node B..."
-docker restart docker-node-b-1 > /dev/null 2>&1
+docker restart docker-node-p1a-1 > /dev/null 2>&1
 
 # Write during first restart.
 mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
@@ -826,12 +834,12 @@ mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
 
 echo "  Waiting for recovery..."
 for attempt in $(seq 1 30); do
-    curl -sf "http://127.0.0.1:3220/version" > /dev/null 2>&1 && break
+    curl -sf "http://127.0.0.1:3310/version" > /dev/null 2>&1 && break
     sleep 1
 done
 
 echo "  Second restart of Node B..."
-docker restart docker-node-b-1 > /dev/null 2>&1
+docker restart docker-node-p1a-1 > /dev/null 2>&1
 
 # Write during second restart.
 mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
@@ -839,11 +847,11 @@ mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
 
 echo "  Waiting for recovery..."
 for attempt in $(seq 1 30); do
-    curl -sf "http://127.0.0.1:3220/version" > /dev/null 2>&1 && break
+    curl -sf "http://127.0.0.1:3310/version" > /dev/null 2>&1 && break
     sleep 1
 done
 
-NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
 
 sleep 4
@@ -1103,16 +1111,16 @@ PRE_KILL=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_KILL_M=$(jval messages "$PRE_KILL")
 
 echo "  Killing Node A..."
-docker stop docker-node-a-1 > /dev/null 2>&1
+docker stop docker-node-p0a-1 > /dev/null 2>&1
 sleep 2
 
 echo "  Killing Node B..."
-docker stop docker-node-b-1 > /dev/null 2>&1
+docker stop docker-node-p1a-1 > /dev/null 2>&1
 sleep 2
 
 echo "  Restarting both nodes..."
-docker start docker-node-a-1 > /dev/null 2>&1
-docker start docker-node-b-1 > /dev/null 2>&1
+docker start docker-node-p0a-1 > /dev/null 2>&1
+docker start docker-node-p1a-1 > /dev/null 2>&1
 
 echo "  Waiting for recovery..."
 for attempt in $(seq 1 60); do
@@ -1122,8 +1130,8 @@ for attempt in $(seq 1 60); do
     sleep 1
 done
 
-NODE_A_KEY=$(docker exec docker-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
-NODE_B_KEY=$(docker exec docker-node-b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
 
@@ -1545,14 +1553,14 @@ echo -e "${BOLD}Test 34: Clock Monotonicity After Restart (TSO)${NC}"
 PRE_RESTART_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_RESTART_AM=$(jval messages "$PRE_RESTART_A")
 
-docker restart docker-node-a-1 > /dev/null 2>&1
+docker restart docker-node-p0a-1 > /dev/null 2>&1
 echo "  Waiting for Node A recovery..."
 for attempt in $(seq 1 30); do
     curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 && break
     sleep 1
 done
 
-NODE_A_KEY=$(docker exec docker-node-a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
 
 # Write after restart — TSO must give a valid timestamp.

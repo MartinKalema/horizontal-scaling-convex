@@ -1,6 +1,6 @@
 # Horizontal Scaling for Convex
 
-The first horizontal scaling implementation for the [Convex open-source backend](https://github.com/get-convex/convex-backend) — both reads and writes.
+The first horizontal scaling implementation for the [Convex open-source backend](https://github.com/get-convex/convex-backend) — reads, writes, and automatic failover.
 
 Convex is a reactive database: real-time subscriptions, in-memory snapshots, OCC with automatic retry, TypeScript function execution. No distributed database — CockroachDB, TiDB, Vitess, YugabyteDB, or Spanner — has all of these. We made it scale horizontally without losing any of them.
 
@@ -23,12 +23,47 @@ We took the best engineering from five distributed databases and combined them:
 | Replica timestamp isolation | No TSO or system clock on apply — monotonic counters only | CockroachDB closed timestamp, TiDB resolved-ts |
 | Delta replication | NATS JetStream with durable consumers and self-delta skip | All five systems |
 | System table classification | Classify by what data describes, not which table stores it | CockroachDB system ranges |
+| Automatic leader failover | tikv/raft-rs consensus per partition — sub-second leader election | TiKV, etcd |
+| Raft transport | gRPC with batched messages and exponential backoff retry | TiKV RaftClient |
+| Leadership lifecycle | Committer starts on election, stops on demotion via SoftState | TiKV, CockroachDB |
+| Deployment state replication | GLOBAL table locality — `_modules`, `_udf_config`, `_source_packages` replicate to all nodes | CockroachDB GLOBAL tables, YugabyteDB system catalog |
+| Persistent Raft log | raft-engine — append-only WAL with ~1x write amplification, crash-safe atomic batches | TiKV raft-engine (replaced RocksDB in v6.1) |
 
 The combination — real-time subscriptions + in-memory OCC + partitioned multi-writer + delta replication + 2PC — doesn't exist in any of those systems. CockroachDB doesn't have subscriptions. TiDB doesn't have in-memory snapshots. Vitess doesn't have OCC. We kept Convex's unique architecture and grafted distributed database patterns onto it.
 
 Full details: [docs/what-we-built.md](docs/what-we-built.md)
 
 ## Results
+
+### Raft Failover Tests
+
+```
+ALL 10 TESTS PASSED
+
+Test 1: All 3 Nodes Healthy
+  PASS  Node A (port 3210) healthy
+  PASS  Node B (port 3220) healthy
+  PASS  Node C (port 3230) healthy
+
+Test 2: Write to Leader
+  PASS  Write to Node A succeeded
+
+Test 3: Read from All Nodes
+  PASS  Node A sees data: 1 messages
+  PASS  All 3 nodes agree: 1 messages
+
+Test 4: Kill Leader, Verify Failover
+  PASS  Failover: writes accepted on http://127.0.0.1:3220 after leader kill
+  PASS  Data written after failover: B=2 C=2 (pre-kill=1)
+
+Test 5: Restart Killed Node, Verify Rejoin
+  PASS  Node A recovered: sees 2 messages (>=1)
+  PASS  All nodes converged after rejoin: 2 messages
+```
+
+Based on CockroachDB roachtest failover/non-system/crash, TiKV fail-rs chaos testing, and YugabyteDB Jepsen nightly resilience benchmarks.
+
+### Write Scaling Tests
 
 ```
 ALL 77 TESTS PASSED — 3,823 messages | 3,069 tasks | 1,390 sustained writes/node
@@ -76,6 +111,29 @@ Every test pattern comes from a real bug found by Jepsen in a production databas
 
 ## Architecture
 
+### Raft Consensus (Automatic Failover)
+
+```
+Partition 0 — 3-node Raft group (tikv/raft-rs):
+
+  Node A (leader)  ────Raft────▶ Node B (follower)
+        │          ────Raft────▶ Node C (follower)
+        │
+        ▼
+   Committer active         Committers dormant
+   Accepts writes           Reject writes (redirect)
+        │
+        ├── NATS delta ──▶ Node B applies replica delta
+        └── NATS delta ──▶ Node C applies replica delta
+
+  Node A dies:
+    Node B elected leader (~1s) → Committer activates → accepts writes
+    Node C remains follower → applies deltas from Node B
+    Node A restarts → rejoins as follower → converges via NATS
+```
+
+Each partition is a 3-node Raft group. The leader runs the Committer. If the leader dies, followers elect a new leader within ~1 second and the Committer activates automatically. Zero manual intervention, zero data loss. Deployment state (`_modules`, `_udf_config`, `_source_packages`) replicates to all nodes via the CockroachDB GLOBAL table locality pattern so every node can serve queries.
+
 ### Write Scaling (Partitioned Multi-Writer)
 
 ```
@@ -119,64 +177,102 @@ One Primary handles writes, multiple Replicas serve reads. Replicas remap Tablet
 
 ## Quick Start
 
-### Build
+One Docker Compose file, two profiles — same as CockroachDB, etcd, and YugabyteDB. Raft consensus is always on (single-node is a Raft group of 1).
 
-```sh
-docker build -f self-hosted/docker-build/Dockerfile.backend \
-  -t convex-backend-replicated .
-```
-
-### Run Partitioned Multi-Writer
+### Run
 
 ```sh
 cd self-hosted/docker
-docker compose -f docker-compose.partitioned.yml up
+
+# 1 node (dev/test)
+docker compose --profile single up
+
+# 6 nodes — 2 partitions × 3 Raft nodes (read + write scaling + HA)
+docker compose --profile cluster up
 ```
 
-Two writer nodes: Node A (port 3210, partition 0) and Node B (port 3220, partition 1).
-
-### Run Primary-Replica
-
-```sh
-cd self-hosted/docker
-docker compose -f docker-compose.replicated.yml up
-```
+Images are published to `ghcr.io/martinkalema/convex-horizontal-scaling` — no local build needed.
 
 ### Test
 
 ```sh
 cd self-hosted/docker
-./test-write-scaling.sh
+
+./test.sh              # All tests (87 tests — scaling + failover)
+./test.sh scaling      # Write scaling only (77 tests)
+./test.sh failover     # Raft failover only (10 tests)
 ```
 
-77 integration tests across 37 categories. Takes ~3 minutes including 30 seconds of sustained writes, NATS partition simulation, and full cluster restart.
+### Formal Jepsen Harness
+
+This repository contains the backend fork, Docker cluster topology, and the
+Jepsen-inspired shell and integration tests under `self-hosted/docker/`.
+
+The dedicated formal Jepsen harness is under development and lives in a
+separate repository:
+
+- GitHub: `https://github.com/MartinKalema/convex-jepsen-tests`
+- Local working copy: `/Users/martin/Desktop/convex-jepsen-tests`
+
+That separate repository is where the Clojure Jepsen suite, reusable
+workloads, and fault injectors will evolve. This repository remains the home
+for the Convex backend implementation itself and its integration/chaos test
+scripts.
 
 ### Deploy Functions
 
 ```sh
-docker compose -f docker-compose.partitioned.yml exec node-a ./generate_admin_key.sh
+docker compose --profile cluster exec node-p0a ./generate_admin_key.sh
 npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 ```
 
+### Resource Requirements
+
+Per-node requirements, following the format used by CockroachDB, YugabyteDB, and etcd.
+
+| | Dev/Test | Production |
+| --- | --- | --- |
+| **CPU** | 2 vCPUs | 4+ vCPUs |
+| **RAM** | 2 GB | 8+ GB |
+| **Storage** | 10 GB (HDD ok) | 50+ GB SSD |
+| **Network** | 100 Mbps | 1 Gbps |
+
+**Total cluster resources:**
+
+| Profile | Nodes | Min CPU | Min RAM | Min Storage |
+| --- | --- | --- | --- | --- |
+| `single` | 1 backend + postgres + NATS | 4 vCPUs | 4 GB | 20 GB |
+| `cluster` | 6 backends + postgres + NATS | 16 vCPUs | 16 GB | 80 GB |
+
+Observed idle memory usage per backend node: ~20 MB. Under load with in-memory snapshots: scales with dataset size (similar to CockroachDB's range cache).
+
 ### Ports
 
-| Service | Port |
-| --- | --- |
-| Node A API | 3210 |
-| Node B API | 3220 |
-| Node A gRPC (2PC) | 50051 |
-| Node B gRPC (2PC) | 50052 |
-| Dashboard | 6791 |
-| PostgreSQL | 5433 |
-| NATS | 4222 |
+| Service | Single | Cluster |
+| --- | --- | --- |
+| Partition 0 node A API | 3210 | 3210 |
+| Partition 0 node B API | — | 3220 |
+| Partition 0 node C API | — | 3230 |
+| Partition 1 node A API | — | 3310 |
+| Partition 1 node B API | — | 3320 |
+| Partition 1 node C API | — | 3330 |
+| gRPC (Raft + 2PC) | 50051 | 50051–50063 |
+| Dashboard | 6791 | 6791 |
+| PostgreSQL | 5433 | 5433 |
+| NATS | 4222 | 4222 |
 
 ## Key Components
 
 | Component | File | What it does |
 | --- | --- | --- |
+| RaftNode | `raft_node.rs` | Raft loop: tick, receive, propose, process Ready, advance. Leadership callbacks via SoftState |
+| RaftPartitionManager | `raft_partition.rs` | Wraps RaftNode, activates/deactivates Committer on leader election/demotion |
+| RaftTransport | `raft_transport.rs` | gRPC transport with batched messages, exponential backoff retry (TiKV RaftClient pattern) |
+| RaftStorage | `raft_storage.rs` | Persistent Raft log backed by TiKV raft-engine — entries + hard state survive restarts |
+| RaftStateMachine | `raft_state_machine.rs` | Serialization format for Raft log entries, bridges committed entries to Committer |
 | CommitDelta | `commit_delta.rs` | Captures everything changed in a transaction — documents, indexes, table mappings |
 | NatsDistributedLog | `nats_distributed_log.rs` | Publishes/subscribes deltas via NATS JetStream with per-partition subjects and self-delta skip |
-| apply_replica_delta | `committer.rs` | Classifies updates by what they describe, creates tables with reassigned numbers, applies through Raft-pattern pipeline |
+| apply_replica_delta | `committer.rs` | Classifies updates as GLOBAL or node-local, creates tables with reassigned numbers, applies through Raft-pattern pipeline |
 | BatchTimestampOracle | `timestamp_oracle.rs` | Reserves timestamp ranges from NATS KV via atomic CAS. Zero network calls in hot path |
 | PartitionMap | `partition.rs` | Table-to-partition assignment. System tables always on partition 0 |
 | TwoPhaseCoordinator | `two_phase_coordinator.rs` | Detects cross-partition writes, orchestrates prepare/commit/rollback |
@@ -185,9 +281,15 @@ npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 
 ## Tests
 
-**346 unit tests** + **77 integration tests** across **37 categories**.
+**346 unit tests** + **87 integration tests** across **42 categories**.
 
-The integration tests cover every test pattern from CockroachDB's 7 nightly Jepsen workloads (bank, register, sequential, set, monotonic, G2, comments), TiDB's Jepsen suite (bank-multitable, monotonic, stale read), YugabyteDB's Jepsen tests (counter, linearizable set), Vitess (VDiff, partition enforcement, 2PC), CockroachDB roachtest (KV scaling, nemesis, workload check), Chaos Mesh (NATS partition), Elle anomaly classes (read skew, write skew), and boundary testing (empty tables, null fields, 200-doc batch).
+### Raft Failover (10 tests, 5 categories)
+
+Leader election, write to leader, read from all nodes, kill leader + verify failover, restart killed node + verify rejoin. Based on CockroachDB roachtest failover/non-system/crash, TiKV fail-rs, and YugabyteDB Jepsen resilience benchmarks.
+
+### Write Scaling (77 tests, 37 categories)
+
+Every test pattern from CockroachDB's 7 nightly Jepsen workloads (bank, register, sequential, set, monotonic, G2, comments), TiDB's Jepsen suite (bank-multitable, monotonic, stale read), YugabyteDB's Jepsen tests (counter, linearizable set), Vitess (VDiff, partition enforcement, 2PC), CockroachDB roachtest (KV scaling, nemesis, workload check), Chaos Mesh (NATS partition), Elle anomaly classes (read skew, write skew), and boundary testing (empty tables, null fields, 200-doc batch).
 
 Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 
@@ -195,6 +297,8 @@ Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 
 | Document | Contents |
 | --- | --- |
+| [Production Deployment](docs/production-deployment.md) | Kubernetes (GKE, EKS), bare VMs (EC2), load balancing, persistent storage, peer discovery |
+| [Raft Integration](docs/raft-integration.md) | tikv/raft-rs integration design — Raft loop, storage, transport, state machine, leader lifecycle |
 | [What We Built](docs/what-we-built.md) | What we took from each distributed database and what's new |
 | [Write Scaling Research](docs/write-scaling-research.md) | Vitess, TiDB, CockroachDB comparison |
 | [Two-Phase Commit Design](docs/two-phase-commit.md) | 2PC architecture with Vitess/TiDB/CockroachDB patterns |
@@ -211,6 +315,8 @@ Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 
 | Variable | Description | Example |
 | --- | --- | --- |
+| `RAFT_NODE_ID` | This node's Raft ID (1-based) | `1` |
+| `RAFT_PEERS` | All Raft peers with gRPC addresses | `1=http://node-a:50051,2=http://node-b:50051,3=http://node-c:50051` |
 | `PARTITION_ID` | This node's partition number | `0` |
 | `PARTITION_MAP` | Table-to-partition assignment | `messages=0,users=0,projects=1,tasks=1` |
 | `NUM_PARTITIONS` | Total partitions in cluster | `2` |

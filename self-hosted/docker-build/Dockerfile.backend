@@ -30,7 +30,7 @@ printf 'APT::Get::Assume-Yes \"true\";\n' > /etc/apt/apt.conf.d/90forceyes
 printf 'DPkg::Lock::Timeout \"30\";\n' > /etc/apt/apt.conf.d/85timeout
 echo 'DEBIAN_FRONTEND=noninteractive' > /etc/environment
 apt-get update
-apt-get install -y --no-install-recommends cmake libclang-dev libstdc++6 libc6
+apt-get install -y --no-install-recommends cmake libclang-dev libstdc++6 libc6 protobuf-compiler
 EOF
 
 # Install Just (for build scripts)

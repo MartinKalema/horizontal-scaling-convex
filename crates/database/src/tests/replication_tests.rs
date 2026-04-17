@@ -43,6 +43,7 @@ async fn test_primary_commit_publishes_delta(rt: TestRuntime) -> anyhow::Result<
         false,
         None,
         None,
+        None,
     )
     .await?;
     primary.set_search_storage(Arc::new(LocalDirStorage::new(rt.clone())?));

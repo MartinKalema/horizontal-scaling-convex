@@ -190,6 +190,7 @@ use crate::{
     schema_registry::SchemaRegistry,
     search_index_bootstrap::SearchIndexBootstrapWorker,
     snapshot_manager::{
+        replication_frontiers_from_json,
         Snapshot,
         SnapshotManager,
         TableSummaries,
@@ -980,6 +981,7 @@ impl<RT: Runtime> Database<RT> {
         replica_mode: bool,
         partition_map: Option<crate::partition::PartitionMap>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
+        raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> anyhow::Result<Self> {
         let _load_database_timer = metrics::load_database_timer();
 
@@ -1023,7 +1025,24 @@ impl<RT: Runtime> Database<RT> {
             ..
         } = db_snapshot;
 
-        let snapshot_manager = SnapshotManager::new(*ts, snapshot);
+        let replication_frontiers = match reader
+            .get_persistence_global(PersistenceGlobalKey::ReplicationFrontiers)
+            .await?
+        {
+            Some(value) => replication_frontiers_from_json(value)?,
+            None => partition_map
+                .as_ref()
+                .map(|map| {
+                    map.all_partitions()
+                        .into_iter()
+                        .filter(|partition| *partition != map.local_partition())
+                        .map(|partition| (partition, Timestamp::MIN))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+
+        let snapshot_manager = SnapshotManager::new(*ts, snapshot, replication_frontiers);
         let (snapshot_reader, snapshot_writer) = new_split_rw_lock(snapshot_manager);
 
         let retention_workers = retention_worker_seed
@@ -1075,6 +1094,7 @@ impl<RT: Runtime> Database<RT> {
             committer_distributed_log,
             partition_map,
             timestamp_oracle,
+            raft_state,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
@@ -1124,6 +1144,19 @@ impl<RT: Runtime> Database<RT> {
 
     pub async fn finish_table_summary_bootstrap(&self) -> anyhow::Result<()> {
         self.committer.finish_table_summary_bootstrap().await
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn committer_for_test(&self) -> CommitterClient {
+        self.committer.clone()
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn replication_frontier_for_test(
+        &self,
+        partition: crate::partition::PartitionId,
+    ) -> Option<Timestamp> {
+        self.snapshot_manager.lock().replication_frontier(partition)
     }
 
     #[cfg(test)]
