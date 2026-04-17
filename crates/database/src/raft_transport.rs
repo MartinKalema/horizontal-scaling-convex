@@ -15,10 +15,7 @@
 //!
 //! Reference: [TiKV Raft Transport](https://www.pingcap.com/blog/raft-in-tikv/)
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::collections::HashMap;
 
 use anyhow::Context;
 use raft::prelude::Message;
@@ -92,7 +89,6 @@ impl RaftTransportClient {
                 Ok(c) => {
                     tracing::info!("Raft transport: connected to {}", self.address);
                     client = c;
-                    backoff = std::time::Duration::from_secs(1);
                     break;
                 },
                 Err(_) => {
@@ -127,18 +123,17 @@ impl RaftTransportClient {
                     self.address
                 );
                 // Reconnect with exponential backoff (TiKV/CockroachDB pattern).
-                backoff = std::time::Duration::from_secs(1);
+                let mut reconnect_backoff = std::time::Duration::from_secs(1);
                 loop {
                     match RaftTransportServiceClient::connect(self.address.clone()).await {
                         Ok(c) => {
                             client = c;
                             tracing::info!("Raft transport: reconnected to {}", self.address);
-                            backoff = std::time::Duration::from_secs(1);
                             break;
                         },
                         Err(_) => {
-                            tokio::time::sleep(backoff).await;
-                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                            tokio::time::sleep(reconnect_backoff).await;
+                            reconnect_backoff = std::cmp::min(reconnect_backoff * 2, max_backoff);
                         },
                     }
                 }

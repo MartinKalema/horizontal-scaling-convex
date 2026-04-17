@@ -13,13 +13,9 @@
 //!   - Vitess: https://vitess.io/docs/22.0/reference/features/distributed-transaction/
 //!   - CockroachDB: https://www.cockroachlabs.com/blog/parallel-commits/
 
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-};
+use std::collections::BTreeMap;
 
 use common::types::Timestamp;
-use value::TableName;
 
 use crate::{
     committer::CommitterClient,
@@ -28,10 +24,7 @@ use crate::{
         PartitionMap,
     },
     transaction::FinalTransaction,
-    two_phase::{
-        TwoPhaseDecision,
-        TwoPhaseTransactionId,
-    },
+    two_phase::TwoPhaseTransactionId,
     write_log::WriteSource,
 };
 
@@ -91,7 +84,7 @@ pub async fn coordinate_two_phase_commit(
     local_committer: &CommitterClient,
     transaction: FinalTransaction,
     write_source: WriteSource,
-    partition_map: &PartitionMap,
+    _partition_map: &PartitionMap,
 ) -> anyhow::Result<Timestamp> {
     let txn_id = TwoPhaseTransactionId::new();
 

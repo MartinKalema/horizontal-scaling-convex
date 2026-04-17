@@ -151,7 +151,9 @@ impl RaftNode {
         // On restart, pick up where we left off (applied index from
         // the persisted hard state's commit). This prevents raft-rs
         // from re-applying already-committed entries.
-        let initial_state = storage.initial_state().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let initial_state = storage
+            .initial_state()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let applied = initial_state.hard_state.get_commit();
 
         let raft_config = Config {
@@ -311,7 +313,9 @@ impl RaftNode {
                             // Configuration change — apply to Raft membership.
                             let cc = ConfChange::default();
                             if let Ok(cs) = self.raw_node.apply_conf_change(&cc) {
-                                self.storage.set_conf_state(cs);
+                                if let Err(e) = self.storage.set_conf_state(cs) {
+                                    tracing::error!("Failed to persist conf state: {e}");
+                                }
                             }
                         },
                         EntryType::EntryNormal => {
@@ -405,6 +409,7 @@ impl RaftNode {
 
         // Track leadership and fire callbacks.
         if let Some(ss) = ready.ss() {
+            (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
             let now_leader = ss.raft_state == StateRole::Leader;
             (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
             if now_leader && !self.is_leader_flag {
@@ -528,19 +533,19 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
 
-        let became_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let became_leader_clone = became_leader.clone();
         let observed_leader_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let observed_leader_id_clone = observed_leader_id.clone();
+        let became_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let became_leader_clone = became_leader.clone();
 
         node.set_leadership_callbacks(LeadershipCallbacks {
             on_became_leader: Box::new(move || {
                 became_leader_clone.store(true, std::sync::atomic::Ordering::SeqCst);
             }),
-            on_lost_leadership: Box::new(|| {}),
             on_leader_changed: Box::new(move |leader_id| {
                 observed_leader_id_clone.store(leader_id, std::sync::atomic::Ordering::SeqCst);
             }),
+            on_lost_leadership: Box::new(|| {}),
         });
 
         assert!(!became_leader.load(std::sync::atomic::Ordering::SeqCst));

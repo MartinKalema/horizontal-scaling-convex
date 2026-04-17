@@ -44,6 +44,7 @@ use search::{
     TextIndexManager,
     TextIndexWriteSize,
 };
+use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use value::{
     ResolvedDocumentId,
@@ -58,6 +59,7 @@ use vector::{
 };
 
 use crate::{
+    partition::PartitionId,
     schema_registry::SchemaRegistry,
     table_registry::{
         TableUpdate,
@@ -88,8 +90,10 @@ use crate::{
 pub struct SnapshotManager {
     persisted_max_repeatable_ts: Timestamp,
     versions: VecDeque<(Timestamp, Snapshot)>,
+    replication_frontiers: BTreeMap<PartitionId, Timestamp>,
     write_throughput_limiter: WriteThroughputLimiter,
     waiters: Mutex<VecDeque<(Timestamp, oneshot::Sender<()>)>>,
+    replication_waiters: Mutex<BTreeMap<PartitionId, VecDeque<(Timestamp, oneshot::Sender<()>)>>>,
 }
 
 #[derive(Clone)]
@@ -552,14 +556,20 @@ impl Snapshot {
 }
 
 impl SnapshotManager {
-    pub fn new(initial_ts: Timestamp, initial_snapshot: Snapshot) -> Self {
+    pub fn new(
+        initial_ts: Timestamp,
+        initial_snapshot: Snapshot,
+        replication_frontiers: BTreeMap<PartitionId, Timestamp>,
+    ) -> Self {
         let mut versions = VecDeque::new();
         versions.push_back((initial_ts, initial_snapshot));
         Self {
             versions,
             persisted_max_repeatable_ts: initial_ts,
+            replication_frontiers,
             write_throughput_limiter: WriteThroughputLimiter::new(),
             waiters: Mutex::new(VecDeque::new()),
+            replication_waiters: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -613,6 +623,30 @@ impl SnapshotManager {
         }
     }
 
+    fn notify_replication_waiters(&self, partition: PartitionId) {
+        let Some(frontier) = self.replication_frontiers.get(&partition).copied() else {
+            return;
+        };
+        let mut waiters = self.replication_waiters.lock();
+        let Some(partition_waiters) = waiters.get_mut(&partition) else {
+            return;
+        };
+        let mut i = 0;
+        while i < partition_waiters.len() {
+            if frontier >= partition_waiters[i].0 || partition_waiters[i].1.is_closed() {
+                let waiter = partition_waiters
+                    .swap_remove_back(i)
+                    .expect("checked above");
+                let _ = waiter.1.send(());
+                continue;
+            }
+            i += 1;
+        }
+        if partition_waiters.is_empty() {
+            waiters.remove(&partition);
+        }
+    }
+
     /// Returns a future that blocks until the snapshot manager has advanced
     /// past the given timestamp.
     pub fn wait_for_higher_ts(&self, target_ts: Timestamp) -> impl Future<Output = ()> + use<> {
@@ -625,6 +659,63 @@ impl SnapshotManager {
             Some(receiver)
         } else {
             None
+        };
+
+        async move {
+            if let Some(receiver) = receiver {
+                _ = receiver.await;
+            }
+        }
+    }
+
+    pub fn replication_frontier(&self, partition: PartitionId) -> Option<Timestamp> {
+        self.replication_frontiers.get(&partition).copied()
+    }
+
+    pub fn replication_frontiers(&self) -> BTreeMap<PartitionId, Timestamp> {
+        self.replication_frontiers.clone()
+    }
+
+    pub fn update_replication_frontier(
+        &mut self,
+        partition: PartitionId,
+        ts: Timestamp,
+    ) -> anyhow::Result<bool> {
+        if let Some(current) = self.replication_frontiers.get(&partition) {
+            anyhow::ensure!(
+                ts >= *current,
+                "replication frontier for {partition} went backward from {current:?} to {ts:?}",
+            );
+            if ts == *current {
+                return Ok(false);
+            }
+        }
+        self.replication_frontiers.insert(partition, ts);
+        self.notify_replication_waiters(partition);
+        Ok(true)
+    }
+
+    pub fn wait_for_replication_frontier(
+        &self,
+        partition: PartitionId,
+        target_ts: Timestamp,
+    ) -> impl Future<Output = ()> + use<> {
+        self.notify_replication_waiters(partition);
+
+        let receiver = if self
+            .replication_frontiers
+            .get(&partition)
+            .is_some_and(|frontier| *frontier >= target_ts)
+        {
+            None
+        } else {
+            let (sender, receiver) = oneshot::channel();
+            self.replication_waiters
+                .lock()
+                .entry(partition)
+                .or_default()
+                .push_back((target_ts, sender));
+            Some(receiver)
         };
 
         async move {
@@ -793,4 +884,30 @@ impl SnapshotManager {
             Ok(false)
         }
     }
+}
+
+pub fn replication_frontiers_to_json(frontiers: &BTreeMap<PartitionId, Timestamp>) -> JsonValue {
+    JsonValue::Object(
+        frontiers
+            .iter()
+            .map(|(partition, ts)| (partition.0.to_string(), JsonValue::from(u64::from(*ts))))
+            .collect(),
+    )
+}
+
+pub fn replication_frontiers_from_json(
+    value: JsonValue,
+) -> anyhow::Result<BTreeMap<PartitionId, Timestamp>> {
+    let JsonValue::Object(entries) = value else {
+        anyhow::bail!("replication frontiers must be a JSON object");
+    };
+
+    entries
+        .into_iter()
+        .map(|(partition, ts)| {
+            let partition_id = partition.parse::<u32>()?;
+            let ts = Timestamp::try_from(ts)?;
+            anyhow::Ok((PartitionId(partition_id), ts))
+        })
+        .collect()
 }

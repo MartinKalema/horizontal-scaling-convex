@@ -247,11 +247,8 @@ mod tests {
 
         // The shared state should now reflect leadership.
         assert!(state.is_leader());
-        assert_eq!(
-            state.leader_id(),
-            1,
-            "Shared state should expose the elected leader ID"
-        );
+        assert_eq!(state.leader_id(), 1);
+        assert_eq!(state.leader_id(), 1, "Shared state should expose the elected leader ID");
     }
 
     #[test]
