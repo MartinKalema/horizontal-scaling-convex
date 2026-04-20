@@ -113,7 +113,6 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     let preempt_signal = ShutdownSignal::new(preempt_tx);
     // Use to signal to the http service to stop.
     let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
-    let is_replica = config.replication_mode == "replica";
     let persistence = connect_persistence(
         config.db,
         &config.db_spec,

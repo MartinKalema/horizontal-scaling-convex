@@ -62,7 +62,10 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             .ok_or_else(|| Status::invalid_argument("Prepare missing transaction payload"))?;
         let transaction = ParticipantTransaction::try_from(transaction)
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare payload: {e:#}")))?;
-        let prepare_ts = req.prepare_ts.into();
+        let prepare_ts = req
+            .prepare_ts
+            .try_into()
+            .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
 
         let result = self
             .committer

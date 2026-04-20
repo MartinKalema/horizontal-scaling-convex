@@ -190,7 +190,8 @@ pub struct ParticipantTabletMetadata {
     pub table_name: TableName,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "testing"), derive(PartialEq))]
 pub struct ParticipantTransaction {
     pub begin_timestamp: RepeatableTimestamp,
     pub tablet_metadata: BTreeMap<TabletId, ParticipantTabletMetadata>,
