@@ -53,6 +53,10 @@ impl TestDriver {
         Self::new_with_seed(0)
     }
 
+    pub fn new_with_io() -> Self {
+        Self::new_with_config_and_io(0, PauseClient::new(), true)
+    }
+
     pub fn new_with_seed(seed: u64) -> Self {
         Self::new_with_config(seed, PauseClient::new())
     }
@@ -62,8 +66,16 @@ impl TestDriver {
     }
 
     pub fn new_with_config(seed: u64, pause_client: PauseClient) -> Self {
+        Self::new_with_config_and_io(seed, pause_client, false)
+    }
+
+    fn new_with_config_and_io(seed: u64, pause_client: PauseClient, enable_io: bool) -> Self {
         let tokio_seed = RngSeed::from_bytes(&seed.to_le_bytes());
-        let tokio_runtime = Builder::new_current_thread()
+        let mut builder = Builder::new_current_thread();
+        if enable_io {
+            builder.enable_io();
+        }
+        let tokio_runtime = builder
             .enable_time()
             .start_paused(true)
             .unhandled_panic(UnhandledPanic::ShutdownRuntime)
