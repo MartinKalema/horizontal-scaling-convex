@@ -3,6 +3,8 @@ syntax = "proto3";
 package replication;
 
 import "convex_identity.proto";
+import "common.proto";
+import "searchlight.proto";
 
 // Service for forwarding mutations from Replica nodes to the Primary.
 // Replicas call ForwardMutation when they receive a mutation request
@@ -75,18 +77,58 @@ message TwoPcPrepareRequest {
   // Globally unique 2PC transaction ID.
   string transaction_id = 1;
 
-  // Serialized FinalTransaction (the partition's subset of writes).
-  // Encoded as the full transaction — the receiving Committer validates
-  // and stages only the writes for its partition.
-  bytes serialized_transaction = 2;
+  // The participant's subset of the transaction, including the full read set
+  // and the writes owned by this participant.
+  TwoPcParticipantTransaction transaction = 2;
 
   // Write source for logging.
   string write_source = 3;
+
+  // Globally assigned prepare/commit timestamp chosen by the coordinator.
+  uint64 prepare_ts = 4;
 }
 
 message TwoPcPrepareResponse {
   // The prepare timestamp assigned by the participant's TSO.
   uint64 prepare_ts = 1;
+}
+
+message TwoPcParticipantTransaction {
+  common.RepeatableTimestamp begin_timestamp = 1;
+  repeated TwoPcTabletMetadata tablet_metadata = 2;
+  repeated TwoPcIndexedRead indexed_reads = 3;
+  repeated TwoPcSearchRead search_reads = 4;
+  repeated common.DocumentUpdateWithPrevTs writes = 5;
+}
+
+message TwoPcTabletMetadata {
+  bytes tablet_id = 1;
+  uint32 table_number = 2;
+  string table_name = 3;
+}
+
+message TwoPcIndexedRead {
+  bytes tablet_id = 1;
+  string descriptor = 2;
+  repeated common.FieldPath fields = 3;
+  repeated common.Interval intervals = 4;
+}
+
+message TwoPcSearchRead {
+  bytes tablet_id = 1;
+  string descriptor = 2;
+  repeated TwoPcTextQueryTermRead text_queries = 3;
+  repeated TwoPcFilterConditionRead filter_conditions = 4;
+}
+
+message TwoPcTextQueryTermRead {
+  common.FieldPath field_path = 1;
+  searchlight.TextQueryTerm term = 2;
+}
+
+message TwoPcFilterConditionRead {
+  common.FieldPath field_path = 1;
+  bytes value = 2;
 }
 
 message TwoPcCommitRequest {

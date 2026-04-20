@@ -218,12 +218,13 @@ impl PersistenceWrite {
 pub const AFTER_PENDING_WRITE_SNAPSHOT: &str = "after_pending_write_snapshot";
 
 fn remote_read_partitions(
-    transaction: &FinalTransaction,
+    reads: &ReadSet,
+    table_mapping: &TableMapping,
     partition_map: &crate::partition::PartitionMap,
 ) -> BTreeSet<crate::partition::PartitionId> {
     let mut partitions = BTreeSet::new();
     let mut visit_tablet = |tablet_id| {
-        if let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) {
+        if let Ok(table_name) = table_mapping.tablet_name(tablet_id) {
             if table_name.is_system() {
                 return;
             }
@@ -234,10 +235,10 @@ fn remote_read_partitions(
         }
     };
 
-    for (index_name, _) in transaction.reads.read_set().iter_indexed() {
+    for (index_name, _) in reads.iter_indexed() {
         visit_tablet(*index_name.table());
     }
-    for (index_name, _) in transaction.reads.read_set().iter_search() {
+    for (index_name, _) in reads.iter_search() {
         visit_tablet(*index_name.table());
     }
     partitions
@@ -245,11 +246,12 @@ fn remote_read_partitions(
 
 fn stale_replica_frontiers(
     snapshot_manager: &SnapshotManager,
-    transaction: &FinalTransaction,
+    begin_ts: Timestamp,
+    reads: &ReadSet,
+    table_mapping: &TableMapping,
     partition_map: &crate::partition::PartitionMap,
 ) -> Vec<(crate::partition::PartitionId, Timestamp)> {
-    let begin_ts = *transaction.begin_timestamp;
-    remote_read_partitions(transaction, partition_map)
+    remote_read_partitions(reads, table_mapping, partition_map)
         .into_iter()
         .filter_map(|partition| {
             let frontier = snapshot_manager
@@ -330,6 +332,7 @@ impl<RT: Runtime> Committer<RT> {
         virtual_system_mapping: VirtualSystemMapping,
         distributed_log: Arc<dyn DistributedLog>,
         partition_map: Option<crate::partition::PartitionMap>,
+        node_addresses: Option<crate::two_phase::NodeAddresses>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> CommitterClient {
@@ -371,6 +374,7 @@ impl<RT: Runtime> Committer<RT> {
             retention_validator,
             snapshot_reader,
             partition_map: client_partition_map,
+            node_addresses,
         }
     }
 
@@ -578,6 +582,27 @@ impl<RT: Runtime> Committer<RT> {
                             result,
                         }) => {
                             let r = self.handle_prepare(transaction_id, transaction, write_source);
+                            let _ = result.send(r);
+                        },
+                        Some(CommitterMessage::PrepareRemote {
+                            transaction_id,
+                            transaction,
+                            write_source,
+                            prepare_ts,
+                            result,
+                        }) => {
+                            let r = self.handle_prepare_remote(
+                                transaction_id,
+                                transaction,
+                                write_source,
+                                prepare_ts,
+                            );
+                            let _ = result.send(r);
+                        },
+                        Some(CommitterMessage::AllocateCommitTs { result }) => {
+                            let r = self
+                                .ensure_leader_for_writes()
+                                .and_then(|_| self.next_commit_ts());
                             let _ = result.send(r);
                         },
                         Some(CommitterMessage::CommitPrepared {
@@ -906,19 +931,72 @@ impl<RT: Runtime> Committer<RT> {
         });
     }
 
+    fn ensure_leader_for_writes(&self) -> anyhow::Result<()> {
+        if let Some(ref raft) = self.raft_state {
+            if !raft.is_leader() {
+                let leader = raft.leader_id();
+                anyhow::bail!(
+                    "Not the Raft leader for partition {}. Current leader: node {}. Forward this \
+                     mutation to the leader.",
+                    raft.partition_id(),
+                    leader,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_prepare_ownership(
+        &self,
+        writes: &[DocumentUpdateWithPrevTs],
+        table_mapping: &TableMapping,
+    ) -> anyhow::Result<()> {
+        let Some(partition_map) = self.partition_map.as_ref() else {
+            return Ok(());
+        };
+
+        for write in writes {
+            let tablet_id = write.id.tablet_id;
+            let table_name = table_mapping
+                .tablet_name(tablet_id)
+                .with_context(|| format!("Missing table mapping for prepared write {tablet_id}"))?;
+            if table_name.is_system() {
+                continue;
+            }
+            if !partition_map.is_local(&table_name) {
+                let partition = partition_map.partition_for_table(&table_name);
+                anyhow::bail!(
+                    "Write to table '{}' rejected during prepare: owned by {}, not this node \
+                     ({}). Coordinator routed this transaction to the wrong participant.",
+                    table_name,
+                    partition,
+                    partition_map.local_partition(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn validate_remote_read_frontiers(
         &self,
-        transaction: &FinalTransaction,
+        begin_ts: Timestamp,
+        reads: &ReadSet,
+        table_mapping: &TableMapping,
         write_source: &WriteSource,
     ) -> anyhow::Result<()> {
         let Some(partition_map) = self.partition_map.as_ref() else {
             return Ok(());
         };
 
-        let begin_ts = *transaction.begin_timestamp;
         let stale = {
             let snapshot_manager = self.snapshot_manager.read();
-            stale_replica_frontiers(&snapshot_manager, transaction, partition_map)
+            stale_replica_frontiers(
+                &snapshot_manager,
+                begin_ts,
+                reads,
+                table_mapping,
+                partition_map,
+            )
         };
         if stale.is_empty() {
             return Ok(());
@@ -937,6 +1015,123 @@ impl<RT: Runtime> Committer<RT> {
         )))
     }
 
+    fn stage_prepared_transaction(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        begin_ts: Timestamp,
+        reads: &ReadSet,
+        mut writes: Vec<DocumentUpdateWithPrevTs>,
+        table_mapping: &TableMapping,
+        write_source: WriteSource,
+        explicit_commit_ts: Option<Timestamp>,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        self.ensure_leader_for_writes()?;
+        self.ensure_prepare_ownership(&writes, table_mapping)?;
+        self.validate_remote_read_frontiers(begin_ts, reads, table_mapping, &write_source)?;
+
+        let local_commit_floor =
+            cmp::max(self.log.max_ts(), *self.snapshot_manager.read().latest_ts()).succ()?;
+
+        if let Some(existing) = self.prepared_transactions.get(&transaction_id) {
+            if let Some(commit_ts) = explicit_commit_ts {
+                anyhow::ensure!(
+                    existing.commit_ts == commit_ts,
+                    "2PC Prepare retried with a different commit timestamp for {}",
+                    transaction_id
+                );
+            }
+            return Ok(crate::two_phase::PrepareResult {
+                prepare_ts: existing.commit_ts,
+            });
+        }
+
+        let commit_ts = if let Some(commit_ts) = explicit_commit_ts {
+            anyhow::ensure!(
+                commit_ts >= local_commit_floor,
+                "2PC Prepare assigned ts={} but this participant requires ts>={}",
+                commit_ts,
+                local_commit_floor,
+            );
+            commit_ts
+        } else {
+            self.next_commit_ts()?
+        };
+        if commit_ts > self.last_assigned_ts {
+            self.last_assigned_ts = commit_ts;
+        }
+        let timer = metrics::commit_is_stale_timer();
+        if let Some(conflicting_read) = self.commit_has_conflict(reads, begin_ts, commit_ts)? {
+            anyhow::bail!(conflicting_read.into_error(table_mapping, &write_source));
+        }
+        timer.finish();
+
+        writes.sort_by_key(|update| {
+            table_dependency_sort_key(
+                BootstrapTableIds::new(table_mapping),
+                InternalDocumentId::from(update.id),
+                update.new_document.as_ref(),
+            )
+        });
+
+        let ordered_update_refs: Vec<_> = writes.iter().collect();
+        let (document_writes, index_writes, snapshot) =
+            self.compute_writes(commit_ts, &ordered_update_refs)?;
+
+        let pending_write = self.pending_writes.push_back(
+            commit_ts,
+            writes
+                .into_iter()
+                .map(|update| (update.id, PackedDocumentUpdate::pack(&update)))
+                .collect(),
+            write_source.clone(),
+            snapshot,
+        );
+
+        let mut write_bytes: u64 = 0;
+        let doc_entries: Vec<DocumentLogEntry> = document_writes
+            .into_iter()
+            .map(|w| {
+                let entry = DocumentLogEntry {
+                    ts: w.commit_ts,
+                    id: w.id,
+                    value: w.write,
+                    prev_ts: w.prev_ts,
+                };
+                write_bytes += entry.size();
+                entry
+            })
+            .collect();
+        let idx_entries: Vec<PersistenceIndexEntry> = index_writes
+            .into_iter()
+            .map(|(ts, update)| {
+                let entry = PersistenceIndexEntry::from_index_update(ts, &update);
+                write_bytes += entry.size();
+                entry
+            })
+            .collect();
+
+        self.prepared_transactions.insert(
+            transaction_id.clone(),
+            PreparedTransaction {
+                pending_write,
+                commit_ts,
+                write_bytes,
+                document_writes: Arc::new(doc_entries),
+                index_writes: Arc::new(idx_entries),
+            },
+        );
+
+        tracing::info!(
+            "2PC Prepared: txn={}, ts={}",
+            transaction_id,
+            u64::from(commit_ts),
+        );
+
+        Ok(crate::two_phase::PrepareResult {
+            prepare_ts: commit_ts,
+        })
+    }
+
     /// First, check that it's valid to apply this transaction in-memory. If it
     /// passes validation, we can rebase the transaction to a new timestamp
     /// if other transactions have committed.
@@ -946,21 +1141,7 @@ impl<RT: Runtime> Committer<RT> {
         transaction: FinalTransaction,
         write_source: WriteSource,
     ) -> anyhow::Result<ValidatedCommit> {
-        // Raft leadership check: if Raft is configured and this node is
-        // not the leader, reject writes. Clients should forward to the
-        // current leader. This is TiKV's pattern — only the Raft leader
-        // runs the Apply Worker.
-        if let Some(ref raft) = self.raft_state {
-            if !raft.is_leader() {
-                let leader = raft.leader_id();
-                anyhow::bail!(
-                    "Not the Raft leader for partition {}. Current leader: node {}. Forward this \
-                     mutation to the leader.",
-                    raft.partition_id(),
-                    leader,
-                );
-            }
-        }
+        self.ensure_leader_for_writes()?;
 
         // Partition ownership check: if partitioning is enabled, verify
         // that all writes to USER tables target tables owned by this node.
@@ -988,7 +1169,12 @@ impl<RT: Runtime> Committer<RT> {
             }
         }
 
-        self.validate_remote_read_frontiers(&transaction, &write_source)?;
+        self.validate_remote_read_frontiers(
+            *transaction.begin_timestamp,
+            transaction.reads.read_set(),
+            &transaction.table_mapping,
+            &write_source,
+        )?;
 
         let commit_ts = self.next_commit_ts()?;
         let timer = metrics::commit_is_stale_timer();
@@ -1708,89 +1894,47 @@ impl<RT: Runtime> Committer<RT> {
             transaction.writes.coalesced_writes().count(),
         );
 
-        // Skip partition ownership check — the coordinator already routed
-        // the correct subset of writes to this partition. Run the rest of
-        // validation (OCC conflict check, compute writes).
-        self.validate_remote_read_frontiers(&transaction, &write_source)?;
-        let commit_ts = self.next_commit_ts()?;
-        let timer = metrics::commit_is_stale_timer();
-        if let Some(conflicting_read) = self.commit_has_conflict(
-            transaction.reads.read_set(),
-            *transaction.begin_timestamp,
-            commit_ts,
-        )? {
-            anyhow::bail!(conflicting_read.into_error(&transaction.table_mapping, &write_source));
-        }
-        timer.finish();
-
-        let updates: Vec<_> = transaction.writes.coalesced_writes().collect();
-        let mut ordered_updates = updates;
-        ordered_updates.sort_by_key(|update| {
-            table_dependency_sort_key(
-                BootstrapTableIds::new(&transaction.table_mapping),
-                InternalDocumentId::from(update.id),
-                update.new_document.as_ref(),
-            )
-        });
-
-        let (document_writes, index_writes, snapshot) =
-            self.compute_writes(commit_ts, &ordered_updates)?;
-
-        let pending_write = self.pending_writes.push_back(
-            commit_ts,
-            ordered_updates
-                .into_iter()
-                .map(|update| (update.id, PackedDocumentUpdate::pack(update)))
-                .collect(),
-            write_source.clone(),
-            snapshot,
-        );
-
-        // Build persistence entries.
-        let mut write_bytes: u64 = 0;
-        let doc_entries: Vec<DocumentLogEntry> = document_writes
-            .into_iter()
-            .map(|w| {
-                let entry = DocumentLogEntry {
-                    ts: w.commit_ts,
-                    id: w.id,
-                    value: w.write,
-                    prev_ts: w.prev_ts,
-                };
-                write_bytes += entry.size();
-                entry
-            })
-            .collect();
-        let idx_entries: Vec<PersistenceIndexEntry> = index_writes
-            .into_iter()
-            .map(|(ts, update)| {
-                let entry = PersistenceIndexEntry::from_index_update(ts, &update);
-                write_bytes += entry.size();
-                entry
-            })
-            .collect();
-
-        // Store in prepared_transactions map for later commit/rollback.
-        self.prepared_transactions.insert(
-            transaction_id.clone(),
-            PreparedTransaction {
-                pending_write,
-                commit_ts,
-                write_bytes,
-                document_writes: Arc::new(doc_entries),
-                index_writes: Arc::new(idx_entries),
-            },
-        );
-
-        tracing::info!(
-            "2PC Prepared: txn={}, ts={}",
+        self.stage_prepared_transaction(
             transaction_id,
-            u64::from(commit_ts),
+            *transaction.begin_timestamp,
+            transaction.reads.read_set(),
+            transaction.writes.coalesced_writes().cloned().collect(),
+            &transaction.table_mapping,
+            write_source,
+            None,
+        )
+    }
+
+    fn handle_prepare_remote(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        prepare_ts: Timestamp,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        tracing::info!(
+            "2PC Remote Prepare: txn={}, {} writes, prepare_ts={}",
+            transaction_id,
+            transaction.writes.len(),
+            u64::from(prepare_ts),
         );
 
-        Ok(crate::two_phase::PrepareResult {
-            prepare_ts: commit_ts,
-        })
+        let mut table_mapping = self
+            .snapshot_manager
+            .read()
+            .latest_snapshot()
+            .table_mapping()
+            .clone();
+        transaction.augment_table_mapping(&mut table_mapping)?;
+        self.stage_prepared_transaction(
+            transaction_id,
+            *transaction.begin_timestamp,
+            &transaction.reads,
+            transaction.writes,
+            &table_mapping,
+            write_source,
+            Some(prepare_ts),
+        )
     }
 
     /// Commit a previously prepared transaction: write to persistence,
@@ -1814,8 +1958,7 @@ impl<RT: Runtime> Committer<RT> {
 
         // Write to persistence (same as normal commit path).
         block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
+            let write_future = async {
                 self.persistence
                     .write(
                         &prepared.document_writes,
@@ -1823,7 +1966,13 @@ impl<RT: Runtime> Committer<RT> {
                         ConflictStrategy::Error,
                     )
                     .await
-            })
+            };
+            let rt = tokio::runtime::Handle::current();
+            if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                futures::executor::block_on(write_future)
+            } else {
+                rt.block_on(write_future)
+            }
         })?;
 
         // Publish commit — makes writes visible to reads.
@@ -2121,25 +2270,37 @@ impl<RT: Runtime> Committer<RT> {
             let tso = tso.clone();
             let ts = block_in_place(|| {
                 let rt = tokio::runtime::Handle::current();
-                rt.block_on(tso.next_ts())
+                if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                    futures::executor::block_on(tso.next_ts())
+                } else {
+                    rt.block_on(tso.next_ts())
+                }
             })?;
             // Still enforce local monotonicity against snapshot and last_assigned.
+            let log_floor = self.log.max_ts().succ()?;
             let latest_ts = self.snapshot_manager.read().latest_ts();
             let max = cmp::max(
                 ts,
-                cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
+                cmp::max(
+                    log_floor,
+                    cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
+                ),
             );
             self.last_assigned_ts = max;
             return Ok(max);
         }
 
         // Single-node mode: existing behavior (local clock + monotonic counter).
+        let log_floor = self.log.max_ts().succ()?;
         let latest_ts = self.snapshot_manager.read().latest_ts();
         let max = cmp::max(
-            latest_ts.succ()?,
+            log_floor,
             cmp::max(
-                self.runtime.generate_timestamp()?,
-                self.last_assigned_ts.succ()?,
+                latest_ts.succ()?,
+                cmp::max(
+                    self.runtime.generate_timestamp()?,
+                    self.last_assigned_ts.succ()?,
+                ),
             ),
         );
         self.last_assigned_ts = max;
@@ -2178,6 +2339,7 @@ pub struct CommitterClient {
     retention_validator: Arc<dyn RetentionValidator>,
     snapshot_reader: Reader<SnapshotManager>,
     partition_map: Option<crate::partition::PartitionMap>,
+    node_addresses: Option<crate::two_phase::NodeAddresses>,
 }
 
 impl CommitterClient {
@@ -2243,20 +2405,31 @@ impl CommitterClient {
         self.persistence_reader.clone()
     }
 
+    pub(crate) fn node_addresses(&self) -> Option<&crate::two_phase::NodeAddresses> {
+        self.node_addresses.as_ref()
+    }
+
     async fn wait_for_remote_read_frontiers(
         &self,
-        transaction: &FinalTransaction,
+        begin_ts: Timestamp,
+        reads: &ReadSet,
     ) -> anyhow::Result<()> {
         let Some(partition_map) = self.partition_map.as_ref() else {
             return Ok(());
         };
 
-        let required = remote_read_partitions(transaction, partition_map);
+        let required = {
+            let snapshot_reader = self.snapshot_reader.lock();
+            remote_read_partitions(
+                reads,
+                snapshot_reader.latest_snapshot().table_mapping(),
+                partition_map,
+            )
+        };
         if required.is_empty() {
             return Ok(());
         }
 
-        let begin_ts = *transaction.begin_timestamp;
         let waits: Vec<_> = {
             let snapshot_reader = self.snapshot_reader.lock();
             required
@@ -2309,7 +2482,11 @@ impl CommitterClient {
             .as_ref()
             .is_some_and(|partition_map| has_nonlocal_user_writes(&transaction, partition_map))
         {
-            self.wait_for_remote_read_frontiers(&transaction).await?;
+            self.wait_for_remote_read_frontiers(
+                *transaction.begin_timestamp,
+                transaction.reads.read_set(),
+            )
+            .await?;
         }
 
         // Note that we do a best effort validation for memory index sizes. We
@@ -2373,12 +2550,50 @@ impl CommitterClient {
         transaction: FinalTransaction,
         write_source: WriteSource,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        self.wait_for_remote_read_frontiers(&transaction).await?;
+        self.wait_for_remote_read_frontiers(
+            *transaction.begin_timestamp,
+            transaction.reads.read_set(),
+        )
+        .await?;
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::Prepare {
             transaction_id,
             transaction,
             write_source,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
+    pub async fn allocate_commit_ts(&self) -> anyhow::Result<Timestamp> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::AllocateCommitTs { result: tx };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
+    pub async fn prepare_remote(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        prepare_ts: Timestamp,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        self.wait_for_remote_read_frontiers(*transaction.begin_timestamp, &transaction.reads)
+            .await?;
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::PrepareRemote {
+            transaction_id,
+            transaction,
+            write_source,
+            prepare_ts,
             result: tx,
         };
         self.sender.try_send(message).map_err(|e| match e {
@@ -2529,6 +2744,16 @@ enum CommitterMessage {
         transaction: FinalTransaction,
         write_source: WriteSource,
         result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
+    },
+    PrepareRemote {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        prepare_ts: Timestamp,
+        result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
+    },
+    AllocateCommitTs {
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     /// 2PC CommitPrepared: finalize a previously prepared transaction.
     /// Writes to persistence, publishes commit, deletes redo log.

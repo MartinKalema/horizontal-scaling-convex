@@ -224,6 +224,10 @@ pub async fn make_app(
                 num_partitions,
             )
         }),
+        config
+            .node_addresses
+            .as_deref()
+            .map(database::two_phase::NodeAddresses::from_config),
         timestamp_oracle,
         None, // raft_state: set after Raft node starts, not during Database::load
     )

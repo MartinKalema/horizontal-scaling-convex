@@ -980,6 +980,7 @@ impl<RT: Runtime> Database<RT> {
         distributed_log: Arc<dyn crate::commit_delta::DistributedLog>,
         replica_mode: bool,
         partition_map: Option<crate::partition::PartitionMap>,
+        node_addresses: Option<crate::two_phase::NodeAddresses>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> anyhow::Result<Self> {
@@ -1093,6 +1094,7 @@ impl<RT: Runtime> Database<RT> {
             virtual_system_mapping.clone(),
             committer_distributed_log,
             partition_map,
+            node_addresses,
             timestamp_oracle,
             raft_state,
         );
