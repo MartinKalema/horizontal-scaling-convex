@@ -313,7 +313,6 @@ fn compact_checkpoint_documents(checkpoint: &CheckpointData) -> Vec<DocumentLogE
 fn checkpoint_index_entries(
     snapshot: &Snapshot,
     documents: &[DocumentLogEntry],
-    ts: Timestamp,
 ) -> Vec<PersistenceIndexEntry> {
     let mut index_entries = Vec::new();
     for entry in documents {
@@ -331,7 +330,7 @@ fn checkpoint_index_entries(
                 continue;
             };
             index_entries.push(PersistenceIndexEntry {
-                ts,
+                ts: entry.ts,
                 index_id: index.id(),
                 key: index_key.clone(),
                 value: Some(InternalDocumentId::new(
@@ -1755,7 +1754,6 @@ impl<RT: Runtime> Committer<RT> {
                 let index_entries = checkpoint_index_entries(
                     &db_snapshot.snapshot,
                     &compacted_documents,
-                    checkpoint_ts,
                 );
 
                 let mut existing_documents = Vec::new();

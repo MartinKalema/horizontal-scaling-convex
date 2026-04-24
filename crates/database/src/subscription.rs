@@ -55,6 +55,7 @@ use futures::{
     StreamExt as _,
 };
 use interval_map::IntervalMap;
+use itertools::Itertools;
 use parking_lot::Mutex;
 use prometheus::VMHistogram;
 use search::query::TextSearchSubscriptions;
@@ -265,9 +266,42 @@ impl CountingReceiver {
 }
 
 impl SubscriptionManager {
+    fn reanchor_if_log_rewound(&mut self) -> anyhow::Result<bool> {
+        let log_max_ts = self.log.max_ts();
+        if log_max_ts >= self.processed_ts {
+            return Ok(false);
+        }
+
+        tracing::warn!(
+            manager_id = self.manager_id,
+            old_processed_ts = %self.processed_ts,
+            new_log_max_ts = %log_max_ts,
+            num_subscribers = self.subscribers.len(),
+            "Subscription worker detected write-log rewind; invalidating derived subscriptions \
+             and re-anchoring to the new log base"
+        );
+
+        let subscriber_ids = self.subscribers.iter().map(|(id, _)| id).collect_vec();
+        self.closed_subscriptions = FuturesUnordered::new();
+        for subscriber_id in subscriber_ids {
+            self._remove(subscriber_id, None, Some(log_max_ts));
+        }
+        self.processed_ts = log_max_ts;
+        self.retention_coordinator
+            .update_and_enforce_retention(self.manager_id, log_max_ts)?;
+        Ok(true)
+    }
+
     async fn run_worker(&mut self, mut rx: CountingReceiver) {
         tracing::info!("Starting subscriptions worker");
         loop {
+            match self.reanchor_if_log_rewound() {
+                Ok(true) => continue,
+                Ok(false) => (),
+                Err(mut e) => {
+                    report_error(&mut e).await;
+                },
+            }
             futures::select_biased! {
                 // N.B.: `futures` select macro (not `tokio`) needed for `select_next_some`
                 key = self.closed_subscriptions.select_next_some() => {
@@ -290,6 +324,12 @@ impl SubscriptionManager {
                     }
                 },
                 next_ts = self.log.wait_for_higher_ts(self.processed_ts).fuse() => {
+                    if next_ts <= self.processed_ts {
+                        if let Err(mut e) = self.reanchor_if_log_rewound() {
+                            report_error(&mut e).await;
+                        }
+                        continue;
+                    }
                     if let Err(mut e) = self.advance_log(next_ts) {
                         report_error(&mut e).await;
                     }
@@ -366,6 +406,7 @@ impl SubscriptionManager {
         sender: SubscriptionSender,
         is_system: bool,
     ) -> anyhow::Result<SubscriberId> {
+        let _ = self.reanchor_if_log_rewound()?;
         metrics::log_subscription_queue_lag(self.log.max_ts().secs_since_f64(token.ts()));
         // The client may not have fully refreshed their token past our
         // processed timestamp, so finish the job for them if needed.
@@ -1289,6 +1330,30 @@ mod tests {
         subscription_manager.run_worker(disconnected_rx()).await;
         assert!(subscription_manager.subscribers.get(id).is_none());
         assert!(subscription_manager.subscribers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_log_rewind_invalidates_subscriptions_and_reanchors_manager() {
+        let (log_owner, log_reader, mut log_writer) = new_write_log(Timestamp::must(100));
+        let coordinator = RetentionCoordinator::new(1, log_reader.max_ts(), log_owner);
+        let mut subscription_manager =
+            SubscriptionManager::new(0, log_reader, coordinator, Timestamp::must(100));
+
+        let (subscription, _id) = subscription_manager
+            .subscribe_for_testing(Token::empty(Timestamp::must(100)))
+            .unwrap();
+        subscription_manager.processed_ts = Timestamp::must(150);
+
+        log_writer.reset(Timestamp::must(120));
+
+        assert!(subscription_manager.reanchor_if_log_rewound().unwrap());
+        assert_eq!(subscription_manager.processed_ts, Timestamp::must(120));
+        assert!(subscription_manager.subscribers.is_empty());
+        assert!(subscription_manager.subscriptions.indexed.is_empty());
+        assert_eq!(
+            subscription.wait_for_invalidation().await,
+            Some(Timestamp::must(120))
+        );
     }
 
     #[test]

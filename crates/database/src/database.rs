@@ -169,7 +169,10 @@ use crate::{
         NUM_RESERVED_LEGACY_TABLE_NUMBERS,
         NUM_RESERVED_SYSTEM_TABLE_NUMBERS,
     },
-    checkpoint::CheckpointData,
+    checkpoint::{
+        create_checkpoint,
+        CheckpointData,
+    },
     committer::{
         Committer,
         CommitterClient,
@@ -1970,28 +1973,8 @@ impl<RT: Runtime> Database<RT> {
     pub async fn build_raft_snapshot_checkpoint(&self) -> anyhow::Result<CheckpointData> {
         let db_snapshot = self.latest_database_snapshot()?;
         let ts = *db_snapshot.timestamp();
-        let mut documents = Vec::new();
-
-        for (tablet_id, index_id) in db_snapshot.index_registry().by_id_indexes() {
-            let mut stream = db_snapshot.persistence_snapshot.index_scan(
-                index_id,
-                tablet_id,
-                &Interval::all(),
-                Order::Asc,
-                usize::MAX,
-            );
-            while let Some((_, latest_document)) = stream.try_next().await? {
-                documents.push(DocumentLogEntry {
-                    ts,
-                    id: value::InternalDocumentId::new(
-                        latest_document.value.id().tablet_id,
-                        latest_document.value.id().internal_id(),
-                    ),
-                    value: Some(latest_document.value),
-                    prev_ts: latest_document.prev_ts,
-                });
-            }
-        }
+        let mut checkpoint = create_checkpoint(self.reader.as_ref(), ts, self.retention_validator())
+            .await?;
 
         let mut globals = BTreeMap::new();
         for key in PersistenceGlobalKey::all_keys() {
@@ -2022,11 +2005,8 @@ impl<RT: Runtime> Database<RT> {
             );
         }
 
-        Ok(CheckpointData {
-            timestamp: ts,
-            documents,
-            globals,
-        })
+        checkpoint.globals = globals;
+        Ok(checkpoint)
     }
 
     pub async fn build_raft_snapshot_bytes(&self) -> anyhow::Result<Vec<u8>> {

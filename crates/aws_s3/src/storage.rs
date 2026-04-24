@@ -239,6 +239,11 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
     #[fastrace::trace]
     async fn start_upload(&self) -> anyhow::Result<Box<BufferedUpload>> {
         let key: ObjectKey = self.runtime.new_uuid_v4().to_string().try_into()?;
+        self.start_upload_with_key(key).await
+    }
+
+    #[fastrace::trace]
+    async fn start_upload_with_key(&self, key: ObjectKey) -> anyhow::Result<Box<BufferedUpload>> {
         let s3_key = S3Key(self.key_prefix.clone() + &key);
         let upload_builder = self
             .client

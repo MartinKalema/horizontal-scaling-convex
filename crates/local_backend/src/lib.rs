@@ -166,6 +166,7 @@ pub async fn make_app(
     preempt_tx: ShutdownSignal,
 ) -> anyhow::Result<LocalAppState> {
     let key_broker = config.key_broker()?;
+    let persistence_was_fresh = persistence.is_fresh();
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
     let searcher: Arc<dyn Searcher> = in_process_searcher.clone();
     // TODO(CX-6572) Separate `SegmentMetadataFetcher` from `SearcherImpl`
@@ -236,6 +237,34 @@ pub async fn make_app(
         None, // raft_state: set after Raft node starts, not during Database::load
     )
     .await?;
+
+    if config.replication_mode == "replica" && persistence_was_fresh {
+        let checkpoint_path = config.checkpoint_storage_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "CHECKPOINT_STORAGE_PATH is required to bootstrap a fresh replica from checkpoint"
+            )
+        })?;
+        let checkpoint_storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            checkpoint_path,
+            StorageUseCase::Checkpoints,
+        )?);
+        let checkpoint = database::snapshot_checkpointer::load_latest_checkpoint(&checkpoint_storage)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Fresh replica startup requires a checkpoint, but none was found at {}",
+                    checkpoint_path
+                )
+            })?;
+        let checkpoint_ts = checkpoint.timestamp;
+        database
+            .committer_client()
+            .install_snapshot(checkpoint)
+            .await?;
+        tracing::info!("Bootstrapped fresh replica from checkpoint at ts={checkpoint_ts}");
+    }
+
     initialize_application_system_tables(&database).await?;
     let application_storage = if config.replication_mode == "replica" {
         // Replica uses local storage — doesn't write storage config to DB.
@@ -369,6 +398,8 @@ pub async fn make_app(
         let beacon_future = beacon::start_beacon(
             runtime.clone(),
             database.clone(),
+            config.convex_http_proxy.clone(),
+            config.name(),
             config.beacon_tag.clone(),
             config.beacon_fields.clone(),
         );
@@ -390,8 +421,8 @@ pub async fn make_app(
             // stream. Each node has its own database with independent timestamps,
             // so we can't use the local database timestamp as a lower bound.
             // The self-delta skip (source_node filter) prevents double-applying.
-            // In replica mode, use the local timestamp since the replica loaded
-            // from the same persistence as the primary.
+            // In replica mode, start from the locally visible snapshot, which
+            // may have just been bootstrapped from the latest checkpoint.
             let from_ts = if config.partition_id.is_some() {
                 common::types::Timestamp::MIN
             } else {
@@ -633,5 +664,134 @@ impl RouteMapper for HttpActionRouteMapper {
         } else {
             route
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::Arc,
+    };
+
+    use common::{
+        assert_obj,
+        persistence::{
+            NoopRetentionValidator,
+            PersistenceReader,
+            TimestampRange,
+        },
+        query::Order,
+        shutdown::ShutdownSignal,
+        testing::TestPersistence,
+    };
+    use futures::TryStreamExt;
+    use keybroker::Identity;
+    use storage::{
+        LocalDirStorage,
+        Storage,
+        StorageUseCase,
+        Upload,
+    };
+    use value::TableName;
+    use runtime::prod::ProdRuntime;
+
+    use crate::{
+        config::LocalConfig,
+        make_app,
+    };
+
+    #[test]
+    fn test_fresh_replica_bootstraps_from_checkpoint() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        let test_runtime = runtime.clone();
+        runtime.block_on("test_fresh_replica_bootstraps_from_checkpoint", async move {
+            let primary_persistence = Arc::new(TestPersistence::new());
+            let (_primary_shutdown_tx, primary_shutdown_rx) = async_broadcast::broadcast(1);
+            let primary = make_app(
+                test_runtime.clone(),
+                LocalConfig::new_for_test()?,
+                primary_persistence.clone(),
+                primary_shutdown_rx,
+                ShutdownSignal::no_op(),
+            )
+            .await?;
+
+            let table_name: TableName = "bootstrap_messages".parse()?;
+            let mut tx = primary.application.database().begin(Identity::system()).await?;
+            database::TestFacingModel::new(&mut tx)
+                .insert(&table_name, assert_obj!("text" => "hello from checkpoint"))
+                .await?;
+            primary.application.database().commit(tx).await?;
+
+            let checkpoint = primary
+                .application
+                .database()
+                .build_raft_snapshot_checkpoint()
+                .await?;
+            let checkpoint_dir = tempfile::tempdir()?;
+            let checkpoint_storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::for_use_case(
+                test_runtime.clone(),
+                checkpoint_dir.path().to_str().unwrap(),
+                StorageUseCase::Checkpoints,
+            )?);
+            let mut upload = checkpoint_storage
+                .start_upload_with_key(
+                    database::snapshot_checkpointer::LATEST_CHECKPOINT_KEY.try_into()?,
+                )
+                .await?;
+            upload
+                .write(database::snapshot_checkpointer::checkpoint_to_bytes(&checkpoint)?.into())
+                .await?;
+            let _ = upload.complete().await?;
+
+            let replica_persistence = Arc::new(TestPersistence::new());
+            let replica_storage_dir = tempfile::tempdir()?;
+            let (_shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
+            let mut config = LocalConfig::new_for_test()?;
+            config.replication_mode = "replica".into();
+            config.replica_storage_path = Some(replica_storage_dir.path().to_str().unwrap().into());
+            config.checkpoint_storage_path = Some(checkpoint_dir.path().to_str().unwrap().into());
+
+            let st = make_app(
+                test_runtime.clone(),
+                config,
+                replica_persistence.clone(),
+                shutdown_rx,
+                ShutdownSignal::no_op(),
+            )
+            .await?;
+
+            assert_eq!(
+                *st.application.database().now_ts_for_reads(),
+                checkpoint.timestamp
+            );
+
+            let replica_docs: Vec<_> = replica_persistence
+                .load_documents(
+                    TimestampRange::all(),
+                    Order::Asc,
+                    10_000,
+                    Arc::new(NoopRetentionValidator),
+                )
+                .try_collect()
+                .await?;
+            let expected_latest_docs = checkpoint
+                .documents
+                .iter()
+                .fold(BTreeMap::new(), |mut acc, entry| {
+                    acc.insert(entry.id, entry.clone());
+                    acc
+                })
+                .into_values()
+                .filter(|entry| entry.value.is_some())
+                .count();
+            assert_eq!(replica_docs.len(), expected_latest_docs);
+
+            primary.shutdown().await?;
+            st.shutdown().await?;
+            Ok(())
+        })
     }
 }
