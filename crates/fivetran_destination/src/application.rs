@@ -10,7 +10,7 @@ use chrono::{
 use common::{
     try_chunks::TryChunksExt,
     value::{
-        ConvexObject,
+        DocumentObject,
         TableName,
     },
 };
@@ -242,7 +242,7 @@ async fn row_stream<'a>(
     let mut reader = read_rows(&mut deserializer, reader_params, schema);
 
     while let Some(row) = reader.next().await {
-        let row: ConvexObject = row
+        let row: DocumentObject = row
             .map_err(|err| DestinationError::FileReadError(file.clone(), err))?
             .try_into()
             .map_err(DestinationError::InvalidRow)?;

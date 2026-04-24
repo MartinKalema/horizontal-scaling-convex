@@ -16,7 +16,7 @@ use shape_inference::{
     UnionShape,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     FieldName,
     IdentifierFieldName,
     TableNumber,
@@ -84,7 +84,7 @@ impl ReducedShape {
             }),
             ShapeEnum::Boolean => ReducedShape::Boolean,
             ShapeEnum::StringLiteral(s) => {
-                if let Ok(id) = DeveloperDocumentId::decode(s)
+                if let Ok(id) = PublicDocumentId::decode(s)
                     && table_exists(id.table())
                 {
                     ReducedShape::Id(id.table())

@@ -10,7 +10,7 @@ use sync_types::{
 use value::{
     codegen_convex_serialization,
     sha256::Sha256Digest,
-    DeveloperDocumentId,
+    PublicDocumentId,
 };
 
 use super::module_versions::{
@@ -52,7 +52,7 @@ impl TryFrom<SerializedModuleMetadata> for ModuleMetadata {
                 let path: ModulePath = m.path.parse()?;
                 path.assume_canonicalized()?
             },
-            source_package_id: DeveloperDocumentId::decode(&m.source_package_id)?.into(),
+            source_package_id: PublicDocumentId::decode(&m.source_package_id)?.into(),
             environment: m.environment.parse()?,
             analyze_result: m.analyze_result.map(|s| s.try_into()).transpose()?,
             sha256: Sha256Digest::from_base64(&m.sha256)?,
@@ -66,7 +66,7 @@ impl TryFrom<ModuleMetadata> for SerializedModuleMetadata {
     fn try_from(m: ModuleMetadata) -> anyhow::Result<Self> {
         Ok(Self {
             path: String::from(m.path),
-            source_package_id: DeveloperDocumentId::from(m.source_package_id).to_string(),
+            source_package_id: PublicDocumentId::from(m.source_package_id).to_string(),
             environment: m.environment.to_string(),
             analyze_result: m.analyze_result.map(|s| s.try_into()).transpose()?,
             sha256: m.sha256.as_base64(),

@@ -34,7 +34,7 @@ use serde_json::{
     Value as JsonValue,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     ConvexValue,
     FieldPath,
     InternalId,
@@ -464,7 +464,7 @@ impl PartialEq for VectorSearchQueryResult {
 impl VectorSearchQueryResult {
     pub fn to_public(self, table_number: TableNumber) -> PublicVectorSearchQueryResult {
         PublicVectorSearchQueryResult {
-            id: DeveloperDocumentId::new(table_number, self.id),
+            id: PublicDocumentId::new(table_number, self.id),
             score: self.score,
         }
     }
@@ -579,7 +579,7 @@ impl TryFrom<proto::VectorQueryResult> for VectorSearchQueryResult {
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct PublicVectorSearchQueryResult {
     pub score: f32,
-    pub id: DeveloperDocumentId,
+    pub id: PublicDocumentId,
 }
 
 impl Size for PublicVectorSearchQueryResult {

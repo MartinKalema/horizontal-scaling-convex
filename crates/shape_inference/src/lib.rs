@@ -41,9 +41,9 @@ pub use union::{
     UnionShape,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
-    ConvexObject,
+    id_v6::PublicDocumentId,
     ConvexValue,
+    DocumentObject,
     FieldName,
     IdentifierFieldName,
     TableNumber,
@@ -265,7 +265,7 @@ impl<C: ShapeConfig> CountedShape<C> {
         Self::new(variant, 1)
     }
 
-    fn shape_of_object(object: &ConvexObject) -> Self {
+    fn shape_of_object(object: &DocumentObject) -> Self {
         Self::new(ObjectShape::shape_of(object), 1)
     }
 
@@ -279,7 +279,7 @@ impl<C: ShapeConfig> CountedShape<C> {
     }
 
     /// Insert an object into a shape, returning the updated shape.
-    pub fn insert(&self, object: &ConvexObject) -> Self {
+    pub fn insert(&self, object: &DocumentObject) -> Self {
         let union_builder = match &*self.variant {
             ShapeEnum::Union(union) => union.clone().into_builder(),
             _ => UnionBuilder::new().push(self.clone()),
@@ -300,7 +300,7 @@ impl<C: ShapeConfig> CountedShape<C> {
     /// must have been previously inserted into the shape, and this function
     /// may return `Err` if it wasn't. Since there may be false successes,
     /// it's usually not safe to recover from this `Err`.
-    pub fn remove(&self, object: &ConvexObject) -> anyhow::Result<Self> {
+    pub fn remove(&self, object: &DocumentObject) -> anyhow::Result<Self> {
         self._remove_object(object).ok_or_else(|| {
             anyhow::anyhow!(
                 "Object with shape {:?} and id {:?} not in {self:?}",
@@ -359,7 +359,7 @@ impl<C: ShapeConfig> CountedShape<C> {
                 ShapeEnum::StringLiteral(s2.clone())
             },
             (ConvexValue::String(s), ShapeEnum::Id(table_number)) => {
-                if let Ok(id) = DeveloperDocumentId::decode(s)
+                if let Ok(id) = PublicDocumentId::decode(s)
                     && id.table() == *table_number
                 {
                     ShapeEnum::Id(*table_number)
@@ -401,7 +401,7 @@ impl<C: ShapeConfig> CountedShape<C> {
         Some(Self::new(new_variant, self.num_values - 1))
     }
 
-    fn _remove_object(&self, object: &ConvexObject) -> Option<Self> {
+    fn _remove_object(&self, object: &DocumentObject) -> Option<Self> {
         if self.num_values == 0 {
             return None;
         }

@@ -24,8 +24,8 @@ use crate::{
         ConvexValueType,
         ConvexValueWalker,
     },
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
 };
 
 #[derive(thiserror::Error)]
@@ -799,7 +799,7 @@ where
     }
 }
 
-pub fn from_object<T: DeserializeOwned>(object: ConvexObject) -> anyhow::Result<T> {
+pub fn from_object<T: DeserializeOwned>(object: DocumentObject) -> anyhow::Result<T> {
     from_value(ConvexValueType::<ConvexValue>::Object(object))
 }
 

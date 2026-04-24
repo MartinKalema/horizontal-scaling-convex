@@ -33,6 +33,9 @@ The combination — real-time subscriptions + in-memory OCC + partitioned multi-
 
 Full details: [docs/what-we-built.md](docs/what-we-built.md)
 
+Issue journal for regressions, fixes, and validation history:
+[docs/issue-journal.md](docs/issue-journal.md)
+
 ## Results
 
 ### Raft Failover Tests

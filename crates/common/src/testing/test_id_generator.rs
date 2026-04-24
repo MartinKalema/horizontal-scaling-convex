@@ -7,7 +7,7 @@ use std::{
 };
 
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     ResolvedDocumentId,
     TableMapping,
     TableNamespace,
@@ -182,7 +182,7 @@ impl TestIdGenerator {
             let table_metadata = TableMetadata::new(namespace, table_name.clone(), table_number);
             let id = ResolvedDocumentId::new(
                 tables_table_id.tablet_id,
-                DeveloperDocumentId::new(tables_table_id.table_number, table_id.0),
+                PublicDocumentId::new(tables_table_id.table_number, table_id.0),
             );
             let doc = ResolvedDocument::new(id, CreationTime::ONE, table_metadata.try_into()?)?;
             let index_update = PersistenceIndexEntry {
@@ -209,7 +209,7 @@ impl TestIdGenerator {
         let table_id = self.user_table_id(table_name);
         ResolvedDocumentId::new(
             table_id.tablet_id,
-            DeveloperDocumentId::new(table_id.table_number, self.generate_internal()),
+            PublicDocumentId::new(table_id.table_number, self.generate_internal()),
         )
     }
 
@@ -218,12 +218,12 @@ impl TestIdGenerator {
         let table_id = self.system_table_id(table_name);
         ResolvedDocumentId::new(
             table_id.tablet_id,
-            DeveloperDocumentId::new(table_id.table_number, self.generate_internal()),
+            PublicDocumentId::new(table_id.table_number, self.generate_internal()),
         )
     }
 
-    pub fn generate_virtual(&mut self, table_name: &TableName) -> DeveloperDocumentId {
+    pub fn generate_virtual(&mut self, table_name: &TableName) -> PublicDocumentId {
         let table_num = self.generate_virtual_table(table_name);
-        DeveloperDocumentId::new(table_num, self.generate_internal())
+        PublicDocumentId::new(table_num, self.generate_internal())
     }
 }

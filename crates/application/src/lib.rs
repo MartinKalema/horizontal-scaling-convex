@@ -361,7 +361,7 @@ use usage_tracking::{
     UsageCounter,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     sha256::Sha256Digest,
     JsonPackedValue,
     Namespace,
@@ -1515,7 +1515,7 @@ impl<RT: Runtime> Application<RT> {
         component: ComponentId,
         requestor: ExportRequestor,
         expiration_ts_ns: Option<u64>,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         anyhow::ensure!(
             identity.is_admin() || identity.is_system(),
             unauthorized_error("request_export")
@@ -1570,7 +1570,7 @@ impl<RT: Runtime> Application<RT> {
     pub async fn get_zip_export(
         &self,
         identity: Identity,
-        id: Either<DeveloperDocumentId, Timestamp>,
+        id: Either<PublicDocumentId, Timestamp>,
     ) -> anyhow::Result<(StorageGetStream, String)> {
         let (object_key, snapshot_ts) = {
             let mut tx = self.begin(identity).await?;
@@ -2353,7 +2353,7 @@ impl<RT: Runtime> Application<RT> {
         component_path: ComponentPath,
         upload_token: ClientDrivenUploadToken,
         part_tokens: Vec<ClientDrivenUploadPartToken>,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         if !identity.is_admin() {
             anyhow::bail!(ErrorMetadata::forbidden(
                 "InvalidImport",
@@ -2782,7 +2782,7 @@ impl<RT: Runtime> Application<RT> {
         content_type: Option<ContentType>,
         expected_sha256: Option<Sha256Digest>,
         body: BoxStream<'_, anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         self.bail_if_not_running().await?;
         let storage_id = self
             .file_storage
@@ -2802,7 +2802,7 @@ impl<RT: Runtime> Application<RT> {
         &self,
         component: ComponentId,
         entry: FileStorageEntry,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let storage_id = self
             .file_storage
             .store_entry(component.into(), entry, &self.usage_counter)
@@ -2857,7 +2857,7 @@ impl<RT: Runtime> Application<RT> {
             )
             .into());
         };
-        let doc_id = parsed_doc.developer_id().to_string();
+        let doc_id = parsed_doc.document_id().to_string();
         let file_entry = parsed_doc.into_value();
         let mut file_stream = self
             .file_storage
@@ -2907,7 +2907,7 @@ impl<RT: Runtime> Application<RT> {
             )
             .into());
         };
-        let doc_id = parsed_doc.developer_id().to_string();
+        let doc_id = parsed_doc.document_id().to_string();
         let file_entry = parsed_doc.into_value();
         let mut file_stream = self
             .file_storage
@@ -3410,7 +3410,7 @@ impl<RT: Runtime> Application<RT> {
                 // Replace or delete the record or insert if there is no existing record that
                 // matches this value for the primary key.
                 if let Some(doc) = query_stream.expect_at_most_one(tx).await? {
-                    let doc_id = DeveloperDocumentId::from(doc.id());
+                    let doc_id = PublicDocumentId::from(doc.id());
                     if deleted {
                         UserFacingModel::new(tx, namespace).delete(doc_id).await?;
                     } else {

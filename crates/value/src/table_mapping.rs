@@ -6,7 +6,7 @@ use imbl::OrdMap;
 use serde::Serialize;
 
 use crate::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     TableName,
     TableNumber,
     TabletId,
@@ -23,7 +23,7 @@ pub enum TableNamespace {
 
     /// Some tables are namespaced by component, like user tables,
     /// _file_storage, etc.
-    ByComponent(DeveloperDocumentId),
+    ByComponent(PublicDocumentId),
 }
 
 impl TableNamespace {
@@ -37,7 +37,7 @@ impl TableNamespace {
 
     #[cfg(any(test, feature = "testing"))]
     pub const fn test_component() -> Self {
-        Self::ByComponent(DeveloperDocumentId::MIN)
+        Self::ByComponent(PublicDocumentId::MIN)
     }
 
     /// Use this to make it clear that a table pertains to the root component.

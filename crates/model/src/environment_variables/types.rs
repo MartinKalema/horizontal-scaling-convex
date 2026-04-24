@@ -7,30 +7,30 @@ pub use common::types::{
 };
 use value::{
     obj,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
 };
 
 #[derive(Debug, PartialEq, Clone)]
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct PersistedEnvironmentVariable(pub EnvironmentVariable);
 
-impl TryFrom<PersistedEnvironmentVariable> for ConvexObject {
+impl TryFrom<PersistedEnvironmentVariable> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(
         PersistedEnvironmentVariable(
             EnvironmentVariable { name, value }
         ): PersistedEnvironmentVariable,
-    ) -> anyhow::Result<ConvexObject> {
+    ) -> anyhow::Result<DocumentObject> {
         obj!("name" => String::from(name), "value" => String::from(value))
     }
 }
 
-impl TryFrom<ConvexObject> for PersistedEnvironmentVariable {
+impl TryFrom<DocumentObject> for PersistedEnvironmentVariable {
     type Error = anyhow::Error;
 
-    fn try_from(obj: ConvexObject) -> anyhow::Result<PersistedEnvironmentVariable> {
+    fn try_from(obj: DocumentObject) -> anyhow::Result<PersistedEnvironmentVariable> {
         let mut fields = BTreeMap::from(obj);
         let name: String = match fields.remove("name") {
             Some(ConvexValue::String(s)) => s.into(),
@@ -54,7 +54,7 @@ mod tests {
     use proptest::prelude::*;
     use value::{
         testing::assert_roundtrips,
-        ConvexObject,
+        DocumentObject,
     };
 
     use super::PersistedEnvironmentVariable;
@@ -65,7 +65,7 @@ mod tests {
         )]
         #[test]
         fn test_env_var_to_object_roundtrip(e in any::<PersistedEnvironmentVariable>()) {
-            assert_roundtrips::<PersistedEnvironmentVariable, ConvexObject>(e);
+            assert_roundtrips::<PersistedEnvironmentVariable, DocumentObject>(e);
         }
     }
 }

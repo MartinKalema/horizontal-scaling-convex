@@ -109,7 +109,7 @@ async fn test_db_index_backfill_progress(
     let mut tx = db.begin_system().await?;
     let mut model = IndexBackfillModel::new(&mut tx);
     let backfill_progress = model
-        .existing_backfill_metadata(index_id.developer_id)
+        .existing_backfill_metadata(index_id.document_id)
         .await?
         .unwrap();
     assert_eq!(backfill_progress.num_docs_indexed, 10);
@@ -166,7 +166,7 @@ async fn test_db_index_multi_index_backfill_progress_multiple_indexes_same_table
 
     for index in [index_id1, index_id2] {
         let progress = model
-            .existing_backfill_metadata(index.developer_id)
+            .existing_backfill_metadata(index.document_id)
             .await?
             .unwrap();
         // With CHUNK_SIZE=10 and 2 indexes, expecting 5 docs
@@ -266,7 +266,7 @@ async fn test_db_index_backfill_resumable(
     let mut tx = db.begin_system().await?;
     let mut model = IndexBackfillModel::new(&mut tx);
     let backfill_progress = model
-        .existing_backfill_metadata(index_id.developer_id)
+        .existing_backfill_metadata(index_id.document_id)
         .await?
         .unwrap();
     assert_eq!(backfill_progress.num_docs_indexed, 10);
@@ -293,7 +293,7 @@ async fn test_db_index_backfill_resumable(
     let mut tx = db.begin_system().await?;
     let mut model = IndexBackfillModel::new(&mut tx);
     let backfill_progress = model
-        .existing_backfill_metadata(index_id.developer_id)
+        .existing_backfill_metadata(index_id.document_id)
         .await?
         .unwrap();
     // Check that backfill is complete

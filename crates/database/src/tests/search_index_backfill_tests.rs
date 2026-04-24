@@ -3,7 +3,7 @@
 /// `SearchIndexTestHarness` so they run for both text and vector indexes.
 use async_trait::async_trait;
 use runtime::testing::TestRuntime;
-use value::DeveloperDocumentId;
+use value::PublicDocumentId;
 
 /// Simplified view of a segment's document counts, common to both index
 /// types.
@@ -31,13 +31,13 @@ pub trait SearchIndexTestHarness: Sized + Send {
     async fn create_backfilling_index(&self) -> anyhow::Result<()>;
 
     /// Insert `count` documents and return their IDs.
-    async fn add_documents(&self, count: u32) -> anyhow::Result<Vec<DeveloperDocumentId>>;
+    async fn add_documents(&self, count: u32) -> anyhow::Result<Vec<PublicDocumentId>>;
 
     /// Delete a document by ID.
-    async fn delete_document(&self, id: DeveloperDocumentId) -> anyhow::Result<()>;
+    async fn delete_document(&self, id: PublicDocumentId) -> anyhow::Result<()>;
 
     /// Replace a document's content (new random content).
-    async fn replace_document(&self, id: DeveloperDocumentId) -> anyhow::Result<()>;
+    async fn replace_document(&self, id: PublicDocumentId) -> anyhow::Result<()>;
 
     /// Create a backfill flusher whose incremental threshold yields roughly
     /// `docs_per_segment` documents per segment, and step it once.
@@ -55,7 +55,7 @@ pub trait SearchIndexTestHarness: Sized + Send {
     /// Assert that exactly `expected_ids` are returned by a broad search.
     async fn assert_documents_searchable(
         &self,
-        expected_ids: &[DeveloperDocumentId],
+        expected_ids: &[PublicDocumentId],
     ) -> anyhow::Result<()>;
 }
 
@@ -280,7 +280,7 @@ mod text {
     };
     use runtime::testing::TestRuntime;
     use value::{
-        DeveloperDocumentId,
+        PublicDocumentId,
         TableNamespace,
     };
 
@@ -307,19 +307,19 @@ mod text {
             Ok(())
         }
 
-        async fn add_documents(&self, count: u32) -> anyhow::Result<Vec<DeveloperDocumentId>> {
+        async fn add_documents(&self, count: u32) -> anyhow::Result<Vec<PublicDocumentId>> {
             let mut ids = Vec::new();
             for i in 0..count {
                 let resolved_id = self
                     .fixtures
                     .add_document(&format!("searchable_text_{i}"))
                     .await?;
-                ids.push(resolved_id.developer_id);
+                ids.push(resolved_id.document_id);
             }
             Ok(ids)
         }
 
-        async fn delete_document(&self, id: DeveloperDocumentId) -> anyhow::Result<()> {
+        async fn delete_document(&self, id: PublicDocumentId) -> anyhow::Result<()> {
             let mut tx = self.fixtures.db.begin_system().await?;
             let resolved = tx.resolve_developer_id(&id, TableNamespace::test_user())?;
             tx.delete_inner(resolved).await?;
@@ -327,7 +327,7 @@ mod text {
             Ok(())
         }
 
-        async fn replace_document(&self, id: DeveloperDocumentId) -> anyhow::Result<()> {
+        async fn replace_document(&self, id: PublicDocumentId) -> anyhow::Result<()> {
             let resolved = {
                 let mut tx = self.fixtures.db.begin_system().await?;
                 tx.resolve_developer_id(&id, TableNamespace::test_user())?
@@ -396,12 +396,12 @@ mod text {
 
         async fn assert_documents_searchable(
             &self,
-            expected_ids: &[DeveloperDocumentId],
+            expected_ids: &[PublicDocumentId],
         ) -> anyhow::Result<()> {
             let index_name = "table.search_index".parse()?;
             // Search for a term that all added documents contain.
             let results = self.fixtures.search(index_name, "searchable_text").await?;
-            let mut result_ids: Vec<_> = results.iter().map(|r| r.id().developer_id).collect();
+            let mut result_ids: Vec<_> = results.iter().map(|r| r.id().document_id).collect();
             result_ids.sort();
             let mut expected: Vec<_> = expected_ids.to_vec();
             expected.sort();
@@ -477,7 +477,7 @@ mod vector {
     use value::{
         assert_obj,
         ConvexValue,
-        DeveloperDocumentId,
+        PublicDocumentId,
         TableName,
         TableNamespace,
     };
@@ -563,7 +563,7 @@ mod vector {
             Ok(())
         }
 
-        async fn add_documents(&self, count: u32) -> anyhow::Result<Vec<DeveloperDocumentId>> {
+        async fn add_documents(&self, count: u32) -> anyhow::Result<Vec<PublicDocumentId>> {
             let mut ids = Vec::new();
             for _ in 0..count {
                 let mut tx = self.database.begin(Identity::system()).await?;
@@ -581,7 +581,7 @@ mod vector {
             Ok(ids)
         }
 
-        async fn delete_document(&self, id: DeveloperDocumentId) -> anyhow::Result<()> {
+        async fn delete_document(&self, id: PublicDocumentId) -> anyhow::Result<()> {
             let mut tx = self.database.begin_system().await?;
             let mut model = UserFacingModel::new(&mut tx, TableNamespace::test_user());
             model.delete(id).await?;
@@ -589,7 +589,7 @@ mod vector {
             Ok(())
         }
 
-        async fn replace_document(&self, id: DeveloperDocumentId) -> anyhow::Result<()> {
+        async fn replace_document(&self, id: PublicDocumentId) -> anyhow::Result<()> {
             let mut tx = self.database.begin_system().await?;
             let random_vector = random_vector_value(&mut self.rt.rng());
             let obj = assert_obj!(
@@ -694,7 +694,7 @@ mod vector {
 
         async fn assert_documents_searchable(
             &self,
-            expected_ids: &[DeveloperDocumentId],
+            expected_ids: &[PublicDocumentId],
         ) -> anyhow::Result<()> {
             use common::components::ComponentId;
             use maplit::btreeset;
@@ -713,8 +713,7 @@ mod vector {
                     },
                 )
                 .await?;
-            let mut result_ids: Vec<DeveloperDocumentId> =
-                results.into_iter().map(|r| r.id).collect();
+            let mut result_ids: Vec<PublicDocumentId> = results.into_iter().map(|r| r.id).collect();
             result_ids.sort();
             let mut expected: Vec<_> = expected_ids.to_vec();
             expected.sort();

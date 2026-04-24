@@ -30,8 +30,8 @@ use types::CronJobMetadata;
 use value::{
     heap_size::WithHeapSize,
     ConvexValue,
-    DeveloperDocumentId,
     FieldPath,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -229,7 +229,7 @@ impl<'a, RT: Runtime> CronModel<'a, RT> {
         let cron_job_id = SystemMetadataModel::new(self.tx, self.component.into())
             .insert(&CRON_JOBS_TABLE, cron.try_into()?)
             .await?
-            .developer_id;
+            .document_id;
 
         let next_run = CronNextRun {
             cron_job_id,
@@ -247,7 +247,7 @@ impl<'a, RT: Runtime> CronModel<'a, RT> {
 
     pub async fn next_run(
         &mut self,
-        cron_job_id: DeveloperDocumentId,
+        cron_job_id: PublicDocumentId,
     ) -> anyhow::Result<Option<ParsedDocument<CronNextRun>>> {
         let query = Query::index_range(IndexRange {
             index_name: CRON_NEXT_RUN_INDEX_BY_CRON_JOB_ID.name(),
@@ -282,7 +282,7 @@ impl<'a, RT: Runtime> CronModel<'a, RT> {
             if next_next_run.secs_since_f64(now) > 30.0 {
                 // Read in next-run to the readset and update it.
                 let mut next_run = self
-                    .next_run(cron_job.id().developer_id)
+                    .next_run(cron_job.id().document_id)
                     .await?
                     .context("No next run found")?
                     .into_value();
@@ -308,7 +308,7 @@ impl<'a, RT: Runtime> CronModel<'a, RT> {
             .delete(cron_job.id())
             .await?;
         let next_run = self
-            .next_run(cron_job.id().developer_id)
+            .next_run(cron_job.id().document_id)
             .await?
             .context("No next run found")?;
         SystemMetadataModel::new(self.tx, self.component.into())
@@ -366,7 +366,7 @@ impl<'a, RT: Runtime> CronModel<'a, RT> {
         };
         let cron: ParsedDocument<CronJobMetadata> = job.parse()?;
         let next_run = self
-            .next_run(id.developer_id)
+            .next_run(id.document_id)
             .await?
             .context("No next run found")?
             .into_value();
@@ -380,7 +380,7 @@ impl<'a, RT: Runtime> CronModel<'a, RT> {
         while let Some(job) = query_stream.next(self.tx, None).await? {
             let cron: ParsedDocument<CronJobMetadata> = job.parse()?;
             let next_run = self
-                .next_run(cron.id().developer_id)
+                .next_run(cron.id().document_id)
                 .await?
                 .context("No next run found")?
                 .into_value();

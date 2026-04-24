@@ -788,7 +788,7 @@ pub(crate) async fn incremental_table_scan<T: SearchIndex>(
 
         let page_len = page.len();
         for (i, (index_key, latest_doc)) in page.into_iter().enumerate() {
-            let developer_doc_id = latest_doc.value.id().developer_id;
+            let developer_doc_id = latest_doc.value.id().document_id;
             let size = T::estimate_document_size(schema, &latest_doc.value);
             total_size += size;
 

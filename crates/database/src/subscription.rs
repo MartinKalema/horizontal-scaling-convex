@@ -830,12 +830,12 @@ mod tests {
     use sync_types::Timestamp;
     use tokio::sync::mpsc;
     use value::{
-        ConvexObject,
         ConvexString,
         ConvexValue,
-        DeveloperDocumentId,
+        DocumentObject,
         FieldName,
         FieldPath,
+        PublicDocumentId,
         ResolvedDocumentId,
         TableNumber,
         TabletId,
@@ -979,7 +979,7 @@ mod tests {
                 let internal_id = id_generator.generate_internal();
                 let id = ResolvedDocumentId::new(
                     *index_name.table(),
-                    DeveloperDocumentId::new(TableNumber::try_from(1).unwrap(), internal_id),
+                    PublicDocumentId::new(TableNumber::try_from(1).unwrap(), internal_id),
                 );
                 assert_eq!(*index_name.table(), id.tablet_id);
 
@@ -1013,19 +1013,19 @@ mod tests {
         ResolvedDocument::new(id, time, object).unwrap()
     }
 
-    fn create_object(field_path: FieldPath, field_value: String) -> ConvexObject {
+    fn create_object(field_path: FieldPath, field_value: String) -> DocumentObject {
         let mut map: BTreeMap<FieldName, ConvexValue> = BTreeMap::new();
         let name = field_path.fields().last().unwrap();
         map.insert(
             FieldName::from(name.clone()),
             ConvexValue::String(ConvexString::try_from(field_value).unwrap()),
         );
-        let mut object = ConvexObject::try_from(map).unwrap();
+        let mut object = DocumentObject::try_from(map).unwrap();
 
         for field in field_path.fields().iter().rev().skip(1) {
             let mut new_map = BTreeMap::new();
             new_map.insert(FieldName::from(field.clone()), ConvexValue::Object(object));
-            object = ConvexObject::try_from(new_map).unwrap();
+            object = DocumentObject::try_from(new_map).unwrap();
         }
         object
     }

@@ -5,7 +5,7 @@ use std::{
 
 use derive_more::Deref;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     ConvexValue,
     InternalId,
     Size,
@@ -72,14 +72,14 @@ impl Borrow<[u8]> for IndexKeyBytes {
 /// will hold `(doc.a, doc.b, doc._id)`.
 pub struct IndexKey {
     values_with_id: Vec<Option<ConvexValue>>,
-    id: DeveloperDocumentId,
+    id: PublicDocumentId,
 }
 
 impl IndexKey {
     /// Construct an `IndexKey`.
     pub fn new_allow_missing(
         mut index_values: Vec<Option<ConvexValue>>,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
     ) -> Self {
         let id_value: ConvexValue = id.into();
         index_values.push(Some(id_value));
@@ -89,7 +89,7 @@ impl IndexKey {
         }
     }
 
-    pub fn new(index_values: Vec<ConvexValue>, id: DeveloperDocumentId) -> Self {
+    pub fn new(index_values: Vec<ConvexValue>, id: PublicDocumentId) -> Self {
         Self::new_allow_missing(index_values.into_iter().map(Some).collect(), id)
     }
 
@@ -115,7 +115,7 @@ impl IndexKey {
     }
 }
 
-impl From<IndexKey> for (Vec<Option<ConvexValue>>, DeveloperDocumentId) {
+impl From<IndexKey> for (Vec<Option<ConvexValue>>, PublicDocumentId) {
     fn from(k: IndexKey) -> Self {
         let mut values = k.values_with_id;
         values.pop();
@@ -138,7 +138,7 @@ impl PartialOrd for IndexKey {
 mod proptest {
     use proptest::prelude::*;
     use value::{
-        id_v6::DeveloperDocumentId,
+        id_v6::PublicDocumentId,
         ConvexValue,
     };
 
@@ -150,7 +150,7 @@ mod proptest {
         type Strategy = impl Strategy<Value = IndexKey>;
 
         fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-            any::<(Vec<Option<ConvexValue>>, DeveloperDocumentId)>()
+            any::<(Vec<Option<ConvexValue>>, PublicDocumentId)>()
                 .prop_map(|(values, id)| IndexKey::new_allow_missing(values, id))
         }
     }

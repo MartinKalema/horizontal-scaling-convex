@@ -67,7 +67,7 @@ use usage_tracking::{
     StorageUsageTracker,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     TableNamespace,
 };
 
@@ -431,7 +431,7 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
         tx: &mut Transaction<RT>,
         namespace: TableNamespace,
         entry: FileStorageEntry,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let system_doc_id = FileStorageModel::new(tx, namespace)
             .store_file(entry)
             .await?;
@@ -452,7 +452,7 @@ impl<RT: Runtime> FileStorage<RT> {
         file: impl Stream<Item = anyhow::Result<impl Into<Bytes>>> + Send,
         expected_sha256: Option<Sha256Digest>,
         usage_tracker: &dyn StorageUsageTracker,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let entry = self
             .transactional_file_storage
             .upload_file(content_length, content_type, file, expected_sha256)
@@ -467,7 +467,7 @@ impl<RT: Runtime> FileStorage<RT> {
         namespace: TableNamespace,
         entry: FileStorageEntry,
         usage_tracker: &dyn StorageUsageTracker,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let storage_id = entry.storage_id.clone();
         let size = entry.size;
         let content_type = entry

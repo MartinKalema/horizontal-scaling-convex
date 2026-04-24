@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     proptest::float64_strategy,
     ConvexArray,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
     InternalId,
 };
@@ -40,7 +40,7 @@ pub fn shape_member_strategy<C: ShapeConfig>(t: &CountedShape<C>) -> BoxedStrate
             let table = *table;
             any::<InternalId>()
                 .prop_map(move |id| {
-                    let id = DeveloperDocumentId::new(table, id);
+                    let id = PublicDocumentId::new(table, id);
                     ConvexValue::String(String::from(id).try_into().unwrap())
                 })
                 .boxed()
@@ -95,7 +95,7 @@ pub fn shape_member_strategy<C: ShapeConfig>(t: &CountedShape<C>) -> BoxedStrate
                 shape_member_strategy(record.value()),
                 0..BRANCHING,
             )
-            .prop_map(|value| ConvexValue::Object(ConvexObject::try_from(value).unwrap()))
+            .prop_map(|value| ConvexValue::Object(DocumentObject::try_from(value).unwrap()))
             .boxed()
         },
         ShapeEnum::Union(union) => {

@@ -45,7 +45,7 @@ use errors::ErrorMetadata;
 use imbl::OrdSet;
 use value::{
     values_to_bytes,
-    DeveloperDocumentId,
+    PublicDocumentId,
     TabletId,
 };
 
@@ -218,7 +218,7 @@ pub struct TransactionWriteSize {
     // Total number of writes (i.e. calls to `mutate`)
     pub num_writes: usize,
 
-    // Total size of mutations. Writing to the same DocumentId twice will still count twice.
+    // Total size of mutations. Writing to the same PublicDocumentId twice will still count twice.
     pub size: usize,
 }
 
@@ -376,7 +376,7 @@ impl Writes {
             // Writes to a table require the table still exists.
             let table_id_bytes = IndexKey::new(
                 vec![],
-                DeveloperDocumentId::new(table_mapping.tables_id.table_number, tablet_id.0),
+                PublicDocumentId::new(table_mapping.tables_id.table_number, tablet_id.0),
             )
             .to_bytes();
             reads.record_indexed_derived(
@@ -408,7 +408,7 @@ impl Writes {
         Ok(())
     }
 
-    /// Register a newly allocated DocumentId.
+    /// Register a newly allocated PublicDocumentId.
     /// This enables us to check for reuse on commit.
     pub(crate) fn register_new_id(
         &mut self,
@@ -438,7 +438,8 @@ impl Writes {
         &self.system_tx_size
     }
 
-    /// Iterate over the coalesced writes (so no `DocumentId` appears twice).
+    /// Iterate over the coalesced writes (so no `PublicDocumentId` appears
+    /// twice).
     pub fn coalesced_writes(&self) -> impl Iterator<Item = &DocumentUpdateWithPrevTs> {
         self.updates.iter().map(|x| &**x)
     }

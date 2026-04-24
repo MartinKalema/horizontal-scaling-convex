@@ -609,7 +609,7 @@ impl TryFrom<AnalyzedModule> for SerializedMappedModule {
 mod tests {
     use value::{
         obj,
-        ConvexObject,
+        DocumentObject,
     };
 
     use super::AnalyzedFunction;
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn test_analyzed_function_backwards_compatibility() -> anyhow::Result<()> {
         // Old metadata won't have `visibility` or `args`
-        let metadata: ConvexObject = obj!(
+        let metadata: DocumentObject = obj!(
             "name" =>  "myFunction",
             "lineno" => 1,
             "udfType" => "Query"

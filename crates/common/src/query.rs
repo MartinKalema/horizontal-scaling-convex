@@ -31,11 +31,11 @@ use sha2::{
 };
 use value::{
     heap_size::HeapSize,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     utils::display_sequence,
     val,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     TabletId,
 };
 
@@ -916,7 +916,7 @@ mod proptest {
 
 fn binary_arithmetic<I, F>(
     name: &'static str,
-    environ: &ConvexObject,
+    environ: &DocumentObject,
     l_expr: &Expression,
     r_expr: &Expression,
     do_ints: I,
@@ -953,7 +953,7 @@ where
 impl Expression {
     /// Evaluate the expression and return the result. Expression::Fields are
     /// evaluated on `environ`.
-    pub fn eval(&self, environ: &ConvexObject) -> anyhow::Result<MaybeValue> {
+    pub fn eval(&self, environ: &DocumentObject) -> anyhow::Result<MaybeValue> {
         // Convert input value into a value that compares with ==, !=, >, <, etc. in
         // the same order as they would be compared in an index.
         let comparable_value = |v: MaybeValue| v.0;
@@ -1122,7 +1122,7 @@ impl Query {
         }
     }
 
-    pub fn get(table_name: TableName, id: DeveloperDocumentId) -> Self {
+    pub fn get(table_name: TableName, id: PublicDocumentId) -> Self {
         Self::index_range(IndexRange {
             index_name: IndexName::by_id(table_name),
             range: vec![IndexRangeExpression::Eq(

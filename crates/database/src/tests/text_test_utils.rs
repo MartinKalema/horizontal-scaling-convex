@@ -51,8 +51,8 @@ use sync_types::Timestamp;
 use usage_tracking::UsageCounter;
 use value::{
     assert_obj,
-    DeveloperDocumentId,
     FieldPath,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -233,7 +233,7 @@ impl TextFixtures {
 
     pub async fn index_backfill_progress(
         &self,
-        index_id: DeveloperDocumentId,
+        index_id: PublicDocumentId,
     ) -> anyhow::Result<Option<Arc<ParsedDocument<IndexBackfillMetadata>>>> {
         let mut tx = self.db.begin_system().await?;
         IndexBackfillModel::new(&mut tx)

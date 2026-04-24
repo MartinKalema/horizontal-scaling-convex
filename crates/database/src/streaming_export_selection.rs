@@ -19,7 +19,7 @@
 //! # use sync_types::Timestamp;
 //! # use value::{
 //! #     assert_obj,
-//! #     DeveloperDocumentId,
+//! #     PublicDocumentId,
 //! #     TableNumber,
 //! # };
 //! # use database::streaming_export_selection::{
@@ -57,7 +57,7 @@
 //! assert!(!selection.is_table_included(&"other_component".parse()?, &"users".parse()?));
 //!
 //! // This can also be used to filter documents
-//! let doc_id = DeveloperDocumentId::new(TableNumber::try_from(1)?, InternalId::MIN);
+//! let doc_id = PublicDocumentId::new(TableNumber::try_from(1)?, InternalId::MIN);
 //! let doc = DeveloperDocument::new(
 //!     doc_id.clone(),
 //!     CreationTime::try_from(Timestamp::MIN)?,
@@ -99,9 +99,9 @@ use proptest_derive::Arbitrary;
 use serde_json::Value as JsonValue;
 use value::{
     export::ValueFormat,
-    ConvexObject,
-    DeveloperDocumentId,
+    DocumentObject,
     FieldName,
+    PublicDocumentId,
     Size,
     TableName,
 };
@@ -324,12 +324,12 @@ impl StreamingExportColumnSelection {
 #[derive(Eq, PartialEq, Debug)]
 #[cfg_attr(test, derive(Clone))]
 pub struct StreamingExportDocument {
-    id: DeveloperDocumentId,
-    value: PII<ConvexObject>,
+    id: PublicDocumentId,
+    value: PII<DocumentObject>,
 }
 
 impl StreamingExportDocument {
-    pub fn new(id: DeveloperDocumentId, value: PII<ConvexObject>) -> anyhow::Result<Self> {
+    pub fn new(id: PublicDocumentId, value: PII<DocumentObject>) -> anyhow::Result<Self> {
         // Verify that `value` contains `_id`
         anyhow::ensure!(
             value.0.get(&FieldName::from(ID_FIELD.clone()))
@@ -377,7 +377,7 @@ impl StreamingExportDocument {
         }
     }
 
-    pub fn id(&self) -> DeveloperDocumentId {
+    pub fn id(&self) -> PublicDocumentId {
         self.id
     }
 }
@@ -653,7 +653,7 @@ mod tests_column_filtering {
 
     #[test]
     fn test_filter_document_with_creation_time() -> anyhow::Result<()> {
-        let id = DeveloperDocumentId::new(TableNumber::try_from(1)?, InternalId::MIN);
+        let id = PublicDocumentId::new(TableNumber::try_from(1)?, InternalId::MIN);
         let creation_time = CreationTime::try_from(Timestamp::MIN)?;
         let value = assert_obj!(
             "_id" => id.encode(),
@@ -690,7 +690,7 @@ mod tests_column_filtering {
 
     #[test]
     fn test_filter_document_without_creation_time() -> anyhow::Result<()> {
-        let id = DeveloperDocumentId::new(TableNumber::try_from(1)?, InternalId::MIN);
+        let id = PublicDocumentId::new(TableNumber::try_from(1)?, InternalId::MIN);
         let creation_time = CreationTime::try_from(Timestamp::MIN)?;
         let value = assert_obj!(
             "_id" => id.encode(),
@@ -836,7 +836,7 @@ mod tests_export_fields {
     fn test_export_fields_convex_encoded_json() -> anyhow::Result<()> {
         let mut id_generator = TestIdGenerator::new();
         let posts_table_name: TableName = "posts".parse()?;
-        let id = id_generator.user_generate(&posts_table_name).developer_id;
+        let id = id_generator.user_generate(&posts_table_name).document_id;
 
         let big_value: i64 = 1234567890123456789;
         let doc = StreamingExportDocument::new(
@@ -865,7 +865,7 @@ mod tests_export_fields {
     fn test_export_fields_convex_clean_json() -> anyhow::Result<()> {
         let mut id_generator = TestIdGenerator::new();
         let posts_table_name: TableName = "posts".parse()?;
-        let id = id_generator.user_generate(&posts_table_name).developer_id;
+        let id = id_generator.user_generate(&posts_table_name).document_id;
 
         let big_value: i64 = 1234567890123456789;
         let doc = StreamingExportDocument::new(

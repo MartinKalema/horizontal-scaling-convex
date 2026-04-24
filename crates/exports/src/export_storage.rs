@@ -96,7 +96,7 @@ pub(crate) async fn write_storage_table<'a, 'b: 'a, RT: Runtime>(
         let log_interval = Duration::from_secs(60 * 60);
         while let Some(LatestDocument { value: doc, .. }) = stream.try_next().await? {
             let file_storage_entry = ParseDocument::<FileStorageEntry>::parse(doc)?;
-            let virtual_storage_id = file_storage_entry.id().developer_id;
+            let virtual_storage_id = file_storage_entry.id().document_id;
             let creation_time = f64::from(file_storage_entry.creation_time());
             table_upload
                 .write_json_line(json!(FileStorageZipMetadata {
@@ -127,7 +127,7 @@ pub(crate) async fn write_storage_table<'a, 'b: 'a, RT: Runtime>(
         .stream_documents_in_table(*tablet_id, *by_id, None)
         .map_ok(|LatestDocument { value: doc, .. }| async {
             let file_storage_entry = ParseDocument::<FileStorageEntry>::parse(doc)?;
-            let virtual_storage_id = file_storage_entry.id().developer_id;
+            let virtual_storage_id = file_storage_entry.id().document_id;
             // Add an extension, which isn't necessary for anything and might be incorrect,
             // but allows the file to be viewed at a glance in most cases.
             let extension_guess = file_storage_entry
@@ -148,7 +148,7 @@ pub(crate) async fn write_storage_table<'a, 'b: 'a, RT: Runtime>(
                 .with_context(|| {
                     format!(
                         "file missing from storage: {} with key {:?}",
-                        file_storage_entry.developer_id().encode(),
+                        file_storage_entry.document_id().encode(),
                         file_storage_entry.storage_key,
                     )
                 })?;

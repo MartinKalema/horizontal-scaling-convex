@@ -5,7 +5,7 @@ use serde::{
 use sync_types::Timestamp;
 use value::{
     codegen_convex_serialization,
-    DeveloperDocumentId,
+    PublicDocumentId,
 };
 
 /// Cursor for a database index that has an in-progress backfill
@@ -13,7 +13,7 @@ use value::{
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct BackfillCursor {
     pub snapshot_ts: Timestamp,
-    pub cursor: Option<DeveloperDocumentId>,
+    pub cursor: Option<PublicDocumentId>,
 }
 
 /// Metadata for tracking index backfill progress.
@@ -30,7 +30,7 @@ pub struct BackfillCursor {
 pub struct IndexBackfillMetadata {
     /// The ID of the index being backfilled. Should correspond to a document in
     /// the index table in `Backfilling` state.
-    pub index_id: DeveloperDocumentId,
+    pub index_id: PublicDocumentId,
     /// Number of documents that have been indexed so far from the snapshot
     /// (does not include documents written since the backfill began).
     pub num_docs_indexed: u64,

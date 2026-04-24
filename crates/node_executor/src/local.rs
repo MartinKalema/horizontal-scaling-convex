@@ -396,9 +396,9 @@ mod tests {
     use udf::validation::ValidatedPathAndArgs;
     use value::{
         array,
-        id_v6::DeveloperDocumentId,
+        id_v6::PublicDocumentId,
         ConvexArray,
-        ConvexObject,
+        DocumentObject,
     };
 
     use super::LocalNodeExecutor;
@@ -440,7 +440,7 @@ mod tests {
         })
     }
 
-    fn create_args(args_object: ConvexObject) -> anyhow::Result<ConvexArray> {
+    fn create_args(args_object: DocumentObject) -> anyhow::Result<ConvexArray> {
         array![ConvexValue::Object(args_object)]
     }
 
@@ -451,7 +451,7 @@ mod tests {
         ExecuteRequest {
             path_and_args,
             source_package,
-            source_package_id: DeveloperDocumentId::MIN.into(),
+            source_package_id: PublicDocumentId::MIN.into(),
             user_identity: None,
             auth_header: None,
             environment_variables: btreemap! {},
@@ -570,7 +570,7 @@ mod tests {
                     VERSION.clone(),
                 ),
                 source_package,
-                source_package_id: DeveloperDocumentId::MIN.into(),
+                source_package_id: PublicDocumentId::MIN.into(),
                 user_identity: Some(identity.attributes.clone()),
                 auth_header: None,
                 environment_variables: btreemap! {},
@@ -878,7 +878,7 @@ mod tests {
                     VERSION.clone(),
                 ),
                 source_package,
-                source_package_id: DeveloperDocumentId::MIN.into(),
+                source_package_id: PublicDocumentId::MIN.into(),
                 user_identity: None,
                 auth_header: None,
                 environment_variables,

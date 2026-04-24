@@ -18,6 +18,7 @@ use common::types::Timestamp;
 use crate::{
     committer::CommitterClient,
     partition::{
+        routed_partition_for_table,
         PartitionId,
         PartitionMap,
     },
@@ -38,6 +39,9 @@ pub enum TransactionClassification {
     /// All writes target a single partition — use the normal fast path (TiDB
     /// 1PC).
     SinglePartition,
+    /// All writes target a single remote partition. This should be rejected by
+    /// the receiving node instead of running 2PC locally.
+    RemoteSinglePartition { owner: PartitionId },
     /// Writes span multiple partitions — use 2PC.
     CrossPartition {
         /// Writes grouped by owning partition.
@@ -49,23 +53,33 @@ pub enum TransactionClassification {
 pub fn classify_transaction(
     transaction: &FinalTransaction,
     partition_map: &PartitionMap,
+    write_source: &WriteSource,
 ) -> TransactionClassification {
     let mut partitions: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
 
     for (i, write) in transaction.writes.coalesced_writes().enumerate() {
         let tablet_id = write.id.tablet_id;
         if let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) {
-            // System tables stay on the coordinator path.
-            if table_name.is_system() {
-                continue;
+            if let Some(partition) =
+                routed_partition_for_table(&table_name, partition_map, write_source)
+            {
+                partitions.entry(partition).or_default().push(i);
             }
-            let partition = partition_map.partition_for_table(&table_name);
-            partitions.entry(partition).or_default().push(i);
         }
     }
 
-    if partitions.len() <= 1 {
+    if partitions.is_empty() {
         TransactionClassification::SinglePartition
+    } else if partitions.len() == 1 {
+        let owner = *partitions
+            .keys()
+            .next()
+            .expect("single-partition classification should have one owner");
+        if owner == partition_map.local_partition() {
+            TransactionClassification::SinglePartition
+        } else {
+            TransactionClassification::RemoteSinglePartition { owner }
+        }
     } else {
         TransactionClassification::CrossPartition { partitions }
     }
@@ -74,22 +88,21 @@ pub fn classify_transaction(
 fn participant_write_indexes(
     transaction: &FinalTransaction,
     partition_map: &PartitionMap,
-    user_partitions: &BTreeMap<PartitionId, Vec<usize>>,
+    write_source: &WriteSource,
 ) -> BTreeMap<PartitionId, Vec<usize>> {
-    let mut participant_indexes = user_partitions.clone();
+    let mut participant_indexes: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
     let local_partition = partition_map.local_partition();
 
     for (index, write) in transaction.writes.coalesced_writes().enumerate() {
-        if transaction
-            .table_mapping
-            .tablet_name(write.id.tablet_id)
-            .is_ok_and(|table_name| table_name.is_system())
-        {
-            participant_indexes
-                .entry(local_partition)
-                .or_default()
-                .push(index);
-        }
+        let Ok(table_name) = transaction.table_mapping.tablet_name(write.id.tablet_id) else {
+            continue;
+        };
+        let participant = routed_partition_for_table(&table_name, partition_map, write_source)
+            .unwrap_or(local_partition);
+        participant_indexes
+            .entry(participant)
+            .or_default()
+            .push(index);
     }
 
     participant_indexes.retain(|_, indexes| !indexes.is_empty());
@@ -116,9 +129,12 @@ async fn prepare_participant(
             )
             .await?
     } else {
-        let node_addresses = node_addresses.context(
-            "NODE_ADDRESSES is required for cross-partition transactions with remote participants",
-        )?;
+        let node_addresses = node_addresses.with_context(|| {
+            format!(
+                "NODE_ADDRESSES is required to route this transaction to the authoritative owner \
+                 {participant}"
+            )
+        })?;
         let addr = node_addresses
             .address_for(participant)
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
@@ -155,9 +171,12 @@ async fn rollback_participant(
             .rollback_prepared(transaction_id.clone())
             .await
     } else {
-        let node_addresses = node_addresses.context(
-            "NODE_ADDRESSES is required for cross-partition transactions with remote participants",
-        )?;
+        let node_addresses = node_addresses.with_context(|| {
+            format!(
+                "NODE_ADDRESSES is required to route rollback to the authoritative owner \
+                 {participant}"
+            )
+        })?;
         let addr = node_addresses
             .address_for(participant)
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
@@ -178,9 +197,12 @@ async fn commit_participant(
             .commit_prepared(transaction_id.clone())
             .await
     } else {
-        let node_addresses = node_addresses.context(
-            "NODE_ADDRESSES is required for cross-partition transactions with remote participants",
-        )?;
+        let node_addresses = node_addresses.with_context(|| {
+            format!(
+                "NODE_ADDRESSES is required to route commit to the authoritative owner \
+                 {participant}"
+            )
+        })?;
         let addr = node_addresses
             .address_for(participant)
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
@@ -190,7 +212,8 @@ async fn commit_participant(
 }
 
 fn is_retryable_prepare_ts_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains("2PC Prepare assigned ts=")
+    err.chain()
+        .any(|cause| cause.to_string().contains("2PC Prepare assigned ts="))
 }
 
 /// Execute the 2PC protocol for a cross-partition transaction.
@@ -200,13 +223,13 @@ pub async fn coordinate_two_phase_commit(
     write_source: WriteSource,
     partition_map: &PartitionMap,
 ) -> anyhow::Result<Timestamp> {
-    let TransactionClassification::CrossPartition { partitions } =
-        classify_transaction(&transaction, partition_map)
+    let TransactionClassification::CrossPartition { partitions: _ } =
+        classify_transaction(&transaction, partition_map, &write_source)
     else {
         anyhow::bail!("2PC coordinator called for a single-partition transaction");
     };
 
-    let participant_indexes = participant_write_indexes(&transaction, partition_map, &partitions);
+    let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
     let txn_id = TwoPhaseTransactionId::new();
     let node_addresses = local_committer.node_addresses();
     let participants: Vec<_> = participant_indexes
@@ -214,7 +237,13 @@ pub async fn coordinate_two_phase_commit(
         .map(|(participant, write_indexes)| -> anyhow::Result<_> {
             Ok((
                 *participant,
-                ParticipantTransaction::from_final_transaction(&transaction, write_indexes)?,
+                ParticipantTransaction::from_final_transaction(
+                    &transaction,
+                    *participant,
+                    write_indexes,
+                    partition_map,
+                    &write_source,
+                )?,
             ))
         })
         .collect::<anyhow::Result<_>>()?;
@@ -272,6 +301,13 @@ pub async fn coordinate_two_phase_commit(
                     }
 
                     if is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES {
+                        tracing::info!(
+                            "2PC Coordinator: retrying txn={} with a newer prepare timestamp \
+                             after participant {} rejected ts on attempt {}",
+                            txn_id,
+                            participant,
+                            attempt + 1,
+                        );
                         last_retryable_error = Some(err);
                         retry_prepare = true;
                         break;
@@ -322,4 +358,24 @@ pub async fn coordinate_two_phase_commit(
             txn_id
         )
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_retryable_prepare_ts_error;
+
+    #[test]
+    fn retryable_prepare_ts_error_detects_wrapped_grpc_status() {
+        let err = anyhow::anyhow!(
+            "Prepare failed: 2PC Prepare assigned ts=10 but this participant requires ts>=20"
+        )
+        .context("gRPC Prepare failed");
+        assert!(is_retryable_prepare_ts_error(&err));
+    }
+
+    #[test]
+    fn retryable_prepare_ts_error_rejects_unrelated_errors() {
+        let err = anyhow::anyhow!("gRPC Prepare failed");
+        assert!(!is_retryable_prepare_ts_error(&err));
+    }
 }

@@ -22,8 +22,8 @@ use common::{
 use semver::Version;
 use value::{
     val,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
     TableMapping,
 };
@@ -73,7 +73,7 @@ impl VirtualSystemDocMapper for FileStorageDocMapper {
             size: metadata.size as f64,
             content_type: metadata.content_type,
         };
-        let mut public_metadata_resolved: ConvexObject = public_metadata.try_into()?;
+        let mut public_metadata_resolved: DocumentObject = public_metadata.try_into()?;
 
         let virtual_developer_id =
             virtual_system_mapping.system_resolved_id_to_virtual_developer_id(doc.id())?;
@@ -103,7 +103,7 @@ struct PublicFileMetadata {
     content_type: Option<String>, // Optional ContentType header saved with file
 }
 
-impl TryFrom<PublicFileMetadata> for ConvexObject {
+impl TryFrom<PublicFileMetadata> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(
@@ -123,6 +123,6 @@ impl TryFrom<PublicFileMetadata> for ConvexObject {
                 Some(ct) => val!(ct),
             },
         );
-        ConvexObject::try_from(obj)
+        DocumentObject::try_from(obj)
     }
 }

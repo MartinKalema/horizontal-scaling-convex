@@ -9,8 +9,8 @@ use anyhow::{
 };
 use chrono::DateTime;
 use common::value::{
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
 };
 use fivetran_common::fivetran_sdk::value_type::Inner as FivetranValue;
@@ -180,10 +180,10 @@ fn timestamp_to_ms(ts: Timestamp) -> f64 {
 ///   }
 /// }
 /// ```
-impl TryInto<ConvexObject> for FileRow {
+impl TryInto<DocumentObject> for FileRow {
     type Error = anyhow::Error;
 
-    fn try_into(self) -> Result<ConvexObject, Self::Error> {
+    fn try_into(self) -> Result<DocumentObject, Self::Error> {
         let mut row: BTreeMap<FieldName, ConvexValue> = BTreeMap::new();
         let mut metadata: BTreeMap<FieldName, ConvexValue> = BTreeMap::new();
         let mut underscore_columns: BTreeMap<FieldName, ConvexValue> = BTreeMap::new();
@@ -228,15 +228,15 @@ impl TryInto<ConvexObject> for FileRow {
         if !underscore_columns.is_empty() {
             metadata.insert(
                 UNDERSCORED_COLUMNS_CONVEX_FIELD_NAME.clone().into(),
-                ConvexValue::Object(ConvexObject::try_from(underscore_columns)?),
+                ConvexValue::Object(DocumentObject::try_from(underscore_columns)?),
             );
         }
 
         row.insert(
             METADATA_CONVEX_FIELD_NAME.clone().into(),
-            ConvexValue::Object(ConvexObject::try_from(metadata)?),
+            ConvexValue::Object(DocumentObject::try_from(metadata)?),
         );
-        ConvexObject::try_from(row)
+        DocumentObject::try_from(row)
     }
 }
 
@@ -349,8 +349,8 @@ mod tests {
     use common::{
         assert_obj,
         value::{
-            ConvexObject,
             ConvexValue,
+            DocumentObject,
         },
     };
     use fivetran_common::fivetran_sdk::value_type::Inner as FivetranValue;
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn convert_file_row_into_convex_object() -> anyhow::Result<()> {
-        let actual: ConvexObject = FileRow(btreemap! {
+        let actual: DocumentObject = FileRow(btreemap! {
             FivetranFieldName::from_str("name")? => FivetranFileValue::Value(FivetranValue::String("Nicolas".to_string())),
             FivetranFieldName::from_str("null_attribute")? => FivetranFileValue::Value(FivetranValue::Null(true)),
             FivetranFieldName::from_str("unmodified_attribute")? => FivetranFileValue::Unmodified,
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn convert_file_row_with_all_metadata_fields() -> anyhow::Result<()> {
-        let actual: ConvexObject = FileRow(btreemap! {
+        let actual: DocumentObject = FileRow(btreemap! {
             FivetranFieldName::from_str("name")? => FivetranFileValue::Value(FivetranValue::String("Nicolas".to_string())),
             FivetranFieldName::from_str("_fivetran_id")? => FivetranFileValue::Value(FivetranValue::Int(42)),
             FivetranFieldName::from_str("_fivetran_deleted")? => FivetranFileValue::Value(FivetranValue::Bool(false)),
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn convert_file_row_with_column_names_starting_with_underscore() -> anyhow::Result<()> {
-        let actual: ConvexObject = FileRow(btreemap! {
+        let actual: DocumentObject = FileRow(btreemap! {
             FivetranFieldName::from_str("_name")? => FivetranFileValue::Value(FivetranValue::String("Nicolas".to_string())),
             FivetranFieldName::from_str("_fivetran_synced")? => FivetranFileValue::Value(FivetranValue::UtcDatetime(Timestamp {
                 seconds: 1715700652,

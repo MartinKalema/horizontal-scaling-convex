@@ -61,9 +61,9 @@ pub use crate::{
     array::ConvexArray,
     bytes::ConvexBytes,
     document_id::{
-        DeveloperDocumentId,
         InternalDocumentId,
         InternalId,
+        PublicDocumentId,
         ResolvedDocumentId,
     },
     field_name::{
@@ -94,7 +94,7 @@ pub use crate::{
         remove_string,
         remove_vec,
         remove_vec_of_strings,
-        ConvexObject,
+        DocumentObject,
         MAX_OBJECT_FIELDS,
     },
     size::{
@@ -126,7 +126,7 @@ pub mod testing {
     pub use sync_types::testing::assert_roundtrips;
 }
 
-/// The various types that can be stored as a field in a [`ConvexObject`].
+/// The various types that can be stored as a field in a [`DocumentObject`].
 #[derive(Clone, Debug)]
 pub enum ConvexValue {
     /// Sentinel `Null` value.
@@ -156,7 +156,7 @@ pub enum ConvexValue {
 
     /// Nested object with [`FieldName`] keys and (potentially heterogenous)
     /// values.
-    Object(ConvexObject),
+    Object(DocumentObject),
 }
 
 impl ConvexValue {
@@ -167,20 +167,20 @@ impl ConvexValue {
     }
 }
 
-impl From<ConvexObject> for ConvexValue {
-    fn from(o: ConvexObject) -> ConvexValue {
+impl From<DocumentObject> for ConvexValue {
+    fn from(o: DocumentObject) -> ConvexValue {
         ConvexValue::Object(o)
     }
 }
 
 impl From<ResolvedDocumentId> for ConvexValue {
     fn from(value: ResolvedDocumentId) -> Self {
-        DeveloperDocumentId::from(value).into()
+        PublicDocumentId::from(value).into()
     }
 }
 
-impl From<DeveloperDocumentId> for ConvexValue {
-    fn from(value: DeveloperDocumentId) -> Self {
+impl From<PublicDocumentId> for ConvexValue {
+    fn from(value: PublicDocumentId) -> Self {
         ConvexValue::String(
             value
                 .encode()
@@ -190,12 +190,12 @@ impl From<DeveloperDocumentId> for ConvexValue {
     }
 }
 
-impl TryFrom<ConvexValue> for DeveloperDocumentId {
+impl TryFrom<ConvexValue> for PublicDocumentId {
     type Error = anyhow::Error;
 
     fn try_from(value: ConvexValue) -> Result<Self, Self::Error> {
         if let ConvexValue::String(s) = value {
-            DeveloperDocumentId::decode(&s).map_err(|e| anyhow::anyhow!(e))
+            PublicDocumentId::decode(&s).map_err(|e| anyhow::anyhow!(e))
         } else {
             Err(anyhow::anyhow!("Value is not an ID"))
         }
@@ -323,7 +323,7 @@ impl TryFrom<ConvexValue> for ConvexArray {
     }
 }
 
-impl TryFrom<ConvexValue> for ConvexObject {
+impl TryFrom<ConvexValue> for DocumentObject {
     type Error = Error;
 
     fn try_from(v: ConvexValue) -> anyhow::Result<Self> {
@@ -582,14 +582,14 @@ pub mod proptest {
         S: Strategy<Value = FieldName> + 'static,
     {
         use crate::{
-            id_v6::DeveloperDocumentId,
+            id_v6::PublicDocumentId,
             resolved_object_strategy,
             ConvexArray,
         };
 
         // https://altsysrq.github.io/proptest-book/proptest/tutorial/recursive.html
         let leaf = prop_oneof![
-            1 => any::<DeveloperDocumentId>()
+            1 => any::<PublicDocumentId>()
                 .prop_map(|id| {
                     let s = id.encode().try_into().expect("Could not create String value from ID");
                     ConvexValue::String(s)
@@ -605,7 +605,7 @@ pub mod proptest {
                     }
                 }),
             1 => any::<bool>().prop_map(ConvexValue::from),
-            1 => any::<ConvexString>().prop_filter_map("String ID", |s| match DeveloperDocumentId::decode(&s) {
+            1 => any::<ConvexString>().prop_filter_map("String ID", |s| match PublicDocumentId::decode(&s) {
                 Ok(_) => None,
                 Err(_) => Some(ConvexValue::String(s))
             }),

@@ -39,7 +39,7 @@ use common::{
         Timestamp,
     },
     value::{
-        ConvexObject,
+        DocumentObject,
         JsonInteger,
         Size,
         TableMapping,
@@ -118,7 +118,7 @@ impl TableSummary {
         &self.inferred_type
     }
 
-    pub fn insert(&self, object: &ConvexObject) -> Self {
+    pub fn insert(&self, object: &DocumentObject) -> Self {
         let total_size = self.total_size + object.size() as u64;
         Self {
             inferred_type: self.inferred_type.insert(object),
@@ -126,7 +126,7 @@ impl TableSummary {
         }
     }
 
-    pub fn remove(&self, object: &ConvexObject) -> anyhow::Result<Self> {
+    pub fn remove(&self, object: &DocumentObject) -> anyhow::Result<Self> {
         let size = object.size() as u64;
         Ok(Self {
             inferred_type: self.inferred_type.remove(object)?,
@@ -134,6 +134,37 @@ impl TableSummary {
                 .total_size
                 .checked_sub(size)
                 .context("total_size went negative?")?,
+        })
+    }
+
+    pub fn lossy_update(
+        &self,
+        old: Option<&DocumentObject>,
+        new: Option<&DocumentObject>,
+    ) -> anyhow::Result<Self> {
+        let old_count = u64::from(old.is_some());
+        let new_count = u64::from(new.is_some());
+        let old_size = old.map(|object| object.size() as u64).unwrap_or(0);
+        let new_size = new.map(|object| object.size() as u64).unwrap_or(0);
+
+        let num_values = self
+            .num_values()
+            .saturating_sub(old_count)
+            .checked_add(new_count)
+            .context("num_values overflowed?")?;
+        let total_size = self
+            .total_size
+            .saturating_sub(old_size)
+            .checked_add(new_size)
+            .context("total_size overflowed?")?;
+
+        if num_values == 0 {
+            return Ok(Self::empty());
+        }
+
+        Ok(Self {
+            inferred_type: CountedShape::new(ShapeEnum::Unknown, num_values),
+            total_size,
         })
     }
 
@@ -187,7 +218,7 @@ impl Arbitrary for TableSummary {
     type Strategy = impl Strategy<Value = TableSummary>;
 
     fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        let values = prop::collection::vec((any::<bool>(), any::<ConvexObject>()), 0..10);
+        let values = prop::collection::vec((any::<bool>(), any::<DocumentObject>()), 0..10);
         values.prop_map(|values| {
             let mut summary = TableSummary::empty();
             for (_, value) in values.iter() {
@@ -603,7 +634,7 @@ mod tests {
             FieldName,
             TableName,
         },
-        value::ConvexObject,
+        value::DocumentObject,
     };
     use keybroker::Identity;
     use prop::collection::vec as prop_vec;
@@ -613,6 +644,7 @@ mod tests {
         TestRuntime,
     };
     use serde_json::Value as JsonValue;
+    use shape_inference::ShapeEnum;
     use value::{
         assert_obj,
         proptest::{
@@ -621,6 +653,7 @@ mod tests {
         },
         resolved_object_strategy,
         resolved_value_strategy,
+        Size,
         TableNamespace,
     };
 
@@ -773,7 +806,7 @@ mod tests {
         }
     }
 
-    fn small_user_object() -> impl Strategy<Value = ConvexObject> {
+    fn small_user_object() -> impl Strategy<Value = DocumentObject> {
         let values = resolved_value_strategy(
             FieldName::user_strategy,
             ValueBranching::small(),
@@ -782,11 +815,11 @@ mod tests {
         resolved_object_strategy(FieldName::user_strategy(), values, 0..4)
     }
 
-    fn small_user_objects() -> impl Strategy<Value = Vec<ConvexObject>> {
+    fn small_user_objects() -> impl Strategy<Value = Vec<DocumentObject>> {
         prop_vec(small_user_object(), 0..8)
     }
 
-    fn backfill_matches_test(table_name: TableName, vs: Vec<ConvexObject>) {
+    fn backfill_matches_test(table_name: TableName, vs: Vec<DocumentObject>) {
         let td = TestDriver::new();
         let runtime = td.rt();
         let test = async {
@@ -828,7 +861,7 @@ mod tests {
         td.run_until(test).unwrap();
     }
 
-    fn multiple_tables_test(values: BTreeMap<TableName, Vec<ConvexObject>>) {
+    fn multiple_tables_test(values: BTreeMap<TableName, Vec<DocumentObject>>) {
         let td = TestDriver::new();
         let runtime = td.rt();
         let test = async {
@@ -902,5 +935,45 @@ mod tests {
         ) {
             multiple_tables_test(values);
         }
+    }
+
+    #[test]
+    fn test_lossy_update_degrades_summary_shape_but_preserves_counts() {
+        let old_value = assert_obj!("field" => 1);
+        let new_value = assert_obj!("field" => true);
+
+        let summary = TableSummary::empty().insert(&old_value);
+        let degraded = summary
+            .lossy_update(Some(&old_value), Some(&new_value))
+            .expect("lossy update should succeed");
+
+        assert_eq!(degraded.num_values(), 1);
+        assert_eq!(degraded.total_size(), new_value.size() as u64);
+        assert!(matches!(
+            degraded.inferred_type().variant(),
+            ShapeEnum::Unknown
+        ));
+
+        let emptied = degraded
+            .remove(&new_value)
+            .expect("unknown summaries should remain removable");
+        assert!(emptied.is_empty());
+    }
+
+    #[test]
+    fn test_lossy_update_recovers_from_empty_summary_replacement() {
+        let old_value = assert_obj!("field" => 1);
+        let new_value = assert_obj!("field" => true);
+
+        let degraded = TableSummary::empty()
+            .lossy_update(Some(&old_value), Some(&new_value))
+            .expect("lossy update should recover from empty summaries");
+
+        assert_eq!(degraded.num_values(), 1);
+        assert_eq!(degraded.total_size(), new_value.size() as u64);
+        assert!(matches!(
+            degraded.inferred_type().variant(),
+            ShapeEnum::Unknown
+        ));
     }
 }

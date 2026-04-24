@@ -6,8 +6,8 @@ use common::{
     testing::assert_contains,
     types::FieldName,
     value::{
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
     },
 };
 use keybroker::Identity;
@@ -92,7 +92,7 @@ async fn test_references(rt: TestRuntime) -> anyhow::Result<()> {
         let field_name: FieldName = "field".parse()?;
         must_let!(let ConvexValue::Object(obj) = t.mutation(
                 "basic:insertObject",
-                ConvexObject::for_value(field_name, ConvexValue::Null)?,
+                DocumentObject::for_value(field_name, ConvexValue::Null)?,
             ).await?);
         must_let!(let Some(ConvexValue::String(..)) = obj.get("_id"));
         Ok(())

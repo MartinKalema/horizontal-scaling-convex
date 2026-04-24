@@ -34,8 +34,8 @@ use types::{
 };
 use value::{
     ConvexValue,
-    DeveloperDocumentId,
     FieldPath,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -215,7 +215,7 @@ impl<'a, RT: Runtime> ExportsModel<'a, RT> {
 
     pub async fn get(
         &mut self,
-        snapshot_id: DeveloperDocumentId,
+        snapshot_id: PublicDocumentId,
     ) -> anyhow::Result<Option<ParsedDocument<Export>>> {
         let export = self
             .tx
@@ -227,7 +227,7 @@ impl<'a, RT: Runtime> ExportsModel<'a, RT> {
 
     pub async fn set_expiration(
         &mut self,
-        snapshot_id: DeveloperDocumentId,
+        snapshot_id: PublicDocumentId,
         expiration_ts_ns: u64,
     ) -> anyhow::Result<()> {
         let (id, mut export) = self
@@ -281,7 +281,7 @@ impl<'a, RT: Runtime> ExportsModel<'a, RT> {
         Ok(to_delete)
     }
 
-    pub async fn cancel(&mut self, snapshot_id: DeveloperDocumentId) -> anyhow::Result<()> {
+    pub async fn cancel(&mut self, snapshot_id: PublicDocumentId) -> anyhow::Result<()> {
         let (id, export) = self
             .get(snapshot_id)
             .await?
@@ -315,7 +315,7 @@ mod tests {
         TestRuntime,
     };
     use sync_types::Timestamp;
-    use value::ConvexObject;
+    use value::DocumentObject;
 
     use crate::{
         exports::{
@@ -333,7 +333,7 @@ mod tests {
     fn test_export_deserialization() -> anyhow::Result<()> {
         #[track_caller]
         fn check_roundtrip(export: &Export) {
-            let object: ConvexObject = export
+            let object: DocumentObject = export
                 .clone()
                 .try_into()
                 .expect("failed to serialize export");
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(exports_model.latest_in_progress().await?, None);
         assert_eq!(
             exports_model
-                .get(snapshot_id.developer_id)
+                .get(snapshot_id.document_id)
                 .await?
                 .unwrap()
                 .into_value(),
@@ -541,10 +541,10 @@ mod tests {
 
         let new_expiration = ts_u64 + 2000;
         exports_model
-            .set_expiration(id.developer_id, new_expiration)
+            .set_expiration(id.document_id, new_expiration)
             .await?;
         let export = exports_model
-            .get(id.developer_id)
+            .get(id.document_id)
             .await?
             .context("Not found")?
             .into_value();
@@ -625,10 +625,10 @@ mod tests {
             let mut tx = db.begin_system().await?;
             let mut exports_model = ExportsModel::new(&mut tx);
             let export_id = exports_model.insert_export(export).await?;
-            exports_model.cancel(export_id.developer_id).await?;
+            exports_model.cancel(export_id.document_id).await?;
             assert_matches!(
                 *exports_model
-                    .get(export_id.developer_id)
+                    .get(export_id.document_id)
                     .await?
                     .expect("Document must exist"),
                 Export::Canceled { .. }
@@ -652,7 +652,7 @@ mod tests {
             let mut exports_model = ExportsModel::new(&mut tx);
             let export_id = exports_model.insert_export(export).await?;
             exports_model
-                .cancel(export_id.developer_id)
+                .cancel(export_id.document_id)
                 .await
                 .unwrap_err();
             db.commit(tx).await?;

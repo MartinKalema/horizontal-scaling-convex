@@ -13,8 +13,8 @@ use common::{
 };
 use sync_types::Timestamp;
 use value::{
-    DeveloperDocumentId,
     FieldPath,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -76,15 +76,15 @@ impl<'a, RT: Runtime> IndexBackfillModel<'a, RT> {
         Self { tx }
     }
 
-    fn index_id_as_developer_id(&mut self, index_id: IndexId) -> DeveloperDocumentId {
+    fn index_id_as_developer_id(&mut self, index_id: IndexId) -> PublicDocumentId {
         let index_table_id = self.tx.bootstrap_tables().index_id;
-        DeveloperDocumentId::new(index_table_id.table_number, index_id)
+        PublicDocumentId::new(index_table_id.table_number, index_id)
     }
 
     #[fastrace::trace]
     pub(crate) async fn existing_backfill_metadata(
         &mut self,
-        index_id: DeveloperDocumentId,
+        index_id: PublicDocumentId,
     ) -> anyhow::Result<Option<Arc<ParsedDocument<IndexBackfillMetadata>>>> {
         self.tx
             .query_system(TableNamespace::Global, &*INDEX_BACKFILLS_BY_INDEX_ID)?
@@ -174,7 +174,7 @@ impl<'a, RT: Runtime> IndexBackfillModel<'a, RT> {
             index_id,
             tablet_id,
             num_docs_indexed,
-            Some(cursor.developer_id),
+            Some(cursor.document_id),
         )
         .await
     }
@@ -190,7 +190,7 @@ impl<'a, RT: Runtime> IndexBackfillModel<'a, RT> {
         index_id: IndexId,
         tablet_id: TabletId,
         num_docs_indexed: u64,
-        cursor: Option<DeveloperDocumentId>,
+        cursor: Option<PublicDocumentId>,
     ) -> anyhow::Result<()> {
         let index_id = self.index_id_as_developer_id(index_id);
         let maybe_existing_backfill_metadata = self.existing_backfill_metadata(index_id).await?;
@@ -254,7 +254,7 @@ impl<'a, RT: Runtime> IndexBackfillModel<'a, RT> {
         index_id: ResolvedDocumentId,
     ) -> anyhow::Result<()> {
         if let Some(existing_backfill_metadata) = self
-            .existing_backfill_metadata(index_id.developer_id)
+            .existing_backfill_metadata(index_id.document_id)
             .await?
         {
             SystemMetadataModel::new_global(self.tx)

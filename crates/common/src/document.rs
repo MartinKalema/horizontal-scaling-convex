@@ -44,15 +44,15 @@ pub use value::InternalId;
 use value::{
     export::ValueFormat,
     heap_size::HeapSize,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     serde::ConvexSerializable,
     sorting::{
         write_sort_key,
         write_sort_key_or_undefined,
     },
     walk::ConvexValueType,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
     FieldPath,
     IdentifierFieldName,
@@ -237,9 +237,9 @@ impl CreationTime {
 /// DeveloperDocument is the public-facing document type.
 #[derive(Clone, Eq, PartialEq)]
 pub struct DeveloperDocument {
-    id: DeveloperDocumentId,
+    id: PublicDocumentId,
     creation_time: CreationTime,
-    value: PII<ConvexObject>,
+    value: PII<DocumentObject>,
 }
 
 impl DeveloperDocument {
@@ -253,12 +253,12 @@ impl DeveloperDocument {
     }
 
     /// The body/payload of the document
-    pub fn value(&self) -> &PII<ConvexObject> {
+    pub fn value(&self) -> &PII<DocumentObject> {
         &self.value
     }
 
     /// Consume the document's value.
-    pub fn into_value(self) -> PII<ConvexObject> {
+    pub fn into_value(self) -> PII<DocumentObject> {
         self.value
     }
 
@@ -326,7 +326,7 @@ impl TryFrom<ResolvedDocument> for ResolvedDocumentProto {
         let value = value.0.json_serialize()?.into_bytes();
         let id = ResolvedDocumentId {
             tablet_id,
-            developer_id: id,
+            document_id: id,
         };
         Ok(Self {
             id: Some(id.into()),
@@ -352,7 +352,7 @@ impl TryFrom<ResolvedDocumentProto> for ResolvedDocument {
         let creation_time = creation_time
             .ok_or_else(|| anyhow::anyhow!("Missing creation time"))?
             .try_into()?;
-        let value: ConvexObject = serde_json::from_slice::<JsonValue>(
+        let value: DocumentObject = serde_json::from_slice::<JsonValue>(
             &value.ok_or_else(|| anyhow::anyhow!("Missing value"))?,
         )?
         .try_into()?;
@@ -372,7 +372,7 @@ impl ResolvedDocument {
     pub fn new(
         id: ResolvedDocumentId,
         creation_time: CreationTime,
-        mut value: ConvexObject,
+        mut value: DocumentObject,
     ) -> anyhow::Result<Self> {
         let id_value: ConvexValue = id.into();
         if let Some(existing_value) = value.get(&FieldName::from(ID_FIELD.clone())) {
@@ -446,7 +446,7 @@ impl ResolvedDocument {
 
         match self.value.get(&FieldName::from(ID_FIELD.clone())) {
             Some(ConvexValue::String(s)) => {
-                if let Ok(document_id) = DeveloperDocumentId::decode(s) {
+                if let Ok(document_id) = PublicDocumentId::decode(s) {
                     if document_id.table() != self.id.table() {
                         violations.push(DocumentValidationError::IdWrongTable);
                     } else if document_id.internal_id() != self.internal_id() {
@@ -504,7 +504,7 @@ impl ResolvedDocument {
                 values.push(None);
             }
         }
-        IndexKey::new_allow_missing(values, self.developer_id())
+        IndexKey::new_allow_missing(values, self.document_id())
     }
 
     /// Create a copy of this document with a different TabletId.
@@ -521,9 +521,9 @@ impl ResolvedDocument {
     /// This method assumes that system-provided fields, like `_id`, have
     /// already been inserted into `value`.
     pub fn from_database(tablet_id: TabletId, value: ConvexValue) -> anyhow::Result<Self> {
-        let object: ConvexObject = value.try_into()?;
+        let object: DocumentObject = value.try_into()?;
         let id = match object.get(&FieldName::from(ID_FIELD.clone())) {
-            Some(ConvexValue::String(s)) => DeveloperDocumentId::decode(s)?,
+            Some(ConvexValue::String(s)) => PublicDocumentId::decode(s)?,
             _ => anyhow::bail!("Object {} missing _id field", object),
         };
         let creation_time = match object.get(&FieldName::from(CREATION_TIME_FIELD.clone())) {
@@ -545,7 +545,7 @@ impl ResolvedDocument {
         value: ConvexValue,
         document_id: ResolvedDocumentId,
     ) -> anyhow::Result<Self> {
-        let object: ConvexObject = value.try_into()?;
+        let object: DocumentObject = value.try_into()?;
         let creation_time = match object.get(&FieldName::from(CREATION_TIME_FIELD.clone())) {
             Some(ConvexValue::Float64(ts)) => (*ts).try_into()?,
             None => anyhow::bail!("Object {object} missing _creationTime field"),
@@ -564,11 +564,11 @@ impl ResolvedDocument {
     /// Return a new [`Document`] with the value updated to `new_value`. If
     /// `new_value` contains an `_id` field, it must match the current `_id`
     /// field's value.
-    pub fn replace_value(&self, new_value: ConvexObject) -> anyhow::Result<Self> {
+    pub fn replace_value(&self, new_value: DocumentObject) -> anyhow::Result<Self> {
         Self::new(self.id(), self.creation_time, new_value)
     }
 
-    pub fn into_value(self) -> PII<ConvexObject> {
+    pub fn into_value(self) -> PII<DocumentObject> {
         self.document.into_value()
     }
 
@@ -584,7 +584,7 @@ impl ResolvedDocument {
         ResolvedDocumentId::new(self.tablet_id, self.id)
     }
 
-    pub fn developer_id(&self) -> DeveloperDocumentId {
+    pub fn document_id(&self) -> PublicDocumentId {
         self.id
     }
 
@@ -592,7 +592,7 @@ impl ResolvedDocument {
         self.document.into_value().0.export(format)
     }
 
-    /// Enforce that the size of the underlying ConvexObject doesn't exceed
+    /// Enforce that the size of the underlying DocumentObject doesn't exceed
     /// `MAX_USER_SIZE`.
     pub fn check_user_size(&self) -> anyhow::Result<()> {
         let size = self.value.size();
@@ -762,7 +762,7 @@ impl DocumentUpdateRef for DocumentUpdate {
 }
 
 impl DeveloperDocument {
-    pub fn new(id: DeveloperDocumentId, creation_time: CreationTime, value: ConvexObject) -> Self {
+    pub fn new(id: PublicDocumentId, creation_time: CreationTime, value: DocumentObject) -> Self {
         Self {
             id,
             creation_time,
@@ -777,7 +777,7 @@ impl DeveloperDocument {
         }
     }
 
-    pub fn id(&self) -> DeveloperDocumentId {
+    pub fn id(&self) -> PublicDocumentId {
         self.id
     }
 
@@ -825,8 +825,8 @@ impl PackedDocument {
         self.id
     }
 
-    pub fn developer_id(&self) -> DeveloperDocumentId {
-        self.id().developer_id
+    pub fn document_id(&self) -> PublicDocumentId {
+        self.id().document_id
     }
 
     pub fn value(&self) -> &PackedValue<ByteBuffer> {
@@ -853,7 +853,7 @@ impl PackedDocument {
             write_sort_key_or_undefined(value, out).expect("failed to unpack opened value");
         }
         let Ok(()) = write_sort_key(
-            self.id().developer_id.encode_into(&mut Default::default()),
+            self.id().document_id.encode_into(&mut Default::default()),
             out,
         );
         &buffer.0
@@ -893,7 +893,7 @@ impl<D> ParsedDocument<D> {
         self.id
     }
 
-    pub fn developer_id(&self) -> DeveloperDocumentId {
+    pub fn document_id(&self) -> PublicDocumentId {
         self.id.into()
     }
 
@@ -926,10 +926,10 @@ pub trait ParseDocument<D> {
 }
 
 // this impl can't use ConvexSerializable because it's used with some types that
-// directly impl `From<ConvexObject>`
+// directly impl `From<DocumentObject>`
 impl<D> ParseDocument<D> for ResolvedDocument
 where
-    D: TryFrom<ConvexObject, Error = anyhow::Error>,
+    D: TryFrom<DocumentObject, Error = anyhow::Error>,
 {
     fn parse(self) -> anyhow::Result<ParsedDocument<D>> {
         let id = self.id();
@@ -1019,7 +1019,7 @@ pub enum DocumentValidationError {
     #[error("The document belongs to a different table than its '_id' field")]
     IdWrongTable,
     #[error("The document has id {0}, but its '_id' field is {1}")]
-    IdMismatch(DeveloperDocumentId, ConvexValue),
+    IdMismatch(PublicDocumentId, ConvexValue),
     #[error("The '_id' field {0} must be an Id")]
     IdBadType(ConvexValue),
     #[error("The '_id' field is missing")]
@@ -1064,7 +1064,7 @@ impl proptest::arbitrary::Arbitrary for ResolvedDocument {
             RestrictNaNs,
             ValueBranching,
         };
-        any_with::<(ResolvedDocumentId, CreationTime, ConvexObject)>((
+        any_with::<(ResolvedDocumentId, CreationTime, DocumentObject)>((
             (),
             (),
             (
@@ -1083,7 +1083,7 @@ impl proptest::arbitrary::Arbitrary for ResolvedDocument {
                     CREATION_TIME_FIELD.clone().into(),
                     ConvexValue::from(f64::from(creation_time)),
                 );
-                let value = ConvexObject::try_from(object).unwrap();
+                let value = DocumentObject::try_from(object).unwrap();
                 let doc = ResolvedDocument::new(id, creation_time, value);
                 doc.ok()
             },
@@ -1103,13 +1103,13 @@ mod tests {
     use proptest::prelude::*;
     use sync_types::testing::assert_roundtrips;
     use value::{
-        id_v6::DeveloperDocumentId,
+        id_v6::PublicDocumentId,
         proptest::{
             RestrictNaNs,
             ValueBranching,
         },
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
         FieldType,
         IdentifierFieldName,
         InternalId,
@@ -1154,10 +1154,7 @@ mod tests {
             table_name,
         );
         let doc = ResolvedDocument::new(
-            ResolvedDocumentId::new(
-                tablet_id,
-                DeveloperDocumentId::new(table_number, internal_id),
-            ),
+            ResolvedDocumentId::new(tablet_id, PublicDocumentId::new(table_number, internal_id)),
             CreationTime::ONE,
             assert_obj!(
                 "f" => 5
@@ -1194,7 +1191,7 @@ mod tests {
         fn test_packed_document_index_key_matches(
             id in any::<ResolvedDocumentId>(),
             creation_time in any::<CreationTime>(),
-            value in any_with::<ConvexObject>((
+            value in any_with::<DocumentObject>((
                 prop::collection::SizeRange::default(),
                 FieldType::UserIdentifier,
                 ValueBranching::medium(),
@@ -1214,7 +1211,7 @@ mod tests {
                 CREATION_TIME_FIELD.clone().into(),
                 ConvexValue::from(f64::from(creation_time)),
             );
-            let value = ConvexObject::try_from(object).unwrap();
+            let value = DocumentObject::try_from(object).unwrap();
             let doc = ResolvedDocument::new(id, creation_time, value).unwrap();
             // Generate field paths that have a chance of resolving to something for `doc`
             let mut current_doc = Some(&**doc.value());
@@ -1251,7 +1248,7 @@ mod tests {
             ResolvedDocumentId::MIN,
             CreationTime::ONE,
             assert_obj!(
-                "_id" => DeveloperDocumentId::MIN,
+                "_id" => PublicDocumentId::MIN,
                 "foo" => {
                     "bar" => 5,
                     "baz" => false,
@@ -1262,7 +1259,7 @@ mod tests {
             ResolvedDocumentId::MIN,
             CreationTime::ONE,
             assert_obj!(
-                "_id" => DeveloperDocumentId::MIN,
+                "_id" => PublicDocumentId::MIN,
                 "foo" => {"bar" => 5},
             ),
         )?;

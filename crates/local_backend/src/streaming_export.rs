@@ -231,7 +231,7 @@ async fn _list_snapshot(
             let list_snapshot_cursor = serde_json::from_str::<ListSnapshotCursor>(&cursor)?;
             Ok(ResolvedDocumentId {
                 tablet_id: list_snapshot_cursor.tablet.parse()?,
-                developer_id: list_snapshot_cursor
+                document_id: list_snapshot_cursor
                     .id
                     .parse()
                     .map_err(anyhow::Error::new)?,
@@ -282,7 +282,7 @@ async fn _list_snapshot(
             .map(|new_cursor| -> anyhow::Result<String> {
                 serde_json::to_string(&ListSnapshotCursor {
                     tablet: new_cursor.tablet_id.to_string(),
-                    id: new_cursor.developer_id.encode(),
+                    id: new_cursor.document_id.encode(),
                 })
                 .context("Failed to serialize cursor")
             })

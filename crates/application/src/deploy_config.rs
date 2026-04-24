@@ -131,7 +131,7 @@ use usage_tracking::FunctionUsageTracker;
 use value::{
     identifier::Identifier,
     sha256::Sha256Digest,
-    DeveloperDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNamespace,
 };
@@ -571,7 +571,7 @@ impl<RT: Runtime> Application<RT> {
             let schema_table_number = tx.table_mapping().tablet_number(schema_id.table())?;
             let schema_id = ResolvedDocumentId::new(
                 schema_id.table(),
-                DeveloperDocumentId::new(schema_table_number, schema_id.internal_id()),
+                PublicDocumentId::new(schema_table_number, schema_id.internal_id()),
             );
             let document = tx
                 .get(schema_id)
@@ -905,7 +905,7 @@ impl<RT: Runtime> InitializerEvaluator for ApplicationInitializerEvaluator<'_, R
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct StartPushRequest {
     pub admin_key: String,
@@ -981,7 +981,7 @@ impl From<NodeDependencyJson> for NodeDependency {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AppDefinitionConfigJson {
     pub definition: Option<ModuleJson>,
@@ -1053,7 +1053,7 @@ mod tests {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentDefinitionConfigJson {
     pub definition_path: String,
@@ -1202,7 +1202,7 @@ pub fn parse_module_path(path: &str) -> anyhow::Result<ModulePath> {
     })
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeDependencyJson {
     name: String,

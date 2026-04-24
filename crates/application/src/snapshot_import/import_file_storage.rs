@@ -45,10 +45,10 @@ use usage_tracking::{
     StorageUsageTracker,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     sha256::Sha256Digest,
     val,
-    ConvexObject,
+    DocumentObject,
     ResolvedDocumentId,
     TableMapping,
     TabletIdAndTableNumber,
@@ -70,7 +70,7 @@ pub async fn import_storage_table<RT: Runtime>(
     table_id: TabletIdAndTableNumber,
     component_path: &ComponentPath,
     mut documents: impl Stream<Item = anyhow::Result<JsonValue>> + Unpin,
-    storage_files: Vec<(DeveloperDocumentId, ImportStorageFileStream)>,
+    storage_files: Vec<(PublicDocumentId, ImportStorageFileStream)>,
     usage: &FunctionUsageTracker,
     import_id: Option<ResolvedDocumentId>,
     num_to_skip: u64,
@@ -85,7 +85,7 @@ pub async fn import_storage_table<RT: Runtime>(
         lineno += 1;
         let metadata: FileStorageZipMetadata = serde_json::from_value(exported_value)
             .map_err(|e| ImportError::InvalidConvexValue(lineno, e.into()))?;
-        let id = DeveloperDocumentId::decode(&metadata.id)
+        let id = PublicDocumentId::decode(&metadata.id)
             .map_err(|e| ImportError::InvalidConvexValue(lineno, e.into()))?;
         anyhow::ensure!(
             id.table() == virtual_table_number,
@@ -161,7 +161,7 @@ pub async fn import_storage_table<RT: Runtime>(
                 |tx| {
                     async {
                         let mut entry_object_map =
-                            BTreeMap::from(ConvexObject::try_from(entry.clone())?);
+                            BTreeMap::from(DocumentObject::try_from(entry.clone())?);
                         entry_object_map.insert(ID_FIELD.clone().into(), val!(id));
                         if let Some(creation_time) = creation_time {
                             entry_object_map.insert(
@@ -169,7 +169,7 @@ pub async fn import_storage_table<RT: Runtime>(
                                 val!(f64::from(creation_time)),
                             );
                         }
-                        let entry_object = ConvexObject::try_from(entry_object_map)?;
+                        let entry_object = DocumentObject::try_from(entry_object_map)?;
                         ImportFacingModel::new(tx)
                             .insert(
                                 table_id,

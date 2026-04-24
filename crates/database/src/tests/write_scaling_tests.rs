@@ -10,10 +10,16 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use common::{
     assert_obj,
     bootstrap_model::index::database_index::IndexedFields,
     interval::Interval,
+    pause::PauseController,
+    query::{
+        Order,
+        Query,
+    },
     runtime::{
         new_unlimited_rate_limiter,
         testing::{
@@ -23,7 +29,10 @@ use common::{
     },
     shutdown::ShutdownSignal,
     testing::TestPersistence,
-    types::TabletIndexName,
+    types::{
+        TabletIndexName,
+        Timestamp,
+    },
 };
 use keybroker::Identity;
 use pb::replication::{
@@ -62,7 +71,10 @@ use crate::{
         testing::InMemoryDistributedLog,
         CommitDelta,
     },
-    committer::CommitterClient,
+    committer::{
+        CommitterClient,
+        AFTER_PENDING_WRITE_SNAPSHOT,
+    },
     partition::{
         PartitionId,
         PartitionMap,
@@ -77,6 +89,7 @@ use crate::{
         TwoPhaseCommitGrpcClient,
         TwoPhaseTransactionId,
     },
+    tests::run_query,
     Database,
     TestFacingModel,
     UserFacingModel,
@@ -146,10 +159,14 @@ fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1", local_partition, 2)
 }
 
+fn partitioned_map_with_tasks(local_partition: PartitionId) -> PartitionMap {
+    PartitionMap::from_config("messages=0,projects=1,tasks=1", local_partition, 2)
+}
+
 async fn insert_doc_get_id(
     db: &Database<TestRuntime>,
     table: &str,
-    fields: common::value::ConvexObject,
+    fields: common::value::DocumentObject,
 ) -> anyhow::Result<ResolvedDocumentId> {
     let table_name: TableName = table.parse()?;
     let mut tx = db.begin(Identity::system()).await?;
@@ -163,7 +180,7 @@ async fn insert_doc_get_id(
 async fn insert_doc(
     db: &Database<TestRuntime>,
     table: &str,
-    fields: common::value::ConvexObject,
+    fields: common::value::DocumentObject,
 ) -> anyhow::Result<common::types::Timestamp> {
     let table_name: TableName = table.parse()?;
     let mut tx = db.begin(Identity::system()).await?;
@@ -268,6 +285,23 @@ impl TwoPhaseCommitService for FailingPrepareGrpcService {
         Err(Status::failed_precondition(
             "rollback_prepared should not be called after a failed prepare",
         ))
+    }
+}
+
+struct FailingTimestampOracle;
+
+#[async_trait]
+impl TimestampOracle for FailingTimestampOracle {
+    async fn next_ts(&self) -> anyhow::Result<Timestamp> {
+        anyhow::bail!("TSO unavailable during idle heartbeat test");
+    }
+
+    async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
+        anyhow::bail!("TSO unavailable during idle heartbeat test");
+    }
+
+    async fn advance_committed_ts(&self, _ts: Timestamp) -> anyhow::Result<()> {
+        anyhow::bail!("TSO unavailable during idle heartbeat test");
     }
 }
 
@@ -834,6 +868,220 @@ async fn test_replication_frontier_persists_across_restart(rt: TestRuntime) -> a
     Ok(())
 }
 
+#[convex_macro::test_runtime]
+async fn test_replication_frontier_heartbeat_does_not_advance_snapshot_ts(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let initial_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(initial_delta)
+        .await?;
+
+    let snapshot_ts_before = *node_a.now_ts_for_reads();
+    let persisted_repeatable_before = *node_a.persisted_max_repeatable_ts_for_test();
+    let projects = run_query(
+        node_a.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 1, "replica should expose the seeded project");
+
+    let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(CommitDelta {
+            ts: heartbeat_ts,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("replication_frontier_snapshot_ts_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        })
+        .await?;
+
+    assert_eq!(
+        *node_a.now_ts_for_reads(),
+        snapshot_ts_before,
+        "frontier-only heartbeats should not publish a cloned snapshot",
+    );
+    assert_eq!(
+        *node_a.persisted_max_repeatable_ts_for_test(),
+        persisted_repeatable_before,
+        "frontier-only heartbeats should not advertise a newer persisted snapshot",
+    );
+    assert_eq!(
+        node_a.replication_frontier_for_test(PartitionId(1)),
+        Some(heartbeat_ts),
+        "heartbeat should still advance the remote replication frontier",
+    );
+
+    let projects_after = run_query(
+        node_a,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        projects_after.len(),
+        1,
+        "heartbeat should not erase replica-queryable state",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_replica_table_number_allocation_waits_for_prior_publish(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(
+        &rt,
+        log.clone(),
+        Some(partitioned_map_with_tasks(PartitionId(0))),
+    )
+    .await?;
+    let node_b = create_node(
+        &rt,
+        log.clone(),
+        Some(partitioned_map_with_tasks(PartitionId(1))),
+    )
+    .await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed-project")).await?;
+    let project_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("project seed should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(project_delta)
+        .await?;
+
+    insert_doc(
+        &node_b,
+        "tasks",
+        assert_obj!("title" => "seed-task", "project" => "seed-project"),
+    )
+    .await?;
+    let task_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("task seed should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(task_delta)
+        .await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    let mapping = tx.table_mapping().namespace(TableNamespace::Global);
+    let projects = mapping.id(&"projects".parse()?)?;
+    let tasks = mapping.id(&"tasks".parse()?)?;
+
+    assert_ne!(
+        projects.table_number, tasks.table_number,
+        "replica-applied tables must allocate distinct local table numbers",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_replica_delta_does_not_erase_pending_local_table_creation(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(
+        &rt,
+        log.clone(),
+        Some(partitioned_map_with_tasks(PartitionId(0))),
+    )
+    .await?;
+    let node_b = create_node(
+        &rt,
+        log.clone(),
+        Some(partitioned_map_with_tasks(PartitionId(1))),
+    )
+    .await?;
+
+    let hold_guard = pause.hold(AFTER_PENDING_WRITE_SNAPSHOT);
+    let node_b_for_commit = node_b.clone();
+    let first_task_fut = async move {
+        insert_doc_get_id(
+            &node_b_for_commit,
+            "tasks",
+            assert_obj!("title" => "task-1", "project" => "alpha"),
+        )
+        .await
+    };
+
+    let node_a_for_delta = node_a.clone();
+    let node_b_for_delta = node_b.clone();
+    let log_for_delta = log.clone();
+    let orchestrate = async move {
+        let pause_guard = hold_guard.wait_for_blocked().await;
+
+        insert_doc(
+            &node_a_for_delta,
+            "messages",
+            assert_obj!("text" => "remote-message"),
+        )
+        .await?;
+        let delta = log_for_delta
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("remote message should publish a delta");
+
+        let committer = node_b_for_delta.committer_for_test();
+        let apply_fut = committer.apply_replica_delta(delta);
+        if let Some(guard) = pause_guard {
+            guard.unpause();
+        }
+        apply_fut.await?;
+        anyhow::Ok(())
+    };
+
+    let (first_task_id, ..) = futures::try_join!(first_task_fut, orchestrate)?;
+
+    let second_task_id = insert_doc_get_id(
+        &node_b,
+        "tasks",
+        assert_obj!("title" => "task-2", "project" => "alpha"),
+    )
+    .await?;
+
+    let mut tx = node_b.begin(Identity::system()).await?;
+    assert_eq!(
+        tx.get(first_task_id).await?.is_some(),
+        true,
+        "the first locally created task must remain readable after replica apply",
+    );
+    assert_eq!(
+        tx.get(second_task_id).await?.is_some(),
+        true,
+        "the second locally created task must remain readable after replica apply",
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_remote_prepare_over_grpc_is_idempotent() -> anyhow::Result<()> {
     let td = TestDriver::new_with_io();
@@ -868,8 +1116,15 @@ fn test_remote_prepare_over_grpc_is_idempotent() -> anyhow::Result<()> {
             .enumerate()
             .map(|(index, _)| index)
             .collect();
-        let participant_tx =
-            ParticipantTransaction::from_final_transaction(&final_tx, &write_indexes)?;
+        let write_source = WriteSource::new("remote_prepare_idempotent_test");
+        let partition_map = partitioned_map(PartitionId(1));
+        let participant_tx = ParticipantTransaction::from_final_transaction(
+            &final_tx,
+            PartitionId(1),
+            &write_indexes,
+            &partition_map,
+            &write_source,
+        )?;
 
         let txn_id = TwoPhaseTransactionId::new();
         let prepare_ts = node_b.committer_for_test().allocate_commit_ts().await?;
@@ -878,17 +1133,12 @@ fn test_remote_prepare_over_grpc_is_idempotent() -> anyhow::Result<()> {
             .prepare(
                 &txn_id,
                 participant_tx.clone(),
-                WriteSource::new("remote_prepare_idempotent_test"),
+                write_source.clone(),
                 prepare_ts,
             )
             .await?;
         let second = client
-            .prepare(
-                &txn_id,
-                participant_tx,
-                WriteSource::new("remote_prepare_idempotent_test"),
-                prepare_ts,
-            )
+            .prepare(&txn_id, participant_tx, write_source, prepare_ts)
             .await?;
 
         assert_eq!(first.prepare_ts, prepare_ts);
@@ -1033,7 +1283,7 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
 
         let message_id =
             insert_doc_get_id(&node_a, "messages", assert_obj!("text" => "seed")).await?;
-        let message_id = value::DeveloperDocumentId::from(message_id);
+        let message_id = value::PublicDocumentId::from(message_id);
 
         let mut tx = node_a.begin(Identity::system()).await?;
         let mut model = TestFacingModel::new(&mut tx);
@@ -1063,6 +1313,34 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
         node_a.commit(retry_tx).await?;
 
         failing_server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_idle_replication_frontier_heartbeat_tso_failure_is_nonfatal() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(FailingTimestampOracle);
+        let node = create_node_with_options(
+            &rt,
+            log,
+            Some(partitioned_map(PartitionId(0))),
+            None,
+            Some(tso),
+        )
+        .await?;
+
+        let committer = node.committer_for_test();
+        committer
+            .tick_idle_replication_frontier_heartbeat_for_test()
+            .await?;
+        committer
+            .tick_idle_replication_frontier_heartbeat_for_test()
+            .await?;
+
         Ok(())
     })
 }

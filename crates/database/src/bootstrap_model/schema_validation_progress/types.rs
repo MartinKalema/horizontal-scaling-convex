@@ -4,7 +4,7 @@ use serde::{
 };
 use value::{
     codegen_convex_serialization,
-    DeveloperDocumentId,
+    PublicDocumentId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -15,7 +15,7 @@ use value::{
 pub struct SchemaValidationProgressMetadata {
     /// The ID of the schema being validated. Should correspond to a document in
     /// the _schemas table in `Pending` state.
-    pub schema_id: DeveloperDocumentId,
+    pub schema_id: PublicDocumentId,
     /// The number of documents that have been validated so far.
     pub num_docs_validated: u64,
     /// The number of total documents that need to be validated. Note this is

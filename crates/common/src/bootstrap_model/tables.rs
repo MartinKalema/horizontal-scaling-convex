@@ -168,7 +168,7 @@ mod tests {
     use value::{
         assert_obj,
         obj,
-        ConvexObject,
+        DocumentObject,
         TableNamespace,
     };
 
@@ -203,7 +203,7 @@ mod tests {
             state: TableState::Active,
             namespace: TableNamespace::Global,
         };
-        let serialized: ConvexObject = table.try_into()?;
+        let serialized: DocumentObject = table.try_into()?;
         assert_eq!(
             serialized,
             assert_obj!(

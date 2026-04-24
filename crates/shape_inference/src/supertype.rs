@@ -7,7 +7,7 @@ use std::{
 };
 
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     FieldName,
     IdentifierFieldName,
 };
@@ -121,7 +121,7 @@ fn id_candidates<C: ShapeConfig>(
             let mut candidates = BTreeMap::new();
             for (i, t) in types.iter().enumerate() {
                 if let ShapeEnum::StringLiteral(s) = &*t.variant
-                    && let Ok(id) = DeveloperDocumentId::decode(s)
+                    && let Ok(id) = PublicDocumentId::decode(s)
                 {
                     candidates
                         .entry(id.table())

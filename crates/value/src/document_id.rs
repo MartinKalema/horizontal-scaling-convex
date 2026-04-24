@@ -29,7 +29,7 @@ use crate::{
     TabletId,
 };
 
-/// A raw reference to a document. `DocumentId`s can appear in `Value`s as
+/// A raw reference to a document. `PublicDocumentId`s can appear in `Value`s as
 /// `Id`s, `StrongRef`s, or `WeakRef`s.
 #[derive(Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Copy)]
 pub struct InternalDocumentId {
@@ -38,7 +38,7 @@ pub struct InternalDocumentId {
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Copy)]
-pub struct DeveloperDocumentId {
+pub struct PublicDocumentId {
     table: TableNumber,
     internal_id: InternalId,
 }
@@ -46,7 +46,7 @@ pub struct DeveloperDocumentId {
 #[derive(Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Copy, Debug)]
 pub struct ResolvedDocumentId {
     pub tablet_id: TabletId,
-    pub developer_id: DeveloperDocumentId,
+    pub document_id: PublicDocumentId,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -62,7 +62,7 @@ impl proptest::arbitrary::Arbitrary for InternalDocumentId {
 }
 
 #[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for DeveloperDocumentId {
+impl proptest::arbitrary::Arbitrary for PublicDocumentId {
     type Parameters = ();
 
     type Strategy = impl proptest::strategy::Strategy<Value = Self>;
@@ -81,11 +81,9 @@ impl proptest::arbitrary::Arbitrary for ResolvedDocumentId {
 
     fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
         use proptest::prelude::*;
-        (any::<TabletId>(), any::<DeveloperDocumentId>()).prop_map(|(tablet_id, developer_id)| {
-            Self {
-                tablet_id,
-                developer_id,
-            }
+        (any::<TabletId>(), any::<PublicDocumentId>()).prop_map(|(tablet_id, document_id)| Self {
+            tablet_id,
+            document_id,
         })
     }
 }
@@ -111,7 +109,7 @@ impl InternalDocumentId {
         self.internal_id
     }
 
-    /// How large is the given `DocumentId`?
+    /// How large is the given `PublicDocumentId`?
     pub fn size(&self) -> usize {
         self.table.size() + self.internal_id.size()
     }
@@ -121,14 +119,12 @@ impl InternalDocumentId {
     }
 }
 
-impl DeveloperDocumentId {
-    pub const MAX: DeveloperDocumentId =
-        DeveloperDocumentId::new(TableNumber::MAX, InternalId::MAX);
-    /// Minimum valid [`DeveloperDocumentId`].
-    pub const MIN: DeveloperDocumentId =
-        DeveloperDocumentId::new(TableNumber::MIN, InternalId::MIN);
+impl PublicDocumentId {
+    pub const MAX: PublicDocumentId = PublicDocumentId::new(TableNumber::MAX, InternalId::MAX);
+    /// Minimum valid [`PublicDocumentId`].
+    pub const MIN: PublicDocumentId = PublicDocumentId::new(TableNumber::MIN, InternalId::MIN);
 
-    /// Create a new [`DeveloperDocumentId`] from a [`TableNumber`] and an
+    /// Create a new [`PublicDocumentId`] from a [`TableNumber`] and an
     /// [`InternalId`].
     pub const fn new(table: TableNumber, internal_id: InternalId) -> Self {
         Self { table, internal_id }
@@ -144,7 +140,7 @@ impl DeveloperDocumentId {
         self.internal_id
     }
 
-    /// How large is the given `DocumentId`?
+    /// How large is the given `PublicDocumentId`?
     pub fn size(&self) -> usize {
         self.table.size() + self.internal_id.size()
     }
@@ -160,7 +156,7 @@ impl Debug for InternalDocumentId {
     }
 }
 
-impl Debug for DeveloperDocumentId {
+impl Debug for PublicDocumentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self}")
     }
@@ -172,8 +168,8 @@ impl From<InternalDocumentId> for String {
     }
 }
 
-impl From<DeveloperDocumentId> for String {
-    fn from(id: DeveloperDocumentId) -> Self {
+impl From<PublicDocumentId> for String {
+    fn from(id: PublicDocumentId) -> Self {
         id.table().document_id_to_string(id.internal_id)
     }
 }
@@ -184,8 +180,8 @@ impl From<InternalDocumentId> for JsonValue {
     }
 }
 
-impl From<DeveloperDocumentId> for JsonValue {
-    fn from(id: DeveloperDocumentId) -> JsonValue {
+impl From<PublicDocumentId> for JsonValue {
+    fn from(id: PublicDocumentId) -> JsonValue {
         serde_json::Value::String(id.into())
     }
 }
@@ -196,7 +192,7 @@ impl Display for InternalDocumentId {
     }
 }
 
-impl Display for DeveloperDocumentId {
+impl Display for PublicDocumentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", String::from(*self))
     }
@@ -229,7 +225,7 @@ impl HeapSize for InternalDocumentId {
     }
 }
 
-impl HeapSize for DeveloperDocumentId {
+impl HeapSize for PublicDocumentId {
     fn heap_size(&self) -> usize {
         self.table.heap_size()
     }
@@ -237,27 +233,27 @@ impl HeapSize for DeveloperDocumentId {
 
 impl From<ResolvedDocumentId> for InternalDocumentId {
     fn from(value: ResolvedDocumentId) -> Self {
-        InternalDocumentId::new(value.tablet_id, value.developer_id.internal_id)
+        InternalDocumentId::new(value.tablet_id, value.document_id.internal_id)
     }
 }
 
 impl ResolvedDocumentId {
     pub const MIN: ResolvedDocumentId =
-        ResolvedDocumentId::new(TabletId::MIN, DeveloperDocumentId::MIN);
+        ResolvedDocumentId::new(TabletId::MIN, PublicDocumentId::MIN);
 
-    pub const fn new(tablet_id: TabletId, developer_id: DeveloperDocumentId) -> Self {
+    pub const fn new(tablet_id: TabletId, document_id: PublicDocumentId) -> Self {
         Self {
             tablet_id,
-            developer_id,
+            document_id,
         }
     }
 
     pub fn internal_id(&self) -> InternalId {
-        self.developer_id.internal_id
+        self.document_id.internal_id
     }
 
     pub fn size(&self) -> usize {
-        self.tablet_id.size() + self.developer_id.size()
+        self.tablet_id.size() + self.document_id.size()
     }
 }
 
@@ -269,7 +265,7 @@ impl HeapSize for ResolvedDocumentId {
 
 impl Display for ResolvedDocumentId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.developer_id)
+        write!(f, "{}", self.document_id)
     }
 }
 
@@ -277,7 +273,7 @@ impl InternalDocumentId {
     pub fn to_resolved(&self, table_number: TableNumber) -> ResolvedDocumentId {
         ResolvedDocumentId {
             tablet_id: self.table,
-            developer_id: DeveloperDocumentId::new(table_number, self.internal_id),
+            document_id: PublicDocumentId::new(table_number, self.internal_id),
         }
     }
 }

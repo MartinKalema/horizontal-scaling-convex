@@ -31,6 +31,7 @@ x-node-env-common: &node-env-common
   NATS_URL: nats://nats:4222
   GRPC_PORT: "50051"
   CHECKPOINT_STORAGE_PATH: /convex/data/checkpoints
+  SHARED_INSTANCE_SECRET_PATH: /convex/data/storage/cluster_credentials/instance_secret
   REPLICATION_MODE: primary
 
 # ── Infrastructure ─────────────────────────────────────────────────
@@ -122,6 +123,7 @@ services:
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
+      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
       RAFT_NODE_ID: "1"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
     depends_on:
@@ -148,6 +150,7 @@ services:
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
+      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
       RAFT_NODE_ID: "2"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
@@ -175,6 +178,7 @@ services:
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
+      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
       RAFT_NODE_ID: "3"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
@@ -204,6 +208,7 @@ services:
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
+      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
       RAFT_NODE_ID: "1"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
     depends_on:
@@ -230,6 +235,7 @@ services:
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
+      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
       RAFT_NODE_ID: "2"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
@@ -257,6 +263,7 @@ services:
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
+      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
       RAFT_NODE_ID: "3"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage

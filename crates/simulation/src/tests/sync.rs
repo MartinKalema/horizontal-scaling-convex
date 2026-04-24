@@ -4,8 +4,8 @@ use common::{
     value::{
         array,
         ConvexArray,
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
     },
 };
 use must_let::must_let;
@@ -55,7 +55,7 @@ fn assert_results_match(expected: &ConvexValue, actual: &ConvexValue) -> anyhow:
     Ok(())
 }
 
-fn assert_objects_match(expected: &ConvexObject, actual: &ConvexObject) -> anyhow::Result<()> {
+fn assert_objects_match(expected: &DocumentObject, actual: &DocumentObject) -> anyhow::Result<()> {
     for (key, value) in expected.iter() {
         let actual_value = actual
             .get(key)

@@ -10,7 +10,7 @@ use serde::{
 use value::{
     codegen_convex_serialization,
     identifier::Identifier,
-    DeveloperDocumentId,
+    PublicDocumentId,
 };
 
 use crate::components::{
@@ -22,7 +22,7 @@ use crate::components::{
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct ComponentMetadata {
-    pub definition_id: DeveloperDocumentId,
+    pub definition_id: PublicDocumentId,
     pub component_type: ComponentType,
     pub state: ComponentState,
 }
@@ -38,7 +38,7 @@ pub enum ComponentState {
 }
 
 impl ComponentMetadata {
-    pub fn parent_and_name(&self) -> Option<(DeveloperDocumentId, ComponentName)> {
+    pub fn parent_and_name(&self) -> Option<(PublicDocumentId, ComponentName)> {
         match &self.component_type {
             ComponentType::App => None,
             ComponentType::ChildComponent { parent, name, .. } => Some((*parent, name.clone())),
@@ -51,7 +51,7 @@ impl ComponentMetadata {
 pub enum ComponentType {
     App,
     ChildComponent {
-        parent: DeveloperDocumentId,
+        parent: PublicDocumentId,
         name: ComponentName,
         args: BTreeMap<Identifier, Resource>,
     },

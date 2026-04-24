@@ -25,14 +25,14 @@ use shape_inference::{
 };
 use value::{
     export::ValueFormat,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     sorting::TotalOrdF64,
     utils::{
         display_map,
         display_sequence,
     },
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
     FieldPath,
     IdentifierFieldName,
@@ -165,7 +165,7 @@ impl Validator {
     ) -> Result<(), ValidationError> {
         match (self, value) {
             (Validator::Id(validator_table), ConvexValue::String(s)) => {
-                if let Ok(id) = DeveloperDocumentId::decode(s)
+                if let Ok(id) = PublicDocumentId::decode(s)
                     && let Ok(table_name) = all_tables_number_to_name(id.table())
                 {
                     if &table_name != validator_table {
@@ -945,7 +945,7 @@ pub enum ValidationError {
          in validator `v.id(\"{validator_table}\")`.{context}"
     )]
     TableNamesDoNotMatch {
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         found_table_name: TableName,
         validator_table: TableName,
         context: ValidationContext,
@@ -955,7 +955,7 @@ pub enum ValidationError {
          `v.id(\"{validator_table}\")`.{context}"
     )]
     SystemTableReference {
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         validator_table: TableName,
         context: ValidationContext,
     },
@@ -975,7 +975,7 @@ Object: {object}
 Validator: {object_validator}"
     )]
     MissingRequiredField {
-        object: ConvexObject,
+        object: DocumentObject,
         field_name: IdentifierFieldName,
         object_validator: ObjectValidator,
         context: ValidationContext,
@@ -987,7 +987,7 @@ Object: {object}
 Validator: {object_validator}"
     )]
     ExtraField {
-        object: ConvexObject,
+        object: DocumentObject,
         field_name: FieldName,
         object_validator: ObjectValidator,
         context: ValidationContext,
@@ -1030,13 +1030,13 @@ mod tests {
         assert_obj,
         assert_val,
         export::ValueFormat,
-        id_v6::DeveloperDocumentId,
+        id_v6::PublicDocumentId,
         proptest::{
             RestrictNaNs,
             ValueBranching,
         },
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
         FieldName,
         FieldType,
         InternalId,
@@ -1082,7 +1082,7 @@ mod tests {
                     id_generator,
                     &id_generator.virtual_system_mapping,
                 )(table_name)?;
-                let doc_idv6 = DeveloperDocumentId::new(table_number, id);
+                let doc_idv6 = PublicDocumentId::new(table_number, id);
                 ConvexValue::String(doc_idv6.encode().try_into()?)
             },
             Validator::Null => assert_val!(null),
@@ -1129,7 +1129,7 @@ mod tests {
     fn object_from_schema(
         schema: DocumentSchema,
         id_generator: &TestIdGenerator,
-    ) -> anyhow::Result<ConvexObject> {
+    ) -> anyhow::Result<DocumentObject> {
         match schema {
             DocumentSchema::Any => Ok(btreemap! {}.try_into()?),
             DocumentSchema::Union(objects) => {
@@ -1598,7 +1598,7 @@ mod tests {
         // generate an ID so it's in the table mapping
         id_generator.user_generate(&table1);
         let document_id = id_generator.user_generate(&table2);
-        let id_v6 = DeveloperDocumentId::from(document_id);
+        let id_v6 = PublicDocumentId::from(document_id);
         let value: ConvexValue = id_v6.into();
 
         let err = id_validator

@@ -11,7 +11,7 @@ use database::{
     Transaction,
 };
 use value::{
-    ConvexObject,
+    DocumentObject,
     FieldPath,
     ResolvedDocumentId,
     TableName,
@@ -85,7 +85,7 @@ impl<'a, RT: Runtime> DeploymentAuditLogModel<'a, RT> {
             .transpose()?;
         let mut deployment_audit_log_ids = vec![];
         for event in events {
-            let event_object: ConvexObject = event.try_into()?;
+            let event_object: DocumentObject = event.try_into()?;
             let event_object_with_member_id = match member_id_value {
                 Some(member_id) => event_object.shallow_merge(obj!("member_id" => member_id)?)?,
                 None => event_object.shallow_merge(obj!("member_id" => null)?)?,

@@ -38,8 +38,8 @@ use errors::ErrorMetadata;
 use value::{
     identifier::Identifier,
     ConvexValue,
-    DeveloperDocumentId,
     FieldPath,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -92,7 +92,7 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
 
     pub fn component_in_parent(
         &mut self,
-        parent_and_name: Option<(DeveloperDocumentId, ComponentName)>,
+        parent_and_name: Option<(PublicDocumentId, ComponentName)>,
     ) -> anyhow::Result<Option<ParsedDocument<ComponentMetadata>>> {
         self.tx
             .component_registry
@@ -101,7 +101,7 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
 
     pub fn component_children(
         &mut self,
-        parent_id: DeveloperDocumentId,
+        parent_id: PublicDocumentId,
     ) -> anyhow::Result<Vec<ParsedDocument<ComponentMetadata>>> {
         self.tx
             .component_registry
@@ -142,7 +142,7 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
 
     pub fn resolve_component_id(
         &mut self,
-        component_id: DeveloperDocumentId,
+        component_id: PublicDocumentId,
     ) -> anyhow::Result<ResolvedDocumentId> {
         let component_table = self
             .tx
@@ -157,7 +157,7 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
 
     pub fn resolve_component_definition_id(
         &mut self,
-        component_definition_id: DeveloperDocumentId,
+        component_definition_id: PublicDocumentId,
     ) -> anyhow::Result<ResolvedDocumentId> {
         let component_definitions_table = self
             .tx

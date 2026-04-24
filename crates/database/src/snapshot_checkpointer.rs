@@ -245,6 +245,10 @@ fn checkpoint_to_proto(data: &CheckpointData) -> anyhow::Result<checkpoint_proto
     })
 }
 
+pub fn checkpoint_to_bytes(data: &CheckpointData) -> anyhow::Result<Vec<u8>> {
+    Ok(checkpoint_to_proto(data)?.encode_to_vec())
+}
+
 pub fn checkpoint_from_proto(
     proto: checkpoint_proto::CheckpointData,
 ) -> anyhow::Result<CheckpointData> {
@@ -307,4 +311,9 @@ pub fn checkpoint_from_proto(
         documents,
         globals,
     })
+}
+
+pub fn checkpoint_from_bytes(bytes: &[u8]) -> anyhow::Result<CheckpointData> {
+    let proto = checkpoint_proto::CheckpointData::decode(bytes)?;
+    checkpoint_from_proto(proto)
 }

@@ -135,9 +135,9 @@ use usage_tracking::{
     UsageCounter,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
-    ConvexObject,
+    id_v6::PublicDocumentId,
     ConvexValue,
+    DocumentObject,
     IdentifierFieldName,
     ResolvedDocumentId,
     Size,
@@ -502,7 +502,7 @@ pub async fn start_stored_import<RT: Runtime>(
     component_path: ComponentPath,
     fq_object_key: FullyQualifiedObjectKey,
     requestor: ImportRequestor,
-) -> anyhow::Result<DeveloperDocumentId> {
+) -> anyhow::Result<PublicDocumentId> {
     if !(identity.is_admin() || identity.is_system()) {
         anyhow::bail!(ImportError::Unauthorized);
     }
@@ -535,7 +535,7 @@ pub async fn start_stored_import<RT: Runtime>(
 pub async fn perform_import<RT: Runtime>(
     application: &Application<RT>,
     identity: Identity,
-    import_id: DeveloperDocumentId,
+    import_id: PublicDocumentId,
 ) -> anyhow::Result<()> {
     if !identity.is_admin() {
         anyhow::bail!(ImportError::Unauthorized);
@@ -563,7 +563,7 @@ pub async fn perform_import<RT: Runtime>(
 pub async fn cancel_import<RT: Runtime>(
     application: &Application<RT>,
     identity: Identity,
-    import_id: DeveloperDocumentId,
+    import_id: PublicDocumentId,
 ) -> anyhow::Result<()> {
     if !identity.is_admin() {
         anyhow::bail!(ImportError::Unauthorized);
@@ -591,7 +591,7 @@ pub async fn cancel_import<RT: Runtime>(
 async fn wait_for_import_worker<RT: Runtime>(
     application: &Application<RT>,
     identity: Identity,
-    import_id: DeveloperDocumentId,
+    import_id: PublicDocumentId,
 ) -> anyhow::Result<ParsedDocument<SnapshotImport>> {
     let snapshot_import = loop {
         let mut tx = application.begin(identity.clone()).await?;
@@ -869,7 +869,7 @@ async fn import_objects<RT: Runtime>(
 
     let mut storage_files_by_component: BTreeMap<
         ComponentPath,
-        Vec<(DeveloperDocumentId, ImportStorageFileStream)>,
+        Vec<(PublicDocumentId, ImportStorageFileStream)>,
     > = BTreeMap::new();
     let mut storage_files = import.storage_files;
     while let Some((component_path, id, stream)) = storage_files.try_next().await? {
@@ -1272,7 +1272,7 @@ async fn import_single_table<RT: Runtime>(
     mut objects: Peekable<ImportDocumentStream>,
     storage_files_by_component: &mut BTreeMap<
         ComponentPath,
-        Vec<(DeveloperDocumentId, ImportStorageFileStream)>,
+        Vec<(PublicDocumentId, ImportStorageFileStream)>,
     >,
     mut generated_schema: Option<&mut GeneratedSchema<ProdConfig>>,
     table_mapping_for_schema: &TableMapping,
@@ -1410,7 +1410,7 @@ async fn import_single_table<RT: Runtime>(
 async fn insert_import_objects<RT: Runtime>(
     database: &Database<RT>,
     identity: &Identity,
-    objects_to_insert: Vec<ConvexObject>,
+    objects_to_insert: Vec<DocumentObject>,
     table_name: &TableName,
     table_id: TabletIdAndTableNumber,
     table_mapping_for_schema: &TableMapping,
@@ -1667,7 +1667,7 @@ async fn table_number_for_import(
     let JsonValue::String(id) = first_id else {
         return None;
     };
-    let id_v6 = DeveloperDocumentId::decode(id).ok()?;
+    let id_v6 = PublicDocumentId::decode(id).ok()?;
     Some(id_v6.table())
 }
 

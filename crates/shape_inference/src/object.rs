@@ -5,7 +5,7 @@ use std::{
 
 use value::{
     identifier::is_valid_identifier,
-    ConvexObject,
+    DocumentObject,
     IdentifierFieldName,
 };
 
@@ -75,7 +75,7 @@ impl<C: ShapeConfig> ObjectShape<C, u64> {
             .all(|f| f.value_shape.num_values < num_values));
     }
 
-    pub fn shape_of(object: &ConvexObject) -> CountedShapeEnum<C> {
+    pub fn shape_of(object: &DocumentObject) -> CountedShapeEnum<C> {
         // N.B.: check is_valid_identifier separately to avoid creating
         // anyhow::Errors, which is expensive
         if object.len() <= C::MAX_OBJECT_FIELDS

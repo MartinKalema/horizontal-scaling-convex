@@ -12,8 +12,8 @@ use fivetran_destination::constants::{
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use value::{
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
     FieldPath,
     IdentifierFieldName,
@@ -43,12 +43,12 @@ static CDC_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IDENTIFIER_PREF
 pub struct AirbyteRecord {
     table_name: TableName,
     deleted: bool,
-    record: ConvexObject,
+    record: DocumentObject,
 }
 
 impl AirbyteRecord {
     #[cfg(any(test, feature = "testing"))]
-    pub fn new(table_name: TableName, deleted: bool, record: ConvexObject) -> Self {
+    pub fn new(table_name: TableName, deleted: bool, record: DocumentObject) -> Self {
         Self {
             table_name,
             deleted,
@@ -64,7 +64,7 @@ impl AirbyteRecord {
         self.deleted
     }
 
-    pub fn into_object(self) -> ConvexObject {
+    pub fn into_object(self) -> DocumentObject {
         self.record
     }
 }
@@ -118,7 +118,7 @@ impl TryFrom<AirbyteRecordMessage> for AirbyteRecord {
 
     fn try_from(msg: AirbyteRecordMessage) -> anyhow::Result<AirbyteRecord> {
         let table_name = msg.table_name.parse::<ValidIdentifier<TableName>>()?.0;
-        let object: ConvexObject = valid_json(msg.data)?.try_into()?;
+        let object: DocumentObject = valid_json(msg.data)?.try_into()?;
         let deleted = match object.get(&*CDC_DELETED_FIELD) {
             Some(ts) => ts != &ConvexValue::Null,
             None => false,
@@ -130,7 +130,7 @@ impl TryFrom<AirbyteRecordMessage> for AirbyteRecord {
             .into_iter()
             .filter(|(field_name, _value)| !field_name.starts_with(&CDC_PREFIX.clone()))
             .collect();
-        let record: ConvexObject = fields_and_values.try_into()?;
+        let record: DocumentObject = fields_and_values.try_into()?;
         Ok(Self {
             table_name,
             deleted,
@@ -204,18 +204,18 @@ impl TryFrom<AirbyteStream> for ValidatedAirbyteStream {
     }
 }
 
-pub fn mark_as_soft_deleted(object: ConvexObject) -> anyhow::Result<ConvexObject> {
+pub fn mark_as_soft_deleted(object: DocumentObject) -> anyhow::Result<DocumentObject> {
     let metadata_key = FieldName::from(METADATA_CONVEX_FIELD_NAME.clone());
 
     let mut new_value: BTreeMap<FieldName, ConvexValue> = object.into();
     let metadata_object = match new_value.remove(&metadata_key) {
         Some(ConvexValue::Object(object)) => object,
-        _ => ConvexObject::empty(),
+        _ => DocumentObject::empty(),
     };
 
     new_value.insert(
         metadata_key,
-        ConvexValue::Object(metadata_object.shallow_merge(ConvexObject::for_value(
+        ConvexValue::Object(metadata_object.shallow_merge(DocumentObject::for_value(
             FieldName::from(SOFT_DELETE_CONVEX_FIELD_NAME.clone()),
             ConvexValue::Boolean(true),
         )?)?),

@@ -19,8 +19,8 @@ use flexbuffers::{
 use value::{
     heap_size::HeapSize,
     serde::ConvexSerializable,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldPath,
 };
 
@@ -132,7 +132,7 @@ impl PackedValue<ByteBuffer> {
         }
     }
 
-    pub fn pack_object(value: &ConvexObject) -> Self {
+    pub fn pack_object(value: &DocumentObject) -> Self {
         let mut builder = Builder::default();
         Self::_pack_object(value, &mut builder);
         Self {
@@ -174,7 +174,7 @@ impl PackedValue<ByteBuffer> {
         }
     }
 
-    fn _pack_object(object: &ConvexObject, builder: &mut impl FlexBuilder) {
+    fn _pack_object(object: &DocumentObject, builder: &mut impl FlexBuilder) {
         let mut map = builder.start_map();
         for (field, value) in object.iter() {
             let mut builder = (&field[..], &mut map);

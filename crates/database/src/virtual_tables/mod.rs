@@ -12,7 +12,7 @@ use common::{
 };
 use errors::ErrorMetadata;
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNamespace,
 };
@@ -42,7 +42,7 @@ impl<'a, RT: Runtime> VirtualTable<'a, RT> {
     pub async fn get(
         &mut self,
         namespace: TableNamespace,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         version: Option<Version>,
     ) -> anyhow::Result<Option<(DeveloperDocument, WriteTimestamp)>> {
         let tablet_id = self

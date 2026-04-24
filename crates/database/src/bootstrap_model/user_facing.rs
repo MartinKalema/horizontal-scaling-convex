@@ -27,8 +27,8 @@ use indexing::backend_in_memory_indexes::{
 };
 use itertools::Itertools;
 use value::{
-    ConvexObject,
-    DeveloperDocumentId,
+    DocumentObject,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -59,7 +59,7 @@ use crate::{
 //  1. System tables are only visible for `Identity::Admin` or
 //     `Identity::System`.
 //  2. We support virtual tables.
-//  3. The interface is in `DeveloperDocumentId`s, not `ResolvedDocumentId`.
+//  3. The interface is in `PublicDocumentId`s, not `ResolvedDocumentId`.
 //  4. We track user size limits for documents, which are more restrictive than
 //     the database's limits.
 //  5. We support branching on the `convex` NPM package's version.
@@ -85,7 +85,7 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
     #[convex_macro::instrument_future]
     pub async fn get(
         &mut self,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         version: Option<Version>,
     ) -> anyhow::Result<Option<DeveloperDocument>> {
         Ok(self
@@ -98,7 +98,7 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
     #[convex_macro::instrument_future]
     pub async fn get_with_ts(
         &mut self,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         version: Option<Version>,
     ) -> anyhow::Result<Option<(DeveloperDocument, WriteTimestamp)>> {
         if !self
@@ -137,11 +137,11 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
     async fn require_active_component(&mut self) -> anyhow::Result<()> {
         match self.namespace {
             TableNamespace::Global => {},
-            TableNamespace::ByComponent(developer_id) => {
+            TableNamespace::ByComponent(document_id) => {
                 let component = BootstrapComponentsModel::new(self.tx)
-                    .load_component(ComponentId::Child(developer_id))
+                    .load_component(ComponentId::Child(document_id))
                     .await?
-                    .with_context(|| format!("Component not found for id: {developer_id}"))?;
+                    .with_context(|| format!("Component not found for id: {document_id}"))?;
 
                 match component.state {
                     ComponentState::Active => {},
@@ -164,8 +164,8 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
     pub async fn insert(
         &mut self,
         table: TableName,
-        value: ConvexObject,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+        value: DocumentObject,
+    ) -> anyhow::Result<PublicDocumentId> {
         self.require_active_component().await?;
         if self.tx.virtual_system_mapping().is_virtual_table(&table) {
             anyhow::bail!(ErrorMetadata::bad_request(
@@ -209,7 +209,7 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
         let document = ResolvedDocument::new(
             ResolvedDocumentId::new(
                 table_id.tablet_id,
-                DeveloperDocumentId::new(table_id.table_number, internal_id),
+                PublicDocumentId::new(table_id.table_number, internal_id),
             ),
             creation_time,
             value,
@@ -226,7 +226,7 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
     #[convex_macro::instrument_future]
     pub async fn patch(
         &mut self,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         value: PatchValue,
     ) -> anyhow::Result<DeveloperDocument> {
         if self.tx.is_system(self.namespace, id.table())
@@ -255,8 +255,8 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
     #[convex_macro::instrument_future]
     pub async fn replace(
         &mut self,
-        id: DeveloperDocumentId,
-        value: ConvexObject,
+        id: PublicDocumentId,
+        value: DocumentObject,
     ) -> anyhow::Result<DeveloperDocument> {
         if self.tx.is_system(self.namespace, id.table())
             && !(self.tx.identity.is_admin() || self.tx.identity.is_system())
@@ -279,7 +279,7 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
     /// (e.g. syscalls)
     #[fastrace::trace]
     #[convex_macro::instrument_future]
-    pub async fn delete(&mut self, id: DeveloperDocumentId) -> anyhow::Result<DeveloperDocument> {
+    pub async fn delete(&mut self, id: PublicDocumentId) -> anyhow::Result<DeveloperDocument> {
         if self.tx.is_system(self.namespace, id.table())
             && !(self.tx.identity.is_admin() || self.tx.identity.is_system())
         {

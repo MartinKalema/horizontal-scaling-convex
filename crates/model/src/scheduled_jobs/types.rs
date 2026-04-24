@@ -19,7 +19,7 @@ use sync_types::types::SerializedArgs;
 use value::{
     codegen_convex_serialization,
     ConvexArray,
-    DeveloperDocumentId,
+    PublicDocumentId,
 };
 
 #[derive(Clone)]
@@ -89,7 +89,7 @@ pub struct ScheduledJobMetadata {
 
     /// ID for the document in the `_scheduled_jobs_args` table in the same
     /// namespace as this scheduled job that has the arguments for the job.
-    pub args_id: Option<DeveloperDocumentId>,
+    pub args_id: Option<PublicDocumentId>,
 
     pub state: ScheduledJobState,
 
@@ -121,7 +121,7 @@ pub fn args_to_bytes(args: ConvexArray) -> anyhow::Result<ByteBuf> {
 impl ScheduledJobMetadata {
     pub fn new(
         path: CanonicalizedComponentFunctionPath,
-        args_id: DeveloperDocumentId,
+        args_id: PublicDocumentId,
         state: ScheduledJobState,
         next_ts: Option<Timestamp>,
         completed_ts: Option<Timestamp>,

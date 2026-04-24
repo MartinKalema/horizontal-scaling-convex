@@ -4,9 +4,9 @@ use common::{
     runtime::Runtime,
 };
 use value::{
-    ConvexObject,
-    DeveloperDocumentId,
+    DocumentObject,
     InternalId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -54,7 +54,7 @@ impl<'a, RT: Runtime> SystemMetadataModel<'a, RT> {
     pub async fn insert(
         &mut self,
         table: &TableName,
-        value: ConvexObject,
+        value: DocumentObject,
     ) -> anyhow::Result<ResolvedDocumentId> {
         anyhow::ensure!(table.is_system());
         if !(self.tx.identity.is_system() || self.tx.identity.is_admin()) {
@@ -63,7 +63,7 @@ impl<'a, RT: Runtime> SystemMetadataModel<'a, RT> {
         let table_id = self.lookup_table_id(table)?;
         let id = ResolvedDocumentId::new(
             table_id.tablet_id,
-            DeveloperDocumentId::new(
+            PublicDocumentId::new(
                 table_id.table_number,
                 self.tx.id_generator.generate_internal(),
             ),
@@ -82,7 +82,7 @@ impl<'a, RT: Runtime> SystemMetadataModel<'a, RT> {
         &mut self,
         table: &TableName,
         internal_id: InternalId,
-        value: ConvexObject,
+        value: DocumentObject,
     ) -> anyhow::Result<ResolvedDocumentId> {
         anyhow::ensure!(table.is_system());
         if !(self.tx.identity.is_system() || self.tx.identity.is_admin()) {
@@ -91,7 +91,7 @@ impl<'a, RT: Runtime> SystemMetadataModel<'a, RT> {
         let table_id = self.lookup_table_id(table)?;
         let document_id = ResolvedDocumentId::new(
             table_id.tablet_id,
-            DeveloperDocumentId::new(table_id.table_number, internal_id),
+            PublicDocumentId::new(table_id.table_number, internal_id),
         );
         let creation_time = self.tx.next_creation_time.increment()?;
         let document = ResolvedDocument::new(document_id, creation_time, value)?;
@@ -122,7 +122,7 @@ impl<'a, RT: Runtime> SystemMetadataModel<'a, RT> {
     pub async fn insert_metadata(
         &mut self,
         table: &TableName,
-        value: ConvexObject,
+        value: DocumentObject,
     ) -> anyhow::Result<ResolvedDocumentId> {
         TableModel::new(self.tx)
             .insert_table_metadata(self.namespace, table)
@@ -168,7 +168,7 @@ impl<'a, RT: Runtime> SystemMetadataModel<'a, RT> {
     pub async fn replace(
         &mut self,
         id: ResolvedDocumentId,
-        value: ConvexObject,
+        value: DocumentObject,
     ) -> anyhow::Result<ResolvedDocument> {
         anyhow::ensure!(self.tx.table_mapping().is_system_tablet(id.tablet_id));
         self.tx.replace_inner(id, value).await
