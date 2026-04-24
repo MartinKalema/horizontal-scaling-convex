@@ -23,8 +23,8 @@ use crate::{
         check_valid_identifier,
         MIN_IDENTIFIER,
     },
-    DeveloperDocumentId,
     Namespace,
+    PublicDocumentId,
     Size,
 };
 
@@ -207,7 +207,7 @@ impl TableNumber {
     pub const MIN: TableNumber = TableNumber(1);
 
     pub fn document_id_to_string(&self, internal_id: InternalId) -> String {
-        let id_v6 = DeveloperDocumentId::new(*self, internal_id);
+        let id_v6 = PublicDocumentId::new(*self, internal_id);
         id_v6.encode()
     }
 
@@ -228,9 +228,9 @@ pub struct TabletIdAndTableNumber {
 
 impl Size for TableNumber {
     fn size(&self) -> usize {
-        // In order to compute size consistently for both DocumentId<TableName> and
-        // DocumentId<TableId> so it represents the size as stored in persistence,
-        // assume that the size is the maximum internal id size.
+        // In order to compute size consistently for both PublicDocumentId<TableName>
+        // and PublicDocumentId<TableId> so it represents the size as stored in
+        // persistence, assume that the size is the maximum internal id size.
         InternalId::MAX_SIZE
     }
 
@@ -241,9 +241,9 @@ impl Size for TableNumber {
 
 impl Size for TabletId {
     fn size(&self) -> usize {
-        // In order to compute size consistently for both DocumentId<TableName> and
-        // DocumentId<TableId> so it represents the size as stored in persistence,
-        // assume that the size is the maximum internal id size.
+        // In order to compute size consistently for both PublicDocumentId<TableName>
+        // and PublicDocumentId<TableId> so it represents the size as stored in
+        // persistence, assume that the size is the maximum internal id size.
         InternalId::MAX_SIZE
     }
 

@@ -105,6 +105,7 @@ message TwoPcTabletMetadata {
   bytes tablet_id = 1;
   uint32 table_number = 2;
   string table_name = 3;
+  optional string component_id = 4;
 }
 
 message TwoPcIndexedRead {

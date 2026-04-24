@@ -75,7 +75,7 @@ use search::{
 use storage::Storage;
 use sync_types::Timestamp;
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     TableNumber,
     TabletId,
 };
@@ -259,7 +259,7 @@ impl SearchIndex for TextSearchIndex {
             .try_filter(move |revision_pair| {
                 let doc_id_index_key = IndexKey::new(
                     vec![],
-                    DeveloperDocumentId::new(table_number, revision_pair.id.internal_id()),
+                    PublicDocumentId::new(table_number, revision_pair.id.internal_id()),
                 );
                 futures::future::ready(filter_id_range.contains(&doc_id_index_key.to_bytes()))
             })

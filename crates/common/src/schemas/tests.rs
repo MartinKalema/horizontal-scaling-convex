@@ -3,7 +3,7 @@ use proptest::prelude::*;
 use serde_json::json;
 use value::{
     assert_obj,
-    ConvexObject,
+    DocumentObject,
     FieldName,
     NamespacedTableMapping,
     TableMapping,
@@ -37,7 +37,7 @@ proptest! {
     }
 
     #[test]
-    fn test_any_matches_all(v in any::<ConvexObject>()) {
+    fn test_any_matches_all(v in any::<DocumentObject>()) {
         let document_schema = DocumentSchema::Any;
         document_schema.check_value(
             &v,
@@ -700,7 +700,7 @@ mod tables_to_revalidate {
     use value::{
         assert_obj,
         assert_val,
-        id_v6::DeveloperDocumentId,
+        id_v6::PublicDocumentId,
         ConvexValue,
         ResolvedDocumentId,
         TableName,
@@ -1032,7 +1032,7 @@ mod tables_to_revalidate {
     #[test]
     fn test_skips_validation_from_virtual_ids_in_shapes() -> anyhow::Result<()> {
         let mut id_generator = TestIdGenerator::new();
-        let dog_id: DeveloperDocumentId = id_generator.generate_virtual(&"dogs".parse()?);
+        let dog_id: PublicDocumentId = id_generator.generate_virtual(&"dogs".parse()?);
         let document_with_id = assert_val!({"field" => dog_id});
         let shape = CountedShape::<TestConfig>::empty().insert_value(&document_with_id);
 
@@ -1075,7 +1075,7 @@ mod tables_to_revalidate {
     #[test]
     fn test_skips_validation_from_virtual_ids_in_type() -> anyhow::Result<()> {
         let mut id_generator = TestIdGenerator::new();
-        let dog_id: DeveloperDocumentId = id_generator.generate_virtual(&"dogs".parse()?);
+        let dog_id: PublicDocumentId = id_generator.generate_virtual(&"dogs".parse()?);
         let shape = CountedShape::<TestConfig>::empty().insert_value(&dog_id.into());
         assert!(Validator::from_shape(
             &shape,

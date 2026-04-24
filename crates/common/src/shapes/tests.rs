@@ -7,7 +7,7 @@ use shape_inference::{
     CountedShape,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     ConvexValue,
     TableName,
     TableNamespace,
@@ -62,13 +62,13 @@ fn test_id_strings() -> anyhow::Result<()> {
     let mut id_generator = TestIdGenerator::new();
 
     // Create three IDs from three different tables
-    let message_id: DeveloperDocumentId = id_generator
+    let message_id: PublicDocumentId = id_generator
         .user_generate(&TableName::from_str("messages")?)
         .into();
     let deleted1_table = TableName::from_str("deleted1")?;
     let deleted2_table = TableName::from_str("deleted2")?;
-    let deleted1_id: DeveloperDocumentId = id_generator.user_generate(&deleted1_table).into();
-    let deleted2_id: DeveloperDocumentId = id_generator.user_generate(&deleted2_table).into();
+    let deleted1_id: PublicDocumentId = id_generator.user_generate(&deleted1_table).into();
+    let deleted2_id: PublicDocumentId = id_generator.user_generate(&deleted2_table).into();
     let table_mapping = id_generator.namespace(TableNamespace::test_user());
 
     // Delete two of the tables

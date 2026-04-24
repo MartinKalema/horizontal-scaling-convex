@@ -16,7 +16,7 @@ use common::{
         ConvexOrigin,
         TableName,
     },
-    value::ConvexObject,
+    value::DocumentObject,
 };
 use database::{
     test_helpers::DbFixtures,
@@ -52,7 +52,7 @@ use usage_tracking::FunctionUsageTracker;
 use value::{
     assert_obj,
     export::ValueFormat,
-    DeveloperDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNamespace,
 };
@@ -223,7 +223,7 @@ async fn test_export_storage(rt: TestRuntime) -> anyhow::Result<()> {
     let file1: ParsedDocument<FileStorageEntry> = tx
         .get(ResolvedDocumentId::new(
             storage_table_id.tablet_id,
-            DeveloperDocumentId::new(storage_table_id.table_number, file1_id.internal_id()),
+            PublicDocumentId::new(storage_table_id.table_number, file1_id.internal_id()),
         ))
         .await?
         .unwrap()
@@ -347,12 +347,12 @@ async fn test_export_with_table_delete(rt: TestRuntime) -> anyhow::Result<()> {
     // Write to two tables and delete one.
     let mut tx = db.begin(Identity::system()).await?;
     UserFacingModel::new_root_for_test(&mut tx)
-        .insert("table_0".parse()?, ConvexObject::empty())
+        .insert("table_0".parse()?, DocumentObject::empty())
         .await?;
     db.commit(tx).await?;
     let mut tx = db.begin(Identity::system()).await?;
     UserFacingModel::new_root_for_test(&mut tx)
-        .insert("table_1".parse()?, ConvexObject::empty())
+        .insert("table_1".parse()?, DocumentObject::empty())
         .await?;
     db.commit(tx).await?;
     let mut tx = db.begin(Identity::system()).await?;

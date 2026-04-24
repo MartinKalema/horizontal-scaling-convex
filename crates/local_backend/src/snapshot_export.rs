@@ -38,7 +38,7 @@ use model::exports::{
 use serde::Deserialize;
 use storage::StorageGetStream;
 use sync_types::Timestamp;
-use value::DeveloperDocumentId;
+use value::PublicDocumentId;
 
 use crate::{
     admin::must_be_admin_with_write_access,
@@ -93,7 +93,7 @@ pub async fn get_zip_export(
     Path(ZipExportRequest { id }): Path<ZipExportRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
-    let id: Either<DeveloperDocumentId, Timestamp> = match id.parse() {
+    let id: Either<PublicDocumentId, Timestamp> = match id.parse() {
         Ok(id) => Either::Left(id),
         Err(_) => Either::Right(id.parse().context(ErrorMetadata::bad_request(
             "BadSnapshotId",
@@ -140,8 +140,8 @@ pub async fn set_export_expiration(
             "Must have system or admin identity to set export expiration"
         )))?;
     }
-    let snapshot_id: DeveloperDocumentId = snapshot_id
-        .parse::<DeveloperDocumentId>()
+    let snapshot_id: PublicDocumentId = snapshot_id
+        .parse::<PublicDocumentId>()
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut tx = st.application.begin(identity).await?;
     ExportsModel::new(&mut tx)
@@ -164,8 +164,8 @@ pub async fn cancel_export(
             "Must have system or admin identity to cancel cloud export"
         )))?;
     }
-    let snapshot_id: DeveloperDocumentId = snapshot_id
-        .parse::<DeveloperDocumentId>()
+    let snapshot_id: PublicDocumentId = snapshot_id
+        .parse::<PublicDocumentId>()
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut tx = st.application.begin(identity).await?;
     ExportsModel::new(&mut tx).cancel(snapshot_id).await?;

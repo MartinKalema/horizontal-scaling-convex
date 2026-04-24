@@ -62,7 +62,7 @@ use usage_tracking::{
     UsageCounter,
 };
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNamespace,
     TabletId,
@@ -258,7 +258,7 @@ impl<RT: Runtime> IndexWorker<RT> {
                 && matches!(on_disk_state, DatabaseIndexState::Backfilling(_))
             {
                 let backfill_metadata = model
-                    .existing_backfill_metadata(index_metadata.id().developer_id)
+                    .existing_backfill_metadata(index_metadata.id().document_id)
                     .await?;
                 let backfill_cursor =
                     backfill_metadata.and_then(|metadata| metadata.cursor.clone());
@@ -340,12 +340,12 @@ impl<RT: Runtime> IndexWorker<RT> {
                 let mut model = IndexBackfillModel::new(&mut tx);
                 let cursor = ResolvedDocumentId::new(
                     tablet_id,
-                    DeveloperDocumentId::new(table_number, cursor.internal_id())
+                    PublicDocumentId::new(table_number, cursor.internal_id())
                 );
                 tracing::info!(
                     "IndexWorker got progress update for {} indexes in tablet {tablet_id} at cursor {}",
                     index_ids.len(),
-                    cursor.developer_id,
+                    cursor.document_id,
                 );
                 for index_id in index_ids {
                     model
@@ -571,7 +571,7 @@ impl<RT: Runtime> IndexWorker<RT> {
         let index_doc = tx
             .get(ResolvedDocumentId::new(
                 index_table_id.tablet_id,
-                DeveloperDocumentId::new(index_table_id.table_number, index_id),
+                PublicDocumentId::new(index_table_id.table_number, index_id),
             ))
             .await?
             .ok_or_else(|| anyhow::anyhow!("Index {index_id:?} no longer exists"))?;
@@ -609,7 +609,7 @@ impl<RT: Runtime> IndexWorker<RT> {
         let index_doc = tx
             .get(ResolvedDocumentId::new(
                 index_table_id.tablet_id,
-                DeveloperDocumentId::new(index_table_id.table_number, index_id),
+                PublicDocumentId::new(index_table_id.table_number, index_id),
             ))
             .await?
             .ok_or_else(|| anyhow::anyhow!("Index {index_id:?} no longer exists"))?;
@@ -658,7 +658,7 @@ impl<RT: Runtime> IndexWorker<RT> {
         let index_table_id = tx.bootstrap_tables().index_id;
         let full_index_id = ResolvedDocumentId::new(
             index_table_id.tablet_id,
-            DeveloperDocumentId::new(index_table_id.table_number, index_id),
+            PublicDocumentId::new(index_table_id.table_number, index_id),
         );
         let index_doc = tx
             .get(full_index_id)

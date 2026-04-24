@@ -44,14 +44,14 @@ impl<T: fmt::Debug> fmt::Debug for PII<T> {
 mod tests {
     use value::{
         assert_obj,
-        ConvexObject,
+        DocumentObject,
     };
 
     use super::PII;
 
     #[test]
     fn test_pii_debug_by_ref() -> anyhow::Result<()> {
-        let obj: ConvexObject = assert_obj!("ssn" => 123456789);
+        let obj: DocumentObject = assert_obj!("ssn" => 123456789);
         let pii_obj = PII(obj);
         let debug_pii = format!("{:?}", &pii_obj);
         // This is a test, so we print the PII wrapped in PII().

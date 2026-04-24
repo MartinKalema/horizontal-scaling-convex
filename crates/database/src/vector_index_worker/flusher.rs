@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(segment.total_point_count(), 1);
         // Should have written backfill progress, and it is halfway done.
         let progress = fixtures
-            .index_backfill_progress(index_id.developer_id)
+            .index_backfill_progress(index_id.document_id)
             .await?
             .unwrap();
         assert_eq!(progress.num_docs_indexed, 1);
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(segment.total_point_count(), 1);
         // Should have written backfill progress, and it is halfway done.
         let progress = fixtures
-            .index_backfill_progress(index_id.developer_id)
+            .index_backfill_progress(index_id.document_id)
             .await?
             .unwrap();
         assert_eq!(progress.num_docs_indexed, 1);

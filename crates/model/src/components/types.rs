@@ -22,7 +22,7 @@ use serde::{
 };
 use serde_json::Value as JsonValue;
 use sync_types::CanonicalizedModulePath;
-use value::ConvexObject;
+use value::DocumentObject;
 
 use crate::{
     config::types::{
@@ -155,7 +155,7 @@ impl TryFrom<EvaluatedComponentDefinition> for SerializedEvaluatedComponentDefin
                 .into_iter()
                 .map(|(k, v)| Ok((String::from(k), v.try_into()?)))
                 .collect::<anyhow::Result<_>>()?,
-            udf_config: ConvexObject::try_from(value.udf_config)?.into(),
+            udf_config: DocumentObject::try_from(value.udf_config)?.into(),
         })
     }
 }
@@ -172,7 +172,7 @@ impl TryFrom<SerializedEvaluatedComponentDefinition> for EvaluatedComponentDefin
                 .into_iter()
                 .map(|(k, v)| Ok((k.parse()?, v.try_into()?)))
                 .collect::<anyhow::Result<_>>()?,
-            udf_config: UdfConfig::try_from(ConvexObject::try_from(value.udf_config)?)?,
+            udf_config: UdfConfig::try_from(DocumentObject::try_from(value.udf_config)?)?,
         })
     }
 }

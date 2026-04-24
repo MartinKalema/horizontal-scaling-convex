@@ -67,7 +67,7 @@ async fn download_module_source_from_package(
         source_package.sha256.clone(),
     )
     .await?;
-    let source_package_id: SourcePackageId = source_package.developer_id().into();
+    let source_package_id: SourcePackageId = source_package.document_id().into();
     for (module_path, module_config) in package {
         result.insert(
             (module_path, source_package_id),

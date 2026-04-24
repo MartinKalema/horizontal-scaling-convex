@@ -5,7 +5,7 @@ use serde::{
 };
 use value::{
     serde::WithUnknown,
-    ConvexObject,
+    DocumentObject,
 };
 
 use crate::types::{
@@ -32,7 +32,7 @@ pub enum TextIndexSnapshotData {
     /// Used because we don't want to delete / recreate index metadata
     /// unintentionally when changing versions and rolling services
     /// backwards/forwards.
-    Unknown(ConvexObject),
+    Unknown(DocumentObject),
 }
 
 impl From<FragmentedTextSegment> for pb::searchlight::FragmentedTextSegment {
@@ -102,7 +102,7 @@ mod proptest {
             RestrictNaNs,
             ValueBranching,
         },
-        ConvexObject,
+        DocumentObject,
         FieldType,
     };
 
@@ -118,7 +118,7 @@ mod proptest {
         fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
             prop_oneof![
                 any::<Vec<FragmentedTextSegment>>().prop_map(TextIndexSnapshotData::MultiSegment),
-                any_with::<ConvexObject>((
+                any_with::<DocumentObject>((
                     size_range(0..=4),
                     FieldType::User,
                     ValueBranching::default(),

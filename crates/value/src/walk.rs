@@ -8,9 +8,9 @@ use std::fmt::{
 use crate::{
     ConvexArray,
     ConvexBytes,
-    ConvexObject,
     ConvexString,
     ConvexValue,
+    DocumentObject,
     FieldName,
 };
 
@@ -92,7 +92,7 @@ impl ConvexValueWalker for ConvexValue {
     type Bytes = ConvexBytes;
     type Error = !;
     type FieldName = FieldName;
-    type Object = ConvexObject;
+    type Object = DocumentObject;
     type String = ConvexString;
 
     fn walk(self) -> Result<ConvexValueType<Self>, !> {
@@ -114,7 +114,7 @@ impl<'a> ConvexValueWalker for &'a ConvexValue {
     type Bytes = &'a ConvexBytes;
     type Error = !;
     type FieldName = &'a FieldName;
-    type Object = &'a ConvexObject;
+    type Object = &'a DocumentObject;
     type String = &'a ConvexString;
 
     fn walk(self) -> Result<ConvexValueType<Self>, !> {
@@ -197,7 +197,7 @@ impl<'a> ConvexArrayWalker for &'a ConvexArray {
     }
 }
 
-impl ConvexObjectWalker for ConvexObject {
+impl ConvexObjectWalker for DocumentObject {
     type Error = !;
     type Walker = ConvexValue;
 
@@ -206,7 +206,7 @@ impl ConvexObjectWalker for ConvexObject {
     }
 }
 
-impl<'a> ConvexObjectWalker for &'a ConvexObject {
+impl<'a> ConvexObjectWalker for &'a DocumentObject {
     type Error = !;
     type Walker = &'a ConvexValue;
 
@@ -216,7 +216,7 @@ impl<'a> ConvexObjectWalker for &'a ConvexObject {
 }
 
 // This impl is useful for callers that already know the concrete type of their
-// ConvexValue (e.g. when holding a `&'a ConvexObject`)
+// ConvexValue (e.g. when holding a `&'a DocumentObject`)
 impl<V: ConvexValueWalker> ConvexValueWalker for ConvexValueType<V> {
     type Array = V::Array;
     type Bytes = V::Bytes;
@@ -244,7 +244,7 @@ impl<'a> ConvexValueWalker for &'a str {
     type Bytes = ConvexBytes;
     type Error = !;
     type FieldName = FieldName;
-    type Object = ConvexObject;
+    type Object = DocumentObject;
     type String = &'a str;
 
     fn walk(self) -> Result<ConvexValueType<Self>, !> {
@@ -257,7 +257,7 @@ impl ConvexValueWalker for ! {
     type Bytes = &'static [u8];
     type Error = !;
     type FieldName = &'static str;
-    type Object = &'static ConvexObject;
+    type Object = &'static DocumentObject;
     type String = &'static str;
 
     fn walk(self) -> Result<ConvexValueType<Self>, Self::Error> {
@@ -270,7 +270,7 @@ impl ConvexValueWalker for i64 {
     type Bytes = &'static [u8];
     type Error = !;
     type FieldName = &'static str;
-    type Object = &'static ConvexObject;
+    type Object = &'static DocumentObject;
     type String = &'static str;
 
     fn walk(self) -> Result<ConvexValueType<Self>, Self::Error> {
@@ -283,7 +283,7 @@ impl ConvexValueWalker for f64 {
     type Bytes = &'static [u8];
     type Error = !;
     type FieldName = &'static str;
-    type Object = &'static ConvexObject;
+    type Object = &'static DocumentObject;
     type String = &'static str;
 
     fn walk(self) -> Result<ConvexValueType<Self>, Self::Error> {

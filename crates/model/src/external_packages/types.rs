@@ -5,11 +5,11 @@ use common::types::{
     ObjectKey,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     obj,
     sha256::Sha256Digest,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
 };
 
 use crate::source_packages::types::PackageSize;
@@ -25,15 +25,15 @@ pub struct ExternalDepsPackage {
 
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalDepsPackageId(DeveloperDocumentId);
+pub struct ExternalDepsPackageId(PublicDocumentId);
 
-impl From<DeveloperDocumentId> for ExternalDepsPackageId {
-    fn from(id: DeveloperDocumentId) -> Self {
+impl From<PublicDocumentId> for ExternalDepsPackageId {
+    fn from(id: PublicDocumentId) -> Self {
         Self(id)
     }
 }
 
-impl From<ExternalDepsPackageId> for DeveloperDocumentId {
+impl From<ExternalDepsPackageId> for PublicDocumentId {
     fn from(value: ExternalDepsPackageId) -> Self {
         value.0
     }
@@ -49,15 +49,15 @@ impl TryFrom<ConvexValue> for ExternalDepsPackageId {
     type Error = anyhow::Error;
 
     fn try_from(value: ConvexValue) -> Result<Self, Self::Error> {
-        let id: DeveloperDocumentId = value.try_into()?;
+        let id: PublicDocumentId = value.try_into()?;
         Ok(Self(id))
     }
 }
 
-impl TryFrom<ConvexObject> for ExternalDepsPackage {
+impl TryFrom<DocumentObject> for ExternalDepsPackage {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> Result<Self, Self::Error> {
         let mut fields = BTreeMap::from(value);
 
         let storage_key = match fields.remove("storageKey") {
@@ -91,7 +91,7 @@ impl TryFrom<ConvexObject> for ExternalDepsPackage {
     }
 }
 
-impl TryFrom<ExternalDepsPackage> for ConvexObject {
+impl TryFrom<ExternalDepsPackage> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(value: ExternalDepsPackage) -> Result<Self, Self::Error> {
@@ -116,7 +116,7 @@ mod tests {
     use cmd_util::env::env_config;
     use common::testing::assert_roundtrips;
     use proptest::prelude::*;
-    use value::ConvexObject;
+    use value::DocumentObject;
 
     use super::ExternalDepsPackage;
 
@@ -126,7 +126,7 @@ mod tests {
         )]
         #[test]
         fn test_external_package_roundtrip(v in any::<ExternalDepsPackage>()) {
-            assert_roundtrips::<ExternalDepsPackage, ConvexObject>(v);
+            assert_roundtrips::<ExternalDepsPackage, DocumentObject>(v);
         }
     }
 }

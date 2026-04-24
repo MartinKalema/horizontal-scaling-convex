@@ -63,7 +63,7 @@ use sync_types::{
 use usage_tracking::FunctionUsageTracker;
 use value::{
     export::ValueFormat,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
 };
 use vector::{
     VectorSearch,
@@ -334,7 +334,7 @@ pub async fn cancel_developer_job(
     }: ExtractActionIdentity,
     Json(CancelDeveloperJobRequest { id }): Json<CancelDeveloperJobRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    let virtual_doc_id = DeveloperDocumentId::from_str(&id).context(ErrorMetadata::bad_request(
+    let virtual_doc_id = PublicDocumentId::from_str(&id).context(ErrorMetadata::bad_request(
         "InvalidArgument",
         "Invalid scheduled function ID",
     ))?;

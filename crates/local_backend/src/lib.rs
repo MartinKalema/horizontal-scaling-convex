@@ -65,6 +65,7 @@ use function_runner::{
 use governor::Quota;
 use http_client::CachedHttpClient;
 use indexing::index_cache::SharedIndexCache;
+use keybroker::InstanceSecret;
 use model::{
     initialize_application_system_tables,
     virtual_system_mapping,
@@ -126,8 +127,11 @@ pub struct LocalAppState {
     pub site_origin: ConvexSite,
     // Name of the instance. (e.g. crazy-giraffe-123)
     pub instance_name: String,
+    pub instance_secret: InstanceSecret,
     pub application: Application<ProdRuntime>,
     pub zombify_rx: async_broadcast::Receiver<()>,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub node_addresses: Option<database::two_phase::NodeAddresses>,
     /// Raft partition mailbox for receiving Raft messages from peers.
     /// None if Raft is not enabled.
     pub raft_mailbox_tx:
@@ -354,6 +358,12 @@ pub async fn make_app(
 
     let origin = config.convex_origin_url()?;
     let instance_name = config.name();
+    let instance_secret = config.secret()?;
+    let partition_id = config.partition_id.map(database::partition::PartitionId);
+    let node_addresses = config
+        .node_addresses
+        .as_deref()
+        .map(database::two_phase::NodeAddresses::from_config);
 
     if !config.disable_beacon {
         let beacon_future = beacon::start_beacon(
@@ -505,7 +515,21 @@ pub async fn make_app(
         let (peer_senders, transport_clients) =
             raft_transport::create_transport(&peer_addresses, raft_node_id);
 
-        let mut manager = RaftPartitionManager::new(raft_config, raft_engine, peer_senders)?;
+        let snapshot_provider = {
+            let database = database.clone();
+            Arc::new(move || {
+                common::runtime::block_in_place(|| {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async { database.build_raft_snapshot_bytes().await })
+                })
+            }) as Arc<dyn database::raft_storage::RaftSnapshotProvider>
+        };
+        let mut manager = RaftPartitionManager::new(
+            raft_config,
+            raft_engine,
+            peer_senders,
+            Some(snapshot_provider),
+        )?;
         let raft_state = manager.state();
         let mb_tx = manager.mailbox_tx();
         raft_mailbox_tx = Some(mb_tx);
@@ -519,36 +543,50 @@ pub async fn make_app(
             let committer = database.committer_client();
             let raft_state_for_apply = raft_state.clone();
             runtime.spawn_background("raft_node", async move {
-                node.run(|data| {
-                    // Deserialize the CommitDelta from the Raft entry.
-                    let envelope: database::nats_distributed_log::DeltaEnvelope =
-                        serde_json::from_slice(data).map_err(|e| {
-                            anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
-                        })?;
-                    let delta = envelope.to_delta()?;
+                node.run(
+                    |data| {
+                        // Deserialize the CommitDelta from the Raft entry.
+                        let envelope: database::nats_distributed_log::DeltaEnvelope =
+                            serde_json::from_slice(data).map_err(|e| {
+                                anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
+                            })?;
+                        let delta = envelope.to_delta()?;
 
-                    // Leader already applied locally — skip.
-                    // Followers apply via the Committer (same path as NATS).
-                    if !raft_state_for_apply.is_leader() {
-                        tracing::info!(
-                            "Raft follower applying committed delta: ts={}",
-                            u64::from(delta.ts),
-                        );
-                        // apply_replica_delta is async — use block_in_place
-                        // since we're in the Raft loop's sync callback.
+                        // Leader already applied locally — skip.
+                        // Followers apply via the Committer (same path as NATS).
+                        if !raft_state_for_apply.is_leader() {
+                            tracing::info!(
+                                "Raft follower applying committed delta: ts={}",
+                                u64::from(delta.ts),
+                            );
+                            // apply_replica_delta is async — use block_in_place
+                            // since we're in the Raft loop's sync callback.
+                            let committer = committer.clone();
+                            common::runtime::block_in_place(|| {
+                                let rt = tokio::runtime::Handle::current();
+                                rt.block_on(async {
+                                    if let Err(e) = committer.apply_replica_delta(delta).await {
+                                        tracing::error!("Raft follower apply failed: {e:#}");
+                                    }
+                                })
+                            });
+                        }
+
+                        Ok(())
+                    },
+                    |snapshot_bytes| {
+                        let checkpoint =
+                            database::snapshot_checkpointer::checkpoint_from_bytes(snapshot_bytes)?;
                         let committer = committer.clone();
                         common::runtime::block_in_place(|| {
                             let rt = tokio::runtime::Handle::current();
                             rt.block_on(async {
-                                if let Err(e) = committer.apply_replica_delta(delta).await {
-                                    tracing::error!("Raft follower apply failed: {e:#}");
-                                }
+                                committer.install_snapshot(checkpoint).await?;
+                                Ok::<_, anyhow::Error>(())
                             })
-                        });
-                    }
-
-                    Ok(())
-                })
+                        })
+                    },
+                )
                 .await;
             });
         }
@@ -572,8 +610,11 @@ pub async fn make_app(
         origin,
         site_origin: config.convex_site_url()?,
         instance_name,
+        instance_secret,
         application,
         zombify_rx,
+        partition_id,
+        node_addresses,
         raft_mailbox_tx,
     };
 

@@ -11,8 +11,8 @@ use common::{
 use pb::storage::FileStorageEntry as FileStorageEntryProto;
 use value::{
     sha256::Sha256Digest,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
 };
 
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
@@ -26,7 +26,7 @@ pub struct FileStorageEntry {
     pub content_type: Option<String>, // Optional ContentType header saved with file
 }
 
-impl TryFrom<FileStorageEntry> for ConvexObject {
+impl TryFrom<FileStorageEntry> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(
@@ -52,10 +52,10 @@ impl TryFrom<FileStorageEntry> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for FileStorageEntry {
+impl TryFrom<DocumentObject> for FileStorageEntry {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> Result<Self, Self::Error> {
         let mut object_fields: BTreeMap<_, _> = value.into();
         let storage_id = match object_fields.remove("storageId") {
             Some(v) => v.try_into()?,
@@ -130,7 +130,7 @@ mod tests {
     use common::testing::assert_roundtrips;
     use pb::storage::FileStorageEntry as FileStorageEntryProto;
     use proptest::prelude::*;
-    use value::ConvexObject;
+    use value::DocumentObject;
 
     use super::FileStorageEntry;
 
@@ -141,7 +141,7 @@ mod tests {
 
         #[test]
         fn test_storage_entry_roundtrip(v in any::<FileStorageEntry>()) {
-            assert_roundtrips::<FileStorageEntry, ConvexObject>(v);
+            assert_roundtrips::<FileStorageEntry, DocumentObject>(v);
         }
 
         #[test]

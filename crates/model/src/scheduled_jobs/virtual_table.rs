@@ -26,8 +26,8 @@ use semver::Version;
 use sync_types::CanonicalizedUdfPath;
 use value::{
     ConvexArray,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
     ResolvedDocumentId,
     TableMapping,
@@ -103,7 +103,7 @@ impl VirtualSystemDocMapper for ScheduledJobsDocMapper {
                 None => None,
             },
         };
-        let mut public_job_resolved: ConvexObject = public_job.try_into()?;
+        let mut public_job_resolved: DocumentObject = public_job.try_into()?;
 
         let virtual_developer_id =
             virtual_system_mapping.system_resolved_id_to_virtual_developer_id(doc.id())?;
@@ -135,7 +135,7 @@ pub struct PublicScheduledJob {
     pub completed_time: Option<f64>,
 }
 
-impl TryFrom<PublicScheduledJob> for ConvexObject {
+impl TryFrom<PublicScheduledJob> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(job: PublicScheduledJob) -> anyhow::Result<Self> {
@@ -147,7 +147,7 @@ impl TryFrom<PublicScheduledJob> for ConvexObject {
         obj.insert("args".parse()?, ConvexValue::Array(job.args));
 
         // Rename `type` -> `kind` in the scheduled job state
-        let system_state: ConvexObject = job.state.try_into()?;
+        let system_state: DocumentObject = job.state.try_into()?;
         let mut fields: BTreeMap<_, _> = system_state.into();
         match fields.remove("type") {
             Some(value) => fields.insert(FieldName::from_str("kind")?, value),
@@ -166,14 +166,14 @@ impl TryFrom<PublicScheduledJob> for ConvexObject {
                 ConvexValue::Float64(completed_time),
             );
         }
-        ConvexObject::try_from(obj)
+        DocumentObject::try_from(obj)
     }
 }
 
-impl TryFrom<ConvexObject> for PublicScheduledJob {
+impl TryFrom<DocumentObject> for PublicScheduledJob {
     type Error = anyhow::Error;
 
-    fn try_from(obj: ConvexObject) -> anyhow::Result<Self> {
+    fn try_from(obj: DocumentObject) -> anyhow::Result<Self> {
         let mut fields = BTreeMap::from(obj);
         let name = match fields.remove("name") {
             Some(ConvexValue::String(name)) => String::from(name).parse()?,
@@ -199,7 +199,7 @@ impl TryFrom<ConvexObject> for PublicScheduledJob {
             Some(value) => state_fields.insert(FieldName::from_str("type")?, value),
             None => anyhow::bail!("Missing `kind` field in ScheduledJobState"),
         };
-        let system_state = ConvexObject::try_from(state_fields)?;
+        let system_state = DocumentObject::try_from(state_fields)?;
         let state = system_state.try_into()?;
         let scheduled_time = match fields.remove("scheduledTime") {
             Some(ConvexValue::Float64(scheduled_time)) => scheduled_time,
@@ -231,7 +231,7 @@ mod tests {
     use proptest::prelude::*;
     use value::{
         testing::assert_roundtrips,
-        ConvexObject,
+        DocumentObject,
     };
 
     use crate::scheduled_jobs::virtual_table::PublicScheduledJob;
@@ -242,7 +242,7 @@ mod tests {
         )]
         #[test]
         fn test_public_scheduled_job_roundtrips(v in any::<PublicScheduledJob>()) {
-            assert_roundtrips::<PublicScheduledJob, ConvexObject>(v);
+            assert_roundtrips::<PublicScheduledJob, DocumentObject>(v);
         }
     }
 }

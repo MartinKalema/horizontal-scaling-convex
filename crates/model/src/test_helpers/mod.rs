@@ -82,7 +82,7 @@ impl<RT: Runtime> DatabaseExt for Database<RT> {
         let parent_component_id = match parent {
             TableNamespace::Global => {
                 if let Some(component) = BootstrapComponentsModel::new(&mut tx).root_component()? {
-                    component.id().developer_id
+                    component.id().document_id
                 } else {
                     // Initialize the root component too
                     let root_definition_id = SystemMetadataModel::new_global(&mut tx)
@@ -102,14 +102,14 @@ impl<RT: Runtime> DatabaseExt for Database<RT> {
                         .insert(
                             &COMPONENTS_TABLE,
                             ComponentMetadata {
-                                definition_id: root_definition_id.developer_id,
+                                definition_id: root_definition_id.document_id,
                                 component_type: ComponentType::App,
                                 state: ComponentState::Active,
                             }
                             .try_into()?,
                         )
                         .await?;
-                    root_component.developer_id
+                    root_component.document_id
                 }
             },
             TableNamespace::ByComponent(id) => id,
@@ -139,7 +139,7 @@ impl<RT: Runtime> DatabaseExt for Database<RT> {
                 &COMPONENTS_TABLE,
                 component_id.internal_id(),
                 ComponentMetadata {
-                    definition_id: definition_id.developer_id,
+                    definition_id: definition_id.document_id,
                     component_type: ComponentType::ChildComponent {
                         parent: parent_component_id,
                         name: name.parse()?,

@@ -153,9 +153,9 @@ use udf::{
 };
 use usage_tracking::FunctionUsageStats;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     serialized_args_ext::SerializedArgsExt,
-    ConvexObject,
+    DocumentObject,
     TableName,
     TableNamespace,
 };
@@ -464,7 +464,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn mutation(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<ConvexValue> {
         self.mutation_with_identity(udf_path, args, Identity::system())
             .await
@@ -473,7 +473,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn mutation_js_error(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<JsError> {
         let outcome: UdfOutcome = self
             .raw_mutation(
@@ -488,7 +488,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn mutation_log_lines(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<LogLines> {
         let (_, outcome) = self
             .mutation_outcome(udf_path, args, Identity::system())
@@ -499,7 +499,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn mutation_with_identity(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
         identity: Identity,
     ) -> anyhow::Result<ConvexValue> {
         let (v, _) = self.mutation_outcome(udf_path, args, identity).await?;
@@ -509,7 +509,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn mutation_outcome(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
         identity: Identity,
     ) -> anyhow::Result<(ConvexValue, UdfOutcome)> {
         let outcome = self
@@ -599,7 +599,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
         Ok(outcome)
     }
 
-    pub async fn query(&self, udf_path: &str, args: ConvexObject) -> anyhow::Result<ConvexValue> {
+    pub async fn query(&self, udf_path: &str, args: DocumentObject) -> anyhow::Result<ConvexValue> {
         self.query_with_identity(udf_path, args, Identity::system())
             .await
     }
@@ -607,7 +607,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn query_js_error(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<JsError> {
         let (outcome, _) = self
             .raw_query(
@@ -623,7 +623,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn query_log_lines(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<LogLines> {
         let (_, outcome) = self
             .query_outcome(udf_path, args, Identity::system())
@@ -634,7 +634,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn query_with_identity(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
         identity: Identity,
     ) -> anyhow::Result<ConvexValue> {
         let (v, _) = self.query_outcome(udf_path, args, identity).await?;
@@ -645,7 +645,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn query_outcome(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
         identity: Identity,
     ) -> anyhow::Result<(ConvexValue, UdfOutcome)> {
         let (outcome, _) = self
@@ -736,7 +736,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn query_js_error_no_validation(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<JsError> {
         let mut tx = self.database.begin(Identity::system()).await?;
         let udf_config = UdfConfigModel::new(&mut tx, TableNamespace::test_user())
@@ -971,7 +971,11 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
         Ok((outcome.result, log_lines.into()))
     }
 
-    pub async fn action(&self, udf_path: &str, args: ConvexObject) -> anyhow::Result<ConvexValue> {
+    pub async fn action(
+        &self,
+        udf_path: &str,
+        args: DocumentObject,
+    ) -> anyhow::Result<ConvexValue> {
         self.action_with_identity(udf_path, args, Identity::system())
             .await
     }
@@ -979,7 +983,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn action_js_error(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<JsError> {
         let (outcome, _log_lines) = self
             .raw_action(
@@ -994,7 +998,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn action_log_lines(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<LogLines> {
         let (_value, _outcome, log_lines) = self
             .action_outcome_and_log_lines(udf_path, args, Identity::system())
@@ -1005,7 +1009,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn action_with_identity(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
         identity: Identity,
     ) -> anyhow::Result<ConvexValue> {
         let (v, _) = self.action_outcome(udf_path, args, identity).await?;
@@ -1015,7 +1019,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn action_outcome(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
         identity: Identity,
     ) -> anyhow::Result<(ConvexValue, ActionOutcome)> {
         let (value, outcome, _) = self
@@ -1027,7 +1031,7 @@ impl<RT: Runtime, P: Persistence> UdfTest<RT, P> {
     pub async fn action_outcome_and_log_lines(
         &self,
         udf_path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
         identity: Identity,
     ) -> anyhow::Result<(ConvexValue, ActionOutcome, LogLines)> {
         let (outcome, log_lines) = self
@@ -1298,7 +1302,7 @@ impl<RT: Runtime, P: Persistence> ActionCallbacks for UdfTest<RT, P> {
         identity: Identity,
         component: ComponentId,
         entry: FileStorageEntry,
-    ) -> anyhow::Result<(ComponentPath, DeveloperDocumentId)> {
+    ) -> anyhow::Result<(ComponentPath, PublicDocumentId)> {
         let mut tx = self.database.begin(identity).await?;
         let id = self
             .file_storage
@@ -1330,7 +1334,7 @@ impl<RT: Runtime, P: Persistence> ActionCallbacks for UdfTest<RT, P> {
         udf_args: SerializedArgs,
         scheduled_ts: UnixTimestamp,
         context: ExecutionContext,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let mut tx: database::Transaction<RT> = self.database.begin(identity).await?;
         let (scheduled_path, udf_args) = validate_schedule_args(
             scheduled_path,
@@ -1354,7 +1358,7 @@ impl<RT: Runtime, P: Persistence> ActionCallbacks for UdfTest<RT, P> {
     async fn cancel_job(
         &self,
         identity: Identity,
-        virtual_id: DeveloperDocumentId,
+        virtual_id: PublicDocumentId,
     ) -> anyhow::Result<()> {
         let mut tx = self.database.begin(identity).await?;
         VirtualSchedulerModel::new(&mut tx, ComponentId::test_user().into())

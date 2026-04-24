@@ -57,7 +57,7 @@ use udf::EvaluateAppDefinitionsResult;
 use value::{
     base64,
     identifier::Identifier,
-    ConvexObject,
+    DocumentObject,
     FieldName,
     NamespacedTableMapping,
 };
@@ -434,7 +434,7 @@ impl ComponentInitializerEvaluator {
                 };
                 args_obj.insert(FieldName::from_str(&arg_name)?, value);
             }
-            let args_obj = ConvexObject::try_from(args_obj)?;
+            let args_obj = DocumentObject::try_from(args_obj)?;
             let args_str = args_obj.json_serialize()?;
             let args_v8_str =
                 v8::String::new(&scope, &args_str).context("Failed to create string for args")?;
@@ -451,7 +451,7 @@ impl ComponentInitializerEvaluator {
                 })?;
             let result_str = helpers::to_rust_string(&scope, &v8_result)?;
             let result_json: JsonValue = serde_json::from_str(&result_str)?;
-            let result_obj = ConvexObject::try_from(result_json)?;
+            let result_obj = DocumentObject::try_from(result_json)?;
 
             let mut result = BTreeMap::new();
             for (arg_name, value) in BTreeMap::from(result_obj) {

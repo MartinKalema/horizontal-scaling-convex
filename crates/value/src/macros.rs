@@ -200,14 +200,14 @@ macro_rules! val {
     };
 
     ({}) => {
-        $crate::ConvexValue::Object($crate::ConvexObject::empty())
+        $crate::ConvexValue::Object($crate::DocumentObject::empty())
     };
 
     ({ $($tt:tt)+ }) => {
         $crate::ConvexValue::Object({
             let mut object = std::collections::BTreeMap::new();
             val!(@object object () ($($tt)+) ($($tt)+));
-            $crate::ConvexObject::try_from(object)?
+            $crate::DocumentObject::try_from(object)?
         })
     };
 
@@ -243,12 +243,12 @@ macro_rules! val_expect_expr_comma {
 /// object.
 macro_rules! obj {
     () => ({
-        anyhow::Ok($crate::ConvexObject::empty())
+        anyhow::Ok($crate::DocumentObject::empty())
     });
     ( $($tt:tt)+ ) => ({
         let mut object = std::collections::BTreeMap::new();
         val!(@object object () ($($tt)+) ($($tt)+));
-        $crate::ConvexObject::try_from(object)
+        $crate::DocumentObject::try_from(object)
     });
 }
 
@@ -266,7 +266,7 @@ macro_rules! assert_val {
 #[macro_export(local_inner_macros)]
 macro_rules! assert_obj {
     () => ({
-        $crate::ConvexObject::empty()
+        $crate::DocumentObject::empty()
     });
     ( $($tt:tt)+ ) => ({
         try bikeshed anyhow::Result<_> {

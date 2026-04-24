@@ -149,7 +149,7 @@ use udf::{
 };
 use usage_tracking::FunctionUsageStats;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     identifier::Identifier,
 };
 use vector::PublicVectorSearchQueryResult;
@@ -283,7 +283,7 @@ pub trait ActionCallbacks: Send + Sync {
         identity: Identity,
         component: ComponentId,
         entry: FileStorageEntry,
-    ) -> anyhow::Result<(ComponentPath, DeveloperDocumentId)>;
+    ) -> anyhow::Result<(ComponentPath, PublicDocumentId)>;
 
     // Scheduler
     async fn schedule_job(
@@ -294,12 +294,12 @@ pub trait ActionCallbacks: Send + Sync {
         udf_args: SerializedArgs,
         scheduled_ts: UnixTimestamp,
         context: ExecutionContext,
-    ) -> anyhow::Result<DeveloperDocumentId>;
+    ) -> anyhow::Result<PublicDocumentId>;
 
     async fn cancel_job(
         &self,
         identity: Identity,
-        virtual_id: DeveloperDocumentId,
+        virtual_id: PublicDocumentId,
     ) -> anyhow::Result<()>;
 
     // Vector Search

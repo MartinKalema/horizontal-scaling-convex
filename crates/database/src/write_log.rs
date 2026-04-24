@@ -317,6 +317,11 @@ impl WriteLogManager {
             self.log.by_ts.pop_front();
         }
     }
+
+    fn reset(&mut self, ts: Timestamp) {
+        self.log = WriteLog::new(ts);
+        self.notify_waiters();
+    }
 }
 
 /// WriteLog holds recent commits that have been written to persistence and
@@ -622,6 +627,10 @@ impl LogWriter {
     pub fn max_ts(&self) -> Timestamp {
         self.inner.lock().log.max_ts()
     }
+
+    pub fn reset(&mut self, ts: Timestamp) {
+        block_in_place(|| self.inner.lock().reset(ts));
+    }
 }
 
 /// Pending writes are used by the committer to detect conflicts between a new
@@ -660,6 +669,13 @@ impl PendingWrites {
             .iter()
             .next_back()
             .map(|(_, (_, _, snapshot))| snapshot.clone())
+    }
+
+    pub fn latest(&self) -> Option<(Timestamp, Snapshot)> {
+        self.by_ts
+            .iter()
+            .next_back()
+            .map(|(ts, (_, _, snapshot))| (*ts, snapshot.clone()))
     }
 
     /// Recomputes the snapshot associated with each pending write, rebasing the
@@ -1090,7 +1106,7 @@ mod tests {
 
         fn make_doc(
             &mut self,
-            obj: common::value::ConvexObject,
+            obj: common::value::DocumentObject,
         ) -> anyhow::Result<(ResolvedDocumentId, IndexKey, PackedDocument)> {
             let id = self.id_generator.user_generate(&"users".parse()?);
             let doc = ResolvedDocument::new(id, CreationTime::ONE, obj)?;

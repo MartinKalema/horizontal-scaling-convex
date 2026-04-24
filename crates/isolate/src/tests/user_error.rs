@@ -20,7 +20,7 @@ use model::{
 use must_let::must_let;
 use runtime::testing::TestRuntime;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     InternalId,
     TableName,
     TableNamespace,
@@ -152,7 +152,7 @@ async fn test_nonexistent_table(rt: TestRuntime) -> anyhow::Result<()> {
         let table_number = TableModel::new(&mut tx)
             .next_user_table_number(TableNamespace::test_user())
             .await?;
-        let nonexistent_id = DeveloperDocumentId::new(table_number, InternalId::MIN);
+        let nonexistent_id = PublicDocumentId::new(table_number, InternalId::MIN);
         t.mutation(
             "userError:nonexistentTable",
             assert_obj!("nonexistentId" => nonexistent_id),
@@ -187,19 +187,19 @@ async fn test_nonexistent_id(rt: TestRuntime) -> anyhow::Result<()> {
                 Some(table_number),
             ).await?
         );
-        let nonexistent_system_table_id = DeveloperDocumentId::new(table_number, InternalId::MIN);
+        let nonexistent_system_table_id = PublicDocumentId::new(table_number, InternalId::MIN);
 
         let virtual_table_number = tx
             .table_mapping()
             .namespace(TableNamespace::test_user())
             .name_to_id_user_input()(FILE_STORAGE_TABLE.clone())?.table_number;
-        let nonexistent_virtual_table_id = DeveloperDocumentId::new(
+        let nonexistent_virtual_table_id = PublicDocumentId::new(
             virtual_table_number, InternalId::MIN);
         let user_document = TestFacingModel::new(&mut tx)
             .insert_and_get("table".parse()?, assert_obj!())
             .await?;
-        let user_table_number = user_document.id().developer_id.table();
-        let nonexistent_user_table_id = DeveloperDocumentId::new(
+        let user_table_number = user_document.id().document_id.table();
+        let nonexistent_user_table_id = PublicDocumentId::new(
             user_table_number, InternalId::MIN);
         t.database.commit(tx).await?;
         t.mutation(

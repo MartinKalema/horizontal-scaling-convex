@@ -9,7 +9,7 @@ use keybroker::Identity;
 use model::environment_variables::EnvironmentVariablesModel;
 use must_let::must_let;
 use runtime::testing::TestRuntime;
-use value::ConvexObject;
+use value::DocumentObject;
 
 use crate::test_helpers::UdfTest;
 
@@ -36,9 +36,9 @@ async fn test_system_udf(rt: TestRuntime) -> anyhow::Result<()> {
         assert_obj!("name" => "A".to_string()),
     )
     .await?);
-    must_let!(let Some(ConvexValue::String(name)) = ConvexObject::get(&obj, "name"));
+    must_let!(let Some(ConvexValue::String(name)) = DocumentObject::get(&obj, "name"));
     assert_eq!(name.to_string(), "A");
-    must_let!(let Some(ConvexValue::String(value)) = ConvexObject::get(&obj, "value"));
+    must_let!(let Some(ConvexValue::String(value)) = DocumentObject::get(&obj, "value"));
     assert_eq!(value.to_string(), "B");
 
     // query a system environment variable
@@ -47,9 +47,9 @@ async fn test_system_udf(rt: TestRuntime) -> anyhow::Result<()> {
         assert_obj!("name" => "CONVEX_CLOUD_URL".to_string()),
     )
     .await?);
-    must_let!(let Some(ConvexValue::String(name)) = ConvexObject::get(&obj, "name"));
+    must_let!(let Some(ConvexValue::String(name)) = DocumentObject::get(&obj, "name"));
     assert_eq!(name.to_string(), "CONVEX_CLOUD_URL");
-    must_let!(let Some(ConvexValue::String(value)) = ConvexObject::get(&obj, "value"));
+    must_let!(let Some(ConvexValue::String(value)) = DocumentObject::get(&obj, "value"));
     assert_eq!(value.to_string(), "https://carnitas.convex.cloud");
 
     // calling with empty argument fails

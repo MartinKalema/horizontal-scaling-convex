@@ -44,8 +44,8 @@ use search::{
 use serde::Deserialize;
 use value::{
     assert_obj,
-    DeveloperDocumentId,
     InternalId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNumber,
     TabletId,
@@ -112,7 +112,7 @@ impl Dataset {
                 let internal_id = alloc_id();
                 let id = ResolvedDocumentId::new(
                     table_id.tablet_id,
-                    DeveloperDocumentId::new(table_id.table_number, internal_id),
+                    PublicDocumentId::new(table_id.table_number, internal_id),
                 );
                 let value = assert_obj!("body" => d.text);
                 let creation_time = CreationTime::try_from(1.)?;

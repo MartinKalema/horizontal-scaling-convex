@@ -49,8 +49,8 @@ use serde::{
 use strum::AsRefStr;
 use sync_types::CanonicalizedModulePath;
 use value::{
-    DeveloperDocumentId,
     InternalDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNamespace,
 };
@@ -109,8 +109,8 @@ impl<'a, RT: Runtime> ComponentDefinitionConfigModel<'a, RT> {
         >,
     ) -> anyhow::Result<(
         BTreeMap<ComponentDefinitionPath, ComponentDefinitionDiff>,
-        BTreeMap<DeveloperDocumentId, NewModules>,
-        BTreeMap<DeveloperDocumentId, UdfConfig>,
+        BTreeMap<PublicDocumentId, NewModules>,
+        BTreeMap<PublicDocumentId, UdfConfig>,
     )> {
         let mut definition_diffs = BTreeMap::new();
 
@@ -196,7 +196,7 @@ impl<'a, RT: Runtime> ComponentDefinitionConfigModel<'a, RT> {
     pub async fn create_component_definition(
         &mut self,
         definition: ComponentDefinitionMetadata,
-    ) -> anyhow::Result<(DeveloperDocumentId, ComponentDefinitionDiff)> {
+    ) -> anyhow::Result<(PublicDocumentId, ComponentDefinitionDiff)> {
         let id = SystemMetadataModel::new_global(self.tx)
             .insert(&COMPONENT_DEFINITIONS_TABLE, definition.clone().try_into()?)
             .await?;
@@ -234,7 +234,7 @@ impl<'a, RT: Runtime> ComponentDefinitionConfigModel<'a, RT> {
 #[derive(Debug)]
 pub struct ComponentDefinitionDiff {}
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SerializedComponentDefinitionDiff {}
 
@@ -352,14 +352,14 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
     pub async fn initialize_component_namespace(
         &mut self,
         is_root: bool,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let internal_id = SystemMetadataModel::new_global(self.tx).allocate_internal_id()?;
         let table_id = self
             .tx
             .table_mapping()
             .namespace(TableNamespace::Global)
             .name_to_id()(COMPONENTS_TABLE.clone())?;
-        let id = DeveloperDocumentId::new(table_id.table_number, internal_id);
+        let id = PublicDocumentId::new(table_id.table_number, internal_id);
         let component_id = ComponentId::new(is_root, id);
 
         if matches!(component_id, ComponentId::Root) {
@@ -408,7 +408,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
                 let table_number = self.tx.table_mapping().tablet_number(id.table())?;
                 anyhow::Ok(ResolvedDocumentId::new(
                     id.table(),
-                    DeveloperDocumentId::new(table_number, id.internal_id()),
+                    PublicDocumentId::new(table_number, id.internal_id()),
                 ))
             })
             .transpose()
@@ -418,9 +418,9 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
     pub async fn apply_component_tree_diff(
         &mut self,
         app: &CheckedComponent,
-        udf_config_by_definition: BTreeMap<DeveloperDocumentId, UdfConfig>,
+        udf_config_by_definition: BTreeMap<PublicDocumentId, UdfConfig>,
         schema_change: &SchemaChange,
-        modules_by_definition: BTreeMap<DeveloperDocumentId, NewModules>,
+        modules_by_definition: BTreeMap<PublicDocumentId, NewModules>,
     ) -> anyhow::Result<BTreeMap<ComponentPath, ComponentDiff>> {
         let definition_id_by_path = BootstrapComponentsModel::new(self.tx)
             .load_all_definitions()
@@ -522,12 +522,12 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
     #[fastrace::trace]
     pub async fn create_component(
         &mut self,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         metadata: ComponentMetadata,
-        modules_by_definition: &BTreeMap<DeveloperDocumentId, NewModules>,
-        udf_config_by_definition: &BTreeMap<DeveloperDocumentId, UdfConfig>,
+        modules_by_definition: &BTreeMap<PublicDocumentId, NewModules>,
+        udf_config_by_definition: &BTreeMap<PublicDocumentId, UdfConfig>,
         schema_id: Option<ResolvedDocumentId>,
-    ) -> anyhow::Result<(DeveloperDocumentId, ComponentDiff)> {
+    ) -> anyhow::Result<(PublicDocumentId, ComponentDiff)> {
         let modules = modules_by_definition
             .get(&metadata.definition_id)
             .context("Missing modules for component definition")?;
@@ -538,7 +538,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
         let document_id = SystemMetadataModel::new_global(self.tx)
             .insert_with_internal_id(&COMPONENTS_TABLE, id.internal_id(), metadata.try_into()?)
             .await?;
-        anyhow::ensure!(DeveloperDocumentId::from(document_id) == id);
+        anyhow::ensure!(PublicDocumentId::from(document_id) == id);
         let component_id = ComponentId::new(is_root, id);
         let udf_config_diff = UdfConfigModel::new(self.tx, component_id.into())
             .set(udf_config.clone())
@@ -590,10 +590,10 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
         &mut self,
         existing: &ParsedDocument<ComponentMetadata>,
         new_metadata: ComponentMetadata,
-        modules_by_definition: &BTreeMap<DeveloperDocumentId, NewModules>,
-        udf_config_by_definition: &BTreeMap<DeveloperDocumentId, UdfConfig>,
+        modules_by_definition: &BTreeMap<PublicDocumentId, NewModules>,
+        udf_config_by_definition: &BTreeMap<PublicDocumentId, UdfConfig>,
         schema_id: Option<ResolvedDocumentId>,
-    ) -> anyhow::Result<(DeveloperDocumentId, ComponentDiff)> {
+    ) -> anyhow::Result<(PublicDocumentId, ComponentDiff)> {
         let component_id = if existing.parent_and_name().is_none() {
             ComponentId::Root
         } else {
@@ -662,7 +662,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
     async fn unmount_component(
         &mut self,
         existing: &ParsedDocument<ComponentMetadata>,
-    ) -> anyhow::Result<(DeveloperDocumentId, ComponentDiff)> {
+    ) -> anyhow::Result<(PublicDocumentId, ComponentDiff)> {
         let component_id = if existing.parent_and_name().is_none() {
             ComponentId::Root
         } else {
@@ -797,11 +797,11 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
 
 fn tree_diff_children<'a>(
     existing_components_by_parent: &'a BTreeMap<
-        Option<(DeveloperDocumentId, ComponentName)>,
+        Option<(PublicDocumentId, ComponentName)>,
         Arc<ParsedDocument<ComponentMetadata>>,
     >,
     new_node: Option<&'a CheckedComponent>,
-    internal_id: DeveloperDocumentId,
+    internal_id: PublicDocumentId,
 ) -> impl Iterator<Item = TreeDiffChild<'a>> {
     std::iter::from_coroutine(
         #[coroutine]
@@ -955,7 +955,7 @@ impl TryFrom<SerializedComponentDiff> for ComponentDiff {
 
 #[derive(Clone, Debug)]
 pub struct SchemaChange {
-    pub allocated_component_ids: BTreeMap<ComponentPath, DeveloperDocumentId>,
+    pub allocated_component_ids: BTreeMap<ComponentPath, PublicDocumentId>,
     pub schema_ids: BTreeMap<ComponentPath, Option<InternalDocumentId>>,
     pub index_diffs: BTreeMap<ComponentPath, AuditLogIndexDiff>,
 }

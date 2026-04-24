@@ -5,11 +5,11 @@ use std::{
 
 use common::document::ParsedDocument;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     obj,
     sha256::Sha256Digest,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
 };
 
@@ -74,7 +74,7 @@ impl AwsLambdaType {
         match self {
             Self::Static => {
                 let source_package_id = deployed_code
-                    .map(|source_package| DeveloperDocumentId::from(source_package.id()).into());
+                    .map(|source_package| PublicDocumentId::from(source_package.id()).into());
                 Ok(AwsLambdaPackageDesc::Static { source_package_id })
             },
             Self::Dynamic => {
@@ -116,7 +116,7 @@ impl AwsLambdaPackageDesc {
     }
 }
 
-impl TryFrom<AwsLambdaPackageDesc> for ConvexObject {
+impl TryFrom<AwsLambdaPackageDesc> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(value: AwsLambdaPackageDesc) -> Result<Self, Self::Error> {
@@ -145,10 +145,10 @@ impl TryFrom<AwsLambdaPackageDesc> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for AwsLambdaPackageDesc {
+impl TryFrom<DocumentObject> for AwsLambdaPackageDesc {
     type Error = anyhow::Error;
 
-    fn try_from(obj: ConvexObject) -> Result<Self, Self::Error> {
+    fn try_from(obj: DocumentObject) -> Result<Self, Self::Error> {
         let mut fields = BTreeMap::from(obj);
 
         let lambda_type: String = match fields.remove("type") {
@@ -182,7 +182,7 @@ impl TryFrom<ConvexObject> for AwsLambdaPackageDesc {
     }
 }
 
-impl TryFrom<AwsLambdaConfig> for ConvexObject {
+impl TryFrom<AwsLambdaConfig> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(
@@ -224,7 +224,7 @@ impl TryFrom<AwsLambdaConfig> for ConvexObject {
     }
 }
 
-impl TryFrom<AwsLambdaVersion> for ConvexObject {
+impl TryFrom<AwsLambdaVersion> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(
@@ -253,10 +253,10 @@ impl TryFrom<AwsLambdaVersion> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for AwsLambdaConfig {
+impl TryFrom<DocumentObject> for AwsLambdaConfig {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> Result<Self, Self::Error> {
         let mut object_fields: BTreeMap<_, _> = value.into();
         let env: anyhow::Result<_> = match object_fields.remove("env") {
             Some(ConvexValue::Object(env)) => env
@@ -322,10 +322,10 @@ impl TryFrom<ConvexObject> for AwsLambdaConfig {
     }
 }
 
-impl TryFrom<ConvexObject> for AwsLambdaVersion {
+impl TryFrom<DocumentObject> for AwsLambdaVersion {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> Result<Self, Self::Error> {
         let mut object_fields: BTreeMap<_, _> = value.into();
         let lambda_name = match object_fields.remove("lambdaName") {
             Some(ConvexValue::String(key)) => key.into(),
@@ -373,7 +373,7 @@ mod tests {
     use cmd_util::env::env_config;
     use common::testing::assert_roundtrips;
     use proptest::prelude::*;
-    use value::ConvexObject;
+    use value::DocumentObject;
 
     use super::{
         AwsLambdaConfig,
@@ -387,12 +387,12 @@ mod tests {
 
         #[test]
         fn test_actions_version_roundtrip(v in any::<AwsLambdaVersion>()) {
-            assert_roundtrips::<AwsLambdaVersion, ConvexObject>(v);
+            assert_roundtrips::<AwsLambdaVersion, DocumentObject>(v);
         }
 
         #[test]
         fn test_lambda_config_roundtrip(v in any::<AwsLambdaConfig>()) {
-            assert_roundtrips::<AwsLambdaConfig, ConvexObject>(v);
+            assert_roundtrips::<AwsLambdaConfig, DocumentObject>(v);
         }
     }
 }

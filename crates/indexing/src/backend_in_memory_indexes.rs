@@ -231,7 +231,7 @@ impl BackendInMemoryIndexes {
             .context("Missing meta index")?;
         let mut meta_index_map = DatabaseIndexMap::new_at(ts);
         for (ts, index_doc) in index_documents {
-            let index_key = IndexKey::new(vec![], index_doc.developer_id());
+            let index_key = IndexKey::new(vec![], index_doc.document_id());
             meta_index_map.insert(index_key.to_bytes(), ts, index_doc);
         }
 
@@ -1300,7 +1300,7 @@ mod cache_tests {
         assert_obj,
         val,
         values_to_bytes,
-        ConvexObject,
+        DocumentObject,
     };
 
     use super::DatabaseIndexSnapshotCache;
@@ -1326,7 +1326,7 @@ mod cache_tests {
         fn make_doc(
             &mut self,
             fields: &[FieldPath],
-            obj: ConvexObject,
+            obj: DocumentObject,
         ) -> anyhow::Result<(IndexKeyBytes, PackedDocument)> {
             let id = self.id_generator.user_generate(&"users".parse()?);
             let doc = ResolvedDocument::new(id, CreationTime::ONE, obj)?;
@@ -1344,7 +1344,7 @@ mod cache_tests {
             index_id: IndexId,
             is_by_id: bool,
             fields: &[FieldPath],
-            obj: ConvexObject,
+            obj: DocumentObject,
             ts: Timestamp,
         ) -> anyhow::Result<(IndexKeyBytes, PackedDocument)> {
             let (key, doc) = self.make_doc(fields, obj)?;

@@ -15,10 +15,7 @@
 //!   - TiDB 1PC: https://pingcap.github.io/tidb-dev-guide/understand-tidb/1pc.html
 //!   - CockroachDB: https://www.cockroachlabs.com/blog/parallel-commits/
 
-use std::collections::{
-    BTreeMap,
-    BTreeSet,
-};
+use std::collections::BTreeMap;
 
 use anyhow::Context;
 use common::{
@@ -76,7 +73,11 @@ use value::{
 };
 
 use crate::{
-    partition::PartitionId,
+    partition::{
+        routed_partition_for_table,
+        PartitionId,
+        PartitionMap,
+    },
     reads::{
         IndexReads,
         ReadSet,
@@ -186,6 +187,7 @@ impl NodeAddresses {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParticipantTabletMetadata {
     pub tablet_id: TabletId,
+    pub namespace: TableNamespace,
     pub table_number: TableNumber,
     pub table_name: TableName,
 }
@@ -202,7 +204,10 @@ pub struct ParticipantTransaction {
 impl ParticipantTransaction {
     pub fn from_final_transaction(
         transaction: &FinalTransaction,
+        participant: PartitionId,
         write_indexes: &[usize],
+        partition_map: &PartitionMap,
+        write_source: &WriteSource,
     ) -> anyhow::Result<Self> {
         let selected_writes: Vec<_> = transaction
             .writes
@@ -211,22 +216,29 @@ impl ParticipantTransaction {
             .filter(|(index, _)| write_indexes.contains(index))
             .map(|(_, write)| write.clone())
             .collect();
-        let relevant_tablets: BTreeSet<_> = selected_writes
-            .iter()
-            .map(|write| write.id.tablet_id)
-            .collect();
+
+        let belongs_to_participant = |tablet_id: TabletId| -> bool {
+            let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) else {
+                return false;
+            };
+            match routed_partition_for_table(&table_name, partition_map, write_source) {
+                Some(owner) => owner == participant,
+                None => participant == partition_map.local_partition(),
+            }
+        };
+
         let indexed_reads = transaction
             .reads
             .read_set()
             .iter_indexed()
-            .filter(|(index_name, _)| relevant_tablets.contains(index_name.table()))
+            .filter(|(index_name, _)| belongs_to_participant(*index_name.table()))
             .map(|(index_name, reads)| (index_name.clone(), reads.clone()))
             .collect();
         let search_reads = transaction
             .reads
             .read_set()
             .iter_search()
-            .filter(|(index_name, _)| relevant_tablets.contains(index_name.table()))
+            .filter(|(index_name, _)| belongs_to_participant(*index_name.table()))
             .map(|(index_name, reads)| (index_name.clone(), reads.clone()))
             .collect();
         let reads = ReadSet::new(indexed_reads, search_reads);
@@ -238,10 +250,12 @@ impl ParticipantTransaction {
             }
             let table_name = transaction.table_mapping.tablet_name(tablet_id)?;
             let table_number = transaction.table_mapping.tablet_number(tablet_id)?;
+            let namespace = transaction.table_mapping.tablet_namespace(tablet_id)?;
             tablet_metadata.insert(
                 tablet_id,
                 ParticipantTabletMetadata {
                     tablet_id,
+                    namespace,
                     table_number,
                     table_name,
                 },
@@ -277,7 +291,7 @@ impl ParticipantTransaction {
             }
             table_mapping.insert_tablet(
                 metadata.tablet_id,
-                TableNamespace::Global,
+                metadata.namespace,
                 metadata.table_number,
                 metadata.table_name.clone(),
             );
@@ -320,16 +334,22 @@ impl TryFrom<TwoPcParticipantTransactionProto> for ParticipantTransaction {
             .map(
                 |TwoPcTabletMetadata {
                      tablet_id,
+                     component_id,
                      table_number,
                      table_name,
                  }| {
                     let tablet_id = tablet_id_from_bytes(tablet_id)?;
+                    let namespace = match component_id {
+                        Some(component_id) => TableNamespace::ByComponent(component_id.parse()?),
+                        None => TableNamespace::Global,
+                    };
                     let table_number = table_number.try_into()?;
                     let table_name = table_name.parse::<TableName>()?;
                     Ok((
                         tablet_id,
                         ParticipantTabletMetadata {
                             tablet_id,
+                            namespace,
                             table_number,
                             table_name,
                         },
@@ -491,6 +511,10 @@ impl TryFrom<ParticipantTransaction> for TwoPcParticipantTransactionProto {
                 .into_values()
                 .map(|metadata| TwoPcTabletMetadata {
                     tablet_id: tablet_id_to_bytes(metadata.tablet_id),
+                    component_id: match metadata.namespace {
+                        TableNamespace::Global => None,
+                        TableNamespace::ByComponent(component_id) => Some(component_id.encode()),
+                    },
                     table_number: u32::from(metadata.table_number),
                     table_name: metadata.table_name.to_string(),
                 })

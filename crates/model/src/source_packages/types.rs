@@ -17,7 +17,7 @@ use serde_bytes::ByteBuf;
 use value::{
     codegen_convex_serialization,
     heap_size::HeapSize,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     sha256::Sha256Digest,
     ConvexValue,
 };
@@ -175,7 +175,7 @@ codegen_convex_serialization!(PackageSize, SerializedPackageSize);
 
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Debug, Clone, PartialEq, Eq, Copy, PartialOrd, Ord, Hash)]
-pub struct SourcePackageId(DeveloperDocumentId);
+pub struct SourcePackageId(PublicDocumentId);
 
 impl HeapSize for SourcePackageId {
     fn heap_size(&self) -> usize {
@@ -183,15 +183,15 @@ impl HeapSize for SourcePackageId {
     }
 }
 
-impl From<DeveloperDocumentId> for SourcePackageId {
-    fn from(id: DeveloperDocumentId) -> Self {
+impl From<PublicDocumentId> for SourcePackageId {
+    fn from(id: PublicDocumentId) -> Self {
         Self(id)
     }
 }
 
 impl From<SourcePackageId> for ConvexValue {
     fn from(value: SourcePackageId) -> Self {
-        let id: DeveloperDocumentId = value.into();
+        let id: PublicDocumentId = value.into();
         id.into()
     }
 }
@@ -200,13 +200,13 @@ impl TryFrom<ConvexValue> for SourcePackageId {
     type Error = anyhow::Error;
 
     fn try_from(value: ConvexValue) -> Result<Self, Self::Error> {
-        let id: DeveloperDocumentId = value.try_into()?;
+        let id: PublicDocumentId = value.try_into()?;
         Ok(SourcePackageId(id))
     }
 }
 
-impl From<SourcePackageId> for DeveloperDocumentId {
-    fn from(id: SourcePackageId) -> DeveloperDocumentId {
+impl From<SourcePackageId> for PublicDocumentId {
+    fn from(id: SourcePackageId) -> PublicDocumentId {
         id.0
     }
 }
@@ -230,7 +230,7 @@ impl TryFrom<SourcePackage> for SerializedSourcePackage {
             sha256: ByteBuf::from(value.sha256.to_vec()),
             external_package_id: value
                 .external_deps_package_id
-                .map(|id| DeveloperDocumentId::from(id).encode()),
+                .map(|id| PublicDocumentId::from(id).encode()),
             package_size: Some(value.package_size.try_into()?),
             node_version: value.node_version.map(String::from),
         })
@@ -244,7 +244,7 @@ impl TryFrom<SerializedSourcePackage> for SourcePackage {
         let sha256 = value.sha256.into_vec().try_into()?;
         let external_package_id = match value.external_package_id {
             None => None,
-            Some(s) => Some(DeveloperDocumentId::decode(&s)?.into()),
+            Some(s) => Some(PublicDocumentId::decode(&s)?.into()),
         };
         let package_size: PackageSize = match value.package_size {
             Some(o) => o.try_into()?,
@@ -274,8 +274,8 @@ mod tests {
     use proptest::prelude::*;
     use value::{
         sha256::Sha256Digest,
-        ConvexObject,
-        DeveloperDocumentId,
+        DocumentObject,
+        PublicDocumentId,
     };
 
     use super::SourcePackage;
@@ -290,7 +290,7 @@ mod tests {
         )]
         #[test]
         fn test_source_package_roundtrip(v in any::<SourcePackage>()) {
-            assert_roundtrips::<SourcePackage, ConvexObject>(v);
+            assert_roundtrips::<SourcePackage, DocumentObject>(v);
         }
     }
 
@@ -310,7 +310,7 @@ mod tests {
                 sha256: Sha256Digest::from(*b"\xed\x65\x82\xb7\xa6\x39\xd8\xdf\xf1\x43\x67\xbb\x4e\x27\x5c\xe9\x93\xc0\xc7\xa2\x80\x52\x8b\x1a\xc5\x57\x15\x72\xae\x5d\x6d\x69"),
                 external_deps_package_id: Some(ExternalDepsPackageId::from(
                     "k423gp2tq6nsw6ngwhkw72c3z17fkb5t"
-                        .parse::<DeveloperDocumentId>()
+                        .parse::<PublicDocumentId>()
                         .unwrap()
                 )),
                 package_size: PackageSize {

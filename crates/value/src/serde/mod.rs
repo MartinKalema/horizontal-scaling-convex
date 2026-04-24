@@ -16,7 +16,7 @@ use serde::{
     Serialize,
 };
 
-use crate::ConvexObject;
+use crate::DocumentObject;
 
 pub trait ConvexSerializable: Sized {
     type Serialized: Serialize
@@ -31,10 +31,10 @@ macro_rules! codegen_convex_serialization {
         codegen_convex_serialization!($struct, $serialized_struct, test_cases = 256);
     };
     ($struct:ident, $serialized_struct:ident, test_cases = $test_cases:expr) => {
-        impl TryFrom<$struct> for value::ConvexObject {
+        impl TryFrom<$struct> for value::DocumentObject {
             type Error = anyhow::Error;
 
-            fn try_from(s: $struct) -> anyhow::Result<value::ConvexObject> {
+            fn try_from(s: $struct) -> anyhow::Result<value::DocumentObject> {
                 value::serde::to_object($serialized_struct::try_from(s)?)
             }
         }
@@ -43,14 +43,14 @@ macro_rules! codegen_convex_serialization {
             type Error = anyhow::Error;
 
             fn try_from(s: $struct) -> anyhow::Result<value::ConvexValue> {
-                Ok(value::ConvexObject::try_from(s)?.into())
+                Ok(value::DocumentObject::try_from(s)?.into())
             }
         }
 
-        impl TryFrom<value::ConvexObject> for $struct {
+        impl TryFrom<value::DocumentObject> for $struct {
             type Error = anyhow::Error;
 
-            fn try_from(s: value::ConvexObject) -> anyhow::Result<$struct> {
+            fn try_from(s: value::DocumentObject) -> anyhow::Result<$struct> {
                 let r = value::serde::from_object::<$serialized_struct>(s)?.try_into()?;
                 Ok(r)
             }
@@ -60,7 +60,7 @@ macro_rules! codegen_convex_serialization {
             type Error = anyhow::Error;
 
             fn try_from(s: value::ConvexValue) -> anyhow::Result<$struct> {
-                value::ConvexObject::try_from(s)?.try_into()
+                value::DocumentObject::try_from(s)?.try_into()
             }
         }
 
@@ -89,7 +89,7 @@ macro_rules! codegen_convex_serialization {
                     proptest::test_runner::TestRunner::new(config)
                         .run(&any::<S>(), |left| {
                             let right = S::try_from(
-                                value::ConvexObject::try_from(left.clone()).unwrap()
+                                value::DocumentObject::try_from(left.clone()).unwrap()
                             ).unwrap();
                             prop_assert_eq!(left, right);
                             Ok(())
@@ -102,7 +102,7 @@ macro_rules! codegen_convex_serialization {
 }
 
 /// For forwards compatibility on enums, it's often useful to preserve an
-/// unknown variant as a raw `ConvexObject`. To do so, wrap your enum in this
+/// unknown variant as a raw `DocumentObject`. To do so, wrap your enum in this
 /// struct:
 /// ```ignore,rust
 /// #[derive(Serialize, Deserialize)]
@@ -129,5 +129,5 @@ macro_rules! codegen_convex_serialization {
 #[serde(untagged)]
 pub enum WithUnknown<T> {
     Known(T),
-    Unknown(ConvexObject),
+    Unknown(DocumentObject),
 }

@@ -67,7 +67,7 @@ use tokio::io::{
 };
 use tokio_util::io::ReaderStream;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     TableName,
 };
 
@@ -81,7 +81,7 @@ pub struct ParsedImport {
     pub documents: Vec<(ComponentPath, TableName, ImportDocumentStream)>,
     pub storage_files: BoxStream<
         'static,
-        anyhow::Result<(ComponentPath, DeveloperDocumentId, ImportStorageFileStream)>,
+        anyhow::Result<(ComponentPath, PublicDocumentId, ImportStorageFileStream)>,
     >,
 }
 
@@ -373,7 +373,7 @@ fn parse_table_filename(
 fn parse_storage_filename(
     filename: &str,
     base_component_path: &ComponentPath,
-) -> anyhow::Result<Option<(ComponentPath, DeveloperDocumentId)>> {
+) -> anyhow::Result<Option<(ComponentPath, PublicDocumentId)>> {
     match STORAGE_FILE_PATTERN.captures(filename) {
         None => Ok(None),
         Some(captures) => {
@@ -384,7 +384,7 @@ fn parse_storage_filename(
             if storage_id_str == "documents" {
                 return Ok(None);
             }
-            let storage_id = DeveloperDocumentId::decode(storage_id_str).map_err(|e| {
+            let storage_id = PublicDocumentId::decode(storage_id_str).map_err(|e| {
                 ErrorMetadata::bad_request(
                     "InvalidStorageId",
                     format!("_storage id '{storage_id_str}' invalid: {e}"),
@@ -475,7 +475,7 @@ async fn parse_generated_schema<T: ShapeConfig>(
         let export_context = ExportContext::try_from(value.clone())
             .map_err(|e| ImportError::InvalidConvexValue(lineno, e))?;
         overrides.insert(
-            DeveloperDocumentId::decode(key)
+            PublicDocumentId::decode(key)
                 .map_err(|e| ImportError::InvalidConvexValue(lineno, e.into()))?,
             export_context,
         );

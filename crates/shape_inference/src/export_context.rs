@@ -28,9 +28,9 @@ use serde_json::{
     Value as JsonValue,
 };
 #[cfg(any(test, feature = "testing"))]
-use value::ConvexObject;
+use value::DocumentObject;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     ConvexValue,
     FieldName,
     IdentifierFieldName,
@@ -176,7 +176,7 @@ impl ExportContext {
 
     #[cfg(any(test, feature = "testing"))]
     pub fn of_object<C: ShapeConfig, S: ShapeCounter>(
-        object: &ConvexObject,
+        object: &DocumentObject,
         shape: &Shape<C, S>,
     ) -> ExportContext {
         let shape_options = btreeset!(shape);
@@ -185,7 +185,7 @@ impl ExportContext {
 
     #[cfg(any(test, feature = "testing"))]
     fn of_object_inner<C: ShapeConfig, S: ShapeCounter>(
-        fields: &ConvexObject,
+        fields: &DocumentObject,
         shape: &BTreeSet<&Shape<C, S>>,
     ) -> ExportContext {
         if !Self::is_ambiguous_inner(shape) {
@@ -1002,7 +1002,7 @@ pub enum GeneratedSchema<T: ShapeConfig> {
     /// zip exports.
     LegacyInferred {
         inferred_shape: StructuralShape<T>,
-        overrides: BTreeMap<DeveloperDocumentId, ExportContext>,
+        overrides: BTreeMap<PublicDocumentId, ExportContext>,
     },
     /// Indicates that values are encoded using a uniform encoding (i.e.
     /// [`value::export::ValueFormat::ConvexExportJSON`]).
@@ -1020,7 +1020,7 @@ impl<T: ShapeConfig> GeneratedSchema<T> {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub fn insert(&mut self, object: &ConvexObject, id: DeveloperDocumentId) {
+    pub fn insert(&mut self, object: &DocumentObject, id: PublicDocumentId) {
         match self {
             GeneratedSchema::LegacyInferred {
                 inferred_shape,
@@ -1060,7 +1060,7 @@ impl<T: ShapeConfig> GeneratedSchema<T> {
             }) => {
                 let export_context =
                     if let Some(JsonValue::String(id_str)) = exported_object.get("_id") {
-                        let id = DeveloperDocumentId::decode(id_str)?;
+                        let id = PublicDocumentId::decode(id_str)?;
                         overrides.remove(&id).unwrap_or(ExportContext::Infer)
                     } else {
                         ExportContext::Infer
@@ -1103,8 +1103,8 @@ mod test_generated_schema {
     use value::{
         assert_val,
         export::ValueFormat,
-        id_v6::DeveloperDocumentId,
-        ConvexObject,
+        id_v6::PublicDocumentId,
+        DocumentObject,
     };
 
     use crate::{
@@ -1119,7 +1119,7 @@ mod test_generated_schema {
         })]
         #[test]
         fn generated_schema_object_roundtrip(
-            objects in prop::collection::vec(any::<(ConvexObject, DeveloperDocumentId)>(), 1..3),
+            objects in prop::collection::vec(any::<(DocumentObject, PublicDocumentId)>(), 1..3),
         ) {
             let mut inferred_shape = CountedShape::<SmallTestConfig>::empty();
             let mut id_to_object = BTreeMap::new();

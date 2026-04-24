@@ -21,7 +21,7 @@ use model::{
     },
 };
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNamespace,
 };
@@ -66,7 +66,7 @@ impl<RT: Runtime> Application<RT> {
         let mut tx = self.begin(Identity::system()).await?;
 
         let id = tx.resolve_developer_id(
-            &DeveloperDocumentId::decode(id).map_err(|_| {
+            &PublicDocumentId::decode(id).map_err(|_| {
                 anyhow::anyhow!(ErrorMetadata::bad_request(
                     "InvalidLogStreamId",
                     "The log stream id is invalid"
@@ -85,7 +85,7 @@ impl<RT: Runtime> Application<RT> {
         let mut tx = self.begin(Identity::system()).await?;
 
         let id = tx.resolve_developer_id(
-            &DeveloperDocumentId::decode(id).map_err(|_| {
+            &PublicDocumentId::decode(id).map_err(|_| {
                 anyhow::anyhow!(ErrorMetadata::bad_request(
                     "InvalidLogStreamId",
                     "The log stream id is invalid"
@@ -116,7 +116,7 @@ impl<RT: Runtime> Application<RT> {
         let mut tx = self.begin(Identity::system()).await?;
 
         let id = tx.resolve_developer_id(
-            &DeveloperDocumentId::decode(id).map_err(|_| {
+            &PublicDocumentId::decode(id).map_err(|_| {
                 anyhow::anyhow!(ErrorMetadata::bad_request(
                     "InvalidLogStreamId",
                     "The log stream id is invalid"

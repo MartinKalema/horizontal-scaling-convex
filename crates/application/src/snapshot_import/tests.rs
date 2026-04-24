@@ -101,10 +101,10 @@ use usage_tracking::FunctionUsageTracker;
 use value::{
     assert_obj,
     assert_val,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     val,
     ConvexArray,
-    ConvexObject,
+    DocumentObject,
     FieldName,
     InternalId,
     TableName,
@@ -657,7 +657,7 @@ async fn import_referencing_virtual_table(rt: TestRuntime) -> anyhow::Result<()>
     let scheduled_functions = SCHEDULED_JOBS_VIRTUAL_TABLE.clone();
     let file_storage = FILE_STORAGE_VIRTUAL_TABLE.clone();
 
-    let storage_id: DeveloperDocumentId = "kg21pzwemsm55e1fnt2kcsvgjh6h6gtf".parse()?;
+    let storage_id: PublicDocumentId = "kg21pzwemsm55e1fnt2kcsvgjh6h6gtf".parse()?;
     {
         let mut tx = app.begin(identity.clone()).await?;
         let job_id = VirtualSchedulerModel::new(&mut tx, TableNamespace::Global)
@@ -1007,7 +1007,7 @@ async fn import_conflicting_table_numbers(rt: TestRuntime) -> anyhow::Result<()>
     let app = Application::new_for_tests(&rt).await?;
     let identity = new_admin_id();
 
-    let id_table10001 = DeveloperDocumentId::new(TableNumber::try_from(10001)?, InternalId::MAX);
+    let id_table10001 = PublicDocumentId::new(TableNumber::try_from(10001)?, InternalId::MAX);
 
     let test_cases = [
         // _tables has two conflicting table numbers
@@ -1118,7 +1118,7 @@ async fn import_table_number_conflict_race(
     let app = Application::new_for_tests(&rt).await?;
     let identity = new_admin_id();
 
-    let id_table10001 = DeveloperDocumentId::new(TableNumber::try_from(10001)?, InternalId::MAX);
+    let id_table10001 = PublicDocumentId::new(TableNumber::try_from(10001)?, InternalId::MAX);
 
     let test_case = make_zip(&[(
         "table1/documents.jsonl",
@@ -1352,7 +1352,7 @@ async fn test_import_counts_bandwidth(rt: TestRuntime) -> anyhow::Result<()> {
     let identity = new_admin_id();
 
     let storage_id = "kg21pzwemsm55e1fnt2kcsvgjh6h6gtf";
-    let storage_idv6 = DeveloperDocumentId::decode(storage_id)?;
+    let storage_idv6 = PublicDocumentId::decode(storage_id)?;
 
     // Calculate expected sizes
     let storage_file_bytes = b"foobarbaz";
@@ -1440,7 +1440,7 @@ async fn test_import_counts_bandwidth(rt: TestRuntime) -> anyhow::Result<()> {
 #[convex_macro::test_runtime]
 async fn test_import_file_storage_changing_table_number(rt: TestRuntime) -> anyhow::Result<()> {
     let app = Application::new_for_tests(&rt).await?;
-    let old_storage_id: DeveloperDocumentId = "4d9wy5r5x7rmjdjqnx45ct829fff4ar".parse()?;
+    let old_storage_id: PublicDocumentId = "4d9wy5r5x7rmjdjqnx45ct829fff4ar".parse()?;
     let import = ParsedImport {
         generated_schemas: vec![],
         documents: vec![(
@@ -1570,7 +1570,7 @@ async fn load_fields_as_maps<'a, RT: Runtime>(
         }
     }
 
-    let objects: Vec<ConvexObject> = docs.into_iter().map(|doc| doc.into_value().0).collect();
+    let objects: Vec<DocumentObject> = docs.into_iter().map(|doc| doc.into_value().0).collect();
 
     let mut fields_list: Vec<BTreeMap<&str, ConvexValue>> = Vec::default();
     for object in objects {

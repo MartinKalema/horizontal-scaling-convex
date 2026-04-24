@@ -28,7 +28,7 @@ use search::{
 };
 use tokio::task;
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     TableNamespace,
     TableNumber,
 };
@@ -248,7 +248,7 @@ impl SearchResultIterator {
 
         self.next_index += 1;
 
-        let id = DeveloperDocumentId::new(self.table_number, candidate.id);
+        let id = PublicDocumentId::new(self.table_number, candidate.id);
         let (document, existing_doc_ts) = UserFacingModel::new(tx, self.namespace)
             .get_with_ts(id, self.version.clone())
             .await?

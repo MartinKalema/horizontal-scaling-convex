@@ -29,13 +29,13 @@ pub async fn run_migration<RT: Runtime>(tx: &mut Transaction<RT>) -> anyhow::Res
         let crons = CronModel::new(tx, namespace.into()).list().await?;
         for cron in crons.values() {
             let next_run = CronNextRun {
-                cron_job_id: cron.id().developer_id,
+                cron_job_id: cron.id().document_id,
                 state: cron.state,
                 prev_ts: cron.prev_ts,
                 next_ts: cron.next_ts,
             };
             if let Some(existing_next_run) = CronModel::new(tx, namespace.into())
-                .next_run(cron.id().developer_id)
+                .next_run(cron.id().document_id)
                 .await?
                 .map(|next_run| next_run.into_value())
             {

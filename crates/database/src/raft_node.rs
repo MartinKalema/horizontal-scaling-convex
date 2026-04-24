@@ -25,6 +25,7 @@ use std::{
 use raft::{
     prelude::*,
     raw_node::RawNode,
+    SnapshotStatus,
     StateRole,
 };
 use slog::o;
@@ -140,12 +141,14 @@ impl RaftNode {
         engine: Arc<raft_engine::Engine>,
         mailbox: mpsc::UnboundedReceiver<RaftMessage>,
         peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
+        snapshot_provider: Option<Arc<dyn crate::raft_storage::RaftSnapshotProvider>>,
     ) -> anyhow::Result<Self> {
         let storage = ConvexRaftStorage::new(
             config.partition_id,
             engine,
             config.node_id,
             config.peers.clone(),
+            snapshot_provider,
         )?;
 
         // On restart, pick up where we left off (applied index from
@@ -185,7 +188,11 @@ impl RaftNode {
 
     /// Run the Raft loop. This is the main event loop following TiKV's pattern:
     /// tick → receive messages → propose → process ready → advance.
-    pub async fn run(&mut self, mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()>) {
+    pub async fn run(
+        &mut self,
+        mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()>,
+        mut on_snapshot: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) {
         let tick_interval = Duration::from_millis(100);
         let mut last_tick = Instant::now();
 
@@ -269,15 +276,27 @@ impl RaftNode {
                 // 1. Send messages to peers.
                 for msg in ready.take_messages() {
                     let to = msg.to;
+                    let is_snapshot = msg.get_msg_type() == MessageType::MsgSnapshot;
                     if let Some(sender) = self.peer_senders.get(&to) {
                         if sender.send(msg).is_err() {
                             tracing::warn!("Failed to send Raft message to node {to}");
+                            if is_snapshot {
+                                self.raw_node.report_snapshot(to, SnapshotStatus::Failure);
+                            }
+                        } else if is_snapshot {
+                            self.raw_node.report_snapshot(to, SnapshotStatus::Finish);
                         }
                     }
                 }
 
-                // 2. Snapshot transfer not yet implemented.
-                // Nodes that fall too far behind must re-bootstrap.
+                // 2. Persist and apply any incoming snapshot before appending entries.
+                if !ready.snapshot().is_empty() {
+                    if let Err(e) = self.storage.apply_snapshot(ready.snapshot()) {
+                        tracing::error!("Failed to persist snapshot: {e}");
+                    } else if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
+                        tracing::error!("Failed to apply snapshot to state machine: {e}");
+                    }
+                }
 
                 // 3+4. Persist log entries + hard state atomically.
                 // TiKV WriteBatch pattern: entries and hard state go in one
@@ -296,8 +315,15 @@ impl RaftNode {
                 // 5. Send persisted messages.
                 for msg in ready.take_persisted_messages() {
                     let to = msg.to;
+                    let is_snapshot = msg.get_msg_type() == MessageType::MsgSnapshot;
                     if let Some(sender) = self.peer_senders.get(&to) {
-                        let _ = sender.send(msg);
+                        if sender.send(msg).is_err() {
+                            if is_snapshot {
+                                self.raw_node.report_snapshot(to, SnapshotStatus::Failure);
+                            }
+                        } else if is_snapshot {
+                            self.raw_node.report_snapshot(to, SnapshotStatus::Finish);
+                        }
                     }
                 }
 
@@ -421,6 +447,9 @@ impl RaftNode {
             }
         }
 
+        if !ready.snapshot().is_empty() {
+            self.storage.apply_snapshot(ready.snapshot()).unwrap();
+        }
         self.storage.append_entries(ready.entries()).unwrap();
         if let Some(hs) = ready.hs() {
             self.storage.set_hardstate(hs).unwrap();
@@ -465,7 +494,7 @@ mod tests {
 
         let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
 
         // Tick enough times to trigger election.
         for _ in 0..20 {
@@ -488,7 +517,7 @@ mod tests {
 
         let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
 
         // Become leader first.
         for _ in 0..20 {
@@ -531,7 +560,7 @@ mod tests {
 
         let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
 
         let observed_leader_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let observed_leader_id_clone = observed_leader_id.clone();

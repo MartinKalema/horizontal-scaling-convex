@@ -29,7 +29,7 @@ use imbl::OrdMap;
 use value::{
     val,
     values_to_bytes,
-    DeveloperDocumentId,
+    PublicDocumentId,
     TableMapping,
     TableNamespace,
     TabletId,
@@ -51,7 +51,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComponentRegistry {
     components_tablet: TabletId,
-    components: OrdMap<DeveloperDocumentId, ParsedDocument<ComponentMetadata>>,
+    components: OrdMap<PublicDocumentId, ParsedDocument<ComponentMetadata>>,
 }
 
 impl ComponentRegistry {
@@ -66,7 +66,7 @@ impl ComponentRegistry {
             .tablet_id;
         let components: OrdMap<_, _> = component_docs
             .into_iter()
-            .map(|component| (component.developer_id(), component))
+            .map(|component| (component.document_id(), component))
             .collect();
         Ok(Self {
             components_tablet,
@@ -102,7 +102,7 @@ impl ComponentRegistry {
                 None => None,
                 Some(old_doc) => Some(old_doc.parse()?),
             };
-            anyhow::ensure!(self.components.get(&id.developer_id) == old_component.as_ref());
+            anyhow::ensure!(self.components.get(&id.document_id) == old_component.as_ref());
             let new_component = match new_doc {
                 None => None,
                 Some(new_doc) => Some(new_doc.parse()?),
@@ -232,7 +232,7 @@ impl ComponentRegistry {
 
     pub fn component_children(
         &self,
-        parent_id: DeveloperDocumentId,
+        parent_id: PublicDocumentId,
         reads: &mut TransactionReadSet,
     ) -> anyhow::Result<Vec<ParsedDocument<ComponentMetadata>>> {
         let interval =
@@ -262,7 +262,7 @@ impl ComponentRegistry {
 
     pub fn component_in_parent(
         &self,
-        parent_and_name: Option<(DeveloperDocumentId, ComponentName)>,
+        parent_and_name: Option<(PublicDocumentId, ComponentName)>,
         reads: &mut TransactionReadSet,
     ) -> anyhow::Result<Option<ParsedDocument<ComponentMetadata>>> {
         let interval = Interval::prefix(
@@ -300,7 +300,7 @@ impl ComponentRegistry {
 
     fn get_component(
         &self,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         reads: &mut TransactionReadSet,
     ) -> Option<&ParsedDocument<ComponentMetadata>> {
         let index_key = IndexKey::new(vec![], id).to_bytes().into();
@@ -328,10 +328,10 @@ impl Update<'_> {
         if let Some(update) = self.update {
             let components = &mut self.registry.components;
             if let Some(old_component) = update.old_component {
-                components.remove(&old_component.developer_id());
+                components.remove(&old_component.document_id());
             }
             if let Some(new_component) = update.new_component {
-                components.insert(new_component.developer_id(), new_component);
+                components.insert(new_component.document_id(), new_component);
             }
         }
     }

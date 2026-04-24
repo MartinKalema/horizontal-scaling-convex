@@ -12,8 +12,8 @@ use common::{
     },
     testing::assert_contains,
     value::{
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
     },
 };
 use must_let::must_let;
@@ -24,12 +24,12 @@ use crate::test_helpers::{
     UdfTestType,
 };
 
-fn get_f64(obj: &ConvexObject, key: &str) -> f64 {
+fn get_f64(obj: &DocumentObject, key: &str) -> f64 {
     must_let!(let Some(ConvexValue::Float64(v)) = obj.get(key));
     *v
 }
 
-fn get_obj<'a>(o: &'a ConvexObject, key: &str) -> &'a ConvexObject {
+fn get_obj<'a>(o: &'a DocumentObject, key: &str) -> &'a DocumentObject {
     must_let!(let Some(ConvexValue::Object(v)) = o.get(key));
     v
 }
@@ -45,7 +45,7 @@ impl ExpectedMetric {
         Self { used, remaining }
     }
 
-    fn assert_eq(&self, obj: &ConvexObject, field: &str) {
+    fn assert_eq(&self, obj: &DocumentObject, field: &str) {
         let v = get_obj(obj, field);
         assert_eq!(get_f64(v, "used"), self.used, "{field}.used");
         assert_eq!(get_f64(v, "remaining"), self.remaining, "{field}.remaining");
@@ -114,7 +114,7 @@ impl ExpectedHeadroom {
     }
 }
 
-fn assert_headroom(h: &ConvexObject, expected: &ExpectedHeadroom) {
+fn assert_headroom(h: &DocumentObject, expected: &ExpectedHeadroom) {
     expected.bytes_read.assert_eq(h, "bytesRead");
     expected.bytes_written.assert_eq(h, "bytesWritten");
     expected.documents_read.assert_eq(h, "documentsRead");

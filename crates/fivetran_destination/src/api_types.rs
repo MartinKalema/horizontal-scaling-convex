@@ -10,7 +10,7 @@ use chrono::{
 use common::{
     schemas::json::TableDefinitionJson,
     value::{
-        ConvexObject,
+        DocumentObject,
         FieldPath,
         IdentifierFieldName,
     },
@@ -128,7 +128,7 @@ pub struct BatchWriteRow {
     pub table: String,
     pub operation: BatchWriteOperation,
     #[serde(with = "common::value::json_object")]
-    pub row: ConvexObject,
+    pub row: DocumentObject,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

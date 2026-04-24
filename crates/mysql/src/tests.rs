@@ -30,8 +30,8 @@ use common::{
         Timestamp,
     },
     value::{
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
         Size,
     },
 };
@@ -257,7 +257,7 @@ async fn test_lease_preempt() -> anyhow::Result<()> {
     let doc_id = id_generator.user_generate(&table);
     id_generator.write_tables(p1.clone()).await?;
 
-    let doc = ResolvedDocument::new(doc_id, CreationTime::ONE, ConvexObject::empty())?;
+    let doc = ResolvedDocument::new(doc_id, CreationTime::ONE, DocumentObject::empty())?;
 
     // Holding lease -- can write.
     p1.write(

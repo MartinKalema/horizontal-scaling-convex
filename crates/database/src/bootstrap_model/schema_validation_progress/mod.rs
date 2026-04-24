@@ -78,7 +78,7 @@ impl<'a, RT: Runtime> SchemaValidationProgressModel<'a, RT> {
     ) -> anyhow::Result<Option<Arc<ParsedDocument<SchemaValidationProgressMetadata>>>> {
         self.tx
             .query_system(self.namespace, &*SCHEMA_VALIDATION_PROGRESS_BY_SCHEMA_ID)?
-            .eq(&[schema_id.developer_id.encode_into(&mut Default::default())])?
+            .eq(&[schema_id.document_id.encode_into(&mut Default::default())])?
             .unique()
             .await
     }
@@ -91,7 +91,7 @@ impl<'a, RT: Runtime> SchemaValidationProgressModel<'a, RT> {
         let maybe_existing_metadata = self.existing_schema_validation_progress(schema_id).await?;
         let mut system_model = SystemMetadataModel::new(self.tx, self.namespace);
         let new_metadata = SchemaValidationProgressMetadata {
-            schema_id: schema_id.developer_id,
+            schema_id: schema_id.document_id,
             total_docs,
             num_docs_validated: 0,
         };
@@ -125,7 +125,7 @@ impl<'a, RT: Runtime> SchemaValidationProgressModel<'a, RT> {
 
         let num_docs_validated = existing_metadata.num_docs_validated + num_docs_validated;
         let new_metadata = SchemaValidationProgressMetadata {
-            schema_id: schema_id.developer_id,
+            schema_id: schema_id.document_id,
             total_docs: existing_metadata.total_docs.or(total_docs),
             num_docs_validated,
         };

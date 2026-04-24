@@ -55,9 +55,9 @@ use search::searcher::{
 use storage::Storage;
 use value::{
     assert_obj,
-    ConvexObject,
     ConvexValue,
-    DeveloperDocumentId,
+    DocumentObject,
+    PublicDocumentId,
     TableName,
     TableNamespace,
 };
@@ -202,7 +202,7 @@ impl<RT: Runtime> Scenario<RT> {
     async fn seed_table_with_vector_data(
         &self,
         num_docs: u32,
-    ) -> anyhow::Result<Vec<DeveloperDocumentId>> {
+    ) -> anyhow::Result<Vec<PublicDocumentId>> {
         let mut ids = vec![];
         for _ in 0..num_docs {
             let mut tx = self.database.begin(Identity::system()).await?;
@@ -359,7 +359,7 @@ enum TestAction {
 
 struct RandomizedTest<RT: Runtime> {
     scenario: Scenario<RT>,
-    model: BTreeMap<TestKey, (DeveloperDocumentId, TestUpdate)>,
+    model: BTreeMap<TestKey, (PublicDocumentId, TestUpdate)>,
 }
 
 impl<RT: Runtime> RandomizedTest<RT> {
@@ -386,7 +386,7 @@ impl<RT: Runtime> RandomizedTest<RT> {
                         ConvexValue::String(format!("{value:?}").try_into()?),
                     );
                 }
-                let new_obj = ConvexObject::try_from(new_obj)?;
+                let new_obj = DocumentObject::try_from(new_obj)?;
                 let id = if let Some((document_id, _)) = self.model.remove(&update.key) {
                     UserFacingModel::new_root_for_test(&mut tx)
                         .replace(document_id, new_obj)
@@ -920,7 +920,7 @@ async fn test_recall_multi_segment(rt: TestRuntime) -> anyhow::Result<()> {
     let mut expected: Vec<_> = by_id
         .iter()
         .map(|(id, vector)| PublicVectorSearchQueryResult {
-            id: DeveloperDocumentId::new(table_number, *id),
+            id: PublicDocumentId::new(table_number, *id),
             score: cosine_similarity(&query, vector),
         })
         .collect();

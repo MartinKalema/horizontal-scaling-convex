@@ -81,21 +81,7 @@ pub async fn create_checkpoint(
         .context("Failed to load documents for checkpoint")?;
 
     let mut globals = BTreeMap::new();
-    if let Some(value) = persistence
-        .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
-        .await?
-    {
-        globals.insert(
-            String::from(PersistenceGlobalKey::MaxRepeatableTimestamp),
-            value,
-        );
-    }
-    for key in [
-        PersistenceGlobalKey::TablesByIdIndex,
-        PersistenceGlobalKey::TablesTabletId,
-        PersistenceGlobalKey::IndexByIdIndex,
-        PersistenceGlobalKey::IndexTabletId,
-    ] {
+    for key in PersistenceGlobalKey::all_keys() {
         if let Some(value) = persistence.get_persistence_global(key).await? {
             globals.insert(String::from(key), value);
         }

@@ -10,8 +10,8 @@ use serde_json::{
 };
 
 use crate::{
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
 };
 
@@ -72,7 +72,7 @@ impl ValueFormat {
     }
 }
 
-impl ConvexObject {
+impl DocumentObject {
     pub fn export(self, value_format: ValueFormat) -> JsonValue {
         let v: serde_json::Map<_, _> = self
             .into_iter()

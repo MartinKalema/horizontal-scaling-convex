@@ -37,8 +37,8 @@ use value::{
     remove_string,
     remove_vec,
     remove_vec_of_strings,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
 };
 
 use crate::{
@@ -109,10 +109,10 @@ impl HeapSize for SystemLogMetadata {
     }
 }
 
-impl TryFrom<ConvexObject> for SystemLogMetadata {
+impl TryFrom<DocumentObject> for SystemLogMetadata {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> Result<Self, Self::Error> {
         let mut fields = BTreeMap::from(value);
         let code = remove_string(&mut fields, "code")?;
         Ok(SystemLogMetadata { code })

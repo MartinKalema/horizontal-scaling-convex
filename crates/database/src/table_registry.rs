@@ -14,7 +14,7 @@ use common::{
         TableName,
     },
     value::{
-        ConvexObject,
+        DocumentObject,
         ResolvedDocumentId,
         TableMapping,
         TabletId,
@@ -67,8 +67,8 @@ impl TableRegistry {
         &mut self,
         index_registry: &IndexRegistry,
         id: ResolvedDocumentId,
-        old_value: Option<&ConvexObject>,
-        new_value: Option<&ConvexObject>,
+        old_value: Option<&DocumentObject>,
+        new_value: Option<&DocumentObject>,
     ) -> anyhow::Result<Option<TableUpdate>> {
         let maybe_table_update = self
             .begin_update(index_registry, id, old_value, new_value)?
@@ -80,8 +80,8 @@ impl TableRegistry {
         &'a mut self,
         index_registry: &IndexRegistry,
         id: ResolvedDocumentId,
-        old_value: Option<&ConvexObject>,
-        new_value: Option<&ConvexObject>,
+        old_value: Option<&DocumentObject>,
+        new_value: Option<&DocumentObject>,
     ) -> anyhow::Result<Update<'a>> {
         let table_update = if self
             .table_mapping

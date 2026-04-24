@@ -34,7 +34,7 @@ message ResolvedDocumentId {
   optional bytes internal_id = 2;
 }
 
-message DeveloperDocumentId {
+message PublicDocumentId {
   optional uint32 table_number = 1;
   optional bytes internal_id = 2;
 }
@@ -142,12 +142,12 @@ message FunctionCaller {
 }
 
 message SchedulerFunctionCaller {
-  common.DeveloperDocumentId job_id = 1;
+  common.PublicDocumentId job_id = 1;
   optional string component_id = 2;
 }
 
 message ActionFunctionCaller {
-  common.DeveloperDocumentId parent_scheduled_job = 1;
+  common.PublicDocumentId parent_scheduled_job = 1;
   optional string component_id = 2;
   optional string parent_execution_id = 3;
 }

@@ -57,7 +57,7 @@ use udf::{
 };
 use value::{
     sha256::Sha256Digest,
-    DeveloperDocumentId,
+    PublicDocumentId,
 };
 
 use crate::{
@@ -224,7 +224,7 @@ pub trait ApplicationApi: Send + Sync {
         content_type: Option<ContentType>,
         expected_sha256: Option<Sha256Digest>,
         body: BoxStream<'_, anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<DeveloperDocumentId>;
+    ) -> anyhow::Result<PublicDocumentId>;
 
     async fn get_file_range(
         &self,
@@ -501,7 +501,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         content_type: Option<ContentType>,
         expected_sha256: Option<Sha256Digest>,
         body: BoxStream<'_, anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         self.store_file(
             component,
             content_length,

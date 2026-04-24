@@ -33,8 +33,8 @@ use common::{
     },
     value::{
         assert_val,
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
     },
     version::ClientVersion,
     RequestId,
@@ -225,7 +225,7 @@ impl<RT: Runtime> TestSyncWorker<RT> {
     async fn mutation(
         &mut self,
         path: &str,
-        args: ConvexObject,
+        args: DocumentObject,
         request_id: SessionRequestSeqNumber,
     ) -> anyhow::Result<(ConvexValue, Timestamp)> {
         self.send(ClientMessage::Mutation {

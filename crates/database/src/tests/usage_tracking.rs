@@ -574,7 +574,7 @@ async fn test_usage_tracking_basic_insert_and_get(rt: TestRuntime) -> anyhow::Re
         .begin_with_usage(Identity::Unknown(None), tx_usage.clone())
         .await?;
     UserFacingModel::new_root_for_test(&mut tx)
-        .get_with_ts(doc_id.developer_id, None)
+        .get_with_ts(doc_id.document_id, None)
         .await?;
     db.commit(tx).await?;
     usage_counter

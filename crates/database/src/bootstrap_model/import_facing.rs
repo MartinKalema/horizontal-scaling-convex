@@ -10,10 +10,10 @@ use common::{
 };
 use errors::ErrorMetadata;
 use value::{
-    ConvexObject,
     ConvexValue,
-    DeveloperDocumentId,
+    DocumentObject,
     FieldName,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableMapping,
     TableName,
@@ -48,9 +48,9 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         &mut self,
         table_id: TabletIdAndTableNumber,
         table_name: &TableName,
-        value: ConvexObject,
+        value: DocumentObject,
         table_mapping_for_schema: &TableMapping,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         if self
             .tx
             .virtual_system_mapping()
@@ -77,7 +77,7 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         self.tx.retention_validator.fail_if_falling_behind()?;
         let id_field = FieldName::from(ID_FIELD.clone());
         let internal_id = if let Some(ConvexValue::String(s)) = value.get(&id_field) {
-            let id_v6 = DeveloperDocumentId::decode(s).context(ErrorMetadata::bad_request(
+            let id_v6 = PublicDocumentId::decode(s).context(ErrorMetadata::bad_request(
                 "InvalidId",
                 format!("invalid _id '{s}'"),
             ))?;
@@ -99,7 +99,7 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         };
         let id = ResolvedDocumentId::new(
             table_id.tablet_id,
-            DeveloperDocumentId::new(table_id.table_number, internal_id),
+            PublicDocumentId::new(table_id.table_number, internal_id),
         );
         let namespace = self
             .tx
@@ -130,9 +130,9 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         &mut self,
         table_id: TabletIdAndTableNumber,
         table_name: &TableName,
-        value: ConvexObject,
+        value: DocumentObject,
         table_mapping_for_schema: &TableMapping,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         if self
             .tx
             .virtual_system_mapping()
@@ -157,8 +157,8 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         }
 
         let id_field = FieldName::from(ID_FIELD.clone());
-        let developer_id = if let Some(ConvexValue::String(s)) = value.get(&id_field) {
-            let id_v6 = DeveloperDocumentId::decode(s).context(ErrorMetadata::bad_request(
+        let document_id = if let Some(ConvexValue::String(s)) = value.get(&id_field) {
+            let id_v6 = PublicDocumentId::decode(s).context(ErrorMetadata::bad_request(
                 "InvalidId",
                 format!("invalid _id '{s}'"),
             ))?;
@@ -176,7 +176,7 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         } else {
             anyhow::bail!("upsert requires _id field");
         };
-        let id = ResolvedDocumentId::new(table_id.tablet_id, developer_id);
+        let id = ResolvedDocumentId::new(table_id.tablet_id, document_id);
         let namespace = self
             .tx
             .table_mapping()
@@ -208,7 +208,7 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         &mut self,
         table_id: TabletIdAndTableNumber,
         table_name: &TableName,
-        developer_id: DeveloperDocumentId,
+        document_id: PublicDocumentId,
     ) -> anyhow::Result<()> {
         if self
             .tx
@@ -233,7 +233,7 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
             ));
         }
 
-        let id = ResolvedDocumentId::new(table_id.tablet_id, developer_id);
+        let id = ResolvedDocumentId::new(table_id.tablet_id, document_id);
         let existing_doc = self.tx.get_with_ts(id).await?;
 
         self.tx.apply_validated_write(id, existing_doc, None)?;

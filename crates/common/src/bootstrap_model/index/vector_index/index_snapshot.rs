@@ -5,7 +5,7 @@ use serde::{
 use sync_types::Timestamp;
 use value::{
     serde::WithUnknown,
-    ConvexObject,
+    DocumentObject,
 };
 
 use super::segment::{
@@ -51,7 +51,7 @@ impl TryFrom<SerializedVectorIndexSnapshot> for VectorIndexSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VectorIndexSnapshotData {
     MultiSegment(Vec<FragmentedVectorSegment>),
-    Unknown(ConvexObject),
+    Unknown(DocumentObject),
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -65,7 +65,7 @@ mod proptest {
             RestrictNaNs,
             ValueBranching,
         },
-        ConvexObject,
+        DocumentObject,
         FieldType,
     };
 
@@ -80,7 +80,7 @@ mod proptest {
             prop_oneof![
                 any::<Vec<FragmentedVectorSegment>>()
                     .prop_map(VectorIndexSnapshotData::MultiSegment),
-                any_with::<ConvexObject>((
+                any_with::<DocumentObject>((
                     size_range(0..=4),
                     FieldType::User,
                     ValueBranching::default(),

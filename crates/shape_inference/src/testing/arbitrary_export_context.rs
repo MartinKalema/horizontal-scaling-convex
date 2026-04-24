@@ -1,6 +1,6 @@
 use proptest::prelude::*;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     FieldName,
 };
 
@@ -44,11 +44,7 @@ impl<T: ShapeConfig> Arbitrary for GeneratedSchema<T> {
     fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
         (
             any::<StructuralShape<T>>(),
-            prop::collection::btree_map(
-                any::<DeveloperDocumentId>(),
-                any::<ExportContext>(),
-                0..10,
-            ),
+            prop::collection::btree_map(any::<PublicDocumentId>(), any::<ExportContext>(), 0..10),
         )
             .prop_map(|(inferred_shape, overrides)| Self::LegacyInferred {
                 inferred_shape,

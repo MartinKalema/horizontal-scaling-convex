@@ -79,7 +79,10 @@ impl<RT: Runtime> TimestampOracle for LocalTimestampOracle<RT> {
     async fn next_ts(&self) -> anyhow::Result<Timestamp> {
         let mut state = self.state.lock();
         let system_ts = self.runtime.generate_timestamp()?;
-        let next = std::cmp::max(system_ts, state.last_assigned.succ()?);
+        let next = std::cmp::max(
+            system_ts,
+            std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?),
+        );
         state.last_assigned = next;
         Ok(next)
     }
@@ -128,6 +131,19 @@ struct BatchState {
 const TSO_COUNTER_KEY: &str = "tso_counter";
 const TSO_MAX_COMMITTED_KEY: &str = "tso_max_committed";
 const DEFAULT_BATCH_SIZE: u64 = 1000;
+
+fn next_ts_from_reserved_batch(
+    current: u64,
+    upper_bound: u64,
+    min_next: u64,
+) -> Option<(u64, u64)> {
+    let candidate = std::cmp::max(current, min_next);
+    (candidate < upper_bound).then_some((candidate, candidate + 1))
+}
+
+fn batch_lower_bound(counter_value: u64, min_next: u64) -> u64 {
+    std::cmp::max(counter_value, min_next)
+}
 
 impl BatchTimestampOracle {
     /// Connect to NATS and initialize the KV bucket for timestamp allocation.
@@ -186,7 +202,7 @@ impl BatchTimestampOracle {
     /// Reserve a new batch of timestamps from the central counter.
     /// Uses NATS KV atomic update (CAS) to ensure no two nodes get
     /// overlapping ranges.
-    async fn reserve_batch(&self) -> anyhow::Result<(u64, u64)> {
+    async fn reserve_batch_at_or_above(&self, min_next: u64) -> anyhow::Result<(u64, u64)> {
         let jetstream = async_nats::jetstream::new(self.nats_client.clone());
         let kv = jetstream
             .get_key_value(&self.kv_bucket)
@@ -209,8 +225,8 @@ impl BatchTimestampOracle {
                     .context("TSO: Invalid counter value")?,
             );
 
-            let new_lower = current_value;
-            let new_upper = current_value + self.batch_size;
+            let new_lower = batch_lower_bound(current_value, min_next);
+            let new_upper = new_lower + self.batch_size;
             let new_value = new_upper.to_be_bytes().to_vec();
 
             // Atomic compare-and-swap: only succeeds if no other node
@@ -240,24 +256,35 @@ impl BatchTimestampOracle {
 #[async_trait]
 impl TimestampOracle for BatchTimestampOracle {
     async fn next_ts(&self) -> anyhow::Result<Timestamp> {
-        // Fast path: check if we have a timestamp available in the current batch.
-        {
-            let mut state = self.state.lock();
-            if state.current < state.upper_bound {
-                let ts = state.current;
-                state.current += 1;
+        let committed_floor = self.max_committed_ts().await?;
+        let min_next = u64::from(committed_floor.succ()?);
+
+        loop {
+            let candidate = {
+                let mut state = self.state.lock();
+                if committed_floor > state.max_committed {
+                    state.max_committed = committed_floor;
+                }
+
+                if let Some((ts, next_current)) =
+                    next_ts_from_reserved_batch(state.current, state.upper_bound, min_next)
+                {
+                    state.current = next_current;
+                    Some(ts)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(ts) = candidate {
                 return Timestamp::try_from(ts);
             }
+
+            let (lower, upper) = self.reserve_batch_at_or_above(min_next).await?;
+            let mut state = self.state.lock();
+            state.current = lower;
+            state.upper_bound = upper;
         }
-
-        // Slow path: reserve a new batch from NATS KV.
-        let (lower, upper) = self.reserve_batch().await?;
-
-        let mut state = self.state.lock();
-        state.current = lower + 1; // We'll return `lower`, advance to lower+1.
-        state.upper_bound = upper;
-
-        Timestamp::try_from(lower)
     }
 
     async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
@@ -294,7 +321,6 @@ impl TimestampOracle for BatchTimestampOracle {
             }
         }
 
-        // Update NATS KV (best-effort, non-blocking for the commit path).
         let jetstream = async_nats::jetstream::new(self.nats_client.clone());
         let kv = jetstream
             .get_key_value(&self.kv_bucket)
@@ -302,9 +328,47 @@ impl TimestampOracle for BatchTimestampOracle {
             .context("TSO: Failed to get KV bucket")?;
 
         let value = ts_u64.to_be_bytes().to_vec();
-        let _ = kv.put(TSO_MAX_COMMITTED_KEY, value.into()).await;
+        for attempt in 0..10 {
+            match kv.entry(TSO_MAX_COMMITTED_KEY).await? {
+                Some(entry) => {
+                    let current = u64::from_be_bytes(
+                        entry
+                            .value
+                            .as_ref()
+                            .try_into()
+                            .context("TSO: Invalid max_committed value")?,
+                    );
+                    if current >= ts_u64 {
+                        return Ok(());
+                    }
 
-        Ok(())
+                    match kv
+                        .update(TSO_MAX_COMMITTED_KEY, value.clone().into(), entry.revision)
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(_) => {
+                            tracing::debug!(
+                                "TSO: max_committed CAS conflict on attempt {attempt}, retrying"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt))
+                                .await;
+                        },
+                    }
+                },
+                None => match kv.create(TSO_MAX_COMMITTED_KEY, value.clone().into()).await {
+                    Ok(_) => return Ok(()),
+                    Err(_) => {
+                        tracing::debug!(
+                            "TSO: max_committed create conflict on attempt {attempt}, retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(1 << attempt)).await;
+                    },
+                },
+            }
+        }
+
+        anyhow::bail!("TSO: Failed to advance max_committed after 10 attempts")
     }
 }
 
@@ -336,7 +400,7 @@ pub mod testing {
     impl TimestampOracle for InMemoryTimestampOracle {
         async fn next_ts(&self) -> anyhow::Result<Timestamp> {
             let mut state = self.state.lock();
-            let next = state.last_assigned.succ()?;
+            let next = std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?);
             state.last_assigned = next;
             Ok(next)
         }
@@ -352,5 +416,42 @@ pub mod testing {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        batch_lower_bound,
+        next_ts_from_reserved_batch,
+    };
+
+    #[test]
+    fn reserved_batch_uses_current_when_already_above_floor() {
+        let (ts, next_current) =
+            next_ts_from_reserved_batch(100, 200, 90).expect("candidate within batch");
+        assert_eq!(ts, 100);
+        assert_eq!(next_current, 101);
+    }
+
+    #[test]
+    fn reserved_batch_fast_forwards_to_committed_floor() {
+        let (ts, next_current) =
+            next_ts_from_reserved_batch(100, 200, 150).expect("candidate within batch");
+        assert_eq!(ts, 150);
+        assert_eq!(next_current, 151);
+    }
+
+    #[test]
+    fn reserved_batch_exhausts_when_floor_is_beyond_range() {
+        assert!(next_ts_from_reserved_batch(100, 200, 200).is_none());
+        assert!(next_ts_from_reserved_batch(100, 200, 250).is_none());
+    }
+
+    #[test]
+    fn reserve_batch_starts_above_committed_floor_when_counter_lags() {
+        assert_eq!(batch_lower_bound(1000, 1001), 1001);
+        assert_eq!(batch_lower_bound(1000, 1500), 1500);
+        assert_eq!(batch_lower_bound(2000, 1500), 2000);
     }
 }

@@ -11,20 +11,20 @@ use serde::{
 };
 use value::{
     obj,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
 };
 
-/// Persisted version of AuthInfo that impls try_from to ConvexObject
+/// Persisted version of AuthInfo that impls try_from to DocumentObject
 /// Ideally this remains local to this crate (has to be pub for db-info)
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct AuthInfoPersisted(pub AuthInfo);
 
-impl TryFrom<ConvexObject> for AuthInfoPersisted {
+impl TryFrom<DocumentObject> for AuthInfoPersisted {
     type Error = anyhow::Error;
 
-    fn try_from(o: ConvexObject) -> Result<Self, Self::Error> {
+    fn try_from(o: DocumentObject) -> Result<Self, Self::Error> {
         let mut fields: BTreeMap<_, _> = o.into();
 
         let is_oidc = match fields.remove("type") {
@@ -76,7 +76,7 @@ impl TryFrom<ConvexObject> for AuthInfoPersisted {
     }
 }
 
-impl TryFrom<AuthInfoPersisted> for ConvexObject {
+impl TryFrom<AuthInfoPersisted> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(info: AuthInfoPersisted) -> Result<Self, Self::Error> {
@@ -120,7 +120,7 @@ impl AuthDiff {
         let added_strings = added
             .into_iter()
             .map(|auth_info| {
-                let auth_info_obj = ConvexObject::try_from(AuthInfoPersisted(auth_info))?;
+                let auth_info_obj = DocumentObject::try_from(AuthInfoPersisted(auth_info))?;
                 let auth_info_json = auth_info_obj.json_serialize()?;
                 anyhow::Ok(auth_info_json)
             })
@@ -129,7 +129,7 @@ impl AuthDiff {
         let removed_strings = removed
             .into_iter()
             .map(|auth_info| {
-                let auth_info_obj = ConvexObject::try_from(AuthInfoPersisted(auth_info))?;
+                let auth_info_obj = DocumentObject::try_from(AuthInfoPersisted(auth_info))?;
                 let auth_info_json = auth_info_obj.json_serialize()?;
                 anyhow::Ok(auth_info_json)
             })

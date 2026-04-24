@@ -66,8 +66,8 @@ use common::{
         WriteTimestamp,
     },
     value::{
-        id_v6::DeveloperDocumentId,
-        ConvexObject,
+        id_v6::PublicDocumentId,
+        DocumentObject,
         ResolvedDocumentId,
         Size,
         TableMapping,
@@ -257,7 +257,7 @@ impl<RT: Runtime> Transaction<RT> {
 
     pub fn resolve_developer_id(
         &mut self,
-        id: &DeveloperDocumentId,
+        id: &PublicDocumentId,
         namespace: TableNamespace,
     ) -> anyhow::Result<ResolvedDocumentId> {
         id.to_resolved(self.table_mapping().namespace(namespace).number_to_tablet())
@@ -301,7 +301,7 @@ impl<RT: Runtime> Transaction<RT> {
 
     pub fn resolve_idv6(
         &mut self,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
         namespace: TableNamespace,
         table_filter: TableFilter,
     ) -> anyhow::Result<TableName> {
@@ -599,7 +599,7 @@ impl<RT: Runtime> Transaction<RT> {
     pub(crate) async fn replace_inner(
         &mut self,
         id: ResolvedDocumentId,
-        value: ConvexObject,
+        value: DocumentObject,
     ) -> anyhow::Result<ResolvedDocument> {
         task::consume_budget().await;
 

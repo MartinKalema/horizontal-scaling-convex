@@ -10,7 +10,7 @@ use crate::paths::FieldPath;
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct DatabaseIndexSpec {
     /// Ordered field(s) to index. The "unindexed" primary key ordering of
-    /// documents by [`DocumentId`] is represented by an empty vector.
+    /// documents by [`PublicDocumentId`] is represented by an empty vector.
     pub fields: IndexedFields,
 }
 

@@ -29,6 +29,8 @@ use std::{
 
 use value::TableName;
 
+use crate::write_log::WriteSource;
+
 /// Identifies a partition (node) in the cluster.
 /// Partition 0 is the default and owns all system tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -152,9 +154,34 @@ impl PartitionMap {
     }
 }
 
+pub fn uses_metadata_owner(write_source: &WriteSource) -> bool {
+    matches!(write_source.as_str(), Some("start_push" | "finish_push"))
+}
+
+/// Returns the authoritative partition for tables that should be coordinated
+/// cluster-wide for the current operation.
+///
+/// - User tables always have a single partition owner.
+/// - Deploy metadata operations (`start_push`, `finish_push`) route system
+///   tables to the metadata owner on partition 0 (TiDB DDL owner pattern).
+/// - Other system-table writes are node-local operational state and therefore
+///   return `None`.
+pub fn routed_partition_for_table(
+    table: &TableName,
+    partition_map: &PartitionMap,
+    write_source: &WriteSource,
+) -> Option<PartitionId> {
+    if !table.is_system() || uses_metadata_owner(write_source) {
+        Some(partition_map.partition_for_table(table))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::write_log::WriteSource;
 
     #[test]
     fn test_single_partition() {
@@ -238,5 +265,31 @@ mod tests {
         let map = PartitionMap::from_config("a=1,b=2", PartitionId(0), 3);
         let all = map.all_partitions();
         assert_eq!(all, vec![PartitionId(0), PartitionId(1), PartitionId(2)]);
+    }
+
+    #[test]
+    fn test_routed_partition_for_table_keeps_non_deploy_system_tables_local() {
+        let map = PartitionMap::from_config("messages=1", PartitionId(1), 2);
+        assert_eq!(
+            routed_partition_for_table(
+                &"_modules".parse().unwrap(),
+                &map,
+                &WriteSource::new("cron_tick"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_routed_partition_for_table_routes_deploy_system_tables_to_owner() {
+        let map = PartitionMap::from_config("messages=1", PartitionId(1), 2);
+        assert_eq!(
+            routed_partition_for_table(
+                &"_modules".parse().unwrap(),
+                &map,
+                &WriteSource::new("finish_push"),
+            ),
+            Some(PartitionId::DEFAULT)
+        );
     }
 }

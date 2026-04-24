@@ -36,8 +36,8 @@ use value::{
     remove_vec,
     remove_vec_of_strings,
     val,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     TableName,
 };
 
@@ -256,7 +256,7 @@ impl DeploymentAuditLogEvent {
         }
     }
 
-    fn metadata(self) -> anyhow::Result<ConvexObject> {
+    fn metadata(self) -> anyhow::Result<DocumentObject> {
         match self {
             DeploymentAuditLogEvent::CreateEnvironmentVariable { name }
             | DeploymentAuditLogEvent::UpdateEnvironmentVariable { name }
@@ -281,7 +281,7 @@ impl DeploymentAuditLogEvent {
                 obj!("request_destination" => request_destination.to_string())
             },
             DeploymentAuditLogEvent::PushConfig { config_diff } => {
-                ConvexObject::try_from(config_diff)
+                DocumentObject::try_from(config_diff)
             },
             DeploymentAuditLogEvent::PushConfigWithComponents { diffs } => diffs.try_into(),
             DeploymentAuditLogEvent::BuildIndexes {
@@ -374,8 +374,8 @@ impl DeploymentAuditLogEvent {
                     "table_names" => table_names,
                     "table_count" => table_count as i64,
                     "import_mode" => import_mode.to_string(),
-                    "import_format" => ConvexObject::try_from(import_format)?,
-                    "requestor" => ConvexObject::try_from(requestor)?,
+                    "import_format" => DocumentObject::try_from(import_format)?,
+                    "requestor" => DocumentObject::try_from(requestor)?,
                     "table_names_deleted" => table_names_deleted,
                     "table_count_deleted" => table_count_deleted as i64,
                 )
@@ -408,7 +408,7 @@ impl DeploymentAuditLogEvent {
     }
 }
 
-impl TryFrom<DeploymentAuditLogEvent> for ConvexObject {
+impl TryFrom<DeploymentAuditLogEvent> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(value: DeploymentAuditLogEvent) -> anyhow::Result<Self> {
@@ -419,21 +419,21 @@ impl TryFrom<DeploymentAuditLogEvent> for ConvexObject {
 fn value_to_index_metadata(
     value: ConvexValue,
 ) -> anyhow::Result<(IndexName, DeveloperIndexConfig)> {
-    let obj = ConvexObject::try_from(value)?;
+    let obj = DocumentObject::try_from(value)?;
     let mut fields = BTreeMap::from(obj);
     let name = remove_string(&mut fields, "name")?;
-    let obj = ConvexObject::try_from(fields)?;
+    let obj = DocumentObject::try_from(fields)?;
     let developer_index_config = obj.try_into()?;
     Ok((IndexName::from_str(&name)?, developer_index_config))
 }
 
-impl TryFrom<ConvexObject> for DeploymentAuditLogEvent {
+impl TryFrom<DocumentObject> for DeploymentAuditLogEvent {
     type Error = anyhow::Error;
 
-    fn try_from(obj: ConvexObject) -> anyhow::Result<Self> {
+    fn try_from(obj: DocumentObject) -> anyhow::Result<Self> {
         let mut fields = BTreeMap::from(obj);
         let action: String = remove_string(&mut fields, "action")?;
-        let metadata: ConvexObject = remove_object(&mut fields, "metadata")?;
+        let metadata: DocumentObject = remove_object(&mut fields, "metadata")?;
         let mut fields = BTreeMap::from(metadata);
         let event = match &*action {
             "create_environment_variable" => DeploymentAuditLogEvent::CreateEnvironmentVariable {
@@ -457,10 +457,10 @@ impl TryFrom<ConvexObject> for DeploymentAuditLogEvent {
                 request_destination: remove_string(&mut fields, "request_destination")?.parse()?,
             },
             "push_config" => DeploymentAuditLogEvent::PushConfig {
-                config_diff: ConvexObject::try_from(fields)?.try_into()?,
+                config_diff: DocumentObject::try_from(fields)?.try_into()?,
             },
             "push_config_with_components" => DeploymentAuditLogEvent::PushConfigWithComponents {
-                diffs: ConvexObject::try_from(fields)?.try_into()?,
+                diffs: DocumentObject::try_from(fields)?.try_into()?,
             },
             "build_indexes" => {
                 let added_indexes = remove_vec(&mut fields, "added_indexes")?
@@ -485,7 +485,7 @@ impl TryFrom<ConvexObject> for DeploymentAuditLogEvent {
                 let table_names: BTreeMap<_, _> = remove_vec(&mut fields, "table_names")?
                     .into_iter()
                     .map(|v| {
-                        let o: ConvexObject = v.try_into()?;
+                        let o: DocumentObject = v.try_into()?;
                         let mut fields = BTreeMap::from(o);
                         let component = ComponentPath::deserialize(
                             remove_nullable_string(&mut fields, "component")?.as_deref(),
@@ -502,7 +502,7 @@ impl TryFrom<ConvexObject> for DeploymentAuditLogEvent {
                     remove_vec(&mut fields, "table_names_deleted")?
                         .into_iter()
                         .map(|v| {
-                            let o: ConvexObject = v.try_into()?;
+                            let o: DocumentObject = v.try_into()?;
                             let mut fields = BTreeMap::from(o);
                             let component = ComponentPath::deserialize(
                                 remove_nullable_string(&mut fields, "component")?.as_deref(),
@@ -723,7 +723,7 @@ mod tests {
     };
     use proptest::prelude::*;
     use serde_json::json;
-    use value::ConvexObject;
+    use value::DocumentObject;
 
     use super::DeploymentAuditLogEvent;
 
@@ -733,7 +733,7 @@ mod tests {
         )]
         #[test]
         fn test_try_from(e in any::<DeploymentAuditLogEvent>()) {
-            ConvexObject::try_from(e).unwrap();
+            DocumentObject::try_from(e).unwrap();
         }
 
         #[test]
@@ -771,7 +771,7 @@ mod proptests {
     use proptest::prelude::*;
     use value::{
         testing::assert_roundtrips,
-        ConvexObject,
+        DocumentObject,
     };
 
     use crate::deployment_audit_log::types::DeploymentAuditLogEvent;
@@ -780,7 +780,7 @@ mod proptests {
         #![proptest_config(ProptestConfig { cases: 16 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, .. ProptestConfig::default() })]
         #[test]
         fn test_deployment_audit_log_roundtrip(v in any::<DeploymentAuditLogEvent>()) {
-            assert_roundtrips::<DeploymentAuditLogEvent, ConvexObject>(v);
+            assert_roundtrips::<DeploymentAuditLogEvent, DocumentObject>(v);
         }
     }
 }

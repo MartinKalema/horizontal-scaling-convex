@@ -187,12 +187,39 @@ impl TableSummaries {
                 anyhow::anyhow!("Updating non-existent table {}", document_id.tablet_id)
             })?
             .clone();
+        let is_system_table = table_mapping.is_system_tablet(document_id.tablet_id);
+        let mut used_lossy_summary_update = false;
         if let Some(old_value) = old {
-            table_summary = table_summary
-                .remove(&old_value.value().0)
-                .with_context(|| format!("removing from table {}", document_id.tablet_id))?;
+            match table_summary.remove(&old_value.value().0) {
+                Ok(updated_summary) => {
+                    table_summary = updated_summary;
+                },
+                Err(error) if is_system_table => {
+                    tracing::warn!(
+                        tablet_id = ?document_id.tablet_id,
+                        error = ?error,
+                        "System table summary drift detected; degrading summary to unknown"
+                    );
+                    table_summary = table_summary
+                        .lossy_update(
+                            old.map(|document| &document.value().0),
+                            new.map(|document| &document.value().0),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "lossy system table summary update failed for table {}",
+                                document_id.tablet_id
+                            )
+                        })?;
+                    used_lossy_summary_update = true;
+                },
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing from table {}", document_id.tablet_id));
+                },
+            }
         }
-        if let Some(new_value) = new {
+        if !used_lossy_summary_update && let Some(new_value) = new {
             table_summary = table_summary.insert(&new_value.value().0);
         }
         if let Some(TableUpdate {
@@ -226,7 +253,6 @@ impl TableSummaries {
         let new_info_total_size = table_summary.total_size();
         match self.tables.insert(document_id.tablet_id, table_summary) {
             Some(old_summary) => {
-                let is_system_table = table_mapping.is_system_tablet(document_id.tablet_id);
                 if !is_system_table {
                     self.num_user_documents =
                         self.num_user_documents + new_info_num_values - old_summary.num_values();
@@ -853,6 +879,23 @@ impl SnapshotManager {
         self.write_throughput_limiter.record_write(ts, write_bytes);
     }
 
+    pub fn replace(
+        &mut self,
+        ts: Timestamp,
+        snapshot: Snapshot,
+        replication_frontiers: BTreeMap<PartitionId, Timestamp>,
+    ) {
+        self.versions.clear();
+        self.versions.push_back((ts, snapshot));
+        self.persisted_max_repeatable_ts = ts;
+        self.replication_frontiers = replication_frontiers;
+        self.notify_waiters();
+        let partitions: Vec<_> = self.replication_frontiers.keys().copied().collect();
+        for partition in partitions {
+            self.notify_replication_waiters(partition);
+        }
+    }
+
     pub fn check_write_throughput_limit(&self) -> anyhow::Result<()> {
         if !self.write_throughput_limiter.check_limit() {
             anyhow::bail!(ErrorMetadata::rate_limited(
@@ -884,6 +927,7 @@ impl SnapshotManager {
             Ok(false)
         }
     }
+
 }
 
 pub fn replication_frontiers_to_json(frontiers: &BTreeMap<PartitionId, Timestamp>) -> JsonValue {

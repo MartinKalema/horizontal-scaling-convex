@@ -26,7 +26,7 @@ use database::{
     Transaction,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     TableName,
     TableNamespace,
 };
@@ -77,7 +77,7 @@ impl<'a, RT: Runtime> ExternalPackagesModel<'a, RT> {
         &mut self,
         external_deps_package_id: ExternalDepsPackageId,
     ) -> anyhow::Result<ParsedDocument<ExternalDepsPackage>> {
-        let id: DeveloperDocumentId = external_deps_package_id.into();
+        let id: PublicDocumentId = external_deps_package_id.into();
         let document_id = self.tx.resolve_developer_id(&id, TableNamespace::Global)?;
         self.tx
             .get(document_id)
@@ -93,7 +93,7 @@ impl<'a, RT: Runtime> ExternalPackagesModel<'a, RT> {
         let id = SystemMetadataModel::new_global(self.tx)
             .insert(&EXTERNAL_PACKAGES_TABLE, external_deps_package.try_into()?)
             .await?;
-        let doc_id: DeveloperDocumentId = id.into();
+        let doc_id: PublicDocumentId = id.into();
         Ok(doc_id.into())
     }
 
@@ -128,7 +128,7 @@ impl<'a, RT: Runtime> ExternalPackagesModel<'a, RT> {
                 .map(|dep| (dep.package, dep.version))
                 .collect();
             if pkg_deps_map.eq(&deps_map) {
-                return Ok(Some((DeveloperDocumentId::from(id).into(), pkg)));
+                return Ok(Some((PublicDocumentId::from(id).into(), pkg)));
             }
 
             cache_entries_checked += 1;
