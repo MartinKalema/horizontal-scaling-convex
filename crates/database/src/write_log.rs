@@ -261,6 +261,12 @@ impl WriteLogManager {
         }
     }
 
+    fn notify_all_waiters(&mut self) {
+        while let Some((_, sender)) = self.waiters.pop_front() {
+            let _ = sender.send(());
+        }
+    }
+
     fn append(&mut self, ts: Timestamp, writes: OrderedIndexKeyWrites, write_source: WriteSource) {
         assert!(self.log.max_ts() < ts, "{:?} >= {}", self.log.max_ts(), ts);
 
@@ -320,7 +326,10 @@ impl WriteLogManager {
 
     fn reset(&mut self, ts: Timestamp) {
         self.log = WriteLog::new(ts);
-        self.notify_waiters();
+        // Reset rewinds the base timestamp seen by readers. Wake all waiters so
+        // they can detect the rewind and re-anchor themselves instead of
+        // waiting forever for a timestamp that may never be reached again.
+        self.notify_all_waiters();
     }
 }
 
@@ -487,13 +496,12 @@ impl LogReader {
         snapshot.max_ts()
     }
 
-    /// Blocks until the log has advanced past the given timestamp.
+    /// Blocks until the log has advanced past the given timestamp, or until the
+    /// log is reset and callers need to re-check their anchor.
     pub async fn wait_for_higher_ts(&self, target_ts: Timestamp) -> Timestamp {
         let fut = self.inner.lock().wait_for_higher_ts(target_ts);
         fut.await;
-        let result = self.inner.lock().log.max_ts();
-        assert!(result > target_ts);
-        result
+        self.inner.lock().log.max_ts()
     }
 
     pub fn for_each<F>(&self, from: Timestamp, to: Timestamp, mut f: F) -> anyhow::Result<()>
@@ -795,6 +803,10 @@ mod tests {
         index_registry::IndexRegistry,
     };
     use runtime::testing::TestRuntime;
+    use tokio::time::{
+        timeout,
+        Duration,
+    };
     use value::{
         assert_obj,
         val,
@@ -888,6 +900,25 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_higher_ts_wakes_on_reset() -> anyhow::Result<()> {
+        let (_owner, reader, mut writer) = new_write_log(Timestamp::must(1000));
+        let reader_for_wait = reader.clone();
+        let wait = tokio::spawn(async move {
+            timeout(
+                Duration::from_secs(1),
+                reader_for_wait.wait_for_higher_ts(Timestamp::must(1000)),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        writer.reset(Timestamp::must(900));
+
+        assert_eq!(wait.await??, Timestamp::must(900));
         Ok(())
     }
 

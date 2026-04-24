@@ -118,7 +118,7 @@ impl proptest::arbitrary::Arbitrary for HttpActionRequest {
                 body in any::<Option<Vec<u8>>>()) -> anyhow::Result<HttpActionRequest> {
                     let origin: String = "http://example-deployment.convex.site/".to_string();
                     let path_and_query: String =  uri.path_and_query().ok_or_else(|| anyhow::anyhow!("No path and query"))?.to_string();
-                    let url: Url = Url::parse(&(origin + &path_and_query))?;
+                    let url: Url = Url::parse(&(origin + path_and_query.as_str()))?;
                 Ok(HttpActionRequest {
                     head: HttpActionRequestHead {
                         headers,

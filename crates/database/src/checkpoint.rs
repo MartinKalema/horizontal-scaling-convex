@@ -21,12 +21,15 @@ use anyhow::Context;
 use async_trait::async_trait;
 use common::{
     document::ResolvedDocument,
+    index::IndexKey,
+    interval::Interval,
     persistence::{
         ConflictStrategy,
         DocumentLogEntry,
         DocumentPrevTsQuery,
         DocumentStream,
         IndexStream,
+        LatestDocument,
         Persistence,
         PersistenceGlobalKey,
         PersistenceIndexEntry,
@@ -267,18 +270,41 @@ impl PersistenceReader for CheckpointPersistence {
     fn index_scan(
         &self,
         _index_id: IndexId,
-        _tablet_id: TabletId,
-        _read_timestamp: Timestamp,
-        _range: &common::interval::Interval,
-        _order: Order,
+        tablet_id: TabletId,
+        read_timestamp: Timestamp,
+        interval: &Interval,
+        order: Order,
         _size_hint: usize,
         _retention_validator: Arc<dyn RetentionValidator>,
     ) -> IndexStream<'_> {
-        // Index scans are not needed during the initial DatabaseSnapshot::load
-        // bootstrap. The bootstrap code loads documents directly via
-        // load_documents and constructs in-memory indexes from them.
-        // If index_scan is called, return empty.
-        stream::empty().boxed()
+        let interval = interval.clone();
+        let inner = self.inner.lock();
+        let mut latest_by_key: BTreeMap<_, (Timestamp, ResolvedDocument, Option<Timestamp>)> =
+            BTreeMap::new();
+
+        for ((ts, id), (document, prev_ts)) in &inner.log {
+            if *ts > read_timestamp || id.table() != tablet_id {
+                continue;
+            }
+            let Some(document) = document.clone() else {
+                continue;
+            };
+            let key = IndexKey::new(vec![], document.document_id()).to_bytes();
+            if !interval.contains(&key) {
+                continue;
+            }
+            latest_by_key.insert(key, (*ts, document, *prev_ts));
+        }
+
+        let mut results: Vec<_> = latest_by_key
+            .into_iter()
+            .map(|(key, (ts, value, prev_ts))| Ok((key, LatestDocument { ts, value, prev_ts })))
+            .collect();
+        if matches!(order, Order::Desc) {
+            results.reverse();
+        }
+
+        stream::iter(results).boxed()
     }
 
     async fn get_persistence_global(

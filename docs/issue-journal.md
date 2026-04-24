@@ -137,6 +137,36 @@ own for distributed changes.
   - clean-cluster rerun via `self-hosted/docker/test.sh`: all `77` write-scaling
     tests passed, Test 26 passed, and the Raft failover suite passed.
 
+### 2026-04 — Fresh replica checkpoint bootstrap rewound the write log behind active subscription workers
+
+- **Status:** fixed
+- **Related issue:** `#77`
+- **Symptom:** the new fresh-replica checkpoint bootstrap test could restore a
+  snapshot, but startup emitted repeated `Can't refresh token to newer
+  timestamp ... than max ts ...` errors. The bootstrap path was technically
+  succeeding while derived subscription state was still anchored to a newer
+  pre-snapshot timestamp.
+- **Root Cause:** `Database::load` started the write log and subscription
+  workers from fresh local state before the checkpoint snapshot was installed.
+  `InstallSnapshot` then reset the write log back to the checkpoint timestamp,
+  but already-running subscription workers kept their older `processed_ts` and
+  assumed the log only moved upward. That left them asking the write log to
+  refresh tokens beyond its new max timestamp.
+- **Fix:** teach write-log waiters to wake on reset, and teach subscription
+  workers to detect a log rewind, invalidate their derived subscriptions, and
+  re-anchor `processed_ts` to the new log max before continuing. This keeps
+  snapshot install and any future log rewind consistent with follower-read
+  derived state. The fresh-replica bootstrap path also now stores and loads a
+  stable `checkpoint-latest` object so a brand-new replica can install the
+  latest checkpoint directly.
+- **Validation:**
+  - `cargo test -p database test_wait_for_higher_ts_wakes_on_reset`
+  - `cargo test -p database test_log_rewind_invalidates_subscriptions_and_reanchors_manager`
+  - `cargo test -p database test_load_latest_checkpoint_reads_stable_latest_object`
+  - `cargo test -p local_backend test_fresh_replica_bootstraps_from_checkpoint -- --nocapture`
+  - the focused local-backend bootstrap test now passes on the real local
+    environment without the earlier token-refresh storm.
+
 ## Open Issues
 
 None currently tracked in this journal after the latest clean-cluster run.
