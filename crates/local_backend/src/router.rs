@@ -405,6 +405,8 @@ pub fn router(st: LocalAppState) -> Router {
         .with_state(RouterState {
             api: Arc::new(st.application.clone()),
             runtime: st.application.runtime(),
+            replica_mode: st.replica_mode,
+            replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
         });
 
     let version = SERVER_VERSION_STR.to_string();

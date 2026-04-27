@@ -177,3 +177,31 @@ None currently tracked in this journal after the latest clean-cluster run.
   writeups still belong in the other docs.
 - When an issue is fixed, append the exact validation command set or point to
   the test suite that proved it.
+
+### 2026-04 — Replica public mutations were not routed through the active forwarding path
+
+- **Status:** fixed
+- **Related issue:** `#76`
+- **Symptom:** the repo already had a gRPC mutation forwarder service and a
+  `PRIMARY_GRPC_URL` config knob, but live `/api/mutation` requests on a
+  replica still executed the normal local path. The forwarding machinery
+  existed, but it was not actually on the active public mutation route.
+- **Root Cause:** the request path in `public_api.rs` authenticated and then
+  called into the local application/database commit path directly. The
+  primary/replica forwarding client was never consulted by the live HTTP
+  handler, so the gateway-node behavior used by CockroachDB, TiDB/TiKV,
+  YugabyteDB, and Spanner was only partially implemented.
+- **Fix:** wire replica-mode `/api/mutation` requests through the
+  `MutationForwarderGrpcClient`, preserving serialized args, caller identity,
+  returned value, log lines, and structured mutation error data. Add a focused
+  local-backend regression test that proves a replica-shaped HTTP router
+  forwards the mutation to the primary and does not execute it locally.
+- **Validation:**
+  - `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
+  - fresh image build and push:
+    `ghcr.io/martinkalema/convex-horizontal-scaling:backend-issue76-forwarding-4389d7f-20260425-224218-dirty`
+  - pushed digest:
+    `sha256:8f74c123c9e225da8f32851b3702e8460fd9dcaaa4b1f073c8758e425b2aeb64`
+  - clean-cluster rerun via `self-hosted/docker/test.sh`: all `77` write-scaling
+    tests passed and all `10` Raft failover tests passed, confirming the
+    routing change did not regress the distributed cluster paths.

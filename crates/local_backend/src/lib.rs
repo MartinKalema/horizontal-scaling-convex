@@ -130,8 +130,10 @@ pub struct LocalAppState {
     pub instance_secret: InstanceSecret,
     pub application: Application<ProdRuntime>,
     pub zombify_rx: async_broadcast::Receiver<()>,
+    pub replica_mode: bool,
     pub partition_id: Option<database::partition::PartitionId>,
     pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
     /// Raft partition mailbox for receiving Raft messages from peers.
     /// None if Raft is not enabled.
     pub raft_mailbox_tx:
@@ -153,6 +155,8 @@ impl LocalAppState {
 pub struct RouterState {
     pub api: Arc<dyn ApplicationApi>,
     pub runtime: ProdRuntime,
+    pub replica_mode: bool,
+    pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
 }
 
 #[derive(Serialize)]
@@ -201,6 +205,18 @@ pub async fn make_app(
             Some(Arc::new(tso))
         } else {
             None
+        }
+    } else {
+        None
+    };
+
+    let replica_mutation_forwarder = if config.replication_mode == "replica" {
+        match config.primary_grpc_url.as_deref() {
+            Some(primary_grpc_url) => Some(Arc::new(
+                mutation_forwarder::MutationForwarderGrpcClient::connect(primary_grpc_url)
+                    .await?,
+            )),
+            None => None,
         }
     } else {
         None
@@ -644,8 +660,10 @@ pub async fn make_app(
         instance_secret,
         application,
         zombify_rx,
+        replica_mode: config.replication_mode == "replica",
         partition_id,
         node_addresses,
+        replica_mutation_forwarder,
         raft_mailbox_tx,
     };
 
