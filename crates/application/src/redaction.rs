@@ -55,6 +55,10 @@ impl RedactedLogLines {
         Self(vec![])
     }
 
+    pub fn from_vec(log_lines: Vec<String>) -> Self {
+        Self(log_lines)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &String> {
         self.0.iter()
     }

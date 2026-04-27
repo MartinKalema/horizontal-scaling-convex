@@ -425,7 +425,7 @@ impl RaftNode {
 
     /// Process one Ready cycle manually (for testing without the full run
     /// loop). Returns committed entry data.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub(crate) fn process_ready_test(&mut self) -> Vec<Vec<u8>> {
         let mut committed = Vec::new();
         if !self.raw_node.has_ready() {

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use application::{
     api::ExecuteQueryTimestamp,
     redaction::{
@@ -47,6 +48,7 @@ use utoipa_axum::router::OpenApiRouter;
 use value::{
     export::ValueFormat,
     ConvexValue,
+    JsonPackedValue,
 };
 
 use crate::{
@@ -190,6 +192,78 @@ impl UdfResponse {
             log_lines,
         })
     }
+}
+
+async fn maybe_forward_public_mutation(
+    st: &RouterState,
+    path: &str,
+    serialized_args: &sync_types::types::SerializedArgs,
+    format: Option<&str>,
+    identity: keybroker::Identity,
+    client_version: &ClientVersion,
+) -> Result<Option<Result<UdfResponse, HttpResponseError>>, HttpResponseError> {
+    if !st.replica_mode {
+        return Ok(None);
+    }
+
+    let Some(forwarder) = &st.replica_mutation_forwarder else {
+        return Ok(Some(Err(anyhow::anyhow!(ErrorMetadata::service_unavailable())
+            .context(
+                "Replica mutation forwarding is not configured. Set PRIMARY_GRPC_URL for replica mode.",
+            )
+            .into())));
+    };
+
+    let value_format = format.map(|f| f.parse()).transpose()?;
+    let forwarded = forwarder
+        .forward(
+            path,
+            serialized_args.get(),
+            identity,
+            &client_version.to_string(),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(ErrorMetadata::service_unavailable())
+                .context(format!("Failed to forward mutation to primary: {e:#}"))
+        })?;
+
+    let response = match forwarded.result {
+        Some(pb::replication::forward_mutation_response::Result::Success(success)) => {
+            let packed = JsonPackedValue::from_network(success.value).context(
+                ErrorMetadata::bad_request(
+                    "InvalidForwardedMutationValue",
+                    "Primary returned an invalid forwarded mutation value.",
+                ),
+            )?;
+            UdfResponse::Success {
+                value: export_value(
+                    packed.unpack()?,
+                    value_format,
+                    client_version.clone(),
+                )?,
+                log_lines: RedactedLogLines::from_vec(success.log_lines),
+            }
+        },
+        Some(pb::replication::forward_mutation_response::Result::Error(error)) => UdfResponse::Error {
+            error_message: error.error_message,
+            error_data: error
+                .error_data
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .context(ErrorMetadata::bad_request(
+                    "InvalidForwardedMutationErrorData",
+                    "Primary returned invalid forwarded mutation error data.",
+                ))?,
+            log_lines: RedactedLogLines::from_vec(error.log_lines),
+        },
+        None => {
+            return Ok(Some(Err(anyhow::anyhow!(ErrorMetadata::service_unavailable())
+                .context("Primary returned an empty forwarded mutation response.")
+                .into())));
+        },
+    };
+    Ok(Some(Ok(response)))
 }
 
 /// Execute any function
@@ -634,6 +708,7 @@ pub async fn public_mutation_post(
     Json(req): Json<UdfPostRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let export_path = parse_export_path(&req.path)?;
+    let serialized_args = req.args.into_serialized_args()?;
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
     // Round trip latency between Usher and Backend is much smaller than between
@@ -642,6 +717,19 @@ pub async fn public_mutation_post(
         .api
         .authenticate(&host, request_id.clone(), auth_token)
         .await?;
+    if let Some(response) =
+        maybe_forward_public_mutation(
+            &st,
+            &req.path,
+            &serialized_args,
+            req.format.as_deref(),
+            identity.clone(),
+            &client_version,
+        )
+        .await?
+    {
+        return response.map(Json);
+    }
     let udf_result = st
         .api
         .execute_public_mutation(
@@ -649,7 +737,7 @@ pub async fn public_mutation_post(
             request_id,
             identity,
             export_path,
-            req.args.into_serialized_args()?,
+            serialized_args,
             FunctionCaller::HttpApi(client_version.clone()),
             None,
             None,
@@ -748,19 +836,66 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::Arc,
+        time::Duration,
+    };
+
+    use anyhow::Context;
     use application::test_helpers::ApplicationTestExt;
     use axum::body::Body;
+    use common::{
+        http::{
+            ConvexHttpService,
+            NoopRouteMapper,
+        },
+        runtime::Runtime,
+    };
     use http::{
         Request,
         StatusCode,
     };
+    use http_body_util::BodyExt;
+        use metrics::SERVER_VERSION_STR;
     use runtime::prod::ProdRuntime;
     use serde_json::{
         json,
         Value as JsonValue,
     };
+    use tokio::sync::oneshot;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tower::ServiceExt;
 
-    use crate::test_helpers::setup_backend_for_test;
+    use crate::{
+        mutation_forwarder::{
+            MutationForwarderGrpcClient,
+            MutationForwarderService,
+        },
+        router::router,
+        test_helpers::setup_backend_for_test,
+        MAX_CONCURRENT_REQUESTS,
+    };
+
+    async fn expect_success_from_app<T: serde::de::DeserializeOwned>(
+        app: &ConvexHttpService,
+        req: Request<Body>,
+    ) -> anyhow::Result<T> {
+        let (parts, body) = app.router().clone().oneshot(req).await?.into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let msg = format!("Got response: {}", String::from_utf8_lossy(&bytes));
+        assert_eq!(parts.status, StatusCode::OK, "{msg}");
+        serde_json::from_slice(if bytes.is_empty() { b"null" } else { &bytes })
+            .map_err(Into::into)
+    }
+
+    fn post_request(uri: &'static str, json_body: JsonValue) -> anyhow::Result<Request<Body>> {
+        Ok(Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .header("Host", "localhost")
+            .body(Body::from(serde_json::to_vec(&json_body)?))?)
+    }
 
     async fn http_format_tester(
         rt: ProdRuntime,
@@ -858,6 +993,91 @@ mod tests {
             Ok(json!("1")),
         )
         .await
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_http_mutation_forwards_when_replica_mode(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let primary = setup_backend_for_test(rt.clone()).await?;
+        let replica = setup_backend_for_test(rt.clone()).await?;
+        primary.st.application.load_udf_tests_modules().await?;
+        replica.st.application.load_udf_tests_modules().await?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_addr = listener.local_addr()?;
+        let forwarder = MutationForwarderService::new(
+            Arc::new(primary.st.application.clone()),
+            primary.st.instance_name.clone(),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _server_handle = rt.spawn("test_mutation_forwarder", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(forwarder.into_server())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let forwarder_client =
+            MutationForwarderGrpcClient::connect(&format!("http://{grpc_addr}")).await?;
+        let mut replica_state = replica.st.clone();
+        replica_state.replica_mode = true;
+        replica_state.replica_mutation_forwarder = Some(Arc::new(forwarder_client));
+        let replica_app = ConvexHttpService::new(
+            router(replica_state),
+            "backend_forwarding_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let mutation_response: JsonValue = expect_success_from_app(
+            &replica_app,
+            post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "forwarded" } },
+                }),
+            )?,
+        )
+        .await?;
+        let inserted_id = mutation_response["value"]
+            .as_str()
+            .context("insertObject should return a document id string")?
+            .to_string();
+
+        let primary_query: JsonValue = primary
+            .expect_success(post_request(
+                "/api/query",
+                json!({
+                    "path": "values:getObject",
+                    "args": { "id": inserted_id.clone() },
+                }),
+            )?)
+            .await?;
+        assert_eq!(primary_query["status"], "success");
+        assert_eq!(primary_query["value"]["hello"], "forwarded");
+
+        let replica_snapshot = replica.st.application.database().latest_snapshot()?;
+        let mut replica_test_docs = 0;
+        for entry in replica_snapshot.iter_table_summaries()? {
+            let (_, _, table_name, summary) = entry?;
+            if table_name.to_string() == "test" {
+                replica_test_docs += summary.num_values();
+            }
+        }
+        assert_eq!(
+            replica_test_docs,
+            0,
+            "replica should not execute the forwarded mutation locally",
+        );
+
+        let _ = shutdown_tx.send(());
+        Ok(())
     }
 
     #[convex_macro::prod_rt_test]

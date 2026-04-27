@@ -1154,12 +1154,12 @@ impl<RT: Runtime> Database<RT> {
         self.committer.finish_table_summary_bootstrap().await
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub(crate) fn committer_for_test(&self) -> CommitterClient {
         self.committer.clone()
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub(crate) fn replication_frontier_for_test(
         &self,
         partition: crate::partition::PartitionId,
@@ -1167,7 +1167,7 @@ impl<RT: Runtime> Database<RT> {
         self.snapshot_manager.lock().replication_frontier(partition)
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub(crate) fn persisted_max_repeatable_ts_for_test(&self) -> RepeatableTimestamp {
         self.snapshot_manager.lock().persisted_max_repeatable_ts()
     }
