@@ -167,17 +167,6 @@ own for distributed changes.
   - the focused local-backend bootstrap test now passes on the real local
     environment without the earlier token-refresh storm.
 
-## Open Issues
-
-None currently tracked in this journal after the latest clean-cluster run.
-
-## Notes
-
-- This journal is intentionally short and high-signal. Deep architectural
-  writeups still belong in the other docs.
-- When an issue is fixed, append the exact validation command set or point to
-  the test suite that proved it.
-
 ### 2026-04 — Replica public mutations were not routed through the active forwarding path
 
 - **Status:** fixed
@@ -205,3 +194,88 @@ None currently tracked in this journal after the latest clean-cluster run.
   - clean-cluster rerun via `self-hosted/docker/test.sh`: all `77` write-scaling
     tests passed and all `10` Raft failover tests passed, confirming the
     routing change did not regress the distributed cluster paths.
+
+### 2026-04 — Cluster correctness outpaced operator visibility and recovery guidance
+
+- **Status:** fixed
+- **Related issue:** `#81`
+- **Symptom:** the cluster could pass the full write-scaling and failover
+  suites, but operators still had to infer leadership, follower lag,
+  checkpoint health, snapshot install activity, and 2PC health from logs and
+  code. There was no concise runbook for the most likely recovery cases.
+- **Root Cause:** we had correctness mechanisms for Raft, checkpoint bootstrap,
+  snapshot install, and 2PC, but we had not turned those internal state
+  machines into a dedicated operator-facing metrics and documentation surface.
+- **Fix:** add cluster metrics for Raft leadership and progress, replication
+  frontiers, repeatable timestamps, checkpoint write/load activity, snapshot
+  installs, non-leader write rejection, fresh-replica bootstrap outcome, and
+  2PC decisions/errors/retries. Document the new `/metrics` surface, alert
+  suggestions, and short runbooks in `docs/cluster-observability.md`, and link
+  that guide from the README.
+- **Validation:**
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+  - fresh image build and push:
+    `ghcr.io/martinkalema/convex-horizontal-scaling:backend-issue81-observability-db1454f-20260428-074208-dirty`
+  - pushed digest:
+    `sha256:1c5c280c6587a9b3bc6d64a45437665b5286d89c33b68048b3963028226c0fa0`
+  - clean-cluster rerun via `self-hosted/docker/test.sh`: all `77` write-scaling
+    tests passed and all `10` Raft failover tests passed on the exact image
+    above.
+
+### 2026-04 — The first observability slice still missed leader-lag, transport, snapshot-cost, and richer 2PC signals
+
+- **Status:** fixed
+- **Related issue:** `#81`
+- **Symptom:** the initial clustered observability work exposed leadership,
+  checkpoint, bootstrap, and coarse 2PC health, but we still could not answer
+  some operator questions cleanly: which followers are behind, whether a
+  partition is under-replicated, whether JetStream transport is backing up,
+  how expensive snapshot apply is, and whether 2PC latency/fanout/retry
+  distributions are drifting.
+- **Root Cause:** the first `#81` slice focused on basic correctness and
+  recovery signals. It did not yet include the richer leader-progress,
+  transport-latency, snapshot-cost, and 2PC-distribution metrics that mature
+  systems like CockroachDB, TiDB/TiKV, YugabyteDB, and Spanner commonly
+  surface for operators.
+- **Fix:** add leader-side Raft follower-lag and quorum-health gauges,
+  JetStream transport lag/backlog/sequence histograms and gauges, snapshot
+  apply duration and bytes histograms, and 2PC coordinator latency,
+  participant-count, and prepare-attempt histograms. Update the operator guide
+  to document the actual exported metric names, leader-local gauge semantics,
+  and lazy histogram behavior.
+- **Validation:**
+  - `cargo check -p database`
+  - host-environment `cargo check -p local_backend`
+  - fresh image build and push:
+    `ghcr.io/martinkalema/convex-horizontal-scaling:backend-issue81-observability-followup-db1454f-20260428-102451-dirty`
+  - pushed digest:
+    `sha256:11d5896bc7b7c226822e3a9efa7fb2c8b2ea4d69946e2530b845bd1dfb899af9`
+  - clean-cluster rerun via `self-hosted/docker/test.sh`: all `77` write-scaling
+    tests passed and all `10` Raft failover tests passed on the exact image
+    above
+  - live scrape verification from the running cluster confirmed the new
+    exported names and behavior for:
+    `convex_local_backend_database_raft_configured_voters_info`,
+    `..._recent_active_voters_info`, `..._lagging_followers_info`,
+    `..._under_replicated_info`, and the
+    `convex_local_backend_database_replication_transport_*` metrics
+  - a targeted post-suite redeploy plus one direct `crossPartitionWrite`
+    mutation confirmed the new 2PC histograms:
+    `convex_local_backend_database_two_phase_coordinator_seconds`,
+    `..._participants_total`, and `..._prepare_attempts_total`
+  - the snapshot-apply histograms are wired and documented as lazy/event-driven;
+    this standard `77 + 10` harness did not force a fresh Raft snapshot install
+    on the scraped node, so those names will appear after the next real
+    snapshot-apply event on that node
+
+## Open Issues
+
+None currently tracked in this journal after the latest clean-cluster run.
+
+## Notes
+
+- This journal is intentionally short and high-signal. Deep architectural
+  writeups still belong in the other docs.
+- When an issue is fixed, append the exact validation command set or point to
+  the test suite that proved it.

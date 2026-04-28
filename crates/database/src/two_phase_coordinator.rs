@@ -17,6 +17,7 @@ use common::types::Timestamp;
 
 use crate::{
     committer::CommitterClient,
+    metrics,
     partition::{
         routed_partition_for_table,
         PartitionId,
@@ -223,6 +224,7 @@ pub async fn coordinate_two_phase_commit(
     write_source: WriteSource,
     partition_map: &PartitionMap,
 ) -> anyhow::Result<Timestamp> {
+    let timer = metrics::two_phase_coordinator_timer();
     let TransactionClassification::CrossPartition { partitions: _ } =
         classify_transaction(&transaction, partition_map, &write_source)
     else {
@@ -247,9 +249,12 @@ pub async fn coordinate_two_phase_commit(
             ))
         })
         .collect::<anyhow::Result<_>>()?;
+    metrics::log_two_phase_participants(participants.len());
 
     let mut last_retryable_error = None;
+    let mut prepare_attempts = 0usize;
     for attempt in 0..MAX_PREPARE_TS_RETRIES {
+        prepare_attempts = attempt + 1;
         let prepare_ts = local_committer.allocate_commit_ts().await?;
         tracing::info!(
             "2PC Coordinator: starting txn={}, participants={:?}, prepare_ts={}, attempt={}",
@@ -301,6 +306,7 @@ pub async fn coordinate_two_phase_commit(
                     }
 
                     if is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES {
+                        metrics::log_two_phase_prepare_retry();
                         tracing::info!(
                             "2PC Coordinator: retrying txn={} with a newer prepare timestamp \
                              after participant {} rejected ts on attempt {}",
@@ -312,6 +318,9 @@ pub async fn coordinate_two_phase_commit(
                         retry_prepare = true;
                         break;
                     }
+                    metrics::log_two_phase_error("prepare");
+                    metrics::log_two_phase_decision("rollback");
+                    metrics::log_two_phase_prepare_attempts(prepare_attempts);
                     return Err(err);
                 },
             }
@@ -323,14 +332,21 @@ pub async fn coordinate_two_phase_commit(
 
         let mut commit_results = Vec::new();
         for participant in &prepared_participants {
-            let commit_ts = commit_participant(
+            let commit_ts = match commit_participant(
                 local_committer,
                 node_addresses,
                 partition_map,
                 &txn_id,
                 *participant,
             )
-            .await?;
+            .await
+            {
+                Ok(commit_ts) => commit_ts,
+                Err(err) => {
+                    metrics::log_two_phase_error("commit");
+                    return Err(err);
+                },
+            };
             commit_results.push((*participant, commit_ts));
         }
 
@@ -349,9 +365,15 @@ pub async fn coordinate_two_phase_commit(
             txn_id,
             u64::from(prepare_ts),
         );
+        metrics::log_two_phase_prepare_attempts(prepare_attempts);
+        metrics::log_two_phase_decision("commit");
+        timer.finish();
         return Ok(prepare_ts);
     }
 
+    metrics::log_two_phase_error("prepare");
+    metrics::log_two_phase_decision("rollback");
+    metrics::log_two_phase_prepare_attempts(prepare_attempts.max(1));
     Err(last_retryable_error.unwrap_or_else(|| {
         anyhow::anyhow!(
             "2PC coordinator exhausted prepare timestamp retries for txn={}",

@@ -425,13 +425,16 @@ impl<RT: Runtime> Committer<RT> {
                 *last_commit_id < commit_id,
                 "queued snapshots must be ordered by commit id"
             );
-            assert!(*last_ts <= ts, "queued snapshots must be monotonic by timestamp");
+            assert!(
+                *last_ts <= ts,
+                "queued snapshots must be monotonic by timestamp"
+            );
         }
         self.queued_snapshots.push_back((commit_id, ts, snapshot));
     }
 
     fn dequeue_snapshot(&mut self, commit_id: usize) {
-        let (queued_commit_id, _, _) = self
+        let (queued_commit_id, ..) = self
             .queued_snapshots
             .pop_front()
             .expect("missing queued snapshot for published write");
@@ -1185,6 +1188,7 @@ impl<RT: Runtime> Committer<RT> {
         if let Some(ref raft) = self.raft_state {
             if !raft.is_leader() {
                 let leader = raft.leader_id();
+                metrics::log_write_rejected_not_leader(raft.partition_id());
                 anyhow::bail!(
                     "Not the Raft leader for partition {}. Current leader: node {}. Forward this \
                      mutation to the leader.",
@@ -1751,10 +1755,8 @@ impl<RT: Runtime> Committer<RT> {
                     db_snapshot.snapshot.table_summaries = Some(table_summaries);
                 }
 
-                let index_entries = checkpoint_index_entries(
-                    &db_snapshot.snapshot,
-                    &compacted_documents,
-                );
+                let index_entries =
+                    checkpoint_index_entries(&db_snapshot.snapshot, &compacted_documents);
 
                 let mut existing_documents = Vec::new();
                 let persistence_reader = persistence.reader();
@@ -2836,9 +2838,7 @@ impl CommitterClient {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub async fn tick_idle_replication_frontier_heartbeat_for_test(
-        &self,
-    ) -> anyhow::Result<()> {
+    pub async fn tick_idle_replication_frontier_heartbeat_for_test(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::TickIdleReplicationFrontierHeartbeat { result: tx };
         self.sender.try_send(message).map_err(|e| match e {
@@ -3126,7 +3126,17 @@ impl CommitterClient {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
         })?;
-        rx.await.map_err(|_| metrics::shutdown_error())?
+        let result = rx.await.map_err(|_| metrics::shutdown_error())?;
+        match &result {
+            Ok(ts) => {
+                metrics::log_snapshot_install_result(true);
+                metrics::log_snapshot_installed_ts(*ts);
+            },
+            Err(_) => {
+                metrics::log_snapshot_install_result(false);
+            },
+        }
+        result
     }
 
     #[cfg(any(test, feature = "testing"))]

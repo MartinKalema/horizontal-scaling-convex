@@ -79,6 +79,7 @@ use crate::{
         PartitionId,
         PartitionMap,
     },
+    tests::run_query,
     timestamp_oracle::{
         testing::InMemoryTimestampOracle,
         TimestampOracle,
@@ -89,7 +90,6 @@ use crate::{
         TwoPhaseCommitGrpcClient,
         TwoPhaseTransactionId,
     },
-    tests::run_query,
     Database,
     TestFacingModel,
     UserFacingModel,
@@ -895,7 +895,11 @@ async fn test_replication_frontier_heartbeat_does_not_advance_snapshot_ts(
         Query::full_table_scan("projects".parse()?, Order::Asc),
     )
     .await?;
-    assert_eq!(projects.len(), 1, "replica should expose the seeded project");
+    assert_eq!(
+        projects.len(),
+        1,
+        "replica should expose the seeded project"
+    );
 
     let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
     node_a

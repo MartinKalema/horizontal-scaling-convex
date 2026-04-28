@@ -121,7 +121,9 @@ impl MutationForwarder for MutationForwarderService {
                     .map(JsonValue::from)
                     .map(|value| serde_json::to_string(&value))
                     .transpose()
-                    .map_err(|e| Status::internal(format!("Failed to serialize error data: {e}")))?;
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to serialize error data: {e}"))
+                    })?;
                 Ok(Response::new(ForwardMutationResponse {
                     result: Some(forward_mutation_response::Result::Error(MutationError {
                         error_message,

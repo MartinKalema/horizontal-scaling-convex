@@ -1973,8 +1973,8 @@ impl<RT: Runtime> Database<RT> {
     pub async fn build_raft_snapshot_checkpoint(&self) -> anyhow::Result<CheckpointData> {
         let db_snapshot = self.latest_database_snapshot()?;
         let ts = *db_snapshot.timestamp();
-        let mut checkpoint = create_checkpoint(self.reader.as_ref(), ts, self.retention_validator())
-            .await?;
+        let mut checkpoint =
+            create_checkpoint(self.reader.as_ref(), ts, self.retention_validator()).await?;
 
         let mut globals = BTreeMap::new();
         for key in PersistenceGlobalKey::all_keys() {

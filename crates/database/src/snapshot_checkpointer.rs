@@ -39,9 +39,12 @@ use value::{
     TabletId,
 };
 
-use crate::checkpoint::{
-    create_checkpoint,
-    CheckpointData,
+use crate::{
+    checkpoint::{
+        create_checkpoint,
+        CheckpointData,
+    },
+    metrics,
 };
 
 /// How often the Primary writes a new checkpoint.
@@ -124,9 +127,12 @@ impl SnapshotCheckpointer {
                 .await
             {
                 Ok(ts) => {
+                    metrics::log_checkpoint_write_result(true);
+                    metrics::log_checkpoint_written_ts(ts);
                     tracing::info!("Wrote checkpoint at ts={ts}");
                 },
                 Err(e) => {
+                    metrics::log_checkpoint_write_result(false);
                     tracing::error!("Failed to write checkpoint: {e:?}");
                 },
             }
@@ -173,10 +179,26 @@ pub async fn load_latest_checkpoint(
     storage: &Arc<dyn Storage>,
 ) -> anyhow::Result<Option<CheckpointData>> {
     let latest_key = latest_checkpoint_object_key()?;
-    let Some(bytes) = read_storage_object(storage, &latest_key).await? else {
+    let bytes = match read_storage_object(storage, &latest_key).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            metrics::log_checkpoint_load_result(false);
+            return Err(e);
+        },
+    };
+    let Some(bytes) = bytes else {
         return Ok(None);
     };
-    Ok(Some(checkpoint_from_bytes(&bytes)?))
+    let checkpoint = match checkpoint_from_bytes(&bytes) {
+        Ok(checkpoint) => checkpoint,
+        Err(e) => {
+            metrics::log_checkpoint_load_result(false);
+            return Err(e);
+        },
+    };
+    metrics::log_checkpoint_load_result(true);
+    metrics::log_checkpoint_loaded_ts(checkpoint.timestamp);
+    Ok(Some(checkpoint))
 }
 
 /// Proto encoding for checkpoint data.
@@ -385,7 +407,9 @@ mod tests {
             .await?;
         let _ = upload.complete().await?;
 
-        let loaded = load_latest_checkpoint(&storage).await?.expect("checkpoint should exist");
+        let loaded = load_latest_checkpoint(&storage)
+            .await?
+            .expect("checkpoint should exist");
         assert_eq!(loaded.timestamp, checkpoint.timestamp);
         assert!(loaded.documents.is_empty());
         assert!(loaded.globals.is_empty());
