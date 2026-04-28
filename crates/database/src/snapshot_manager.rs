@@ -59,6 +59,7 @@ use vector::{
 };
 
 use crate::{
+    metrics,
     partition::PartitionId,
     schema_registry::SchemaRegistry,
     table_registry::{
@@ -589,6 +590,11 @@ impl SnapshotManager {
     ) -> Self {
         let mut versions = VecDeque::new();
         versions.push_back((initial_ts, initial_snapshot));
+        metrics::log_latest_repeatable_ts(initial_ts);
+        metrics::log_persisted_max_repeatable_ts(initial_ts);
+        for (partition, frontier) in &replication_frontiers {
+            metrics::log_replication_frontier_ts(*partition, *frontier);
+        }
         Self {
             versions,
             persisted_max_repeatable_ts: initial_ts,
@@ -717,6 +723,7 @@ impl SnapshotManager {
             }
         }
         self.replication_frontiers.insert(partition, ts);
+        metrics::log_replication_frontier_ts(partition, ts);
         self.notify_replication_waiters(partition);
         Ok(true)
     }
@@ -875,6 +882,7 @@ impl SnapshotManager {
             self.versions.pop_front();
         }
         self.versions.push_back((ts, snapshot));
+        metrics::log_latest_repeatable_ts(ts);
         self.notify_waiters();
         self.write_throughput_limiter.record_write(ts, write_bytes);
     }
@@ -889,6 +897,11 @@ impl SnapshotManager {
         self.versions.push_back((ts, snapshot));
         self.persisted_max_repeatable_ts = ts;
         self.replication_frontiers = replication_frontiers;
+        metrics::log_latest_repeatable_ts(ts);
+        metrics::log_persisted_max_repeatable_ts(ts);
+        for (partition, frontier) in &self.replication_frontiers {
+            metrics::log_replication_frontier_ts(*partition, *frontier);
+        }
         self.notify_waiters();
         let partitions: Vec<_> = self.replication_frontiers.keys().copied().collect();
         for partition in partitions {
@@ -919,6 +932,7 @@ impl SnapshotManager {
             ts
         );
         self.persisted_max_repeatable_ts = ts;
+        metrics::log_persisted_max_repeatable_ts(ts);
         let (latest_ts, snapshot) = self.latest();
         if ts > *latest_ts {
             self.push(ts, snapshot, 0);
@@ -927,7 +941,6 @@ impl SnapshotManager {
             Ok(false)
         }
     }
-
 }
 
 pub fn replication_frontiers_to_json(frontiers: &BTreeMap<PartitionId, Timestamp>) -> JsonValue {

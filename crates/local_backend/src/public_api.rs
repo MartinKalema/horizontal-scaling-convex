@@ -207,11 +207,13 @@ async fn maybe_forward_public_mutation(
     }
 
     let Some(forwarder) = &st.replica_mutation_forwarder else {
-        return Ok(Some(Err(anyhow::anyhow!(ErrorMetadata::service_unavailable())
-            .context(
-                "Replica mutation forwarding is not configured. Set PRIMARY_GRPC_URL for replica mode.",
-            )
-            .into())));
+        return Ok(Some(Err(anyhow::anyhow!(
+            ErrorMetadata::service_unavailable()
+        )
+        .context(
+            "Replica mutation forwarding is not configured. Set PRIMARY_GRPC_URL for replica mode.",
+        )
+        .into())));
     };
 
     let value_format = format.map(|f| f.parse()).transpose()?;
@@ -237,30 +239,30 @@ async fn maybe_forward_public_mutation(
                 ),
             )?;
             UdfResponse::Success {
-                value: export_value(
-                    packed.unpack()?,
-                    value_format,
-                    client_version.clone(),
-                )?,
+                value: export_value(packed.unpack()?, value_format, client_version.clone())?,
                 log_lines: RedactedLogLines::from_vec(success.log_lines),
             }
         },
-        Some(pb::replication::forward_mutation_response::Result::Error(error)) => UdfResponse::Error {
-            error_message: error.error_message,
-            error_data: error
-                .error_data
-                .map(|value| serde_json::from_str(&value))
-                .transpose()
-                .context(ErrorMetadata::bad_request(
-                    "InvalidForwardedMutationErrorData",
-                    "Primary returned invalid forwarded mutation error data.",
-                ))?,
-            log_lines: RedactedLogLines::from_vec(error.log_lines),
+        Some(pb::replication::forward_mutation_response::Result::Error(error)) => {
+            UdfResponse::Error {
+                error_message: error.error_message,
+                error_data: error
+                    .error_data
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .context(ErrorMetadata::bad_request(
+                        "InvalidForwardedMutationErrorData",
+                        "Primary returned invalid forwarded mutation error data.",
+                    ))?,
+                log_lines: RedactedLogLines::from_vec(error.log_lines),
+            }
         },
         None => {
-            return Ok(Some(Err(anyhow::anyhow!(ErrorMetadata::service_unavailable())
-                .context("Primary returned an empty forwarded mutation response.")
-                .into())));
+            return Ok(Some(Err(anyhow::anyhow!(
+                ErrorMetadata::service_unavailable()
+            )
+            .context("Primary returned an empty forwarded mutation response.")
+            .into())));
         },
     };
     Ok(Some(Ok(response)))
@@ -717,16 +719,15 @@ pub async fn public_mutation_post(
         .api
         .authenticate(&host, request_id.clone(), auth_token)
         .await?;
-    if let Some(response) =
-        maybe_forward_public_mutation(
-            &st,
-            &req.path,
-            &serialized_args,
-            req.format.as_deref(),
-            identity.clone(),
-            &client_version,
-        )
-        .await?
+    if let Some(response) = maybe_forward_public_mutation(
+        &st,
+        &req.path,
+        &serialized_args,
+        req.format.as_deref(),
+        identity.clone(),
+        &client_version,
+    )
+    .await?
     {
         return response.map(Json);
     }
@@ -856,7 +857,7 @@ mod tests {
         StatusCode,
     };
     use http_body_util::BodyExt;
-        use metrics::SERVER_VERSION_STR;
+    use metrics::SERVER_VERSION_STR;
     use runtime::prod::ProdRuntime;
     use serde_json::{
         json,
@@ -884,8 +885,7 @@ mod tests {
         let bytes = body.collect().await?.to_bytes();
         let msg = format!("Got response: {}", String::from_utf8_lossy(&bytes));
         assert_eq!(parts.status, StatusCode::OK, "{msg}");
-        serde_json::from_slice(if bytes.is_empty() { b"null" } else { &bytes })
-            .map_err(Into::into)
+        serde_json::from_slice(if bytes.is_empty() { b"null" } else { &bytes }).map_err(Into::into)
     }
 
     fn post_request(uri: &'static str, json_body: JsonValue) -> anyhow::Result<Request<Body>> {
@@ -996,9 +996,7 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
-    async fn test_http_mutation_forwards_when_replica_mode(
-        rt: ProdRuntime,
-    ) -> anyhow::Result<()> {
+    async fn test_http_mutation_forwards_when_replica_mode(rt: ProdRuntime) -> anyhow::Result<()> {
         let primary = setup_backend_for_test(rt.clone()).await?;
         let replica = setup_backend_for_test(rt.clone()).await?;
         primary.st.application.load_udf_tests_modules().await?;
@@ -1071,8 +1069,7 @@ mod tests {
             }
         }
         assert_eq!(
-            replica_test_docs,
-            0,
+            replica_test_docs, 0,
             "replica should not execute the forwarded mutation locally",
         );
 

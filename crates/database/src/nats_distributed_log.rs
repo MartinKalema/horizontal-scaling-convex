@@ -34,6 +34,7 @@ use crate::{
         CommitDelta,
         DistributedLog,
     },
+    metrics,
     partition::PartitionId,
     write_log::WriteSource,
 };
@@ -117,6 +118,9 @@ impl NatsDistributedLog {
             consumer_name,
             publish_subject,
         );
+        metrics::log_replication_transport_pending_messages(0);
+        metrics::log_replication_transport_stream_sequence(0);
+        metrics::log_replication_transport_consumer_sequence(0);
 
         Ok(Self {
             jetstream,
@@ -227,6 +231,8 @@ impl DistributedLog for NatsDistributedLog {
         let envelope = DeltaEnvelope::from_delta(&delta, &self.consumer_name)?;
         let payload = serde_json::to_vec(&envelope).context("Failed to serialize CommitDelta")?;
         let payload_size = payload.len();
+        let publish_timer = metrics::replication_transport_publish_timer();
+        metrics::log_replication_transport_message_bytes("publish", payload_size);
 
         // Publish and wait for acknowledgment from NATS server.
         // The double .await is intentional:
@@ -247,6 +253,7 @@ impl DistributedLog for NatsDistributedLog {
             payload_size,
             ack.sequence,
         );
+        drop(publish_timer);
         Ok(())
     }
 
@@ -258,7 +265,7 @@ impl DistributedLog for NatsDistributedLog {
         // DeliverPolicy::All replays all messages from the stream beginning,
         // and we filter out messages at or before from_ts ourselves.
         let consumer_name = self.consumer_name.clone();
-        let consumer: PullConsumer = self
+        let mut consumer: PullConsumer = self
             .stream
             .get_or_create_consumer(
                 &consumer_name,
@@ -271,6 +278,18 @@ impl DistributedLog for NatsDistributedLog {
             )
             .await
             .context("Failed to create NATS durable consumer")?;
+        let consumer_info = consumer
+            .info()
+            .await
+            .context("Failed to get NATS consumer info")?
+            .clone();
+        metrics::log_replication_transport_pending_messages(consumer_info.num_pending);
+        metrics::log_replication_transport_stream_sequence(
+            consumer_info.delivered.stream_sequence,
+        );
+        metrics::log_replication_transport_consumer_sequence(
+            consumer_info.delivered.consumer_sequence,
+        );
 
         let from_ts_u64 = u64::from(from_ts);
         let messages = consumer
@@ -291,6 +310,34 @@ impl DistributedLog for NatsDistributedLog {
             async move {
                 match msg_result {
                     Ok(msg) => {
+                        metrics::log_replication_transport_message_bytes(
+                            "consume",
+                            msg.payload.len(),
+                        );
+                        match msg.info() {
+                            Ok(info) => {
+                                metrics::log_replication_transport_pending_messages(info.pending);
+                                metrics::log_replication_transport_stream_sequence(
+                                    info.stream_sequence,
+                                );
+                                metrics::log_replication_transport_consumer_sequence(
+                                    info.consumer_sequence,
+                                );
+                                let now_ns = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos() as i128;
+                                let published_ns = info.published.unix_timestamp_nanos();
+                                if now_ns >= published_ns {
+                                    metrics::log_replication_transport_lag(
+                                        (now_ns - published_ns) as f64 / 1_000_000_000.0,
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                tracing::debug!("Failed to parse JetStream message info: {e}");
+                            },
+                        }
                         if let Err(e) = msg.ack().await {
                             tracing::warn!("Failed to ack NATS message: {e:?}");
                         }

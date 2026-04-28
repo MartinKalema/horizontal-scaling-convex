@@ -32,6 +32,7 @@ use slog::o;
 use tokio::sync::mpsc;
 
 use crate::{
+    metrics,
     partition::PartitionId,
     raft_storage::ConvexRaftStorage,
 };
@@ -239,6 +240,46 @@ impl RaftNode {
 
             // Process Ready state.
             if self.raw_node.has_ready() {
+                let replication_health = {
+                    let status = self.raw_node.status();
+                    status.progress.map(|progress| {
+                        let voter_ids: Vec<u64> = progress.conf().voters().ids().iter().collect();
+                        let configured_voters = voter_ids.len();
+                        let leader_committed = status.hs.commit;
+                        let mut recent_active_voters = 0usize;
+                        let mut lagging_followers = 0usize;
+                        let mut max_follower_lag_entries = 0u64;
+                        let mut total_follower_lag_entries = 0u64;
+
+                        for voter_id in voter_ids {
+                            if voter_id == self.config.node_id {
+                                recent_active_voters += 1;
+                                continue;
+                            }
+                            let Some(peer_progress) = progress.get(voter_id) else {
+                                continue;
+                            };
+                            if peer_progress.recent_active {
+                                recent_active_voters += 1;
+                            }
+                            let lag = leader_committed.saturating_sub(peer_progress.matched);
+                            if lag > 0 {
+                                lagging_followers += 1;
+                            }
+                            max_follower_lag_entries = max_follower_lag_entries.max(lag);
+                            total_follower_lag_entries =
+                                total_follower_lag_entries.saturating_add(lag);
+                        }
+
+                        (
+                            configured_voters,
+                            recent_active_voters,
+                            lagging_followers,
+                            max_follower_lag_entries,
+                            total_follower_lag_entries,
+                        )
+                    })
+                };
                 let mut ready = self.raw_node.ready();
 
                 // Detect leadership changes (TiKV SoftState pattern).
@@ -273,6 +314,35 @@ impl RaftNode {
                     }
                 }
 
+                metrics::log_raft_term(self.config.partition_id, self.raw_node.raft.term);
+                metrics::log_raft_committed_index(
+                    self.config.partition_id,
+                    self.raw_node.raft.raft_log.committed,
+                );
+                metrics::log_raft_applied_index(
+                    self.config.partition_id,
+                    self.raw_node.raft.raft_log.applied,
+                );
+                if let Some((
+                    configured_voters,
+                    recent_active_voters,
+                    lagging_followers,
+                    max_follower_lag_entries,
+                    total_follower_lag_entries,
+                )) = replication_health
+                {
+                    metrics::log_raft_replication_health(
+                        self.config.partition_id,
+                        configured_voters,
+                        recent_active_voters,
+                        lagging_followers,
+                        max_follower_lag_entries,
+                        total_follower_lag_entries,
+                    );
+                } else {
+                    metrics::reset_raft_replication_health(self.config.partition_id);
+                }
+
                 // 1. Send messages to peers.
                 for msg in ready.take_messages() {
                     let to = msg.to;
@@ -291,10 +361,17 @@ impl RaftNode {
 
                 // 2. Persist and apply any incoming snapshot before appending entries.
                 if !ready.snapshot().is_empty() {
+                    let snapshot_timer = metrics::raft_snapshot_apply_timer();
+                    let snapshot_bytes = ready.snapshot().get_data().len();
+                    metrics::log_raft_snapshot_apply_bytes(snapshot_bytes);
                     if let Err(e) = self.storage.apply_snapshot(ready.snapshot()) {
                         tracing::error!("Failed to persist snapshot: {e}");
+                        drop(snapshot_timer);
                     } else if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
                         tracing::error!("Failed to apply snapshot to state machine: {e}");
+                        drop(snapshot_timer);
+                    } else {
+                        snapshot_timer.finish();
                     }
                 }
 

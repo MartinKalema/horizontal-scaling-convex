@@ -23,8 +23,8 @@ use common::{
 };
 use database::Database;
 use model::database_globals::DatabaseGlobalsModel;
-use runtime::prod::ProdRuntime;
 use reqwest::Url;
+use runtime::prod::ProdRuntime;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 const COMPILED_REVISION: &str = env!("VERGEN_GIT_SHA");
