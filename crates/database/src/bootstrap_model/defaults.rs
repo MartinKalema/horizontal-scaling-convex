@@ -21,7 +21,7 @@ use common::{
 };
 use maplit::btreemap;
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNamespace,
     TableNumber,
@@ -135,14 +135,14 @@ impl BootstrapTableIds {
     pub fn table_resolved_doc_id(&self, table_id: TabletId) -> ResolvedDocumentId {
         ResolvedDocumentId::new(
             self.tables_id.tablet_id,
-            DeveloperDocumentId::new(self.tables_id.table_number, table_id.0),
+            PublicDocumentId::new(self.tables_id.table_number, table_id.0),
         )
     }
 
     pub fn index_resolved_doc_id(&self, index_id: IndexId) -> ResolvedDocumentId {
         ResolvedDocumentId::new(
             self.index_id.tablet_id,
-            DeveloperDocumentId::new(self.index_id.table_number, index_id),
+            PublicDocumentId::new(self.index_id.table_number, index_id),
         )
     }
 

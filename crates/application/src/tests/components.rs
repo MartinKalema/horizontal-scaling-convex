@@ -39,8 +39,8 @@ use sync_types::{
 };
 use value::{
     assert_obj,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     TableName,
     TableNamespace,
 };
@@ -312,7 +312,7 @@ pub async fn unmount_component(
     Ok(component_id)
 }
 
-fn example_message() -> ConvexObject {
+fn example_message() -> DocumentObject {
     assert_obj!("channel" => "sports", "text" => "the celtics won!")
 }
 

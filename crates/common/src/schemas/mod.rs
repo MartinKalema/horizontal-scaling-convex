@@ -24,9 +24,9 @@ use shape_inference::{
 #[cfg(any(test, feature = "testing"))]
 use value::TableType;
 use value::{
-    id_v6::DeveloperDocumentId,
-    ConvexObject,
+    id_v6::PublicDocumentId,
     ConvexValue,
+    DocumentObject,
     IdentifierFieldName,
     Namespace,
     NamespacedTableMapping,
@@ -71,7 +71,7 @@ pub enum SchemaValidationError {
     ExistingDocument {
         validation_error: ValidationError,
         table_name: TableName,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
     },
 
     // TODO: Figure out if it's possible to surface the document ID here,
@@ -343,7 +343,7 @@ impl DatabaseSchema {
             .map_err(|validation_error| SchemaValidationError::ExistingDocument {
                 validation_error,
                 table_name,
-                id: doc.developer_id(),
+                id: doc.document_id(),
             })
     }
 
@@ -782,7 +782,7 @@ pub enum DocumentSchema {
 impl DocumentSchema {
     fn check_value(
         &self,
-        value: &ConvexObject,
+        value: &DocumentObject,
         table_mapping: &NamespacedTableMapping,
         virtual_system_mapping: &VirtualSystemMapping,
     ) -> Result<(), ValidationError> {

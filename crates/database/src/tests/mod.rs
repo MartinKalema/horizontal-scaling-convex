@@ -67,8 +67,8 @@ use common::{
         WriteTimestamp,
     },
     value::{
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
     },
     virtual_system_mapping::{
         all_tables_name_to_number,
@@ -91,7 +91,7 @@ use sync_types::backoff::Backoff;
 use value::{
     array,
     assert_val,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     val,
     FieldPath,
     ResolvedDocumentId,
@@ -409,14 +409,14 @@ async fn test_delete_conflict(rt: TestRuntime) -> anyhow::Result<()> {
     let database = new_test_database(rt).await;
     let mut tx = database.begin(Identity::system()).await?;
     let id = TestFacingModel::new(&mut tx)
-        .insert(&"key".parse()?, ConvexObject::empty())
+        .insert(&"key".parse()?, DocumentObject::empty())
         .await?;
     database.commit(tx).await?;
 
     let mut tx1 = database.begin(Identity::system()).await?;
     assert!(tx1.get(id).await?.is_some());
     TestFacingModel::new(&mut tx1)
-        .insert(&"key2".parse()?, ConvexObject::empty())
+        .insert(&"key2".parse()?, DocumentObject::empty())
         .await?;
 
     let mut tx2 = database.begin(Identity::system()).await?;
@@ -450,7 +450,7 @@ async fn test_creation_time_success(rt: TestRuntime) -> anyhow::Result<()> {
     let database = new_test_database(rt.clone()).await;
     let mut tx = database.begin(Identity::system()).await?;
     TestFacingModel::new(&mut tx)
-        .insert(&"table".parse()?, ConvexObject::empty())
+        .insert(&"table".parse()?, DocumentObject::empty())
         .await?;
     database.commit(tx).await?;
 
@@ -461,10 +461,10 @@ async fn test_creation_time_success(rt: TestRuntime) -> anyhow::Result<()> {
     assert!(tx1.next_creation_time < tx2.next_creation_time);
 
     TestFacingModel::new(&mut tx1)
-        .insert(&"table".parse()?, ConvexObject::empty())
+        .insert(&"table".parse()?, DocumentObject::empty())
         .await?;
     TestFacingModel::new(&mut tx2)
-        .insert(&"table".parse()?, ConvexObject::empty())
+        .insert(&"table".parse()?, DocumentObject::empty())
         .await?;
 
     database.commit(tx1).await?;
@@ -487,13 +487,13 @@ async fn test_id_reuse_across_transactions(rt: TestRuntime) -> anyhow::Result<()
     let mut tx = database.begin(Identity::system()).await?;
     // Pretend we create another document with the same ID as the first. We can't do
     // this through the normal Transaction interface so we pretend it's an import.
-    let id_v6 = DeveloperDocumentId::from(document.id()).encode();
+    let id_v6 = PublicDocumentId::from(document.id()).encode();
     let table_mapping_for_schema = tx.table_mapping().clone();
     ImportFacingModel::new(&mut tx)
         .insert(
             TabletIdAndTableNumber {
                 tablet_id: document.id().tablet_id,
-                table_number: document.id().developer_id.table(),
+                table_number: document.id().document_id.table(),
             },
             &"table".parse()?,
             assert_obj!("_id" => id_v6),
@@ -513,16 +513,16 @@ async fn test_id_reuse_within_a_transactions(rt: TestRuntime) -> anyhow::Result<
     let database = new_test_database(rt).await;
     let mut tx = database.begin(Identity::system()).await?;
     let document_id = TestFacingModel::new(&mut tx)
-        .insert(&"table".parse()?, ConvexObject::empty())
+        .insert(&"table".parse()?, DocumentObject::empty())
         .await?;
     let table_mapping = tx.table_mapping().clone();
     let table_id = table_mapping
         .namespace(TableNamespace::test_user())
         .name_to_id()("table".parse()?)?;
 
-    // Do another insert using the same DocumentId.
+    // Do another insert using the same PublicDocumentId.
     let value = assert_obj!(
-        "_id" => DeveloperDocumentId::from(document_id).encode(),
+        "_id" => PublicDocumentId::from(document_id).encode(),
     );
     let err = ImportFacingModel::new(&mut tx)
         .insert(table_id, &"table".parse()?, value, &table_mapping)
@@ -647,10 +647,10 @@ async fn test_full_table_scan_order(rt: TestRuntime) -> anyhow::Result<()> {
     let namespace = TableNamespace::test_user();
     let mut tx = database.begin(Identity::system()).await?;
     let doc1 = TestFacingModel::new(&mut tx)
-        .insert_and_get("messages".parse()?, ConvexObject::empty())
+        .insert_and_get("messages".parse()?, DocumentObject::empty())
         .await?;
     let doc2 = TestFacingModel::new(&mut tx)
-        .insert_and_get("messages".parse()?, ConvexObject::empty())
+        .insert_and_get("messages".parse()?, DocumentObject::empty())
         .await?;
     database.commit(tx).await?;
 
@@ -1078,7 +1078,7 @@ async fn test_insert_new_table_for_import(rt: TestRuntime) -> anyhow::Result<()>
         .await?;
     let doc1_id = ResolvedDocumentId::new(
         table_id.tablet_id,
-        DeveloperDocumentId::new(table_id.table_number, doc1_id.internal_id()),
+        PublicDocumentId::new(table_id.table_number, doc1_id.internal_id()),
     );
     let doc2_id = ImportFacingModel::new(&mut tx)
         .insert(
@@ -1090,7 +1090,7 @@ async fn test_insert_new_table_for_import(rt: TestRuntime) -> anyhow::Result<()>
         .await?;
     let doc2_id = ResolvedDocumentId::new(
         table_id.tablet_id,
-        DeveloperDocumentId::new(table_id.table_number, doc2_id.internal_id()),
+        PublicDocumentId::new(table_id.table_number, doc2_id.internal_id()),
     );
 
     database.commit(tx).await?;
@@ -1231,7 +1231,7 @@ async fn test_importing_foreign_reference_schema_validated(rt: TestRuntime) -> a
         )
         .await?;
     let foreign_doc_id =
-        DeveloperDocumentId::new(foreign_table_id.table_number, foreign_doc.internal_id());
+        PublicDocumentId::new(foreign_table_id.table_number, foreign_doc.internal_id());
     ImportFacingModel::new(&mut tx)
         .insert(
             table_id,
@@ -1327,7 +1327,7 @@ async fn test_import_overwrite_foreign_reference_schema_validated(
     let active_foreign_doc = UserFacingModel::new_root_for_test(&mut tx)
         .insert(foreign_table_name.clone(), assert_obj!())
         .await?;
-    let active_foreign_doc_id = DeveloperDocumentId::new(
+    let active_foreign_doc_id = PublicDocumentId::new(
         active_foreign_table_number,
         active_foreign_doc.internal_id(),
     );
@@ -1353,7 +1353,7 @@ async fn test_import_overwrite_foreign_reference_schema_validated(
         )
         .await?;
     let foreign_doc_id =
-        DeveloperDocumentId::new(foreign_table_id.table_number, foreign_doc.internal_id());
+        PublicDocumentId::new(foreign_table_id.table_number, foreign_doc.internal_id());
     ImportFacingModel::new(&mut tx)
         .insert(
             table_id,
@@ -1403,7 +1403,7 @@ async fn test_overwrite_for_import(rt: TestRuntime) -> anyhow::Result<()> {
         .insert(table_name.clone(), object.clone())
         .await?;
     let doc0_id = tx.resolve_developer_id(&doc_id_user_facing, TableNamespace::test_user())?;
-    let doc0_id_str: String = DeveloperDocumentId::from(doc0_id).encode();
+    let doc0_id_str: String = PublicDocumentId::from(doc0_id).encode();
     database.commit(tx).await?;
     let object_with_id = assert_obj!("_id" => &*doc0_id_str, "value" => 2);
 
@@ -1413,7 +1413,7 @@ async fn test_overwrite_for_import(rt: TestRuntime) -> anyhow::Result<()> {
         .insert_table_for_import(
             TableNamespace::test_user(),
             &table_name,
-            Some(doc0_id.developer_id.table()),
+            Some(doc0_id.document_id.table()),
         )
         .await?;
     let mut table_mapping_for_schema = tx.table_mapping().clone();
@@ -1433,11 +1433,11 @@ async fn test_overwrite_for_import(rt: TestRuntime) -> anyhow::Result<()> {
         .await?;
     let doc1_id = ResolvedDocumentId::new(
         table_id.tablet_id,
-        DeveloperDocumentId::new(table_id.table_number, doc1_id.internal_id()),
+        PublicDocumentId::new(table_id.table_number, doc1_id.internal_id()),
     );
     database.commit(tx).await?;
     assert_eq!(doc1_id.internal_id(), doc0_id.internal_id());
-    assert_eq!(doc1_id.developer_id.table(), doc0_id.developer_id.table());
+    assert_eq!(doc1_id.document_id.table(), doc0_id.document_id.table());
     assert!(doc1_id.tablet_id != doc0_id.tablet_id);
 
     let mut tx = database.begin(Identity::system()).await?;
@@ -1512,7 +1512,7 @@ async fn test_interrupted_import_then_delete_table(rt: TestRuntime) -> anyhow::R
         .await?;
     let doc1_id_inner = ResolvedDocumentId::new(
         table_id.tablet_id,
-        DeveloperDocumentId::new(table_id.table_number, doc1_id.internal_id()),
+        PublicDocumentId::new(table_id.table_number, doc1_id.internal_id()),
     );
     database.commit(tx).await?;
     // Now the import fails. The hidden table never gets activated.

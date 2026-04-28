@@ -3,7 +3,7 @@ use common::{
     runtime::Runtime,
 };
 use value::{
-    ConvexObject,
+    DocumentObject,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -27,7 +27,7 @@ impl<'a, RT: Runtime> TestFacingModel<'a, RT> {
     pub async fn insert(
         &mut self,
         table: &TableName,
-        value: ConvexObject,
+        value: DocumentObject,
     ) -> anyhow::Result<ResolvedDocumentId> {
         SystemMetadataModel::new(self.tx, TableNamespace::test_user())
             .insert_metadata(table, value)
@@ -38,7 +38,7 @@ impl<'a, RT: Runtime> TestFacingModel<'a, RT> {
     pub async fn replace(
         &mut self,
         id: ResolvedDocumentId,
-        value: ConvexObject,
+        value: DocumentObject,
     ) -> anyhow::Result<ResolvedDocument> {
         SystemMetadataModel::new(self.tx, TableNamespace::test_user())
             .replace(id, value)
@@ -51,7 +51,7 @@ impl<'a, RT: Runtime> TestFacingModel<'a, RT> {
     pub async fn insert_and_get(
         &mut self,
         table: TableName,
-        value: ConvexObject,
+        value: DocumentObject,
     ) -> anyhow::Result<ResolvedDocument> {
         let id = self.insert(&table, value).await?;
         self.tx

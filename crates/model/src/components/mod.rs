@@ -395,7 +395,7 @@ mod tests {
     };
     use keybroker::Identity;
     use runtime::testing::TestRuntime;
-    use value::DeveloperDocumentId;
+    use value::PublicDocumentId;
 
     use crate::{
         modules::{
@@ -411,7 +411,7 @@ mod tests {
 
         let mut tx = db.begin(Identity::system()).await?;
         let component_metadata = ComponentMetadata {
-            definition_id: DeveloperDocumentId::MIN,
+            definition_id: PublicDocumentId::MIN,
             component_type: ComponentType::App,
             state: ComponentState::Active,
         };

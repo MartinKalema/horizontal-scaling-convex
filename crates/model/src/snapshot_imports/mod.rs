@@ -26,8 +26,8 @@ use errors::ErrorMetadata;
 use sync_types::Timestamp;
 use types::ImportRequestor;
 use value::{
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -392,7 +392,7 @@ impl<'a, RT: Runtime> SnapshotImportModel<'a, RT> {
         &mut self,
         import_state: ImportState,
     ) -> anyhow::Result<Option<ParsedDocument<SnapshotImport>>> {
-        let import_state_type = ConvexObject::try_from(import_state)?
+        let import_state_type = DocumentObject::try_from(import_state)?
             .get("state")
             .context("should have state field")?
             .clone();

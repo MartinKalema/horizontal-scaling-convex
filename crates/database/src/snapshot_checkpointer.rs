@@ -22,11 +22,16 @@ use common::{
         Runtime,
         SpawnHandle,
     },
-    types::Timestamp,
+    types::{
+        ObjectKey,
+        Timestamp,
+    },
 };
+use futures::TryStreamExt;
 use prost::Message;
 use storage::{
     Storage,
+    StorageExt,
     Upload,
 };
 use value::{
@@ -34,13 +39,53 @@ use value::{
     TabletId,
 };
 
-use crate::checkpoint::{
-    create_checkpoint,
-    CheckpointData,
+use crate::{
+    checkpoint::{
+        create_checkpoint,
+        CheckpointData,
+    },
+    metrics,
 };
 
 /// How often the Primary writes a new checkpoint.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
+pub const LATEST_CHECKPOINT_KEY: &str = "checkpoint-latest";
+
+fn checkpoint_object_key(ts: Timestamp) -> anyhow::Result<ObjectKey> {
+    format!("checkpoint-{}", u64::from(ts)).try_into()
+}
+
+fn latest_checkpoint_object_key() -> anyhow::Result<ObjectKey> {
+    LATEST_CHECKPOINT_KEY.try_into()
+}
+
+async fn write_storage_object(
+    storage: &Arc<dyn Storage>,
+    key: ObjectKey,
+    bytes: Bytes,
+) -> anyhow::Result<()> {
+    let mut upload = storage.start_upload_with_key(key).await?;
+    upload.write(bytes).await?;
+    let _ = upload.complete().await?;
+    Ok(())
+}
+
+async fn read_storage_object(
+    storage: &Arc<dyn Storage>,
+    key: &ObjectKey,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(stream) = storage.get(key).await? else {
+        return Ok(None);
+    };
+    let bytes = stream
+        .stream
+        .try_fold(Vec::new(), |mut acc, chunk| async move {
+            acc.extend_from_slice(&chunk);
+            Ok(acc)
+        })
+        .await?;
+    Ok(Some(bytes))
+}
 
 /// Background task that periodically writes checkpoints to object storage.
 pub struct SnapshotCheckpointer {
@@ -82,9 +127,12 @@ impl SnapshotCheckpointer {
                 .await
             {
                 Ok(ts) => {
+                    metrics::log_checkpoint_write_result(true);
+                    metrics::log_checkpoint_written_ts(ts);
                     tracing::info!("Wrote checkpoint at ts={ts}");
                 },
                 Err(e) => {
+                    metrics::log_checkpoint_write_result(false);
                     tracing::error!("Failed to write checkpoint: {e:?}");
                 },
             }
@@ -111,26 +159,15 @@ impl SnapshotCheckpointer {
         let num_docs = checkpoint.documents.len();
 
         // Serialize to proto bytes.
-        let proto = checkpoint_to_proto(&checkpoint)?;
-        let bytes = proto.encode_to_vec();
+        let bytes = Bytes::from(checkpoint_to_bytes(&checkpoint)?);
 
         tracing::info!(
             "Checkpoint at ts={ts}: {num_docs} documents, {} bytes",
             bytes.len()
         );
 
-        // Upload to storage.
-        let checkpoint_key = format!("checkpoint-{}", u64::from(ts));
-        let mut upload = storage.start_upload().await?;
-        upload.write(Bytes::from(bytes)).await?;
-        let _key = upload.complete().await?;
-
-        // Write the latest pointer.
-        let mut latest_upload = storage.start_upload().await?;
-        latest_upload
-            .write(Bytes::from(checkpoint_key.into_bytes()))
-            .await?;
-        let _ = latest_upload.complete().await?;
+        write_storage_object(storage, checkpoint_object_key(ts)?, bytes.clone()).await?;
+        write_storage_object(storage, latest_checkpoint_object_key()?, bytes).await?;
 
         Ok(ts)
     }
@@ -139,20 +176,28 @@ impl SnapshotCheckpointer {
 /// Load the latest checkpoint from storage.
 /// Called by Replicas at startup to bootstrap their SnapshotManager.
 pub async fn load_latest_checkpoint(
-    _storage: &dyn Storage,
-    persistence_reader: &dyn PersistenceReader,
-    retention_validator: Arc<dyn common::persistence::RetentionValidator>,
+    storage: &Arc<dyn Storage>,
 ) -> anyhow::Result<Option<CheckpointData>> {
-    // For now, create a checkpoint directly from the persistence reader.
-    // In production, this would download from object storage.
-    // The persistence_reader here would point to the Primary's database
-    // (read-only) or the checkpoint would be fetched from S3/R2.
-    let max_ts = match persistence_reader.max_ts().await? {
-        Some(ts) => ts,
-        None => return Ok(None),
+    let latest_key = latest_checkpoint_object_key()?;
+    let bytes = match read_storage_object(storage, &latest_key).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            metrics::log_checkpoint_load_result(false);
+            return Err(e);
+        },
     };
-
-    let checkpoint = create_checkpoint(persistence_reader, max_ts, retention_validator).await?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let checkpoint = match checkpoint_from_bytes(&bytes) {
+        Ok(checkpoint) => checkpoint,
+        Err(e) => {
+            metrics::log_checkpoint_load_result(false);
+            return Err(e);
+        },
+    };
+    metrics::log_checkpoint_load_result(true);
+    metrics::log_checkpoint_loaded_ts(checkpoint.timestamp);
     Ok(Some(checkpoint))
 }
 
@@ -245,6 +290,10 @@ fn checkpoint_to_proto(data: &CheckpointData) -> anyhow::Result<checkpoint_proto
     })
 }
 
+pub fn checkpoint_to_bytes(data: &CheckpointData) -> anyhow::Result<Vec<u8>> {
+    Ok(checkpoint_to_proto(data)?.encode_to_vec())
+}
+
 pub fn checkpoint_from_proto(
     proto: checkpoint_proto::CheckpointData,
 ) -> anyhow::Result<CheckpointData> {
@@ -307,4 +356,63 @@ pub fn checkpoint_from_proto(
         documents,
         globals,
     })
+}
+
+pub fn checkpoint_from_bytes(bytes: &[u8]) -> anyhow::Result<CheckpointData> {
+    let proto = checkpoint_proto::CheckpointData::decode(bytes)?;
+    checkpoint_from_proto(proto)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::Arc,
+    };
+
+    use bytes::Bytes;
+    use common::{
+        runtime::testing::TestRuntime,
+        types::Timestamp,
+    };
+    use storage::{
+        LocalDirStorage,
+        Storage,
+        Upload,
+    };
+
+    use super::{
+        checkpoint_to_bytes,
+        load_latest_checkpoint,
+        CheckpointData,
+        LATEST_CHECKPOINT_KEY,
+    };
+
+    #[convex_macro::test_runtime]
+    async fn test_load_latest_checkpoint_reads_stable_latest_object(
+        rt: TestRuntime,
+    ) -> anyhow::Result<()> {
+        let storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::new(rt)?);
+        let checkpoint = CheckpointData {
+            timestamp: Timestamp::try_from(42u64)?,
+            documents: vec![],
+            globals: BTreeMap::new(),
+        };
+
+        let mut upload = storage
+            .start_upload_with_key(LATEST_CHECKPOINT_KEY.try_into()?)
+            .await?;
+        upload
+            .write(Bytes::from(checkpoint_to_bytes(&checkpoint)?))
+            .await?;
+        let _ = upload.complete().await?;
+
+        let loaded = load_latest_checkpoint(&storage)
+            .await?
+            .expect("checkpoint should exist");
+        assert_eq!(loaded.timestamp, checkpoint.timestamp);
+        assert!(loaded.documents.is_empty());
+        assert!(loaded.globals.is_empty());
+        Ok(())
+    }
 }

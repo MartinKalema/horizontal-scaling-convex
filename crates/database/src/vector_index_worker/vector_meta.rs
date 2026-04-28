@@ -61,7 +61,7 @@ use search::{
 use storage::Storage;
 use sync_types::Timestamp;
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     TableNumber,
     TabletId,
 };
@@ -249,7 +249,7 @@ impl SearchIndex for VectorSearchIndex {
             .try_filter(move |entry| {
                 let doc_id_index_key = IndexKey::new(
                     vec![],
-                    DeveloperDocumentId::new(table_number, entry.id.internal_id()),
+                    PublicDocumentId::new(table_number, entry.id.internal_id()),
                 );
                 let in_range = filter_id_range.contains(&doc_id_index_key.to_bytes());
                 let duplicate = documents_seen.contains(&entry.id);

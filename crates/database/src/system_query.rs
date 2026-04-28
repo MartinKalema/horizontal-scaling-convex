@@ -35,7 +35,7 @@ use value::{
     serde::ConvexSerializable,
     sorting::write_sort_key,
     walk::ConvexValueWalker,
-    DeveloperDocumentId,
+    PublicDocumentId,
     TableNamespace,
     TabletId,
 };
@@ -327,7 +327,7 @@ impl<RT: Runtime> Transaction<RT> {
     pub async fn get_system<T: SystemTable>(
         &mut self,
         namespace: TableNamespace,
-        id: DeveloperDocumentId,
+        id: PublicDocumentId,
     ) -> anyhow::Result<Option<Arc<ParsedDocument<T::Metadata>>>>
     where
         T::Metadata: ConvexSerializable,
@@ -476,7 +476,7 @@ mod tests {
         codegen_convex_serialization,
         values_to_bytes,
         ConvexValue,
-        DeveloperDocumentId,
+        PublicDocumentId,
         ResolvedDocumentId,
         TableName,
         TableNamespace,
@@ -613,7 +613,7 @@ mod tests {
                 BinaryKey::min(),
                 End::after_prefix(&k::<ConvexValue, 2>([
                     doc1.creation_time().into(),
-                    doc1.developer_id().encode().try_into().unwrap()
+                    doc1.document_id().encode().try_into().unwrap()
                 ]))
             )])
         );
@@ -627,7 +627,7 @@ mod tests {
                 BinaryKey::min(),
                 End::after_prefix(&k::<ConvexValue, 2>([
                     doc2.creation_time().into(),
-                    doc2.developer_id().encode().try_into().unwrap()
+                    doc2.document_id().encode().try_into().unwrap()
                 ]))
             )])
         );
@@ -828,19 +828,19 @@ mod tests {
         db.commit(tx).await?;
         let mut tx = db.begin_system().await?;
         assert_eq!(
-            tx.get_system::<TestTable>(namespace, doc.developer_id())
+            tx.get_system::<TestTable>(namespace, doc.document_id())
                 .await?
                 .unwrap()
                 .id(),
             doc.id()
         );
         assert_eq!(
-            tx.get_system::<TestTable>(namespace, DeveloperDocumentId::MIN)
+            tx.get_system::<TestTable>(namespace, PublicDocumentId::MIN)
                 .await?,
             None
         );
-        let doc_key = k([doc.developer_id().encode()]);
-        let missing_key = k([DeveloperDocumentId::MIN.encode()]);
+        let doc_key = k([doc.document_id().encode()]);
+        let missing_key = k([PublicDocumentId::MIN.encode()]);
         assert_eq!(
             index_reads(&tx, &SystemIndex::<TestTable>::by_id(), namespace),
             intervals([

@@ -36,7 +36,7 @@ use crate::{
         integer::JsonInteger,
     },
     numeric::is_negative_zero,
-    object::ConvexObject,
+    object::DocumentObject,
     walk::ConvexValueType,
     ConvexArray,
     ConvexValue,
@@ -169,23 +169,23 @@ pub mod object {
 
     use crate::{
         walk::ConvexValueType,
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
     };
 
     pub fn serialize<S: Serializer>(
-        object: &ConvexObject,
+        object: &DocumentObject,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         super::value::serialize(ConvexValueType::<&ConvexValue>::Object(object), serializer)
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<ConvexObject, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DocumentObject, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = JsonValue::deserialize(deserializer)?;
-        ConvexObject::try_from(value).map_err(serde::de::Error::custom)
+        DocumentObject::try_from(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -236,7 +236,7 @@ impl TryFrom<JsonValue> for ConvexValue {
                             }
                             Self::from(n)
                         },
-                        _ => Self::Object(ConvexObject::for_value(
+                        _ => Self::Object(DocumentObject::for_value(
                             key.parse()?,
                             Self::try_from(value)?,
                         )?),
@@ -262,7 +262,7 @@ impl TryFrom<JsonValue> for ConvexArray {
     }
 }
 
-impl TryFrom<JsonValue> for ConvexObject {
+impl TryFrom<JsonValue> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(object: JsonValue) -> anyhow::Result<Self> {
@@ -287,13 +287,13 @@ impl ConvexValue {
     }
 }
 
-impl From<ConvexObject> for JsonValue {
-    fn from(value: ConvexObject) -> Self {
+impl From<DocumentObject> for JsonValue {
+    fn from(value: DocumentObject) -> Self {
         value.to_internal_json()
     }
 }
 
-impl ConvexObject {
+impl DocumentObject {
     pub fn to_internal_json(&self) -> JsonValue {
         value::serialize(
             ConvexValueType::<&ConvexValue>::Object(self),

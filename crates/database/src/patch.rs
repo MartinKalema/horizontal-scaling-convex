@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use common::{
     types::MaybeValue,
     value::{
-        ConvexObject,
+        DocumentObject,
         FieldName,
     },
 };
@@ -17,7 +17,7 @@ pub struct PatchValue {
 }
 
 impl PatchValue {
-    pub fn apply(self, original: ConvexObject) -> anyhow::Result<ConvexObject> {
+    pub fn apply(self, original: DocumentObject) -> anyhow::Result<DocumentObject> {
         let mut original_fields: BTreeMap<_, _> = original.into();
 
         for (field, maybe_value) in self.fields {
@@ -59,8 +59,8 @@ impl TryFrom<JsonValue> for PatchValue {
     }
 }
 
-impl From<ConvexObject> for PatchValue {
-    fn from(obj: ConvexObject) -> Self {
+impl From<DocumentObject> for PatchValue {
+    fn from(obj: DocumentObject) -> Self {
         let mut fields = BTreeMap::new();
         for (field, value) in obj.into_iter() {
             fields.insert(field, MaybeValue::from(value));
@@ -94,13 +94,13 @@ mod tests {
     use common::assert_obj;
     use value::{
         assert_val,
-        ConvexObject,
+        DocumentObject,
     };
 
     #[test]
     fn test_apply() -> anyhow::Result<()> {
         // Overwrite duplicate fields instead of merging sub-fields.
-        let original: ConvexObject = assert_obj!(
+        let original: DocumentObject = assert_obj!(
             "name" => {
                 "first" => "Mr",
                 "last" => "Fantastik",

@@ -101,10 +101,10 @@ use udf::{
 };
 use value::{
     heap_size::HeapSize,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     serialized_args_ext::SerializedArgsExt,
     ConvexArray,
-    ConvexObject,
+    DocumentObject,
     TableName,
 };
 
@@ -328,7 +328,7 @@ pub trait AsyncSyscallProvider<RT: Runtime> {
         &mut self,
         udf_type: UdfType,
         path: ResolvedComponentFunctionPath,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<ConvexValue>;
 
     async fn create_function_handle(
@@ -486,7 +486,7 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
         &mut self,
         udf_type: UdfType,
         path: ResolvedComponentFunctionPath,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<ConvexValue> {
         match (self.udf_type, udf_type) {
             // Queries can call other queries.
@@ -1012,7 +1012,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
 
         let virtual_id_v6 = with_argument_error("db.cancel_job", || {
             let args: CancelJobArgs = serde_json::from_value(args)?;
-            let id = DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
+            let id = PublicDocumentId::decode(&args.id).context(ArgName("id"))?;
             Ok(id)
         })?;
 
@@ -1070,7 +1070,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         let (id, value, table_name) = with_argument_error("db.patch", || {
             let args: UpdateArgs = serde_json::from_value(args)?;
 
-            let id = DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
+            let id = PublicDocumentId::decode(&args.id).context(ArgName("id"))?;
             let actual_table_name = tx
                 .resolve_idv6(id, component.into(), table_filter)
                 .context(ArgName("id"))?;
@@ -1105,7 +1105,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         let (id, value, table_name) = with_argument_error("db.replace", || {
             let args: ReplaceArgs = serde_json::from_value(args)?;
 
-            let id = DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
+            let id = PublicDocumentId::decode(&args.id).context(ArgName("id"))?;
             let actual_table_name = tx
                 .resolve_idv6(id, component.into(), table_filter)
                 .context(ArgName("id"))?;
@@ -1198,8 +1198,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                         };
 
                         let (id, is_system, version) = with_argument_error(method_name, || {
-                            let id =
-                                DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
+                            let id = PublicDocumentId::decode(&args.id).context(ArgName("id"))?;
                             let version = parse_version(args.version)?;
                             Ok((id, args.is_system, version))
                         })?;
@@ -1329,7 +1328,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         let tx = provider.tx()?;
         let (id, table_name) = with_argument_error("db.delete", || {
             let args: RemoveArgs = serde_json::from_value(args)?;
-            let id = DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
+            let id = PublicDocumentId::decode(&args.id).context(ArgName("id"))?;
             let actual_table_name = tx
                 .resolve_idv6(id, component.into(), table_filter)
                 .context(ArgName("id"))?;
@@ -1365,7 +1364,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         } = with_argument_error("runUdf", || Ok(serde_json::from_value(args)?))?;
         let (udf_type, args) = with_argument_error("runUdf", || {
             let udf_type: UdfType = udf_type.parse().context(ArgName("udfType"))?;
-            let args: ConvexObject = ConvexValue::try_from(args)
+            let args: DocumentObject = ConvexValue::try_from(args)
                 .context(ArgName("args"))?
                 .try_into()
                 .context(ArgName("args"))?;

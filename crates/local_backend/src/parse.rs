@@ -2,7 +2,7 @@ use common::components::ExportPath;
 use errors::ErrorMetadata;
 use sync_types::CanonicalizedUdfPath;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     NamespacedTableMapping,
     ResolvedDocumentId,
     TableName,
@@ -38,7 +38,7 @@ pub fn parse_document_id(
     table_mapping: &NamespacedTableMapping,
     table_name: &TableName,
 ) -> anyhow::Result<ResolvedDocumentId> {
-    let id = DeveloperDocumentId::decode(id)?.to_resolved(table_mapping.number_to_tablet())?;
+    let id = PublicDocumentId::decode(id)?.to_resolved(table_mapping.number_to_tablet())?;
     anyhow::ensure!(
         table_mapping.tablet_matches_name(id.tablet_id, table_name),
         invalid_id_error(table_name)
@@ -51,7 +51,7 @@ mod tests {
     use common::testing::TestIdGenerator;
     use model::environment_variables::ENVIRONMENT_VARIABLES_TABLE;
     use value::{
-        id_v6::DeveloperDocumentId,
+        id_v6::PublicDocumentId,
         TableNamespace,
     };
 
@@ -62,7 +62,7 @@ mod tests {
         let mut id_generator = TestIdGenerator::new();
 
         let id_v5 = id_generator.system_generate(&ENVIRONMENT_VARIABLES_TABLE);
-        let id_v6: DeveloperDocumentId = id_v5.into();
+        let id_v6: PublicDocumentId = id_v5.into();
 
         let table_mapping = id_generator.namespace(TableNamespace::Global);
         let id_v6_string = id_v6.encode();

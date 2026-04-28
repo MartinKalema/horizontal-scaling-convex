@@ -11,7 +11,7 @@ use rand::{
 };
 use rand_chacha::ChaCha12Rng;
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNumber,
     TabletIdAndTableNumber,
@@ -55,8 +55,8 @@ impl TransactionIdGenerator {
         InternalId(id_bytes)
     }
 
-    pub fn generate(&mut self, table_number: TableNumber) -> DeveloperDocumentId {
-        DeveloperDocumentId::new(table_number, self.generate_internal())
+    pub fn generate(&mut self, table_number: TableNumber) -> PublicDocumentId {
+        PublicDocumentId::new(table_number, self.generate_internal())
     }
 
     pub fn generate_resolved(
@@ -65,7 +65,7 @@ impl TransactionIdGenerator {
     ) -> ResolvedDocumentId {
         ResolvedDocumentId::new(
             tablet_id_and_number.tablet_id,
-            DeveloperDocumentId::new(tablet_id_and_number.table_number, self.generate_internal()),
+            PublicDocumentId::new(tablet_id_and_number.table_number, self.generate_internal()),
         )
     }
 }

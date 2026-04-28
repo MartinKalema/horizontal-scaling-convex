@@ -15,7 +15,7 @@ use sync_types::types::SessionId;
 use uuid::Uuid;
 use value::{
     heap_size::HeapSize,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     sha256,
 };
 
@@ -33,7 +33,7 @@ pub struct ExecutionContext {
     // function ExecutionId.
     pub execution_id: ExecutionId,
     /// The id of the scheduled job that triggered this UDF, if any.
-    pub parent_scheduled_job: Option<(ComponentId, DeveloperDocumentId)>,
+    pub parent_scheduled_job: Option<(ComponentId, PublicDocumentId)>,
     /// False if this function was called as part of a request (e.g. action
     /// calling a mutation) TODO: This is a stop gap solution. The richer
     /// version of this would be something like parent_execution_id:
@@ -54,7 +54,7 @@ impl ExecutionContext {
     pub fn new_from_parts(
         request_id: RequestId,
         execution_id: ExecutionId,
-        parent_scheduled_job: Option<(ComponentId, DeveloperDocumentId)>,
+        parent_scheduled_job: Option<(ComponentId, PublicDocumentId)>,
         is_root: bool,
     ) -> Self {
         Self {

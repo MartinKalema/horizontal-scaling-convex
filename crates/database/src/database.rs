@@ -101,7 +101,7 @@ use common::{
         Timestamp,
     },
     value::{
-        ConvexObject,
+        DocumentObject,
         ResolvedDocumentId,
         TableMapping,
         TabletId,
@@ -153,7 +153,7 @@ use usage_tracking::{
     FunctionUsageTracker,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     Size,
     TableNamespace,
     TableNumber,
@@ -168,6 +168,10 @@ use crate::{
     bootstrap_model::table::{
         NUM_RESERVED_LEGACY_TABLE_NUMBERS,
         NUM_RESERVED_SYSTEM_TABLE_NUMBERS,
+    },
+    checkpoint::{
+        create_checkpoint,
+        CheckpointData,
     },
     committer::{
         Committer,
@@ -189,8 +193,10 @@ use crate::{
     },
     schema_registry::SchemaRegistry,
     search_index_bootstrap::SearchIndexBootstrapWorker,
+    snapshot_checkpointer::checkpoint_to_bytes,
     snapshot_manager::{
         replication_frontiers_from_json,
+        replication_frontiers_to_json,
         Snapshot,
         SnapshotManager,
         TableSummaries,
@@ -340,7 +346,7 @@ pub struct DocumentDeltas {
     /// because streaming export always uses string IDs
     pub deltas: Vec<(
         Timestamp,
-        DeveloperDocumentId,
+        PublicDocumentId,
         ComponentPath,
         TableName,
         Option<StreamingExportDocument>,
@@ -384,7 +390,7 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
 
     #[fastrace::trace]
     async fn load_raw_and_parsed_table_documents<
-        D: TryFrom<ConvexObject, Error = anyhow::Error>,
+        D: TryFrom<DocumentObject, Error = anyhow::Error>,
     >(
         persistence_snapshot: &PersistenceSnapshot,
         index_id: IndexId,
@@ -980,6 +986,7 @@ impl<RT: Runtime> Database<RT> {
         distributed_log: Arc<dyn crate::commit_delta::DistributedLog>,
         replica_mode: bool,
         partition_map: Option<crate::partition::PartitionMap>,
+        node_addresses: Option<crate::two_phase::NodeAddresses>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> anyhow::Result<Self> {
@@ -1093,6 +1100,7 @@ impl<RT: Runtime> Database<RT> {
             virtual_system_mapping.clone(),
             committer_distributed_log,
             partition_map,
+            node_addresses,
             timestamp_oracle,
             raft_state,
         );
@@ -1146,17 +1154,22 @@ impl<RT: Runtime> Database<RT> {
         self.committer.finish_table_summary_bootstrap().await
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub(crate) fn committer_for_test(&self) -> CommitterClient {
         self.committer.clone()
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub(crate) fn replication_frontier_for_test(
         &self,
         partition: crate::partition::PartitionId,
     ) -> Option<Timestamp> {
         self.snapshot_manager.lock().replication_frontier(partition)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persisted_max_repeatable_ts_for_test(&self) -> RepeatableTimestamp {
+        self.snapshot_manager.lock().persisted_max_repeatable_ts()
     }
 
     #[cfg(test)]
@@ -1463,7 +1476,7 @@ impl<RT: Runtime> Database<RT> {
                 .id(table_name)?;
             let document_id = ResolvedDocumentId::new(
                 tables_table_id.tablet_id,
-                DeveloperDocumentId::new(tables_table_id.table_number, table_id.tablet_id.0),
+                PublicDocumentId::new(tables_table_id.table_number, table_id.tablet_id.0),
             );
             let metadata = TableMetadata::new(
                 TableNamespace::Global,
@@ -1957,6 +1970,50 @@ impl<RT: Runtime> Database<RT> {
         })
     }
 
+    pub async fn build_raft_snapshot_checkpoint(&self) -> anyhow::Result<CheckpointData> {
+        let db_snapshot = self.latest_database_snapshot()?;
+        let ts = *db_snapshot.timestamp();
+        let mut checkpoint =
+            create_checkpoint(self.reader.as_ref(), ts, self.retention_validator()).await?;
+
+        let mut globals = BTreeMap::new();
+        for key in PersistenceGlobalKey::all_keys() {
+            if let Some(value) = self.reader.get_persistence_global(key).await? {
+                globals.insert(String::from(key), value);
+            }
+        }
+        globals.insert(
+            String::from(PersistenceGlobalKey::MaxRepeatableTimestamp),
+            serde_json::Value::from(u64::from(ts)),
+        );
+        globals.insert(
+            String::from(PersistenceGlobalKey::ReplicationFrontiers),
+            replication_frontiers_to_json(&self.snapshot_manager.lock().replication_frontiers()),
+        );
+        if let Some(table_summaries) = db_snapshot.table_summaries() {
+            let table_summary_snapshot = crate::table_summary::TableSummarySnapshot {
+                tables: table_summaries
+                    .tables
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect(),
+                ts,
+            };
+            globals.insert(
+                String::from(PersistenceGlobalKey::TableSummary),
+                serde_json::Value::from(&table_summary_snapshot),
+            );
+        }
+
+        checkpoint.globals = globals;
+        Ok(checkpoint)
+    }
+
+    pub async fn build_raft_snapshot_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        let checkpoint = self.build_raft_snapshot_checkpoint().await?;
+        checkpoint_to_bytes(&checkpoint)
+    }
+
     pub fn check_write_throughput_limit(&self) -> anyhow::Result<()> {
         self.snapshot_manager.lock().check_write_throughput_limit()
     }
@@ -2150,7 +2207,7 @@ impl<RT: Runtime> Database<RT> {
                     .get(&component_id)
                     .cloned()
                     .unwrap_or_else(ComponentPath::root);
-                let id = DeveloperDocumentId::new(table_number, id.internal_id());
+                let id = PublicDocumentId::new(table_number, id.internal_id());
                 let column_filter = filter
                     .selection
                     .column_filter(&component_path, &table_name)?;
@@ -2395,7 +2452,7 @@ impl<RT: Runtime> Database<RT> {
             ),
             PageResult::TableDone(table_iterator) => match tablet_ids.get(1) {
                 Some(&next_tablet_id) => {
-                    // TODO(lee) just use DeveloperDocumentId::min() once we no longer
+                    // TODO(lee) just use PublicDocumentId::min() once we no longer
                     // need to be rollback-safe.
                     let next_table_number = table_mapping.tablet_number(next_tablet_id)?;
                     let next_by_id = *by_id_indexes.get(&next_tablet_id).ok_or_else(|| {
@@ -2403,7 +2460,7 @@ impl<RT: Runtime> Database<RT> {
                     })?;
                     let next_cursor = ResolvedDocumentId::new(
                         next_tablet_id,
-                        DeveloperDocumentId::new(next_table_number, InternalId::MIN),
+                        PublicDocumentId::new(next_table_number, InternalId::MIN),
                     );
                     let next_document_stream = table_iterator
                         .into_stream_documents_in_table(
@@ -2694,7 +2751,7 @@ impl ConflictingReadWithWriteSource {
         if !table_name.is_system() {
             let metadata = ErrorMetadata::user_occ(
                 Some(table_name.into()),
-                Some(self.read.id.developer_id.encode()),
+                Some(self.read.id.document_id.encode()),
                 write_source,
                 occ_msg,
                 write_ts_val,

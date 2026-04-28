@@ -27,7 +27,7 @@ use common::{
         Timestamp,
     },
     value::{
-        id_v6::DeveloperDocumentId,
+        id_v6::PublicDocumentId,
         ConvexValue,
         TabletIdAndTableNumber,
     },
@@ -122,8 +122,8 @@ fn create_write_log_with_standard_index_writes(num_writes: usize) -> Result<(Log
     let field_path: FieldPath = "value".parse()?;
     let mut reads = TransactionReadSet::new();
     // Use IndexKey encoding for interval bounds
-    let start_key = IndexKey::new(vec![val!(0)], DeveloperDocumentId::MIN).to_bytes();
-    let end_key = IndexKey::new(vec![val!(26)], DeveloperDocumentId::MIN).to_bytes();
+    let start_key = IndexKey::new(vec![val!(0)], PublicDocumentId::MIN).to_bytes();
+    let end_key = IndexKey::new(vec![val!(26)], PublicDocumentId::MIN).to_bytes();
     let target_interval = Interval {
         start: StartIncluded(start_key.into()),
         end: End::Excluded(end_key.into()),

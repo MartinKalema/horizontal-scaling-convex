@@ -29,6 +29,7 @@ use pb::replication::{
     MutationError,
     MutationSuccess,
 };
+use serde_json::Value as JsonValue;
 use sync_types::types::SerializedArgs;
 use tonic::{
     transport::Channel,
@@ -112,13 +113,25 @@ impl MutationForwarder for MutationForwarderService {
                     },
                 )),
             })),
-            Ok(Err(err)) => Ok(Response::new(ForwardMutationResponse {
-                result: Some(forward_mutation_response::Result::Error(MutationError {
-                    error_message: format!("{}", err.error),
-                    error_data: None,
-                    log_lines: err.log_lines.iter().cloned().collect(),
-                })),
-            })),
+            Ok(Err(err)) => {
+                let error_message = format!("{}", err.error);
+                let error_data = err
+                    .error
+                    .custom_data_if_any()
+                    .map(JsonValue::from)
+                    .map(|value| serde_json::to_string(&value))
+                    .transpose()
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to serialize error data: {e}"))
+                    })?;
+                Ok(Response::new(ForwardMutationResponse {
+                    result: Some(forward_mutation_response::Result::Error(MutationError {
+                        error_message,
+                        error_data,
+                        log_lines: err.log_lines.iter().cloned().collect(),
+                    })),
+                }))
+            },
             Err(e) => Err(Status::internal(format!("Mutation failed: {e}"))),
         }
     }

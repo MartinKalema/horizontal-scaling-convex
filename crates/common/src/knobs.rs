@@ -375,6 +375,21 @@ pub static MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY: LazyLock<Duration> = LazyLoc
     ))
 });
 
+/// How often an idle partition leader should publish a lightweight
+/// replication-frontier heartbeat to other partitions.
+///
+/// This is separate from `MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY` because
+/// cross-partition OCC needs a much fresher "safe frontier" than follower
+/// persistence readers do. The heartbeat is the distributed equivalent of
+/// CockroachDB's closed timestamp side transport: even if a partition is idle,
+/// peers still learn that reads below this timestamp are safe.
+pub static REPLICATION_FRONTIER_HEARTBEAT_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_millis(env_config(
+        "REPLICATION_FRONTIER_HEARTBEAT_INTERVAL_MS",
+        200,
+    ))
+});
+
 /// This is the max duration between a Commit and bumping max_repeatable_ts.
 /// When reading from a follower persistence, we can only read commits at
 /// timestamps <= max_repeatable_ts (because commits > max_repeatable_ts are

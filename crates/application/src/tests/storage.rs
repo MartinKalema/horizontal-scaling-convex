@@ -339,7 +339,7 @@ async fn test_storage_api_bandwidth_log_events(rt: TestRuntime) -> anyhow::Resul
         .await?;
 
     let mut file_stream = app
-        .get_file(ComponentId::Root, FileStorageId::DocumentId(doc_id))
+        .get_file(ComponentId::Root, FileStorageId::PublicDocumentId(doc_id))
         .await?;
     let mut total = 0u64;
     while let Some(chunk) = file_stream.next().await {
@@ -368,7 +368,7 @@ async fn test_storage_api_bandwidth_log_events(rt: TestRuntime) -> anyhow::Resul
         .await?;
 
     let mut file_stream = app
-        .get_file(ComponentId::Root, FileStorageId::DocumentId(doc_id))
+        .get_file(ComponentId::Root, FileStorageId::PublicDocumentId(doc_id))
         .await?;
     let _first_chunk = file_stream.next().await;
     // Drop without fully consuming.
@@ -395,7 +395,11 @@ async fn test_storage_api_bandwidth_log_events(rt: TestRuntime) -> anyhow::Resul
 
     let range = (Bound::Included(0), Bound::Included(1023));
     let mut file_stream = app
-        .get_file_range(ComponentId::Root, FileStorageId::DocumentId(doc_id), range)
+        .get_file_range(
+            ComponentId::Root,
+            FileStorageId::PublicDocumentId(doc_id),
+            range,
+        )
         .await?;
     let mut total = 0u64;
     while let Some(chunk) = file_stream.next().await {

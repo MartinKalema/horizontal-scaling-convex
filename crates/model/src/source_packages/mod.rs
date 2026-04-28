@@ -14,7 +14,7 @@ use database::{
     Transaction,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     TableName,
     TableNamespace,
 };
@@ -66,7 +66,7 @@ impl<'a, RT: Runtime> SourcePackageModel<'a, RT> {
         let document_id = SystemMetadataModel::new(self.tx, self.namespace)
             .insert(&SOURCE_PACKAGES_TABLE, source_package.try_into()?)
             .await?;
-        let id: DeveloperDocumentId = document_id.into();
+        let id: PublicDocumentId = document_id.into();
         Ok(id.into())
     }
 
@@ -74,7 +74,7 @@ impl<'a, RT: Runtime> SourcePackageModel<'a, RT> {
         &mut self,
         source_package_id: SourcePackageId,
     ) -> anyhow::Result<ParsedDocument<SourcePackage>> {
-        let id: DeveloperDocumentId = source_package_id.into();
+        let id: PublicDocumentId = source_package_id.into();
         let document_id = self.tx.resolve_developer_id(&id, self.namespace)?;
         self.tx
             .get(document_id)

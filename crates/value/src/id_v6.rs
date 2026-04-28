@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-pub use crate::document_id::DeveloperDocumentId;
+pub use crate::document_id::PublicDocumentId;
 use crate::{
     base32::{
         self,
@@ -55,7 +55,7 @@ pub enum IdDecodeError {
     InvalidIdVersion(u16, u16),
 }
 
-impl DeveloperDocumentId {
+impl PublicDocumentId {
     pub fn encoded_len(&self) -> usize {
         let byte_length = vint_len(self.table().into()) + 16 + 2;
         base32::encoded_len(byte_length)
@@ -135,7 +135,7 @@ impl DeveloperDocumentId {
             return Err(IdDecodeError::InvalidLength(s.len()));
         }
 
-        let id = DeveloperDocumentId::new(table_number, internal_id);
+        let id = PublicDocumentId::new(table_number, internal_id);
 
         // Check that decoding was one-to-one.
         // TODO: Checking base32 decoding above alone isn't sufficient, see
@@ -154,22 +154,22 @@ impl DeveloperDocumentId {
     ) -> anyhow::Result<ResolvedDocumentId> {
         Ok(ResolvedDocumentId {
             tablet_id: f(self.table())?,
-            developer_id: *self,
+            document_id: *self,
         })
     }
 }
 
-impl From<ResolvedDocumentId> for DeveloperDocumentId {
+impl From<ResolvedDocumentId> for PublicDocumentId {
     fn from(document_id: ResolvedDocumentId) -> Self {
-        document_id.developer_id
+        document_id.document_id
     }
 }
 
-impl FromStr for DeveloperDocumentId {
+impl FromStr for PublicDocumentId {
     type Err = IdDecodeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        DeveloperDocumentId::decode(s)
+        PublicDocumentId::decode(s)
     }
 }
 
@@ -278,8 +278,8 @@ mod tests {
             vint_encode,
             vint_len,
         },
-        DeveloperDocumentId,
         InternalId,
+        PublicDocumentId,
     };
 
     #[test]
@@ -289,7 +289,7 @@ mod tests {
             internal_id[i] = internal_id[i - 1].wrapping_mul(251);
         }
         let document_id =
-            DeveloperDocumentId::new(1017.try_into().unwrap(), InternalId::from(internal_id));
+            PublicDocumentId::new(1017.try_into().unwrap(), InternalId::from(internal_id));
         assert_eq!(
             document_id.encode(),
             "z43zp6c3e75gkmz1kfwj6mbbx5sw281h".to_string()
@@ -302,7 +302,7 @@ mod tests {
         // table code ends up taking two bytes, which then causes parsing to
         // fail downstream. This is a regression test where we used to panic in
         // this condition.
-        let _ = DeveloperDocumentId::decode("sssswsgggggggggsgcsssfafffsffks");
+        let _ = PublicDocumentId::decode("sssswsgggggggggsgcsssfafffsffks");
     }
 
     proptest! {
@@ -328,33 +328,33 @@ mod tests {
         }
 
         #[test]
-        fn proptest_document_idv6(id in any::<DeveloperDocumentId>()) {
-            assert_eq!(DeveloperDocumentId::decode(&id.encode()).unwrap(), id);
+        fn proptest_document_idv6(id in any::<PublicDocumentId>()) {
+            assert_eq!(PublicDocumentId::decode(&id.encode()).unwrap(), id);
         }
 
         #[test]
-        fn proptest_encoded_len(id in any::<DeveloperDocumentId>()) {
+        fn proptest_encoded_len(id in any::<PublicDocumentId>()) {
             assert_eq!(id.encode().len(), id.encoded_len());
         }
 
         #[test]
         fn proptest_decode_invalid_string(s in any::<String>()) {
             // Check that we don't panic on any input string.
-            let _ = DeveloperDocumentId::decode(&s);
+            let _ = PublicDocumentId::decode(&s);
         }
 
         #[test]
         fn proptest_decode_invalid_bytes(bytes in prop::collection::vec(any::<u8>(), 19..=23)) {
             // Generate bytestrings that pass the first few checks in decode to get more code
             // coverage for later panics.
-            let _ = DeveloperDocumentId::decode(&crate::base32::encode(&bytes));
+            let _ = PublicDocumentId::decode(&crate::base32::encode(&bytes));
         }
 
         #[test]
         fn proptest_id_decoding_one_to_one(
             s in "[0123456789abcdefghjkmnpqrstvwxyz]{31,37}"
         ) {
-            if let Ok(id) = DeveloperDocumentId::decode(&s) {
+            if let Ok(id) = PublicDocumentId::decode(&s) {
                 assert_eq!(id.encode(), s);
             }
         }
@@ -363,6 +363,6 @@ mod tests {
     #[test]
     fn test_id_decoding_one_to_one() {
         let s = "mz1xn7tymdnktmmzqy5xxhn7tjs2nkkfmtjjr";
-        DeveloperDocumentId::decode(s).unwrap_err();
+        PublicDocumentId::decode(s).unwrap_err();
     }
 }

@@ -201,6 +201,13 @@ pub mod test_utils {
             anyhow::bail!("start_upload not implemented for FakeStorage")
         }
 
+        async fn start_upload_with_key(
+            &self,
+            _key: ObjectKey,
+        ) -> anyhow::Result<Box<crate::BufferedUpload>> {
+            anyhow::bail!("start_upload_with_key not implemented for FakeStorage")
+        }
+
         async fn start_client_driven_upload(&self) -> anyhow::Result<ClientDrivenUploadToken> {
             anyhow::bail!("start_client_driven_upload not implemented for FakeStorage")
         }
@@ -288,6 +295,11 @@ pub trait Storage: Send + Sync + Debug {
     /// Storage may choose to implement some checksuming strategy for uploads,
     /// but it's opaque to callers.
     async fn start_upload(&self) -> anyhow::Result<Box<BufferedUpload>>;
+
+    /// Start a new upload for a caller-specified object key.
+    ///
+    /// Used for control-plane artifacts that need stable, addressable names.
+    async fn start_upload_with_key(&self, key: ObjectKey) -> anyhow::Result<Box<BufferedUpload>>;
 
     /// A multi-part upload where the client uploads parts one at a time.
     async fn start_client_driven_upload(&self) -> anyhow::Result<ClientDrivenUploadToken>;
@@ -1006,6 +1018,13 @@ impl TryFrom<ClientDrivenUploadToken> for ClientDrivenUpload {
 impl<RT: Runtime> Storage for LocalDirStorage<RT> {
     async fn start_upload(&self) -> anyhow::Result<Box<BufferedUpload>> {
         let object_key: ObjectKey = self.rt.new_uuid_v4().to_string().try_into()?;
+        self.start_upload_with_key(object_key).await
+    }
+
+    async fn start_upload_with_key(
+        &self,
+        object_key: ObjectKey,
+    ) -> anyhow::Result<Box<BufferedUpload>> {
         let key = self.filename_for_key(object_key.clone());
         let filepath = self.dir.join(key);
 

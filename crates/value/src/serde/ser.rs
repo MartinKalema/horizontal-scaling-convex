@@ -16,8 +16,8 @@ use serde::{
 };
 
 use crate::{
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
 };
 
@@ -670,6 +670,6 @@ pub fn to_value<T: Serialize>(value: T) -> anyhow::Result<ConvexValue> {
     }
 }
 
-pub fn to_object<T: Serialize>(value: T) -> anyhow::Result<ConvexObject> {
+pub fn to_object<T: Serialize>(value: T) -> anyhow::Result<DocumentObject> {
     to_value(value)?.try_into()
 }

@@ -49,7 +49,7 @@ where
         let component_id = if metadata.component_type.is_root() {
             ComponentId::Root
         } else {
-            ComponentId::Child(metadata.developer_id())
+            ComponentId::Child(metadata.document_id())
         };
         return Ok(component_id);
     }
@@ -109,7 +109,7 @@ async fn create_unmounted_component<RT: Runtime>(
                 .context(format!(
                     "{parent_path:?} not found in create_unmounted_component"
                 ))?
-                .developer_id(),
+                .document_id(),
             name: component_name,
             args: btreemap! {},
         },

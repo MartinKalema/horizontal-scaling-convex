@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     TableNamespace,
 };
 
@@ -38,11 +38,11 @@ pub use self::{
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ComponentId {
     Root,
-    Child(DeveloperDocumentId),
+    Child(PublicDocumentId),
 }
 
 impl ComponentId {
-    pub fn new(is_root: bool, id: DeveloperDocumentId) -> Self {
+    pub fn new(is_root: bool, id: PublicDocumentId) -> Self {
         if is_root {
             ComponentId::Root
         } else {
@@ -72,7 +72,7 @@ impl ComponentId {
     pub fn deserialize_from_string(s: Option<&str>) -> anyhow::Result<Self> {
         match s {
             None => Ok(ComponentId::Root),
-            Some(s) => Ok(ComponentId::Child(DeveloperDocumentId::from_str(s)?)),
+            Some(s) => Ok(ComponentId::Child(PublicDocumentId::from_str(s)?)),
         }
     }
 }
@@ -126,7 +126,7 @@ mod proptests {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ComponentDefinitionId {
     Root,
-    Child(DeveloperDocumentId),
+    Child(PublicDocumentId),
 }
 
 impl ComponentDefinitionId {

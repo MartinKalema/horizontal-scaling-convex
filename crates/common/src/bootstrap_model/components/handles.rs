@@ -10,7 +10,7 @@ use sync_types::{
 };
 use value::{
     codegen_convex_serialization,
-    DeveloperDocumentId,
+    PublicDocumentId,
 };
 
 use crate::components::ComponentId;
@@ -64,15 +64,15 @@ codegen_convex_serialization!(FunctionHandleMetadata, SerializedFunctionHandleMe
 pub const FUNCTION_HANDLE_PREFIX: &str = "function://";
 
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct FunctionHandle(DeveloperDocumentId);
+pub struct FunctionHandle(PublicDocumentId);
 
 impl FunctionHandle {
-    pub fn new(handle_id: DeveloperDocumentId) -> Self {
+    pub fn new(handle_id: PublicDocumentId) -> Self {
         Self(handle_id)
     }
 }
 
-impl From<FunctionHandle> for DeveloperDocumentId {
+impl From<FunctionHandle> for PublicDocumentId {
     fn from(handle: FunctionHandle) -> Self {
         handle.0
     }

@@ -1253,7 +1253,7 @@ mod tests {
             PersistenceVersion,
             TableName,
         },
-        value::DeveloperDocumentId,
+        value::PublicDocumentId,
     };
     use pb::convex_keys::{
         admin_key::Identity as AdminIdentityProto,
@@ -1394,7 +1394,7 @@ mod tests {
         let mut journal_with_cursor = QueryJournal::new();
         journal_with_cursor.end_cursor = Some(Cursor {
             position: CursorPosition::After(
-                IndexKey::new(vec![100.into()], DeveloperDocumentId::MIN).to_bytes(),
+                IndexKey::new(vec![100.into()], PublicDocumentId::MIN).to_bytes(),
             ),
             query_fingerprint: query.fingerprint(&IndexedFields::creation_time())?,
         });

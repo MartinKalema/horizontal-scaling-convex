@@ -4,16 +4,17 @@
 //! Prepare/CommitPrepared/RollbackPrepared requests from coordinators on
 //! other nodes.
 //!
-//! The coordinator uses [`TwoPhaseCommitGrpcClient`] to reach remote
+//! The coordinator uses the database-layer gRPC client to reach remote
 //! partitions.
 
-use anyhow::Context;
 use database::{
-    two_phase::TwoPhaseTransactionId,
+    two_phase::{
+        ParticipantTransaction,
+        TwoPhaseTransactionId,
+    },
     CommitterClient,
 };
 use pb::replication::{
-    two_phase_commit_service_client::TwoPhaseCommitServiceClient as TonicTwoPcClient,
     two_phase_commit_service_server::{
         TwoPhaseCommitService,
         TwoPhaseCommitServiceServer as TonicTwoPcServer,
@@ -26,7 +27,6 @@ use pb::replication::{
     TwoPcRollbackResponse,
 };
 use tonic::{
-    transport::Channel,
     Request,
     Response,
     Status,
@@ -57,14 +57,25 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
     ) -> Result<Response<TwoPcPrepareResponse>, Status> {
         let req = request.into_inner();
         let txn_id = TwoPhaseTransactionId(req.transaction_id);
+        let transaction = req
+            .transaction
+            .ok_or_else(|| Status::invalid_argument("Prepare missing transaction payload"))?;
+        let transaction = ParticipantTransaction::try_from(transaction)
+            .map_err(|e| Status::invalid_argument(format!("Invalid prepare payload: {e:#}")))?;
+        let prepare_ts = req
+            .prepare_ts
+            .try_into()
+            .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
 
-        // TODO: Deserialize the FinalTransaction from req.serialized_transaction.
-        // For now, this is a placeholder — full transaction serialization requires
-        // additional protobuf definitions for DocumentUpdate, ReadSet, etc.
-        // The coordinator currently only uses local prepare (same node).
-        Err(Status::unimplemented(
-            "Remote 2PC prepare not yet implemented — requires FinalTransaction serialization",
-        ))
+        let result = self
+            .committer
+            .prepare_remote(txn_id, transaction, req.write_source.into(), prepare_ts)
+            .await
+            .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
+
+        Ok(Response::new(TwoPcPrepareResponse {
+            prepare_ts: u64::from(result.prepare_ts),
+        }))
     }
 
     async fn commit_prepared(
@@ -98,50 +109,5 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             .map_err(|e| Status::internal(format!("RollbackPrepared failed: {e:#}")))?;
 
         Ok(Response::new(TwoPcRollbackResponse {}))
-    }
-}
-
-/// gRPC client for reaching remote partitions' 2PC service.
-pub struct TwoPhaseCommitGrpcClient {
-    client: TonicTwoPcClient<Channel>,
-}
-
-impl TwoPhaseCommitGrpcClient {
-    pub async fn connect(addr: &str) -> anyhow::Result<Self> {
-        let client = TonicTwoPcClient::connect(addr.to_string())
-            .await
-            .with_context(|| format!("Failed to connect to 2PC service at {addr}"))?;
-        Ok(Self { client })
-    }
-
-    pub async fn commit_prepared(
-        &self,
-        transaction_id: &TwoPhaseTransactionId,
-    ) -> anyhow::Result<u64> {
-        let request = TwoPcCommitRequest {
-            transaction_id: transaction_id.0.clone(),
-        };
-        let response = self
-            .client
-            .clone()
-            .commit_prepared(Request::new(request))
-            .await
-            .context("gRPC CommitPrepared failed")?;
-        Ok(response.into_inner().commit_ts)
-    }
-
-    pub async fn rollback_prepared(
-        &self,
-        transaction_id: &TwoPhaseTransactionId,
-    ) -> anyhow::Result<()> {
-        let request = TwoPcRollbackRequest {
-            transaction_id: transaction_id.0.clone(),
-        };
-        self.client
-            .clone()
-            .rollback_prepared(Request::new(request))
-            .await
-            .context("gRPC RollbackPrepared failed")?;
-        Ok(())
     }
 }

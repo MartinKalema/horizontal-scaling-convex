@@ -817,7 +817,7 @@ impl<RT: Runtime> CronJobContext<RT> {
             next_ts = compute_next_ts(&job.cron_spec, Some(next_ts), now)?;
         }
         if num_skipped > 0 {
-            let job_id = job.id.developer_id;
+            let job_id = job.id.document_id;
             tracing::info!(
                 "Skipping {num_skipped} run(s) of job {job_id} because multiple scheduled runs \
                  are in the past"
@@ -901,7 +901,7 @@ impl<RT: Runtime> CronJobContext<RT> {
         }
 
         let next_run = CronNextRun {
-            cron_job_id: job.id.developer_id,
+            cron_job_id: job.id.document_id,
             state: CronJobState::Pending,
             prev_ts: Some(prev_ts),
             next_ts,

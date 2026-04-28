@@ -198,7 +198,8 @@ pub struct LocalConfig {
     pub replica_storage_path: Option<String>,
 
     /// Storage directory for checkpoint files.
-    /// Required in primary mode when NATS_URL is set.
+    /// Required in primary mode when NATS_URL is set, and for fresh replica
+    /// bootstrap.
     /// Example: /convex/data/checkpoints
     #[clap(long, env = "CHECKPOINT_STORAGE_PATH")]
     pub checkpoint_storage_path: Option<String>,
@@ -296,7 +297,7 @@ impl LocalConfig {
         let tempdir_handle = tempfile::tempdir()?;
         let db_path = tempdir_handle.path().join("convex_local_backend.sqlite3");
         // Easiest way to get a config object with defaults is to parse from cmd line
-        let config = Self::try_parse_from([
+        let mut config = Self::try_parse_from([
             "convex-local-backend",
             db_path.to_str().context("invalid db path")?,
             "--local-storage",
@@ -305,6 +306,7 @@ impl LocalConfig {
                 .to_str()
                 .context("invalid local storage path")?,
         ])?;
+        config.disable_beacon = true;
         Ok(config)
     }
 }

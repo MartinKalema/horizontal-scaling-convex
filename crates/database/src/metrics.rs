@@ -1,7 +1,3 @@
-use ::search::metrics::{
-    SearchType,
-    SEARCH_TYPE_LABEL,
-};
 use common::{
     identity::IDENTITY_LABEL,
     runtime::Runtime,
@@ -14,6 +10,8 @@ use metrics::{
     log_counter_with_labels,
     log_distribution,
     log_distribution_with_labels,
+    log_gauge,
+    log_gauge_with_labels,
     register_convex_counter,
     register_convex_gauge,
     register_convex_histogram,
@@ -29,12 +27,454 @@ use prometheus::{
     VMHistogram,
     VMHistogramVec,
 };
+use ::search::metrics::{
+    SearchType,
+    SEARCH_TYPE_LABEL,
+};
 
 use crate::{
+    partition::PartitionId,
     transaction::FinalTransaction,
     RetentionType,
     Transaction,
 };
+
+const PARTITION_LABELS: [&str; 1] = ["partition"];
+const SOURCE_PARTITION_LABELS: [&str; 1] = ["source_partition"];
+const OUTCOME_LABELS: [&str; 1] = ["outcome"];
+const PHASE_LABELS: [&str; 1] = ["phase"];
+
+fn partition_label(partition: PartitionId) -> StaticMetricLabel {
+    StaticMetricLabel::new("partition", partition.0.to_string())
+}
+
+fn source_partition_label(partition: PartitionId) -> StaticMetricLabel {
+    StaticMetricLabel::new("source_partition", partition.0.to_string())
+}
+
+fn outcome_label(outcome: &'static str) -> StaticMetricLabel {
+    StaticMetricLabel::new("outcome", outcome)
+}
+
+fn phase_label(phase: &'static str) -> StaticMetricLabel {
+    StaticMetricLabel::new("phase", phase)
+}
+
+register_convex_gauge!(
+    DATABASE_RAFT_IS_LEADER_INFO,
+    "Whether this node is currently the Raft leader for the partition (1 or 0)",
+    &PARTITION_LABELS
+);
+pub fn log_raft_is_leader(partition: PartitionId, is_leader: bool) {
+    log_gauge_with_labels(
+        &DATABASE_RAFT_IS_LEADER_INFO,
+        if is_leader { 1.0 } else { 0.0 },
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_RAFT_LEADER_ID_INFO,
+    "Current known Raft leader node ID for the partition (0 if unknown)",
+    &PARTITION_LABELS
+);
+pub fn log_raft_leader_id(partition: PartitionId, leader_id: u64) {
+    log_gauge_with_labels(
+        &DATABASE_RAFT_LEADER_ID_INFO,
+        leader_id as f64,
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_RAFT_LEADER_CHANGES_TOTAL,
+    "Number of observed Raft leader changes for a partition",
+    &PARTITION_LABELS
+);
+pub fn log_raft_leader_change(partition: PartitionId) {
+    log_counter_with_labels(
+        &DATABASE_RAFT_LEADER_CHANGES_TOTAL,
+        1,
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_RAFT_TERM_INFO,
+    "Current Raft term for the partition",
+    &PARTITION_LABELS
+);
+pub fn log_raft_term(partition: PartitionId, term: u64) {
+    log_gauge_with_labels(
+        &DATABASE_RAFT_TERM_INFO,
+        term as f64,
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_RAFT_COMMITTED_INDEX_INFO,
+    "Current committed Raft log index for the partition",
+    &PARTITION_LABELS
+);
+pub fn log_raft_committed_index(partition: PartitionId, committed_index: u64) {
+    log_gauge_with_labels(
+        &DATABASE_RAFT_COMMITTED_INDEX_INFO,
+        committed_index as f64,
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_RAFT_APPLIED_INDEX_INFO,
+    "Current applied Raft log index for the partition",
+    &PARTITION_LABELS
+);
+pub fn log_raft_applied_index(partition: PartitionId, applied_index: u64) {
+    log_gauge_with_labels(
+        &DATABASE_RAFT_APPLIED_INDEX_INFO,
+        applied_index as f64,
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_RAFT_CONFIGURED_VOTERS_INFO,
+    "Configured number of Raft voting replicas for the partition",
+    &PARTITION_LABELS
+);
+register_convex_gauge!(
+    DATABASE_RAFT_RECENT_ACTIVE_VOTERS_INFO,
+    "Number of recently active Raft voting replicas for the partition",
+    &PARTITION_LABELS
+);
+register_convex_gauge!(
+    DATABASE_RAFT_LAGGING_FOLLOWERS_INFO,
+    "Number of follower replicas whose matched index is behind the leader commit index",
+    &PARTITION_LABELS
+);
+register_convex_gauge!(
+    DATABASE_RAFT_MAX_FOLLOWER_LAG_ENTRIES_INFO,
+    "Largest Raft log lag in entries observed across followers for the partition",
+    &PARTITION_LABELS
+);
+register_convex_gauge!(
+    DATABASE_RAFT_TOTAL_FOLLOWER_LAG_ENTRIES_INFO,
+    "Total Raft log lag in entries summed across followers for the partition",
+    &PARTITION_LABELS
+);
+register_convex_gauge!(
+    DATABASE_RAFT_UNDER_REPLICATED_INFO,
+    "Whether the partition currently has fewer active voting replicas than configured (1 or 0)",
+    &PARTITION_LABELS
+);
+register_convex_gauge!(
+    DATABASE_RAFT_QUORUM_UNAVAILABLE_INFO,
+    "Whether the partition currently lacks an active write quorum (1 or 0)",
+    &PARTITION_LABELS
+);
+pub fn log_raft_replication_health(
+    partition: PartitionId,
+    configured_voters: usize,
+    recent_active_voters: usize,
+    lagging_followers: usize,
+    max_follower_lag_entries: u64,
+    total_follower_lag_entries: u64,
+) {
+    let quorum_size = if configured_voters == 0 {
+        0
+    } else {
+        (configured_voters / 2) + 1
+    };
+    let under_replicated = configured_voters > 0 && recent_active_voters < configured_voters;
+    let quorum_unavailable = quorum_size > 0 && recent_active_voters < quorum_size;
+
+    log_gauge_with_labels(
+        &DATABASE_RAFT_CONFIGURED_VOTERS_INFO,
+        configured_voters as f64,
+        vec![partition_label(partition)],
+    );
+    log_gauge_with_labels(
+        &DATABASE_RAFT_RECENT_ACTIVE_VOTERS_INFO,
+        recent_active_voters as f64,
+        vec![partition_label(partition)],
+    );
+    log_gauge_with_labels(
+        &DATABASE_RAFT_LAGGING_FOLLOWERS_INFO,
+        lagging_followers as f64,
+        vec![partition_label(partition)],
+    );
+    log_gauge_with_labels(
+        &DATABASE_RAFT_MAX_FOLLOWER_LAG_ENTRIES_INFO,
+        max_follower_lag_entries as f64,
+        vec![partition_label(partition)],
+    );
+    log_gauge_with_labels(
+        &DATABASE_RAFT_TOTAL_FOLLOWER_LAG_ENTRIES_INFO,
+        total_follower_lag_entries as f64,
+        vec![partition_label(partition)],
+    );
+    log_gauge_with_labels(
+        &DATABASE_RAFT_UNDER_REPLICATED_INFO,
+        if under_replicated { 1.0 } else { 0.0 },
+        vec![partition_label(partition)],
+    );
+    log_gauge_with_labels(
+        &DATABASE_RAFT_QUORUM_UNAVAILABLE_INFO,
+        if quorum_unavailable { 1.0 } else { 0.0 },
+        vec![partition_label(partition)],
+    );
+}
+
+pub fn reset_raft_replication_health(partition: PartitionId) {
+    log_raft_replication_health(partition, 0, 0, 0, 0, 0);
+}
+
+register_convex_gauge!(
+    DATABASE_REPLICATION_FRONTIER_TS_INFO,
+    "Latest applied replication frontier timestamp for a source partition on this node",
+    &SOURCE_PARTITION_LABELS
+);
+pub fn log_replication_frontier_ts(source_partition: PartitionId, ts: Timestamp) {
+    log_gauge_with_labels(
+        &DATABASE_REPLICATION_FRONTIER_TS_INFO,
+        u64::from(ts) as f64,
+        vec![source_partition_label(source_partition)],
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_LATEST_REPEATABLE_TS_INFO,
+    "Latest repeatable timestamp currently visible on this node"
+);
+pub fn log_latest_repeatable_ts(ts: Timestamp) {
+    log_gauge(&DATABASE_LATEST_REPEATABLE_TS_INFO, u64::from(ts) as f64);
+}
+
+register_convex_gauge!(
+    DATABASE_PERSISTED_MAX_REPEATABLE_TS_INFO,
+    "Latest repeatable timestamp durably persisted for this node"
+);
+pub fn log_persisted_max_repeatable_ts(ts: Timestamp) {
+    log_gauge(
+        &DATABASE_PERSISTED_MAX_REPEATABLE_TS_INFO,
+        u64::from(ts) as f64,
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_CHECKPOINT_WRITTEN_TS_INFO,
+    "Latest checkpoint timestamp successfully written by this node"
+);
+pub fn log_checkpoint_written_ts(ts: Timestamp) {
+    log_gauge(&DATABASE_CHECKPOINT_WRITTEN_TS_INFO, u64::from(ts) as f64);
+}
+
+register_convex_counter!(
+    DATABASE_CHECKPOINT_WRITE_TOTAL,
+    "Number of checkpoint write attempts by status",
+    &STATUS_LABEL
+);
+pub fn log_checkpoint_write_result(success: bool) {
+    log_counter_with_labels(
+        &DATABASE_CHECKPOINT_WRITE_TOTAL,
+        1,
+        vec![StaticMetricLabel::status(success)],
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_CHECKPOINT_LOADED_TS_INFO,
+    "Latest checkpoint timestamp successfully loaded by this node"
+);
+pub fn log_checkpoint_loaded_ts(ts: Timestamp) {
+    log_gauge(&DATABASE_CHECKPOINT_LOADED_TS_INFO, u64::from(ts) as f64);
+}
+
+register_convex_counter!(
+    DATABASE_CHECKPOINT_LOAD_TOTAL,
+    "Number of checkpoint load attempts by status",
+    &STATUS_LABEL
+);
+pub fn log_checkpoint_load_result(success: bool) {
+    log_counter_with_labels(
+        &DATABASE_CHECKPOINT_LOAD_TOTAL,
+        1,
+        vec![StaticMetricLabel::status(success)],
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_SNAPSHOT_INSTALLED_TS_INFO,
+    "Latest checkpoint timestamp successfully installed into this node"
+);
+pub fn log_snapshot_installed_ts(ts: Timestamp) {
+    log_gauge(&DATABASE_SNAPSHOT_INSTALLED_TS_INFO, u64::from(ts) as f64);
+}
+
+register_convex_counter!(
+    DATABASE_SNAPSHOT_INSTALL_TOTAL,
+    "Number of snapshot install attempts by status",
+    &STATUS_LABEL
+);
+pub fn log_snapshot_install_result(success: bool) {
+    log_counter_with_labels(
+        &DATABASE_SNAPSHOT_INSTALL_TOTAL,
+        1,
+        vec![StaticMetricLabel::status(success)],
+    );
+}
+
+register_convex_histogram!(
+    DATABASE_RAFT_SNAPSHOT_APPLY_SECONDS,
+    "Time to persist and apply an incoming Raft snapshot",
+    &STATUS_LABEL
+);
+pub fn raft_snapshot_apply_timer() -> StatusTimer {
+    StatusTimer::new(&DATABASE_RAFT_SNAPSHOT_APPLY_SECONDS)
+}
+
+register_convex_histogram!(
+    DATABASE_RAFT_SNAPSHOT_APPLY_BYTES,
+    "Size of incoming Raft snapshot payloads applied by this node"
+);
+pub fn log_raft_snapshot_apply_bytes(bytes: usize) {
+    log_distribution(&DATABASE_RAFT_SNAPSHOT_APPLY_BYTES, bytes as f64);
+}
+
+register_convex_counter!(
+    DATABASE_WRITE_REJECTED_NOT_LEADER_TOTAL,
+    "Number of writes rejected because this node is not the Raft leader for the partition",
+    &PARTITION_LABELS
+);
+pub fn log_write_rejected_not_leader(partition: PartitionId) {
+    log_counter_with_labels(
+        &DATABASE_WRITE_REJECTED_NOT_LEADER_TOTAL,
+        1,
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_TWO_PHASE_COORDINATOR_DECISIONS_TOTAL,
+    "Number of 2PC coordinator decisions by outcome",
+    &OUTCOME_LABELS
+);
+pub fn log_two_phase_decision(outcome: &'static str) {
+    log_counter_with_labels(
+        &DATABASE_TWO_PHASE_COORDINATOR_DECISIONS_TOTAL,
+        1,
+        vec![outcome_label(outcome)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_TWO_PHASE_COORDINATOR_ERRORS_TOTAL,
+    "Number of 2PC coordinator errors by phase",
+    &PHASE_LABELS
+);
+pub fn log_two_phase_error(phase: &'static str) {
+    log_counter_with_labels(
+        &DATABASE_TWO_PHASE_COORDINATOR_ERRORS_TOTAL,
+        1,
+        vec![phase_label(phase)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_TWO_PHASE_PREPARE_RETRIES_TOTAL,
+    "Number of 2PC prepare timestamp retries"
+);
+pub fn log_two_phase_prepare_retry() {
+    log_counter(&DATABASE_TWO_PHASE_PREPARE_RETRIES_TOTAL, 1);
+}
+
+register_convex_histogram!(
+    DATABASE_TWO_PHASE_COORDINATOR_SECONDS,
+    "End-to-end duration of a 2PC coordinator attempt",
+    &STATUS_LABEL
+);
+pub fn two_phase_coordinator_timer() -> StatusTimer {
+    StatusTimer::new(&DATABASE_TWO_PHASE_COORDINATOR_SECONDS)
+}
+
+register_convex_histogram!(
+    DATABASE_TWO_PHASE_PARTICIPANTS_TOTAL,
+    "Number of participants involved in a 2PC transaction"
+);
+pub fn log_two_phase_participants(num_participants: usize) {
+    log_distribution(&DATABASE_TWO_PHASE_PARTICIPANTS_TOTAL, num_participants as f64);
+}
+
+register_convex_histogram!(
+    DATABASE_TWO_PHASE_PREPARE_ATTEMPTS_TOTAL,
+    "Number of prepare timestamp allocation attempts for a 2PC transaction"
+);
+pub fn log_two_phase_prepare_attempts(num_attempts: usize) {
+    log_distribution(&DATABASE_TWO_PHASE_PREPARE_ATTEMPTS_TOTAL, num_attempts as f64);
+}
+
+register_convex_histogram!(
+    DATABASE_REPLICATION_TRANSPORT_PUBLISH_SECONDS,
+    "Time to publish a replication delta to the distributed log"
+);
+pub fn replication_transport_publish_timer() -> Timer<VMHistogram> {
+    Timer::new(&DATABASE_REPLICATION_TRANSPORT_PUBLISH_SECONDS)
+}
+
+register_convex_histogram!(
+    DATABASE_REPLICATION_TRANSPORT_MESSAGE_BYTES,
+    "Size of replication transport messages by phase",
+    &PHASE_LABELS
+);
+pub fn log_replication_transport_message_bytes(phase: &'static str, bytes: usize) {
+    log_distribution_with_labels(
+        &DATABASE_REPLICATION_TRANSPORT_MESSAGE_BYTES,
+        bytes as f64,
+        vec![phase_label(phase)],
+    );
+}
+
+register_convex_histogram!(
+    DATABASE_REPLICATION_TRANSPORT_LAG_SECONDS,
+    "Time from replication message publish to local delivery"
+);
+pub fn log_replication_transport_lag(seconds: f64) {
+    log_distribution(&DATABASE_REPLICATION_TRANSPORT_LAG_SECONDS, seconds);
+}
+
+register_convex_gauge!(
+    DATABASE_REPLICATION_TRANSPORT_PENDING_MESSAGES_INFO,
+    "Current number of JetStream replication messages pending for this consumer"
+);
+pub fn log_replication_transport_pending_messages(pending: u64) {
+    log_gauge(
+        &DATABASE_REPLICATION_TRANSPORT_PENDING_MESSAGES_INFO,
+        pending as f64,
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_REPLICATION_TRANSPORT_STREAM_SEQUENCE_INFO,
+    "Latest JetStream stream sequence observed by this consumer"
+);
+pub fn log_replication_transport_stream_sequence(sequence: u64) {
+    log_gauge(
+        &DATABASE_REPLICATION_TRANSPORT_STREAM_SEQUENCE_INFO,
+        sequence as f64,
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_REPLICATION_TRANSPORT_CONSUMER_SEQUENCE_INFO,
+    "Latest JetStream consumer sequence observed by this consumer"
+);
+pub fn log_replication_transport_consumer_sequence(sequence: u64) {
+    log_gauge(
+        &DATABASE_REPLICATION_TRANSPORT_CONSUMER_SEQUENCE_INFO,
+        sequence as f64,
+    );
+}
 
 register_convex_histogram!(
     DOCUMENTS_SIZE_BYTES,

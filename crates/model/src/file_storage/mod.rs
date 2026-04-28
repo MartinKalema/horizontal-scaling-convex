@@ -52,7 +52,7 @@ use pb::storage::{
 };
 use usage_tracking::FunctionUsageTracker;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     ConvexValue,
     FieldPath,
     ResolvedDocumentId,
@@ -128,16 +128,16 @@ impl SystemTable for FileStorageTable {
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum FileStorageId {
     LegacyStorageId(StorageUuid),
-    DocumentId(DeveloperDocumentId),
+    PublicDocumentId(PublicDocumentId),
 }
 
 impl FromStr for FileStorageId {
     type Err = anyhow::Error;
 
     fn from_str(storage_id: &str) -> Result<Self, Self::Err> {
-        let decoded_id = DeveloperDocumentId::decode(storage_id);
+        let decoded_id = PublicDocumentId::decode(storage_id);
         match decoded_id {
-            Ok(decoded_id) => Ok(FileStorageId::DocumentId(decoded_id)),
+            Ok(decoded_id) => Ok(FileStorageId::PublicDocumentId(decoded_id)),
             Err(_) => Ok(FileStorageId::LegacyStorageId(storage_id.parse().context(
                 ErrorMetadata::bad_request(
                     "InvalidStorageId",
@@ -160,7 +160,7 @@ impl TryFrom<FileStorageIdProto> for FileStorageId {
                 FileStorageId::LegacyStorageId(storage_id.parse()?)
             },
             Some(FileStorageIdTypeProto::DocumentId(storage_id)) => {
-                FileStorageId::DocumentId(DeveloperDocumentId::decode(storage_id.as_str())?)
+                FileStorageId::PublicDocumentId(PublicDocumentId::decode(storage_id.as_str())?)
             },
             None => anyhow::bail!("Missing `storage_id_type` field"),
         };
@@ -174,7 +174,7 @@ impl From<FileStorageId> for FileStorageIdProto {
             FileStorageId::LegacyStorageId(storage_id) => {
                 FileStorageIdTypeProto::LegacyStorageId(storage_id.to_string())
             },
-            FileStorageId::DocumentId(storage_id) => {
+            FileStorageId::PublicDocumentId(storage_id) => {
                 FileStorageIdTypeProto::DocumentId(storage_id.encode())
             },
         };
@@ -262,7 +262,7 @@ impl<'a, RT: Runtime> FileStorageModel<'a, RT> {
                 )],
                 order: Order::Asc,
             }),
-            FileStorageId::DocumentId(document_id) => {
+            FileStorageId::PublicDocumentId(document_id) => {
                 let table_name = self
                     .tx
                     .resolve_idv6(

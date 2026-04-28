@@ -15,7 +15,7 @@ use common::{
     value::ConvexValue,
 };
 use value::{
-    ConvexObject,
+    DocumentObject,
     JsonPackedValue,
 };
 
@@ -50,7 +50,7 @@ pub struct SessionRequestRecord {
     pub identity: InertIdentity,
 }
 
-impl TryFrom<SessionRequestRecord> for ConvexObject {
+impl TryFrom<SessionRequestRecord> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(request: SessionRequestRecord) -> anyhow::Result<Self> {
@@ -63,10 +63,10 @@ impl TryFrom<SessionRequestRecord> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for SessionRequestRecord {
+impl TryFrom<DocumentObject> for SessionRequestRecord {
     type Error = anyhow::Error;
 
-    fn try_from(object: ConvexObject) -> anyhow::Result<Self> {
+    fn try_from(object: DocumentObject) -> anyhow::Result<Self> {
         let mut fields: BTreeMap<_, _> = object.into();
 
         let session_id: SessionId = match fields.remove("sessionId") {
@@ -109,7 +109,7 @@ pub enum SessionRequestOutcome {
     },
 }
 
-impl TryFrom<SessionRequestOutcome> for ConvexObject {
+impl TryFrom<SessionRequestOutcome> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(outcome: SessionRequestOutcome) -> anyhow::Result<Self> {
@@ -131,10 +131,10 @@ impl TryFrom<SessionRequestOutcome> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for SessionRequestOutcome {
+impl TryFrom<DocumentObject> for SessionRequestOutcome {
     type Error = anyhow::Error;
 
-    fn try_from(object: ConvexObject) -> anyhow::Result<Self> {
+    fn try_from(object: DocumentObject) -> anyhow::Result<Self> {
         let mut fields: BTreeMap<_, _> = object.into();
 
         let udf_type = match fields.remove("type") {
@@ -182,7 +182,7 @@ mod tests {
     use cmd_util::env::env_config;
     use common::testing::assert_roundtrips;
     use proptest::prelude::*;
-    use value::ConvexObject;
+    use value::DocumentObject;
 
     use super::SessionRequestRecord;
 
@@ -192,7 +192,7 @@ mod tests {
         )]
         #[test]
         fn test_session_request_roundtrips(v in any::<SessionRequestRecord>()) {
-            assert_roundtrips::<SessionRequestRecord, ConvexObject>(v);
+            assert_roundtrips::<SessionRequestRecord, DocumentObject>(v);
         }
     }
 }

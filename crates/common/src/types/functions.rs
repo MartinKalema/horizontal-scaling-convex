@@ -15,7 +15,7 @@ use serde::{
 };
 use value::{
     heap_size::HeapSize,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
 };
 
 use super::HttpActionRoute;
@@ -186,11 +186,11 @@ pub enum FunctionCaller {
     HttpEndpoint,
     Cron,
     Scheduler {
-        job_id: DeveloperDocumentId,
+        job_id: PublicDocumentId,
         component_id: ComponentId,
     },
     Action {
-        parent_scheduled_job: Option<(ComponentId, DeveloperDocumentId)>,
+        parent_scheduled_job: Option<(ComponentId, PublicDocumentId)>,
         parent_execution_id: Option<ExecutionId>,
     },
     #[cfg(any(test, feature = "testing"))]
@@ -214,7 +214,7 @@ impl FunctionCaller {
         .cloned()
     }
 
-    pub fn parent_scheduled_job(&self) -> Option<(ComponentId, DeveloperDocumentId)> {
+    pub fn parent_scheduled_job(&self) -> Option<(ComponentId, PublicDocumentId)> {
         match self {
             FunctionCaller::SyncWorker(_)
             | FunctionCaller::HttpApi(_)

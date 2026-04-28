@@ -40,8 +40,8 @@ use value::{
     remove_string,
     sha256::Sha256Digest,
     ConvexArray,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
 };
 
 use crate::{
@@ -163,7 +163,7 @@ pub struct ConfigFile {
     pub auth_info: Option<Vec<SerializedAuthInfo>>,
 }
 
-impl TryFrom<ConfigMetadata> for ConvexObject {
+impl TryFrom<ConfigMetadata> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(m: ConfigMetadata) -> anyhow::Result<Self> {
@@ -176,7 +176,7 @@ impl TryFrom<ConfigMetadata> for ConvexObject {
             let auth_info = m
                 .auth_info
                 .into_iter()
-                .map(|v| Ok(ConvexObject::try_from(AuthInfoPersisted(v))?.into()))
+                .map(|v| Ok(DocumentObject::try_from(AuthInfoPersisted(v))?.into()))
                 .collect::<anyhow::Result<Vec<ConvexValue>>>()?
                 .try_into()?;
             config.insert("authInfo".parse()?, auth_info);
@@ -189,14 +189,14 @@ impl TryFrom<ConfigMetadata> for ConvexValue {
     type Error = anyhow::Error;
 
     fn try_from(value: ConfigMetadata) -> Result<Self, Self::Error> {
-        Ok(ConvexObject::try_from(value)?.into())
+        Ok(DocumentObject::try_from(value)?.into())
     }
 }
 
-impl TryFrom<ConvexObject> for ConfigMetadata {
+impl TryFrom<DocumentObject> for ConfigMetadata {
     type Error = anyhow::Error;
 
-    fn try_from(o: ConvexObject) -> Result<Self, Self::Error> {
+    fn try_from(o: DocumentObject) -> Result<Self, Self::Error> {
         let mut fields: BTreeMap<_, _> = o.into();
         let functions = match fields.remove("functions") {
             Some(ConvexValue::String(s)) => s.into(),
@@ -209,7 +209,7 @@ impl TryFrom<ConvexObject> for ConfigMetadata {
             Some(v) => ConvexArray::try_from(v)?
                 .into_iter()
                 .map(|v| {
-                    let parsed: AuthInfoPersisted = ConvexObject::try_from(v)?.try_into()?;
+                    let parsed: AuthInfoPersisted = DocumentObject::try_from(v)?.try_into()?;
                     Ok(parsed.0)
                 })
                 .collect::<anyhow::Result<Vec<AuthInfo>>>()?,
@@ -329,7 +329,7 @@ pub struct UdfServerVersionDiff {
     pub previous_version: String,
     pub next_version: String,
 }
-impl TryFrom<UdfServerVersionDiff> for ConvexObject {
+impl TryFrom<UdfServerVersionDiff> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(value: UdfServerVersionDiff) -> Result<Self, Self::Error> {
@@ -337,10 +337,10 @@ impl TryFrom<UdfServerVersionDiff> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for UdfServerVersionDiff {
+impl TryFrom<DocumentObject> for UdfServerVersionDiff {
     type Error = anyhow::Error;
 
-    fn try_from(obj: ConvexObject) -> anyhow::Result<Self> {
+    fn try_from(obj: DocumentObject) -> anyhow::Result<Self> {
         let mut fields = BTreeMap::from(obj);
         Ok(Self {
             previous_version: remove_string(&mut fields, "previous_version")?,

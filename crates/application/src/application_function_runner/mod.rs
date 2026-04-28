@@ -184,7 +184,7 @@ use usage_tracking::{
     OccInfo,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     identifier::Identifier,
     serialized_args_ext::SerializedArgsExt,
     JsonPackedValue,
@@ -2082,7 +2082,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
         identity: Identity,
         component: ComponentId,
         entry: FileStorageEntry,
-    ) -> anyhow::Result<(ComponentPath, DeveloperDocumentId)> {
+    ) -> anyhow::Result<(ComponentPath, PublicDocumentId)> {
         let mut tx = self.database.begin(identity.clone()).await?;
         self.bail_if_backend_not_running(&mut tx).await?;
         let (_ts, r, _stats) = self
@@ -2145,7 +2145,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
         udf_args: SerializedArgs,
         scheduled_ts: UnixTimestamp,
         context: ExecutionContext,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let (_ts, (virtual_id, arg_size), _stats) = self
             .database
             .execute_with_occ_retries(
@@ -2198,7 +2198,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
     async fn cancel_job(
         &self,
         identity: Identity,
-        virtual_id: DeveloperDocumentId,
+        virtual_id: PublicDocumentId,
     ) -> anyhow::Result<()> {
         self.database
             .execute_with_occ_retries(

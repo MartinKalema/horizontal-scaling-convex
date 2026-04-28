@@ -40,7 +40,7 @@ use search::{
 use storage::Storage;
 use sync_types::Timestamp;
 use value::{
-    ConvexObject,
+    DocumentObject,
     TableNumber,
     TabletId,
 };
@@ -264,7 +264,7 @@ impl<T: SearchIndex> SearchOnDiskState<T> {
 pub enum SnapshotData<T> {
     /// An unrecognized snapshot, probably from a newer version of backend than
     /// this one that we subsequently rolled back.
-    Unknown(ConvexObject),
+    Unknown(DocumentObject),
     MultiSegment(Vec<T>),
 }
 

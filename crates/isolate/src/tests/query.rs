@@ -28,8 +28,8 @@ use runtime::testing::TestRuntime;
 use udf::UdfOutcome;
 use value::{
     assert_val,
-    id_v6::DeveloperDocumentId,
-    ConvexObject,
+    id_v6::PublicDocumentId,
+    DocumentObject,
 };
 
 use crate::test_helpers::{
@@ -413,7 +413,7 @@ async fn test_index_range_errors(rt: TestRuntime) -> anyhow::Result<()> {
     .await
 }
 
-fn pagination_opts(cursor: ConvexValue) -> ConvexObject {
+fn pagination_opts(cursor: ConvexValue) -> DocumentObject {
     assert_obj!("paginationOpts" => ConvexValue::Object(assert_obj!(
         "cursor" => cursor,
         "numItems" => 1.0,
@@ -500,17 +500,17 @@ async fn test_pagination_max_bytes_read(rt: TestRuntime) -> anyhow::Result<()> {
         must_let!(let ConvexValue::String(id5) = t.mutation("query:insert", object.clone()).await?);
 
         let expected = vec![
-            DeveloperDocumentId::decode(&id1)?,
-            DeveloperDocumentId::decode(&id2)?,
-            DeveloperDocumentId::decode(&id3)?,
-            DeveloperDocumentId::decode(&id4)?,
-            DeveloperDocumentId::decode(&id5)?,
+            PublicDocumentId::decode(&id1)?,
+            PublicDocumentId::decode(&id2)?,
+            PublicDocumentId::decode(&id3)?,
+            PublicDocumentId::decode(&id4)?,
+            PublicDocumentId::decode(&id5)?,
         ];
 
         async fn read_to_end(
             t: &UdfTest<TestRuntime, TestPersistence>,
             max_bytes_read: usize,
-        ) -> anyhow::Result<(Vec<DeveloperDocumentId>, usize)> {
+        ) -> anyhow::Result<(Vec<PublicDocumentId>, usize)> {
             let mut results = Vec::new();
             let mut num_pages = 0;
             let mut cursor = ConvexValue::Null;
@@ -532,7 +532,7 @@ async fn test_pagination_max_bytes_read(rt: TestRuntime) -> anyhow::Result<()> {
                 for value in page.into_iter() {
                     must_let!(let ConvexValue::Object(object) = value);
                     must_let!(let Some(ConvexValue::String(id)) = object.get("_id"));
-                    results.push(DeveloperDocumentId::decode(id)?);
+                    results.push(PublicDocumentId::decode(id)?);
                 }
             }
             Ok((results, num_pages))
@@ -610,8 +610,8 @@ async fn test_multiple_paginated_queries_error(rt: TestRuntime) -> anyhow::Resul
 pub async fn assert_paginated_query_journal_is_correct(
     t: &UdfTest<TestRuntime, TestPersistence>,
     udf_path: &str,
-    args: ConvexObject,
-    middle_objects: Vec<(&'static str, ConvexObject, bool)>,
+    args: DocumentObject,
+    middle_objects: Vec<(&'static str, DocumentObject, bool)>,
 ) -> anyhow::Result<(ConvexArray, bool)> {
     let (outcome1, _) = t
         .raw_query(

@@ -12,8 +12,8 @@ use serde::{
 
 use crate::{
     ConvexArray,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
 };
 
@@ -35,7 +35,7 @@ impl Serialize for ConvexValue {
     }
 }
 
-impl Serialize for ConvexObject {
+impl Serialize for DocumentObject {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -157,8 +157,8 @@ impl<'de> Deserialize<'de> for ConvexValue {
     }
 }
 
-impl<'de> Deserialize<'de> for ConvexObject {
-    fn deserialize<D>(deserializer: D) -> Result<ConvexObject, D::Error>
+impl<'de> Deserialize<'de> for DocumentObject {
+    fn deserialize<D>(deserializer: D) -> Result<DocumentObject, D::Error>
     where
         D: serde::Deserializer<'de>,
     {

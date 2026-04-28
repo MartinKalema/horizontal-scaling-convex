@@ -111,14 +111,14 @@ mod tests {
     use common::runtime::UnixTimestamp;
     use semver::Version;
     use serde_json::json;
-    use value::ConvexObject;
+    use value::DocumentObject;
 
     use crate::udf_config::types::UdfConfig;
 
     #[test]
     fn test_frozen_obj() {
         assert_eq!(
-            UdfConfig::try_from(ConvexObject::try_from(json!({
+            UdfConfig::try_from(DocumentObject::try_from(json!({
                 "importPhaseRngSeed": {"$bytes": "JycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJyc="},
                 "importPhaseUnixTimestamp": {"$integer": "AADITmdtwRs="},
                 "serverVersion": "123.456.789",

@@ -490,7 +490,7 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
                 .all()
                 .await?
             {
-                let id = SourcePackageId::from(source_package.id().developer_id);
+                let id = SourcePackageId::from(source_package.id().document_id);
                 if !source_package_ids.contains(&id) {
                     SystemMetadataModel::new(&mut tx, namespace)
                         .delete(source_package.id())

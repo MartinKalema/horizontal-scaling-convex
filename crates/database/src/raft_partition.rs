@@ -50,6 +50,7 @@ use raft::prelude::Message;
 use tokio::sync::mpsc;
 
 use crate::{
+    metrics,
     partition::PartitionId,
     raft_node::{
         LeadershipCallbacks,
@@ -116,10 +117,17 @@ impl RaftPartitionManager {
         config: RaftNodeConfig,
         engine: Arc<raft_engine::Engine>,
         peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
+        snapshot_provider: Option<Arc<dyn crate::raft_storage::RaftSnapshotProvider>>,
     ) -> anyhow::Result<Self> {
         let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel();
 
-        let mut node = RaftNode::new(config.clone(), engine, mailbox_rx, peer_senders)?;
+        let mut node = RaftNode::new(
+            config.clone(),
+            engine,
+            mailbox_rx,
+            peer_senders,
+            snapshot_provider,
+        )?;
 
         let is_leader = Arc::new(AtomicBool::new(false));
         let leader_id = Arc::new(AtomicU64::new(0));
@@ -131,6 +139,7 @@ impl RaftPartitionManager {
         node.set_leadership_callbacks(LeadershipCallbacks {
             on_became_leader: Box::new(move || {
                 is_leader_cb.store(true, Ordering::SeqCst);
+                metrics::log_raft_is_leader(partition_id, true);
                 tracing::info!(
                     "Raft partition {}: Committer ACTIVATED (this node is leader)",
                     partition_id,
@@ -141,6 +150,8 @@ impl RaftPartitionManager {
                 let partition_id_lost = partition_id;
                 move || {
                     is_leader_lost.store(false, Ordering::SeqCst);
+                    metrics::log_raft_is_leader(partition_id_lost, false);
+                    metrics::reset_raft_replication_health(partition_id_lost);
                     tracing::info!(
                         "Raft partition {}: Committer DEACTIVATED (lost leadership)",
                         partition_id_lost,
@@ -152,7 +163,9 @@ impl RaftPartitionManager {
                 let partition_id_changed = partition_id;
                 move |new_leader_id| {
                     let old = leader_id_changed.swap(new_leader_id, Ordering::SeqCst);
+                    metrics::log_raft_leader_id(partition_id_changed, new_leader_id);
                     if old != new_leader_id {
+                        metrics::log_raft_leader_change(partition_id_changed);
                         tracing::info!(
                             "Raft partition {}: leader changed from {} to {}",
                             partition_id_changed,
@@ -170,6 +183,9 @@ impl RaftPartitionManager {
             proposal_tx: mailbox_tx.clone(),
             partition_id: config.partition_id,
         };
+        metrics::log_raft_is_leader(config.partition_id, false);
+        metrics::log_raft_leader_id(config.partition_id, 0);
+        metrics::reset_raft_replication_health(config.partition_id);
 
         Ok(Self {
             node: Some(node),
@@ -215,7 +231,8 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = RaftPartitionManager::new(config, test_engine(), HashMap::new()).unwrap();
+        let manager =
+            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None).unwrap();
         let state = manager.state();
 
         assert!(!state.is_leader());
@@ -233,7 +250,8 @@ mod tests {
             heartbeat_tick: 3,
         };
 
-        let mut manager = RaftPartitionManager::new(config, test_engine(), HashMap::new()).unwrap();
+        let mut manager =
+            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None).unwrap();
         let state = manager.state();
 
         assert!(!state.is_leader());
@@ -248,7 +266,11 @@ mod tests {
         // The shared state should now reflect leadership.
         assert!(state.is_leader());
         assert_eq!(state.leader_id(), 1);
-        assert_eq!(state.leader_id(), 1, "Shared state should expose the elected leader ID");
+        assert_eq!(
+            state.leader_id(),
+            1,
+            "Shared state should expose the elected leader ID"
+        );
     }
 
     #[test]
@@ -260,7 +282,8 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = RaftPartitionManager::new(config, test_engine(), HashMap::new()).unwrap();
+        let manager =
+            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None).unwrap();
         let state = manager.state();
 
         // Should be able to send without error (node exists).

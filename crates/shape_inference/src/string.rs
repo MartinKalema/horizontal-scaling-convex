@@ -5,7 +5,7 @@ use std::{
 };
 
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     identifier::is_valid_field_name,
     ConvexString,
 };
@@ -47,7 +47,7 @@ impl<C: ShapeConfig> StringLiteralShape<C> {
             };
             return ShapeEnum::StringLiteral(literal_shape);
         }
-        if let Ok(id) = DeveloperDocumentId::decode(s) {
+        if let Ok(id) = PublicDocumentId::decode(s) {
             return ShapeEnum::Id(id.table());
         }
         if is_valid_field_name(s) {

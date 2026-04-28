@@ -35,12 +35,12 @@ use sync_types::{
 use value::{
     codegen_convex_serialization,
     heap_size::HeapSize,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     json_deserialize,
     obj,
     ConvexArray,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     ResolvedDocumentId,
     Size,
 };
@@ -103,7 +103,7 @@ impl CronJob {
 
     pub fn cron_next_run(&self) -> CronNextRun {
         CronNextRun {
-            cron_job_id: self.id.developer_id,
+            cron_job_id: self.id.document_id,
             state: self.state.clone(),
             prev_ts: self.prev_ts,
             next_ts: self.next_ts,
@@ -802,7 +802,7 @@ pub struct CronJobLog {
     pub execution_time: f64,
 }
 
-impl TryFrom<CronJobLog> for ConvexObject {
+impl TryFrom<CronJobLog> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(log: CronJobLog) -> anyhow::Result<Self, Self::Error> {
@@ -822,10 +822,10 @@ impl TryFrom<CronJobLog> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for CronJobLog {
+impl TryFrom<DocumentObject> for CronJobLog {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> anyhow::Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> anyhow::Result<Self, Self::Error> {
         let mut fields: BTreeMap<_, _> = value.into();
 
         let name = match fields.remove("name") {
@@ -898,7 +898,7 @@ pub enum CronJobStatus {
     Canceled { num_canceled: i64 },
 }
 
-impl TryFrom<CronJobStatus> for ConvexObject {
+impl TryFrom<CronJobStatus> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(status: CronJobStatus) -> anyhow::Result<Self, Self::Error> {
@@ -919,10 +919,10 @@ impl TryFrom<CronJobStatus> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for CronJobStatus {
+impl TryFrom<DocumentObject> for CronJobStatus {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> anyhow::Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> anyhow::Result<Self, Self::Error> {
         let mut fields: BTreeMap<_, _> = value.into();
         let status_t = match fields.remove("type") {
             Some(ConvexValue::String(s)) => s,
@@ -975,7 +975,7 @@ pub enum CronJobResult {
     Truncated(String),
 }
 
-impl TryFrom<CronJobResult> for ConvexObject {
+impl TryFrom<CronJobResult> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(result: CronJobResult) -> anyhow::Result<Self, Self::Error> {
@@ -993,10 +993,10 @@ impl TryFrom<CronJobResult> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for CronJobResult {
+impl TryFrom<DocumentObject> for CronJobResult {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> anyhow::Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> anyhow::Result<Self, Self::Error> {
         let mut fields: BTreeMap<_, _> = value.into();
         let result_t = match fields.remove("type") {
             Some(ConvexValue::String(s)) => s,
@@ -1039,7 +1039,7 @@ pub struct CronJobLogLines {
     pub is_truncated: bool,
 }
 
-impl TryFrom<CronJobLogLines> for ConvexObject {
+impl TryFrom<CronJobLogLines> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(cron_log: CronJobLogLines) -> anyhow::Result<Self, Self::Error> {
@@ -1055,10 +1055,10 @@ impl TryFrom<CronJobLogLines> for ConvexObject {
     }
 }
 
-impl TryFrom<ConvexObject> for CronJobLogLines {
+impl TryFrom<DocumentObject> for CronJobLogLines {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> anyhow::Result<Self, Self::Error> {
+    fn try_from(value: DocumentObject) -> anyhow::Result<Self, Self::Error> {
         let mut fields: BTreeMap<_, _> = value.into();
         let log_lines: RawLogLines = match fields.remove("logLines") {
             Some(ConvexValue::Array(a)) => a
@@ -1091,8 +1091,8 @@ mod tests {
     use sync_types::testing::assert_roundtrips;
     use value::{
         assert_obj,
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
     };
 
     use crate::cron_jobs::types::{
@@ -1109,22 +1109,22 @@ mod tests {
         )]
         #[test]
         fn test_cron_job_log_roundtrips(v in any::<CronJobLog>()) {
-            assert_roundtrips::<CronJobLog, ConvexObject>(v);
+            assert_roundtrips::<CronJobLog, DocumentObject>(v);
         }
 
         #[test]
         fn test_cron_job_status_roundtrips(v in any::<CronJobStatus>()) {
-            assert_roundtrips::<CronJobStatus, ConvexObject>(v);
+            assert_roundtrips::<CronJobStatus, DocumentObject>(v);
         }
 
         #[test]
         fn test_cron_job_result_roundtrips(v in any::<CronJobResult>()) {
-            assert_roundtrips::<CronJobResult, ConvexObject>(v);
+            assert_roundtrips::<CronJobResult, DocumentObject>(v);
         }
 
         #[test]
         fn test_cron_job_log_lines_roundtrips(v in any::<CronJobLogLines>()) {
-            assert_roundtrips::<CronJobLogLines, ConvexObject>(v);
+            assert_roundtrips::<CronJobLogLines, DocumentObject>(v);
         }
     }
 
@@ -1149,7 +1149,7 @@ mod tests {
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CronNextRun {
     // Internally tracked metadata to execute the current run of the cron
-    pub cron_job_id: DeveloperDocumentId,
+    pub cron_job_id: PublicDocumentId,
     pub state: CronJobState,
     pub prev_ts: Option<Timestamp>,
     pub next_ts: Timestamp,
@@ -1180,7 +1180,7 @@ impl TryFrom<SerializedCronNextRun> for CronNextRun {
 
     fn try_from(value: SerializedCronNextRun) -> anyhow::Result<Self, Self::Error> {
         Ok(Self {
-            cron_job_id: DeveloperDocumentId::decode(&value.cron_job_id)?,
+            cron_job_id: PublicDocumentId::decode(&value.cron_job_id)?,
             state: value.state,
             prev_ts: value.prev_ts.map(|ts| ts.try_into()).transpose()?,
             next_ts: value.next_ts.try_into()?,

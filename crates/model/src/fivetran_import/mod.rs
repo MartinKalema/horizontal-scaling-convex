@@ -52,8 +52,8 @@ use fivetran_destination::{
     },
 };
 use value::{
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     FieldName,
     TableName,
     TableNamespace,
@@ -80,7 +80,7 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
             BatchWriteOperation::Upsert => {
                 if let Some(existing_document) = existing_document {
                     UserFacingModel::new(self.tx, TableNamespace::Global)
-                        .replace(existing_document.developer_id(), row.row)
+                        .replace(existing_document.document_id(), row.row)
                         .await?;
                 } else {
                     UserFacingModel::new(self.tx, TableNamespace::Global)
@@ -101,7 +101,7 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
 
                 UserFacingModel::new(self.tx, TableNamespace::Global)
                     .patch(
-                        existing_document.developer_id(),
+                        existing_document.document_id(),
                         fivetran_patch_value(existing_document.into_value().into_value(), row.row),
                     )
                     .await?;
@@ -109,7 +109,7 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
             BatchWriteOperation::HardDelete => {
                 if let Some(existing_document) = existing_document {
                     UserFacingModel::new(self.tx, TableNamespace::Global)
-                        .delete(existing_document.developer_id())
+                        .delete(existing_document.document_id())
                         .await?;
                 }
             },
@@ -126,15 +126,12 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
         match delete_type {
             DeleteType::HardDelete => {
                 UserFacingModel::new(self.tx, TableNamespace::Global)
-                    .delete(doc.developer_id())
+                    .delete(doc.document_id())
                     .await?;
             },
             DeleteType::SoftDelete => {
                 UserFacingModel::new(self.tx, TableNamespace::Global)
-                    .replace(
-                        doc.developer_id(),
-                        mark_as_soft_deleted(doc.into_value().0)?,
-                    )
+                    .replace(doc.document_id(), mark_as_soft_deleted(doc.into_value().0)?)
                     .await?;
             },
         }
@@ -144,7 +141,7 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
     async fn primary_key_query(
         &mut self,
         table_name: &TableName,
-        object: &ConvexObject,
+        object: &DocumentObject,
     ) -> anyhow::Result<ResolvedQuery<RT>> {
         let mut model = IndexModel::new(self.tx);
         let indexes = model
@@ -310,7 +307,7 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
 /// new value. But for Fivetran’s point of view, the metadata fields are all
 /// separate, which means we must make sure that we’re not overriding the entire
 /// `fivetran` field if it contains attributes that are not overridden.
-fn fivetran_patch_value(existing_document: ConvexObject, patch: ConvexObject) -> PatchValue {
+fn fivetran_patch_value(existing_document: DocumentObject, patch: DocumentObject) -> PatchValue {
     let metadata_field_name = FieldName::from(METADATA_CONVEX_FIELD_NAME.clone());
 
     let mut existing_document: BTreeMap<FieldName, ConvexValue> = existing_document.into();
@@ -329,7 +326,7 @@ fn fivetran_patch_value(existing_document: ConvexObject, patch: ConvexObject) ->
     PatchValue::from(
         patch
             .shallow_merge(
-                ConvexObject::for_value(
+                DocumentObject::for_value(
                     metadata_field_name,
                     ConvexValue::Object(existing_metadata.shallow_merge(new_metadata).expect(
                         "The number of metadata fields should always be under the field count \
@@ -345,18 +342,18 @@ fn fivetran_patch_value(existing_document: ConvexObject, patch: ConvexObject) ->
     )
 }
 
-fn mark_as_soft_deleted(object: ConvexObject) -> anyhow::Result<ConvexObject> {
+fn mark_as_soft_deleted(object: DocumentObject) -> anyhow::Result<DocumentObject> {
     let metadata_key = FieldName::from(METADATA_CONVEX_FIELD_NAME.clone());
 
     let mut new_value: BTreeMap<FieldName, ConvexValue> = object.into();
     let metadata_object = match new_value.remove(&metadata_key) {
         Some(ConvexValue::Object(object)) => object,
-        _ => ConvexObject::empty(),
+        _ => DocumentObject::empty(),
     };
 
     new_value.insert(
         metadata_key,
-        ConvexValue::Object(metadata_object.shallow_merge(ConvexObject::for_value(
+        ConvexValue::Object(metadata_object.shallow_merge(DocumentObject::for_value(
             FieldName::from(SOFT_DELETE_CONVEX_FIELD_NAME.clone()),
             ConvexValue::Boolean(true),
         )?)?),

@@ -6,8 +6,8 @@ use std::{
 use crate::{
     assert_obj,
     obj,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
     ResolvedDocumentId,
     Size,
 };
@@ -29,28 +29,28 @@ fn test_value_size() -> anyhow::Result<()> {
 #[test]
 fn test_object_cmp() -> anyhow::Result<()> {
     // Equal ignoring order.
-    let o1: ConvexObject = assert_obj!(
+    let o1: DocumentObject = assert_obj!(
         "chambers" => 36,
         "cuban_linx" => 4,
     );
-    let o2: ConvexObject = assert_obj!(
+    let o2: DocumentObject = assert_obj!(
         "cuban_linx" => 4,
         "chambers" => 36,
     );
     assert!(*o1 == *o2);
 
     // Lexicographic ordering on fields.
-    let o1: ConvexObject = assert_obj!(
+    let o1: DocumentObject = assert_obj!(
         "nested" => { "compton" => 187 },
     );
-    let o2: ConvexObject = assert_obj!(
+    let o2: DocumentObject = assert_obj!(
         "nested" => { "bompton" => 187 },
     );
     assert!(*o2 < *o1);
 
     // Ordered on values if same fields.
-    let o1: ConvexObject = assert_obj!("_93_til" => 94);
-    let o2: ConvexObject = assert_obj!("_93_til" => 95);
+    let o1: DocumentObject = assert_obj!("_93_til" => 94);
+    let o2: DocumentObject = assert_obj!("_93_til" => 95);
     assert!(*o1 < *o2);
 
     Ok(())
@@ -59,7 +59,7 @@ fn test_object_cmp() -> anyhow::Result<()> {
 #[test]
 fn test_shallow_merge() -> anyhow::Result<()> {
     // Overwrite objects with non-objects
-    let mut old: ConvexObject = assert_obj!(
+    let mut old: DocumentObject = assert_obj!(
         "name" => {
             "first" => "Mr",
             "last" => {
@@ -84,7 +84,7 @@ fn test_shallow_merge() -> anyhow::Result<()> {
     assert!(*old == *expected);
 
     // Overwrite non-objects with objects
-    let mut old: ConvexObject = assert_obj!(
+    let mut old: DocumentObject = assert_obj!(
         "name" => "Mr",
     );
     let new = assert_obj!(
@@ -103,7 +103,7 @@ fn test_shallow_merge() -> anyhow::Result<()> {
     assert!(*old == *expected);
 
     // Don't merge sub-fields
-    let mut old: ConvexObject = assert_obj!(
+    let mut old: DocumentObject = assert_obj!(
         "name" => {
             "first" => "Mr",
             "last" => "Fantastik",

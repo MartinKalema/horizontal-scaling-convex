@@ -38,7 +38,7 @@ use storage::{
     ClientDrivenUploadToken,
 };
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     TableName,
 };
 
@@ -261,7 +261,7 @@ pub async fn perform_import(
     Json(PerformImportArgs { import_id }): Json<PerformImportArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
-    let import_id = DeveloperDocumentId::decode(&import_id).context(ErrorMetadata::bad_request(
+    let import_id = PublicDocumentId::decode(&import_id).context(ErrorMetadata::bad_request(
         "InvalidImport",
         format!("invalid import id {import_id}"),
     ))?;
@@ -280,7 +280,7 @@ pub async fn cancel_import(
     ExtractIdentity(identity): ExtractIdentity,
     Json(CancelImportArgs { import_id }): Json<CancelImportArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    let import_id = DeveloperDocumentId::decode(&import_id).context(ErrorMetadata::bad_request(
+    let import_id = PublicDocumentId::decode(&import_id).context(ErrorMetadata::bad_request(
         "InvalidImport",
         format!("invalid import id {import_id}"),
     ))?;

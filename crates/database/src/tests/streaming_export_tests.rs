@@ -80,21 +80,21 @@ async fn test_document_deltas(rt: TestRuntime) -> anyhow::Result<()> {
         vec![
             (
                 ts1,
-                doc1sort.developer_id(),
+                doc1sort.document_id(),
                 ComponentPath::root(),
                 table_mapping.tablet_name(doc1sort.id().tablet_id)?,
                 Some(StreamingExportDocument::with_all_fields(doc1sort.clone()))
             ),
             (
                 ts1,
-                doc2sort.developer_id(),
+                doc2sort.document_id(),
                 ComponentPath::root(),
                 table_mapping.tablet_name(doc2sort.id().tablet_id)?,
                 Some(StreamingExportDocument::with_all_fields(doc2sort.clone()))
             ),
             (
                 ts2,
-                doc3.developer_id(),
+                doc3.document_id(),
                 ComponentPath::root(),
                 table_mapping.tablet_name(doc3.id().tablet_id)?,
                 Some(StreamingExportDocument::with_all_fields(doc3.clone()))
@@ -117,7 +117,7 @@ async fn test_document_deltas(rt: TestRuntime) -> anyhow::Result<()> {
         deltas_cursor.deltas,
         vec![(
             ts2,
-            doc3.developer_id(),
+            doc3.document_id(),
             ComponentPath::root(),
             table_mapping.tablet_name(doc3.id().tablet_id)?,
             Some(StreamingExportDocument::with_all_fields(doc3.clone()))
@@ -145,7 +145,7 @@ async fn test_document_deltas(rt: TestRuntime) -> anyhow::Result<()> {
         deltas_table_filter.deltas,
         vec![(
             ts1,
-            doc1.developer_id(),
+            doc1.document_id(),
             ComponentPath::root(),
             table_mapping.tablet_name(doc1.id().tablet_id)?,
             Some(StreamingExportDocument::with_all_fields(doc1.clone()))
@@ -170,14 +170,14 @@ async fn test_document_deltas(rt: TestRuntime) -> anyhow::Result<()> {
         vec![
             (
                 ts1,
-                doc1sort.developer_id(),
+                doc1sort.document_id(),
                 ComponentPath::root(),
                 table_mapping.tablet_name(doc1sort.id().tablet_id)?,
                 Some(StreamingExportDocument::with_all_fields(doc1sort.clone()))
             ),
             (
                 ts1,
-                doc2sort.developer_id(),
+                doc2sort.document_id(),
                 ComponentPath::root(),
                 table_mapping.tablet_name(doc2sort.id().tablet_id)?,
                 Some(StreamingExportDocument::with_all_fields(doc2sort.clone()))
@@ -276,7 +276,7 @@ async fn document_deltas_should_not_ignore_rows_from_tables_that_were_not_delete
         deltas.deltas,
         vec![(
             ts_insert,
-            remaining_doc.developer_id(),
+            remaining_doc.document_id(),
             ComponentPath::root(),
             table_mapping.tablet_name(remaining_doc.id().tablet_id)?,
             Some(StreamingExportDocument::with_all_fields(
@@ -315,7 +315,7 @@ async fn test_snapshot_list(
         .insert_and_get("table3".parse()?, assert_obj!("f" => 3))
         .await?;
     let doc4 = UserFacingModel::new_root_for_test(&mut tx)
-        .patch(doc2.developer_id(), assert_obj!("f" => 4).into())
+        .patch(doc2.document_id(), assert_obj!("f" => 4).into())
         .await?;
     let tablet_id = tx
         .table_mapping()

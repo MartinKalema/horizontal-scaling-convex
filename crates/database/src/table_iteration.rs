@@ -851,7 +851,7 @@ mod tests {
             IndexName,
         },
         value::{
-            ConvexObject,
+            DocumentObject,
             FieldName,
             FieldPath,
             TableName,
@@ -890,7 +890,7 @@ mod tests {
         UserFacingModel,
     };
 
-    fn small_user_object() -> impl Strategy<Value = ConvexObject> {
+    fn small_user_object() -> impl Strategy<Value = DocumentObject> {
         let values = resolved_value_strategy(
             FieldName::user_strategy,
             ValueBranching::small(),
@@ -903,12 +903,12 @@ mod tests {
     enum Update {
         Insert {
             #[proptest(strategy = "small_user_object()")]
-            object: ConvexObject,
+            object: DocumentObject,
         },
         Replace {
             index: usize,
             #[proptest(strategy = "small_user_object()")]
-            object: ConvexObject,
+            object: DocumentObject,
         },
         Delete {
             index: usize,
@@ -919,7 +919,7 @@ mod tests {
         prop_vec(prop_vec(any::<Update>(), 0..4), 0..4)
     }
 
-    fn small_user_objects() -> impl Strategy<Value = Vec<ConvexObject>> {
+    fn small_user_objects() -> impl Strategy<Value = Vec<DocumentObject>> {
         prop_vec(small_user_object(), 1..8)
     }
 
@@ -934,7 +934,7 @@ mod tests {
         Ok(by_id_metadata.id().internal_id())
     }
 
-    fn iterator_includes_all_documents_test(table_name: TableName, objects: Vec<ConvexObject>) {
+    fn iterator_includes_all_documents_test(table_name: TableName, objects: Vec<DocumentObject>) {
         let td = TestDriver::new();
         let runtime = td.rt();
         let test = async {
@@ -968,7 +968,7 @@ mod tests {
     async fn racing_commits_test(
         runtime: TestRuntime,
         table_name: TableName,
-        initial: Vec<ConvexObject>,
+        initial: Vec<DocumentObject>,
         update_batches: Vec<Vec<Update>>,
         pause: PauseController,
     ) -> anyhow::Result<()> {

@@ -32,7 +32,7 @@ pub const MAX_OBJECT_FIELDS: usize = 1024;
 /// map, and then use `Object::try_from` to convert it back to an object. This
 /// ensures that we check the object invariants after the modifications.
 #[derive(Clone, Debug)]
-pub struct ConvexObject {
+pub struct DocumentObject {
     // Precomputed 1 + (len(field1) + 1) + size(v1) + ... + (len(fieldN) + 1) + size(vN) + 1
     size: usize,
     // Precomputed 1 + max(nesting(v1), ..., nesting(vN))
@@ -41,7 +41,7 @@ pub struct ConvexObject {
     fields: BTreeMap<FieldName, ConvexValue>,
 }
 
-impl PartialEq for ConvexObject {
+impl PartialEq for DocumentObject {
     fn eq(&self, other: &Self) -> bool {
         if self.fields == other.fields {
             // We're just comparing based on fields but make sure the derived data always
@@ -54,9 +54,9 @@ impl PartialEq for ConvexObject {
     }
 }
 
-impl Eq for ConvexObject {}
+impl Eq for DocumentObject {}
 
-impl TryFrom<BTreeMap<FieldName, ConvexValue>> for ConvexObject {
+impl TryFrom<BTreeMap<FieldName, ConvexValue>> for DocumentObject {
     type Error = anyhow::Error;
 
     fn try_from(fields: BTreeMap<FieldName, ConvexValue>) -> anyhow::Result<Self> {
@@ -86,7 +86,7 @@ impl TryFrom<BTreeMap<FieldName, ConvexValue>> for ConvexObject {
     }
 }
 
-impl ConvexObject {
+impl DocumentObject {
     /// Create an empty object.
     pub fn empty() -> Self {
         Self {
@@ -153,7 +153,7 @@ impl ConvexObject {
     ///     job: "mechanic",
     ///     age: 42,
     ///   }`.
-    pub fn shallow_merge(self, other: ConvexObject) -> anyhow::Result<Self> {
+    pub fn shallow_merge(self, other: DocumentObject) -> anyhow::Result<Self> {
         let mut self_fields: BTreeMap<_, _> = self.into();
         let other_fields: BTreeMap<_, _> = other.into();
 
@@ -177,7 +177,7 @@ impl ConvexObject {
     }
 }
 
-impl IntoIterator for ConvexObject {
+impl IntoIterator for DocumentObject {
     type IntoIter = std::collections::btree_map::IntoIter<FieldName, ConvexValue>;
     type Item = (FieldName, ConvexValue);
 
@@ -186,19 +186,19 @@ impl IntoIterator for ConvexObject {
     }
 }
 
-impl fmt::Display for ConvexObject {
+impl fmt::Display for DocumentObject {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         display_map(f, ["{", "}"], self.iter())
     }
 }
 
-impl From<ConvexObject> for BTreeMap<FieldName, ConvexValue> {
-    fn from(o: ConvexObject) -> Self {
+impl From<DocumentObject> for BTreeMap<FieldName, ConvexValue> {
+    fn from(o: DocumentObject) -> Self {
         o.fields
     }
 }
 
-// Helpers for parsing ConvexObject.
+// Helpers for parsing DocumentObject.
 pub fn remove_string(
     fields: &mut BTreeMap<FieldName, ConvexValue>,
     field: &str,
@@ -250,7 +250,7 @@ pub fn remove_nullable_int64(
     }
 }
 
-pub fn remove_object<E, T: TryFrom<ConvexObject, Error = E>>(
+pub fn remove_object<E, T: TryFrom<DocumentObject, Error = E>>(
     fields: &mut BTreeMap<FieldName, ConvexValue>,
     field: &str,
 ) -> anyhow::Result<T>
@@ -262,7 +262,7 @@ where
         v => anyhow::bail!("expected object for {field}, got {v:?}"),
     }
 }
-pub fn remove_nullable_object<E, T: TryFrom<ConvexObject, Error = E>>(
+pub fn remove_nullable_object<E, T: TryFrom<DocumentObject, Error = E>>(
     fields: &mut BTreeMap<FieldName, ConvexValue>,
     field: &str,
 ) -> anyhow::Result<Option<T>>
@@ -327,7 +327,7 @@ pub fn remove_nullable_vec_of_strings(
     ))
 }
 
-impl Size for ConvexObject {
+impl Size for DocumentObject {
     fn size(&self) -> usize {
         self.size
     }
@@ -337,7 +337,7 @@ impl Size for ConvexObject {
     }
 }
 
-impl Deref for ConvexObject {
+impl Deref for DocumentObject {
     type Target = BTreeMap<FieldName, ConvexValue>;
 
     fn deref(&self) -> &Self::Target {
@@ -345,7 +345,7 @@ impl Deref for ConvexObject {
     }
 }
 
-impl Hash for ConvexObject {
+impl Hash for DocumentObject {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.fields.hash(state);
     }
@@ -355,7 +355,7 @@ impl Hash for ConvexObject {
 mod proptest {
     use proptest::prelude::*;
 
-    use super::ConvexObject;
+    use super::DocumentObject;
     use crate::{
         field_name::FieldName,
         proptest::{
@@ -365,7 +365,7 @@ mod proptest {
         ConvexValue,
     };
 
-    impl Arbitrary for ConvexObject {
+    impl Arbitrary for DocumentObject {
         type Parameters = (
             prop::collection::SizeRange,
             <FieldName as Arbitrary>::Parameters,
@@ -373,7 +373,7 @@ mod proptest {
             RestrictNaNs,
         );
 
-        type Strategy = impl Strategy<Value = ConvexObject>;
+        type Strategy = impl Strategy<Value = DocumentObject>;
 
         fn arbitrary_with(
             (size, field_params, branching, restrict_nans): Self::Parameters,
@@ -390,10 +390,10 @@ mod proptest {
         field_strategy: impl Strategy<Value = FieldName>,
         value_strategy: impl Strategy<Value = ConvexValue>,
         size: impl Into<prop::collection::SizeRange>,
-    ) -> impl Strategy<Value = ConvexObject> {
+    ) -> impl Strategy<Value = DocumentObject> {
         prop::collection::btree_map(field_strategy, value_strategy, size)
             .prop_filter_map("Map wasn't a valid Convex value", |s| {
-                ConvexObject::try_from(s).ok()
+                DocumentObject::try_from(s).ok()
             })
     }
 }

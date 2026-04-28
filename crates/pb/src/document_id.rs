@@ -1,19 +1,19 @@
 use anyhow::Context;
 use value::{
-    DeveloperDocumentId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TabletId,
     TabletIdAndTableNumber,
 };
 
 use crate::common::{
-    DeveloperDocumentId as DeveloperDocumentIdProto,
+    PublicDocumentId as PublicDocumentIdProto,
     ResolvedDocumentId as ResolvedDocumentIdProto,
     TabletIdAndTableNumber as TabletIdAndTableNumberProto,
 };
 
-impl From<DeveloperDocumentId> for DeveloperDocumentIdProto {
-    fn from(value: DeveloperDocumentId) -> Self {
+impl From<PublicDocumentId> for PublicDocumentIdProto {
+    fn from(value: PublicDocumentId) -> Self {
         let (table_number, internal_id) = value.into_table_and_id();
         Self {
             table_number: Some(table_number.into()),
@@ -22,14 +22,14 @@ impl From<DeveloperDocumentId> for DeveloperDocumentIdProto {
     }
 }
 
-impl TryFrom<DeveloperDocumentIdProto> for DeveloperDocumentId {
+impl TryFrom<PublicDocumentIdProto> for PublicDocumentId {
     type Error = anyhow::Error;
 
     fn try_from(
-        DeveloperDocumentIdProto {
+        PublicDocumentIdProto {
             table_number,
             internal_id,
-        }: DeveloperDocumentIdProto,
+        }: PublicDocumentIdProto,
     ) -> anyhow::Result<Self> {
         let table_number = table_number
             .context("Missing `table_number` field")?
@@ -45,9 +45,9 @@ impl From<ResolvedDocumentId> for ResolvedDocumentIdProto {
     fn from(value: ResolvedDocumentId) -> Self {
         let tablet_id_and_number = TabletIdAndTableNumber {
             tablet_id: value.tablet_id,
-            table_number: value.developer_id.table(),
+            table_number: value.document_id.table(),
         };
-        let internal_id = value.developer_id.internal_id();
+        let internal_id = value.document_id.internal_id();
         Self {
             table: Some(tablet_id_and_number.into()),
             internal_id: Some(internal_id.0.to_vec()),
@@ -67,10 +67,10 @@ impl TryFrom<ResolvedDocumentIdProto> for ResolvedDocumentId {
         let internal_id = internal_id
             .ok_or_else(|| anyhow::anyhow!("Missing internal_id"))?
             .try_into()?;
-        let developer_id = DeveloperDocumentId::new(table.table_number, internal_id);
+        let document_id = PublicDocumentId::new(table.table_number, internal_id);
         Ok(Self {
             tablet_id: table.tablet_id,
-            developer_id,
+            document_id,
         })
     }
 }
@@ -118,11 +118,11 @@ mod tests {
     use value::testing::assert_roundtrips;
 
     use super::{
-        DeveloperDocumentId,
+        PublicDocumentId,
         ResolvedDocumentId,
     };
     use crate::common::{
-        DeveloperDocumentId as DeveloperDocumentIdProto,
+        PublicDocumentId as PublicDocumentIdProto,
         ResolvedDocumentId as ResolvedDocumentIdProto,
     };
 
@@ -137,8 +137,8 @@ mod tests {
         }
 
         #[test]
-        fn test_developer_document_id_roundtrips(left in any::<DeveloperDocumentId>()) {
-            assert_roundtrips::<DeveloperDocumentId, DeveloperDocumentIdProto>(left);
+        fn test_public_document_id_roundtrips(left in any::<PublicDocumentId>()) {
+            assert_roundtrips::<PublicDocumentId, PublicDocumentIdProto>(left);
         }
     }
 }

@@ -65,6 +65,7 @@ use function_runner::{
 use governor::Quota;
 use http_client::CachedHttpClient;
 use indexing::index_cache::SharedIndexCache;
+use keybroker::InstanceSecret;
 use model::{
     initialize_application_system_tables,
     virtual_system_mapping,
@@ -98,6 +99,7 @@ pub mod environment_variables;
 pub mod http_actions;
 pub mod log_sinks;
 pub mod logs;
+mod metrics;
 pub mod mutation_forwarder;
 pub mod node_action_callbacks;
 pub mod parse;
@@ -126,8 +128,13 @@ pub struct LocalAppState {
     pub site_origin: ConvexSite,
     // Name of the instance. (e.g. crazy-giraffe-123)
     pub instance_name: String,
+    pub instance_secret: InstanceSecret,
     pub application: Application<ProdRuntime>,
     pub zombify_rx: async_broadcast::Receiver<()>,
+    pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
     /// Raft partition mailbox for receiving Raft messages from peers.
     /// None if Raft is not enabled.
     pub raft_mailbox_tx:
@@ -149,6 +156,8 @@ impl LocalAppState {
 pub struct RouterState {
     pub api: Arc<dyn ApplicationApi>,
     pub runtime: ProdRuntime,
+    pub replica_mode: bool,
+    pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
 }
 
 #[derive(Serialize)]
@@ -162,6 +171,7 @@ pub async fn make_app(
     preempt_tx: ShutdownSignal,
 ) -> anyhow::Result<LocalAppState> {
     let key_broker = config.key_broker()?;
+    let persistence_was_fresh = persistence.is_fresh();
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
     let searcher: Arc<dyn Searcher> = in_process_searcher.clone();
     // TODO(CX-6572) Separate `SegmentMetadataFetcher` from `SearcherImpl`
@@ -201,6 +211,17 @@ pub async fn make_app(
         None
     };
 
+    let replica_mutation_forwarder = if config.replication_mode == "replica" {
+        match config.primary_grpc_url.as_deref() {
+            Some(primary_grpc_url) => Some(Arc::new(
+                mutation_forwarder::MutationForwarderGrpcClient::connect(primary_grpc_url).await?,
+            )),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let database = Database::load(
         persistence.clone(),
         runtime.clone(),
@@ -224,10 +245,57 @@ pub async fn make_app(
                 num_partitions,
             )
         }),
+        config
+            .node_addresses
+            .as_deref()
+            .map(database::two_phase::NodeAddresses::from_config),
         timestamp_oracle,
         None, // raft_state: set after Raft node starts, not during Database::load
     )
     .await?;
+
+    if config.replication_mode == "replica" && persistence_was_fresh {
+        let checkpoint_path = config.checkpoint_storage_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "CHECKPOINT_STORAGE_PATH is required to bootstrap a fresh replica from checkpoint"
+            )
+        })?;
+        let checkpoint_storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            checkpoint_path,
+            StorageUseCase::Checkpoints,
+        )?);
+        let checkpoint = match database::snapshot_checkpointer::load_latest_checkpoint(
+            &checkpoint_storage,
+        )
+        .await
+        {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => {
+                metrics::log_replica_bootstrap_result(false);
+                anyhow::bail!(
+                    "Fresh replica startup requires a checkpoint, but none was found at {}",
+                    checkpoint_path
+                );
+            },
+            Err(e) => {
+                metrics::log_replica_bootstrap_result(false);
+                return Err(e);
+            },
+        };
+        let checkpoint_ts = checkpoint.timestamp;
+        if let Err(e) = database
+            .committer_client()
+            .install_snapshot(checkpoint)
+            .await
+        {
+            metrics::log_replica_bootstrap_result(false);
+            return Err(e);
+        }
+        metrics::log_replica_bootstrap_result(true);
+        tracing::info!("Bootstrapped fresh replica from checkpoint at ts={checkpoint_ts}");
+    }
+
     initialize_application_system_tables(&database).await?;
     let application_storage = if config.replication_mode == "replica" {
         // Replica uses local storage — doesn't write storage config to DB.
@@ -350,11 +418,19 @@ pub async fn make_app(
 
     let origin = config.convex_origin_url()?;
     let instance_name = config.name();
+    let instance_secret = config.secret()?;
+    let partition_id = config.partition_id.map(database::partition::PartitionId);
+    let node_addresses = config
+        .node_addresses
+        .as_deref()
+        .map(database::two_phase::NodeAddresses::from_config);
 
     if !config.disable_beacon {
         let beacon_future = beacon::start_beacon(
             runtime.clone(),
             database.clone(),
+            config.convex_http_proxy.clone(),
+            config.name(),
             config.beacon_tag.clone(),
             config.beacon_fields.clone(),
         );
@@ -376,8 +452,8 @@ pub async fn make_app(
             // stream. Each node has its own database with independent timestamps,
             // so we can't use the local database timestamp as a lower bound.
             // The self-delta skip (source_node filter) prevents double-applying.
-            // In replica mode, use the local timestamp since the replica loaded
-            // from the same persistence as the primary.
+            // In replica mode, start from the locally visible snapshot, which
+            // may have just been bootstrapped from the latest checkpoint.
             let from_ts = if config.partition_id.is_some() {
                 common::types::Timestamp::MIN
             } else {
@@ -501,7 +577,21 @@ pub async fn make_app(
         let (peer_senders, transport_clients) =
             raft_transport::create_transport(&peer_addresses, raft_node_id);
 
-        let mut manager = RaftPartitionManager::new(raft_config, raft_engine, peer_senders)?;
+        let snapshot_provider = {
+            let database = database.clone();
+            Arc::new(move || {
+                common::runtime::block_in_place(|| {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async { database.build_raft_snapshot_bytes().await })
+                })
+            }) as Arc<dyn database::raft_storage::RaftSnapshotProvider>
+        };
+        let mut manager = RaftPartitionManager::new(
+            raft_config,
+            raft_engine,
+            peer_senders,
+            Some(snapshot_provider),
+        )?;
         let raft_state = manager.state();
         let mb_tx = manager.mailbox_tx();
         raft_mailbox_tx = Some(mb_tx);
@@ -515,36 +605,50 @@ pub async fn make_app(
             let committer = database.committer_client();
             let raft_state_for_apply = raft_state.clone();
             runtime.spawn_background("raft_node", async move {
-                node.run(|data| {
-                    // Deserialize the CommitDelta from the Raft entry.
-                    let envelope: database::nats_distributed_log::DeltaEnvelope =
-                        serde_json::from_slice(data).map_err(|e| {
-                            anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
-                        })?;
-                    let delta = envelope.to_delta()?;
+                node.run(
+                    |data| {
+                        // Deserialize the CommitDelta from the Raft entry.
+                        let envelope: database::nats_distributed_log::DeltaEnvelope =
+                            serde_json::from_slice(data).map_err(|e| {
+                                anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
+                            })?;
+                        let delta = envelope.to_delta()?;
 
-                    // Leader already applied locally — skip.
-                    // Followers apply via the Committer (same path as NATS).
-                    if !raft_state_for_apply.is_leader() {
-                        tracing::info!(
-                            "Raft follower applying committed delta: ts={}",
-                            u64::from(delta.ts),
-                        );
-                        // apply_replica_delta is async — use block_in_place
-                        // since we're in the Raft loop's sync callback.
+                        // Leader already applied locally — skip.
+                        // Followers apply via the Committer (same path as NATS).
+                        if !raft_state_for_apply.is_leader() {
+                            tracing::info!(
+                                "Raft follower applying committed delta: ts={}",
+                                u64::from(delta.ts),
+                            );
+                            // apply_replica_delta is async — use block_in_place
+                            // since we're in the Raft loop's sync callback.
+                            let committer = committer.clone();
+                            common::runtime::block_in_place(|| {
+                                let rt = tokio::runtime::Handle::current();
+                                rt.block_on(async {
+                                    if let Err(e) = committer.apply_replica_delta(delta).await {
+                                        tracing::error!("Raft follower apply failed: {e:#}");
+                                    }
+                                })
+                            });
+                        }
+
+                        Ok(())
+                    },
+                    |snapshot_bytes| {
+                        let checkpoint =
+                            database::snapshot_checkpointer::checkpoint_from_bytes(snapshot_bytes)?;
                         let committer = committer.clone();
                         common::runtime::block_in_place(|| {
                             let rt = tokio::runtime::Handle::current();
                             rt.block_on(async {
-                                if let Err(e) = committer.apply_replica_delta(delta).await {
-                                    tracing::error!("Raft follower apply failed: {e:#}");
-                                }
+                                committer.install_snapshot(checkpoint).await?;
+                                Ok::<_, anyhow::Error>(())
                             })
-                        });
-                    }
-
-                    Ok(())
-                })
+                        })
+                    },
+                )
                 .await;
             });
         }
@@ -568,8 +672,13 @@ pub async fn make_app(
         origin,
         site_origin: config.convex_site_url()?,
         instance_name,
+        instance_secret,
         application,
         zombify_rx,
+        replica_mode: config.replication_mode == "replica",
+        partition_id,
+        node_addresses,
+        replica_mutation_forwarder,
         raft_mailbox_tx,
     };
 
@@ -588,5 +697,145 @@ impl RouteMapper for HttpActionRouteMapper {
         } else {
             route
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::Arc,
+    };
+
+    use common::{
+        assert_obj,
+        persistence::{
+            NoopRetentionValidator,
+            PersistenceReader,
+            TimestampRange,
+        },
+        query::Order,
+        shutdown::ShutdownSignal,
+        testing::TestPersistence,
+    };
+    use futures::TryStreamExt;
+    use keybroker::Identity;
+    use runtime::prod::ProdRuntime;
+    use storage::{
+        LocalDirStorage,
+        Storage,
+        StorageUseCase,
+        Upload,
+    };
+    use value::TableName;
+
+    use crate::{
+        config::LocalConfig,
+        make_app,
+    };
+
+    #[test]
+    fn test_fresh_replica_bootstraps_from_checkpoint() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        let test_runtime = runtime.clone();
+        runtime.block_on(
+            "test_fresh_replica_bootstraps_from_checkpoint",
+            async move {
+                let primary_persistence = Arc::new(TestPersistence::new());
+                let (_primary_shutdown_tx, primary_shutdown_rx) = async_broadcast::broadcast(1);
+                let primary = make_app(
+                    test_runtime.clone(),
+                    LocalConfig::new_for_test()?,
+                    primary_persistence.clone(),
+                    primary_shutdown_rx,
+                    ShutdownSignal::no_op(),
+                )
+                .await?;
+
+                let table_name: TableName = "bootstrap_messages".parse()?;
+                let mut tx = primary
+                    .application
+                    .database()
+                    .begin(Identity::system())
+                    .await?;
+                database::TestFacingModel::new(&mut tx)
+                    .insert(&table_name, assert_obj!("text" => "hello from checkpoint"))
+                    .await?;
+                primary.application.database().commit(tx).await?;
+
+                let checkpoint = primary
+                    .application
+                    .database()
+                    .build_raft_snapshot_checkpoint()
+                    .await?;
+                let checkpoint_dir = tempfile::tempdir()?;
+                let checkpoint_storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::for_use_case(
+                    test_runtime.clone(),
+                    checkpoint_dir.path().to_str().unwrap(),
+                    StorageUseCase::Checkpoints,
+                )?);
+                let mut upload = checkpoint_storage
+                    .start_upload_with_key(
+                        database::snapshot_checkpointer::LATEST_CHECKPOINT_KEY.try_into()?,
+                    )
+                    .await?;
+                upload
+                    .write(
+                        database::snapshot_checkpointer::checkpoint_to_bytes(&checkpoint)?.into(),
+                    )
+                    .await?;
+                let _ = upload.complete().await?;
+
+                let replica_persistence = Arc::new(TestPersistence::new());
+                let replica_storage_dir = tempfile::tempdir()?;
+                let (_shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
+                let mut config = LocalConfig::new_for_test()?;
+                config.replication_mode = "replica".into();
+                config.replica_storage_path =
+                    Some(replica_storage_dir.path().to_str().unwrap().into());
+                config.checkpoint_storage_path =
+                    Some(checkpoint_dir.path().to_str().unwrap().into());
+
+                let st = make_app(
+                    test_runtime.clone(),
+                    config,
+                    replica_persistence.clone(),
+                    shutdown_rx,
+                    ShutdownSignal::no_op(),
+                )
+                .await?;
+
+                assert_eq!(
+                    *st.application.database().now_ts_for_reads(),
+                    checkpoint.timestamp
+                );
+
+                let replica_docs: Vec<_> = replica_persistence
+                    .load_documents(
+                        TimestampRange::all(),
+                        Order::Asc,
+                        10_000,
+                        Arc::new(NoopRetentionValidator),
+                    )
+                    .try_collect()
+                    .await?;
+                let expected_latest_docs = checkpoint
+                    .documents
+                    .iter()
+                    .fold(BTreeMap::new(), |mut acc, entry| {
+                        acc.insert(entry.id, entry.clone());
+                        acc
+                    })
+                    .into_values()
+                    .filter(|entry| entry.value.is_some())
+                    .count();
+                assert_eq!(replica_docs.len(), expected_latest_docs);
+
+                primary.shutdown().await?;
+                st.shutdown().await?;
+                Ok(())
+            },
+        )
     }
 }

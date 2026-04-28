@@ -585,9 +585,9 @@ mod tests {
     use value::{
         assert_obj,
         ConvexValue,
-        DeveloperDocumentId,
         FieldPath,
         InternalId,
+        PublicDocumentId,
         ResolvedDocumentId,
         TableName,
         TableNamespace,
@@ -650,7 +650,7 @@ mod tests {
 
     fn assert_expected_vector(
         vectors: Vec<PublicVectorSearchQueryResult>,
-        expected: DeveloperDocumentId,
+        expected: PublicDocumentId,
     ) {
         assert_eq!(
             vectors
@@ -911,7 +911,7 @@ mod tests {
         db: &Database<TestRuntime>,
         index_metadata: &IndexMetadata<TableName>,
         vector: [f32; 2],
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         add_vector_by_table(db, index_metadata.name.table().clone(), vector).await
     }
 
@@ -919,7 +919,7 @@ mod tests {
         db: &Database<TestRuntime>,
         table_name: TableName,
         vector: [f32; 2],
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let mut tx = db.begin_system().await?;
         let values: ConvexValue = vector
             .into_iter()

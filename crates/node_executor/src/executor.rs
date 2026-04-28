@@ -97,8 +97,8 @@ use udf::{
 use value::{
     base64,
     heap_size::WithHeapSize,
-    ConvexObject,
     ConvexValue,
+    DocumentObject,
 };
 
 use crate::metrics::{
@@ -578,7 +578,7 @@ impl TryFrom<ExecutorRequest> for JsonValue {
                     .environment_variables
                     .into_iter()
                     .map(|(name, value)| {
-                        ConvexObject::try_from(PersistedEnvironmentVariable(
+                        DocumentObject::try_from(PersistedEnvironmentVariable(
                             EnvironmentVariable::new(name, value),
                         ))
                         .map(JsonValue::from)
@@ -614,7 +614,7 @@ impl TryFrom<ExecutorRequest> for JsonValue {
                     .environment_variables
                     .into_iter()
                     .map(|(name, value)| {
-                        ConvexObject::try_from(PersistedEnvironmentVariable(
+                        DocumentObject::try_from(PersistedEnvironmentVariable(
                             EnvironmentVariable::new(name, value),
                         ))
                         .map(JsonValue::from)

@@ -27,8 +27,8 @@ use database::{
 };
 use value::{
     ConvexValue,
-    DeveloperDocumentId,
     FieldPath,
+    PublicDocumentId,
     TableName,
 };
 
@@ -168,7 +168,7 @@ impl<'a, RT: Runtime> CronModel<'a, RT> {
 
     pub async fn next_run(
         &mut self,
-        cron_job_id: DeveloperDocumentId,
+        cron_job_id: PublicDocumentId,
     ) -> anyhow::Result<Option<ParsedDocument<CronNextRun>>> {
         let query = Query::index_range(IndexRange {
             index_name: CRON_NEXT_RUN_INDEX_BY_CRON_JOB_ID.name(),

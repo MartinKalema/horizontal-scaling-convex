@@ -123,7 +123,7 @@ pub mod sorting_decode {
     use bytes::Buf;
 
     use super::*;
-    use crate::ConvexObject;
+    use crate::DocumentObject;
 
     fn read_escaped_string<R: Buf>(reader: &mut R) -> anyhow::Result<String> {
         Ok(String::from_utf8(read_escaped_bytes(reader)?)?)
@@ -272,7 +272,7 @@ pub mod sorting_decode {
                             anyhow::bail!("Duplicate element in encoded object");
                         }
                     }
-                    ConvexValue::Object(ConvexObject::try_from(elements)?)
+                    ConvexValue::Object(DocumentObject::try_from(elements)?)
                 },
 
                 ESCAPE_BYTE => bail!("Escape code used as tag"),
@@ -518,7 +518,7 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::{
-        id_v6::DeveloperDocumentId,
+        id_v6::PublicDocumentId,
         sorting::{
             sorting_decode::bytes_to_values,
             TotalOrdF64,
@@ -526,9 +526,9 @@ mod tests {
         values_to_bytes,
         ConvexArray,
         ConvexBytes,
-        ConvexObject,
         ConvexString,
         ConvexValue,
+        DocumentObject,
         InternalId,
         ResolvedDocumentId,
         TableNumber,
@@ -540,7 +540,7 @@ mod tests {
         // The random portion of this ID starts with the 0xFF byte which
         // used to break our sorting serialization.
         let id_str = "074wwt1x3qmwz35bvscy44eq2yngrt8";
-        let id = DeveloperDocumentId::decode(id_str)?;
+        let id = PublicDocumentId::decode(id_str)?;
         let trophies = vec![ConvexValue::from(-1), ConvexValue::from(id)];
         for v in trophies {
             assert_eq!(
@@ -588,7 +588,7 @@ mod tests {
         }
 
         #[test]
-        fn test_id_roundtrips(v in any::<DeveloperDocumentId>()) {
+        fn test_id_roundtrips(v in any::<PublicDocumentId>()) {
             let v: ConvexValue = v.into();
             assert_eq!(ConvexValue::read_sort_key(&mut &v.sort_key()[..]).unwrap(), v);
         }
@@ -626,8 +626,8 @@ mod tests {
 
         #[test]
         fn test_compatible_with_id_string(
-            l in any::<DeveloperDocumentId>(),
-            r in any::<DeveloperDocumentId>(),
+            l in any::<PublicDocumentId>(),
+            r in any::<PublicDocumentId>(),
         )  {
             test_compatible_with_ord(l.encode(), r.encode())
         }
@@ -638,11 +638,11 @@ mod tests {
             let table_number = TableNumber::MIN;
             let l = ResolvedDocumentId {
                 tablet_id,
-                developer_id: DeveloperDocumentId::new(table_number, l),
+                document_id: PublicDocumentId::new(table_number, l),
             };
             let r = ResolvedDocumentId {
                 tablet_id,
-                developer_id: DeveloperDocumentId::new(table_number, r),
+                document_id: PublicDocumentId::new(table_number, r),
             };
             test_compatible_with_ord(ConvexValue::from(l), ConvexValue::from(r))
         }
@@ -665,8 +665,8 @@ mod tests {
 
         #[test]
         fn test_compatible_with_object(
-            l in any::<ConvexObject>(),
-            r in any::<ConvexObject>(),
+            l in any::<DocumentObject>(),
+            r in any::<DocumentObject>(),
         )  {
             test_compatible_with_ord(BTreeMap::from(l), BTreeMap::from(r))
         }

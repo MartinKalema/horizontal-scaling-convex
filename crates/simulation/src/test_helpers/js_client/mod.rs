@@ -7,8 +7,8 @@ use common::{
         SpawnHandle,
     },
     value::{
-        ConvexObject,
         ConvexValue,
+        DocumentObject,
     },
 };
 use js_protocol::SyncMutationStatus;
@@ -39,14 +39,14 @@ pub type MutationId = String;
 #[serde(rename_all = "camelCase")]
 pub struct MutationInfo {
     pub mutation_path: String,
-    pub opt_update_args: ConvexObject,
-    pub server_args: ConvexObject,
+    pub opt_update_args: DocumentObject,
+    pub server_args: DocumentObject,
 }
 
 pub enum JsClientThreadRequest {
     AddQuery {
         udf_path: UdfPath,
-        args: ConvexObject,
+        args: DocumentObject,
         sender: oneshot::Sender<QueryToken>,
     },
     QueryResult {
@@ -59,14 +59,14 @@ pub enum JsClientThreadRequest {
     },
     RunMutation {
         udf_path: UdfPath,
-        args: ConvexObject,
+        args: DocumentObject,
         sender: oneshot::Sender<Result<ConvexValue, JsError>>,
     },
 
     AddSyncQuery {
         id: String,
         name: String,
-        args: ConvexObject,
+        args: DocumentObject,
         sender: oneshot::Sender<()>,
     },
     SyncQueryResult {
@@ -118,7 +118,7 @@ impl JsClientThread {
     pub async fn add_query(
         &self,
         udf_path: UdfPath,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<QueryToken> {
         let (sender, receiver) = oneshot::channel();
         self.tx.send(JsClientThreadRequest::AddQuery {
@@ -146,7 +146,7 @@ impl JsClientThread {
     pub async fn run_mutation(
         &self,
         udf_path: UdfPath,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<Result<ConvexValue, JsError>> {
         let (sender, receiver) = oneshot::channel();
         self.tx.send(JsClientThreadRequest::RunMutation {
@@ -160,7 +160,7 @@ impl JsClientThread {
     pub async fn add_sync_query(
         &self,
         name: &str,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<SyncQuerySubscriptionId> {
         let (sender, receiver) = oneshot::channel();
         let id = Uuid::new_v4().to_string();

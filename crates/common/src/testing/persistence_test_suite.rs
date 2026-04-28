@@ -23,11 +23,11 @@ use value::{
     assert_val,
     sha256::Sha256,
     val,
-    ConvexObject,
     ConvexValue,
-    DeveloperDocumentId,
+    DocumentObject,
     InternalDocumentId,
     InternalId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableMapping,
     TabletId,
@@ -286,7 +286,7 @@ pub async fn write_and_load_from_table<P: Persistence>(p: Arc<P>) -> anyhow::Res
 
     let table2: TableName = str::parse("table2")?;
     let doc_id2 = id_generator.user_generate(&table2);
-    let doc2 = ResolvedDocument::new(doc_id2, CreationTime::ONE, ConvexObject::empty())?;
+    let doc2 = ResolvedDocument::new(doc_id2, CreationTime::ONE, DocumentObject::empty())?;
 
     p.write(
         &[
@@ -601,7 +601,7 @@ pub async fn overwrite_document<P: Persistence>(p: Arc<P>) -> anyhow::Result<()>
     let table: TableName = str::parse("table")?;
     let doc_id = id_generator.user_generate(&table);
 
-    let doc = ResolvedDocument::new(doc_id, CreationTime::ONE, ConvexObject::empty())?;
+    let doc = ResolvedDocument::new(doc_id, CreationTime::ONE, DocumentObject::empty())?;
 
     p.write(
         &[
@@ -819,8 +819,8 @@ pub async fn write_and_load_sorting<P: Persistence>(p: Arc<P>) -> anyhow::Result
     let doc_id1 = id_generator.user_generate(&table1);
     let doc_id2 = id_generator.user_generate(&table2);
 
-    let doc1 = ResolvedDocument::new(doc_id1, CreationTime::ONE, ConvexObject::empty())?;
-    let doc2 = ResolvedDocument::new(doc_id2, CreationTime::ONE, ConvexObject::empty())?;
+    let doc1 = ResolvedDocument::new(doc_id1, CreationTime::ONE, DocumentObject::empty())?;
+    let doc2 = ResolvedDocument::new(doc_id2, CreationTime::ONE, DocumentObject::empty())?;
     p.write(
         &[
             // Write doc1 and doc2. Make sure sorted by TS, not ID
@@ -881,7 +881,7 @@ pub async fn same_internal_id_multiple_tables<P: Persistence>(p: Arc<P>) -> anyh
     let doc1 = ResolvedDocument::new(
         ResolvedDocumentId::new(
             table1_id.tablet_id,
-            DeveloperDocumentId::new(table1_id.table_number, internal_id),
+            PublicDocumentId::new(table1_id.table_number, internal_id),
         ),
         CreationTime::ONE,
         assert_obj!("value" => 1),
@@ -889,7 +889,7 @@ pub async fn same_internal_id_multiple_tables<P: Persistence>(p: Arc<P>) -> anyh
     let doc2 = ResolvedDocument::new(
         ResolvedDocumentId::new(
             table2_id.tablet_id,
-            DeveloperDocumentId::new(table2_id.table_number, internal_id),
+            PublicDocumentId::new(table2_id.table_number, internal_id),
         ),
         CreationTime::ONE,
         assert_obj!("value" => 2),
@@ -1480,7 +1480,7 @@ where
     let mut id_generator = TestIdGenerator::new();
     let doc_id = id_generator.user_generate(&table);
 
-    let doc = ResolvedDocument::new(doc_id, CreationTime::ONE, ConvexObject::empty())?;
+    let doc = ResolvedDocument::new(doc_id, CreationTime::ONE, DocumentObject::empty())?;
 
     p_write
         .write(

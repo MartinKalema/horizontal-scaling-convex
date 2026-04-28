@@ -1168,9 +1168,9 @@ mod tests {
         types::IndexDescriptor,
     };
     use value::{
-        ConvexObject,
         ConvexString,
         ConvexValue,
+        DocumentObject,
         ResolvedDocumentId,
         TabletId,
     };
@@ -1187,7 +1187,7 @@ mod tests {
             "title".parse()?,
             ConvexValue::String(ConvexString::try_from("hello world")?),
         );
-        let object = ConvexObject::try_from(map)?;
+        let object = DocumentObject::try_from(map)?;
         let doc = PackedDocument::pack(&ResolvedDocument::new(
             ResolvedDocumentId::MIN,
             CreationTime::ONE,
@@ -1222,7 +1222,7 @@ mod tests {
             "title".parse()?,
             ConvexValue::String(ConvexString::try_from("bonjour")?),
         );
-        let object = ConvexObject::try_from(map)?;
+        let object = DocumentObject::try_from(map)?;
         let doc = PackedDocument::pack(&ResolvedDocument::new(
             ResolvedDocumentId::MIN,
             CreationTime::ONE,
@@ -1248,7 +1248,7 @@ mod tests {
         let doc = PackedDocument::pack(&ResolvedDocument::new(
             ResolvedDocumentId::MIN,
             CreationTime::ONE,
-            ConvexObject::try_from(btreemap! {})?,
+            DocumentObject::try_from(btreemap! {})?,
         )?);
 
         assert!(!tries.overlaps_document(&doc));

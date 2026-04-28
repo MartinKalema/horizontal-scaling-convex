@@ -14,7 +14,11 @@ use std::{
     sync::Arc,
 };
 
-use raft::StateRole;
+use raft::{
+    SnapshotStatus,
+    StateRole,
+    Storage,
+};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -36,6 +40,8 @@ fn test_engine() -> Arc<raft_engine::Engine> {
 fn create_three_node_group() -> Vec<RaftNode> {
     let peer_ids = vec![1u64, 2, 3];
     let mut nodes = Vec::new();
+    let snapshot_provider: Arc<dyn crate::raft_storage::RaftSnapshotProvider> =
+        Arc::new(|| Ok(Vec::new()));
 
     for &id in &peer_ids {
         let engine = test_engine();
@@ -47,7 +53,14 @@ fn create_three_node_group() -> Vec<RaftNode> {
             election_tick: 10,
             heartbeat_tick: 3,
         };
-        let node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
+        let node = RaftNode::new(
+            config,
+            engine,
+            rx,
+            HashMap::new(),
+            Some(snapshot_provider.clone()),
+        )
+        .unwrap();
         nodes.push(node);
     }
 
@@ -66,7 +79,7 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
     }
 
     // Collect all messages from ready states.
-    let mut all_messages: Vec<(u64, raft::prelude::Message)> = Vec::new();
+    let mut all_messages: Vec<(u64, u64, raft::prelude::Message)> = Vec::new();
 
     for (i, node) in nodes.iter_mut().enumerate() {
         if !active[i] {
@@ -76,9 +89,12 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
             let mut ready = node.raw_node.ready();
 
             for msg in ready.take_messages() {
-                all_messages.push((msg.to, msg));
+                all_messages.push((node.node_id(), msg.to, msg));
             }
 
+            if !ready.snapshot().is_empty() {
+                node.storage.apply_snapshot(ready.snapshot()).unwrap();
+            }
             node.storage.append_entries(ready.entries()).unwrap();
             if let Some(hs) = ready.hs() {
                 node.storage.set_hardstate(hs).unwrap();
@@ -93,7 +109,7 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
             }
 
             for msg in ready.take_persisted_messages() {
-                all_messages.push((msg.to, msg));
+                all_messages.push((node.node_id(), msg.to, msg));
             }
 
             let mut light_rd = node.raw_node.advance(ready);
@@ -109,12 +125,25 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
     }
 
     // Route messages to target nodes (only active ones).
-    for (to, msg) in all_messages {
+    for (from, to, msg) in all_messages {
+        let is_snapshot = msg.get_msg_type() == raft::prelude::MessageType::MsgSnapshot;
+        let mut delivered = false;
         for (i, node) in nodes.iter_mut().enumerate() {
             if active[i] && node.node_id() == to {
                 let _ = node.raw_node.step(msg.clone());
+                delivered = true;
                 break;
             }
+        }
+        if is_snapshot && let Some(source) = nodes.iter_mut().find(|node| node.node_id() == from) {
+            source.raw_node.report_snapshot(
+                to,
+                if delivered {
+                    SnapshotStatus::Finish
+                } else {
+                    SnapshotStatus::Failure
+                },
+            );
         }
     }
 
@@ -428,5 +457,63 @@ async fn test_raft_log_consistency() {
         commit_indices[0] >= 5,
         "Commit index too low: {}",
         commit_indices[0]
+    );
+}
+
+// ============================================================
+// Test 8: Lagging follower catches up via snapshot
+// ============================================================
+
+#[tokio::test]
+async fn test_lagging_follower_catches_up_via_snapshot() {
+    let mut nodes = create_three_node_group();
+    let leader_id = elect_leader(&mut nodes);
+    let leader_idx = node_idx(&nodes, leader_id);
+    let lagging_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+
+    let mut active = vec![true; 3];
+    active[lagging_idx] = false;
+
+    for i in 0..12 {
+        nodes[leader_idx]
+            .raw_node
+            .propose(vec![], format!("snapshot-entry-{i}").into_bytes())
+            .unwrap();
+        for _ in 0..5 {
+            tick_cycle(&mut nodes, &active);
+        }
+    }
+
+    let compact_index = nodes[leader_idx].raw_node.raft.raft_log.committed;
+    assert!(
+        compact_index > 1,
+        "expected committed work before compaction"
+    );
+    nodes[leader_idx].storage.compact(compact_index).unwrap();
+
+    active[lagging_idx] = true;
+    nodes[leader_idx]
+        .raw_node
+        .propose(vec![], b"post-snapshot".to_vec())
+        .unwrap();
+
+    for _ in 0..80 {
+        tick_cycle(&mut nodes, &active);
+        if nodes[lagging_idx].storage.last_index().unwrap()
+            == nodes[leader_idx].storage.last_index().unwrap()
+            && nodes[lagging_idx].storage.first_index().unwrap() > 1
+        {
+            break;
+        }
+    }
+
+    assert_eq!(
+        nodes[lagging_idx].storage.last_index().unwrap(),
+        nodes[leader_idx].storage.last_index().unwrap(),
+        "lagging follower should catch up to leader's last index",
+    );
+    assert!(
+        nodes[lagging_idx].storage.first_index().unwrap() > 1,
+        "lagging follower should have installed a snapshot instead of replaying from index 1",
     );
 }

@@ -54,9 +54,9 @@ use serde::Deserialize;
 use tokio::runtime::Runtime;
 use value::{
     ConvexString,
-    DeveloperDocumentId,
     FieldPath,
     InternalId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TabletId,
     TabletIdAndTableNumber,
@@ -124,7 +124,7 @@ fn load_datasets(
             let internal_id = alloc_id();
             let id = ResolvedDocumentId::new(
                 table_id.tablet_id,
-                DeveloperDocumentId::new(table_id.table_number, internal_id),
+                PublicDocumentId::new(table_id.table_number, internal_id),
             );
             let tokenizer = convex_en();
             {

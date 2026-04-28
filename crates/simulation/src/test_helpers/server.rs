@@ -19,7 +19,7 @@ use common::{
         SpawnHandle,
     },
     types::FunctionCaller,
-    value::ConvexObject,
+    value::DocumentObject,
     RequestId,
 };
 use keybroker::Identity;
@@ -58,7 +58,7 @@ pub enum ServerRequest {
     },
     Mutation {
         udf_path: UdfPath,
-        args: ConvexObject,
+        args: DocumentObject,
         result: oneshot::Sender<Result<RedactedMutationReturn, RedactedMutationError>>,
     },
     LatestTimestamp {
@@ -150,7 +150,7 @@ impl ServerThread {
     pub async fn mutation(
         &self,
         udf_path: UdfPath,
-        args: ConvexObject,
+        args: DocumentObject,
     ) -> anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(ServerRequest::Mutation {

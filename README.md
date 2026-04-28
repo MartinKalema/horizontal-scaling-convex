@@ -33,6 +33,24 @@ The combination — real-time subscriptions + in-memory OCC + partitioned multi-
 
 Full details: [docs/what-we-built.md](docs/what-we-built.md)
 
+Issue journal for regressions, fixes, and validation history:
+[docs/issue-journal.md](docs/issue-journal.md)
+
+Operator observability, alert suggestions, and cluster runbooks:
+[docs/cluster-observability.md](docs/cluster-observability.md)
+
+## Recently Landed
+
+- **Raft snapshot catch-up for lagging followers:** followers that fall behind
+  compacted log history can now recover by installing a Raft snapshot instead
+  of requiring manual re-bootstrap.
+- **Fresh replica checkpoint bootstrap:** brand-new replicas can start from the
+  latest stored checkpoint object and then catch up from there, instead of
+  reconstructing from scratch.
+- **Active replica mutation forwarding:** in primary/replica mode, replica
+  `/api/mutation` requests now forward to the primary through gRPC instead of
+  executing the local write path.
+
 ## Results
 
 ### Raft Failover Tests
@@ -171,9 +189,14 @@ Client ──mutation──▶ Primary ──persist──▶ PostgreSQL
                         ├──publish delta──▶ NATS JetStream
                         │                        │
 Client ──query──▶ Replica ◀──consume delta───────┘
+Client ──mutation──▶ Replica ──gRPC forward──▶ Primary
 ```
 
-One Primary handles writes, multiple Replicas serve reads. Replicas remap TabletIds from the Primary's namespace to their own using the `tablet_id_to_table_name` mapping in each CommitDelta.
+One Primary handles writes, multiple Replicas serve reads. Replicas remap
+TabletIds from the Primary's namespace to their own using the
+`tablet_id_to_table_name` mapping in each CommitDelta. If a client sends a
+mutation to a Replica, the Replica now forwards that request to the Primary
+over gRPC and returns the Primary's result.
 
 ## Quick Start
 

@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use imbl::OrdMap;
 use semver::Version;
 use value::{
-    DeveloperDocumentId,
     NamespacedTableMapping,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableMapping,
     TableName,
@@ -286,11 +286,11 @@ impl VirtualSystemMapping {
             })
     }
 
-    // Converts a virtual table DeveloperDocumentId to the system table ResolvedId.
+    // Converts a virtual table PublicDocumentId to the system table ResolvedId.
     pub fn virtual_id_v6_to_system_resolved_doc_id(
         &self,
         namespace: TableNamespace,
-        virtual_id_v6: &DeveloperDocumentId,
+        virtual_id_v6: &PublicDocumentId,
         table_mapping: &TableMapping,
     ) -> anyhow::Result<ResolvedDocumentId> {
         let table_number = virtual_id_v6.table();
@@ -302,12 +302,12 @@ impl VirtualSystemMapping {
     }
 
     // Converts a system table ResolvedDocumentId to the equivalent virtual table
-    // DeveloperDocumentId by mapping the TableName and using the same InternalId
+    // PublicDocumentId by mapping the TableName and using the same InternalId
     pub fn system_resolved_id_to_virtual_developer_id(
         &self,
         system_doc_id: ResolvedDocumentId,
-    ) -> anyhow::Result<DeveloperDocumentId> {
-        Ok(system_doc_id.developer_id)
+    ) -> anyhow::Result<PublicDocumentId> {
+        Ok(system_doc_id.document_id)
     }
 }
 

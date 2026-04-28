@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use application::deploy_config::{
     EvaluatePushResponse,
     FinishPushDiff,
@@ -28,7 +29,9 @@ use common::{
         },
         HttpResponseError,
     },
+    types::Timestamp,
 };
+use database::partition::PartitionId;
 use errors::{
     ErrorMetadata,
     ErrorMetadataAnyhowExt,
@@ -40,6 +43,11 @@ use fastrace::{
         SpanRecord,
         TraceId,
     },
+};
+use keybroker::{
+    AdminIdentityPrincipal,
+    Identity,
+    KeyBroker,
 };
 use model::{
     auth::types::AuthDiff,
@@ -57,14 +65,16 @@ use model::{
     source_packages::types::SourcePackage,
 };
 use serde::{
+    de::DeserializeOwned,
     Deserialize,
     Serialize,
 };
 use serde_json::Value as JsonValue;
+use url::Url;
 use value::{
     base64,
-    ConvexObject,
-    DeveloperDocumentId,
+    DocumentObject,
+    PublicDocumentId,
 };
 
 use crate::{
@@ -74,6 +84,146 @@ use crate::{
     },
     LocalAppState,
 };
+
+const INTERNAL_BACKEND_HTTP_PORT: u16 = 3210;
+
+fn metadata_owner_origin(st: &LocalAppState) -> anyhow::Result<Option<String>> {
+    let Some(local_partition) = st.partition_id else {
+        return Ok(None);
+    };
+    if local_partition == PartitionId::DEFAULT {
+        return Ok(None);
+    }
+    let node_addresses = st
+        .node_addresses
+        .as_ref()
+        .context("NODE_ADDRESSES is required to forward deploy metadata operations to the owner")?;
+    let owner_addr = node_addresses
+        .address_for(PartitionId::DEFAULT)
+        .context("Missing NODE_ADDRESSES entry for deploy metadata owner partition-0")?;
+    Ok(Some(http_origin_from_peer_addr(owner_addr)?))
+}
+
+fn http_origin_from_peer_addr(addr: &str) -> anyhow::Result<String> {
+    let normalized = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+    let mut url = Url::parse(&normalized)?;
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_port(Some(INTERNAL_BACKEND_HTTP_PORT))
+        .map_err(|_| anyhow::anyhow!("Failed to map peer address {addr} to backend HTTP port"))?;
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+trait AdminKeyCarrier {
+    fn admin_key(&self) -> &str;
+    fn set_admin_key(&mut self, admin_key: String);
+}
+
+async fn metadata_owner_instance_name(owner_origin: &str) -> anyhow::Result<String> {
+    let url = format!("{owner_origin}/instance_name");
+    let response = reqwest::Client::new().get(&url).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "Metadata owner instance-name request to {url} failed with HTTP {status}: {body}"
+    );
+    let instance_name = body.trim();
+    anyhow::ensure!(
+        !instance_name.is_empty(),
+        "Metadata owner at {owner_origin} returned an empty instance name"
+    );
+    Ok(instance_name.to_owned())
+}
+
+fn issue_owner_admin_key(
+    st: &LocalAppState,
+    owner_instance_name: &str,
+    identity: &Identity,
+) -> anyhow::Result<String> {
+    let (principal, is_read_only) = match identity {
+        Identity::InstanceAdmin(admin_identity) | Identity::ActingUser(admin_identity, _) => (
+            admin_identity.principal().clone(),
+            admin_identity.is_read_only(),
+        ),
+        _ => anyhow::bail!("Deploy metadata forwarding requires an authenticated admin identity"),
+    };
+    let owner_key_broker = KeyBroker::new(owner_instance_name, st.instance_secret)?;
+    let owner_admin_key = match principal {
+        AdminIdentityPrincipal::Member(member_id) => {
+            if is_read_only {
+                owner_key_broker.issue_read_only_admin_key(member_id)
+            } else {
+                owner_key_broker.issue_admin_key(member_id)
+            }
+        },
+        AdminIdentityPrincipal::Team(_) => anyhow::bail!(
+            "Deploy metadata forwarding does not yet support team-scoped admin identities"
+        ),
+    };
+    Ok(owner_admin_key.as_string())
+}
+
+async fn maybe_forward_deploy_request<Req, Resp>(
+    st: &LocalAppState,
+    path: &str,
+    req: &mut Req,
+    needs_write_access: bool,
+) -> anyhow::Result<Option<Resp>>
+where
+    Req: Serialize + AdminKeyCarrier,
+    Resp: DeserializeOwned,
+{
+    let Some(owner_origin) = metadata_owner_origin(st)? else {
+        return Ok(None);
+    };
+    let identity = if needs_write_access {
+        must_be_admin_from_key_with_write_access(
+            st.application.app_auth(),
+            st.instance_name.clone(),
+            req.admin_key().to_owned(),
+        )
+        .await?
+    } else {
+        must_be_admin_from_key(
+            st.application.app_auth(),
+            st.instance_name.clone(),
+            req.admin_key().to_owned(),
+        )
+        .await?
+    };
+    let owner_instance_name = metadata_owner_instance_name(&owner_origin).await?;
+    let owner_admin_key = issue_owner_admin_key(st, &owner_instance_name, &identity)?;
+    req.set_admin_key(owner_admin_key);
+    Ok(Some(
+        forward_deploy_request(&owner_origin, path, req).await?,
+    ))
+}
+
+async fn forward_deploy_request<Req, Resp>(
+    owner_origin: &str,
+    path: &str,
+    req: &Req,
+) -> anyhow::Result<Resp>
+where
+    Req: Serialize + ?Sized,
+    Resp: DeserializeOwned,
+{
+    let url = format!("{owner_origin}{path}");
+    let response = reqwest::Client::new().post(&url).json(req).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "Metadata owner request to {url} failed with HTTP {status}: {body}"
+    );
+    Ok(serde_json::from_str(&body)?)
+}
 
 impl TryFrom<StartPushResponse> for SerializedStartPushResponse {
     type Error = anyhow::Error;
@@ -87,11 +237,16 @@ impl TryFrom<StartPushResponse> for SerializedStartPushResponse {
                 .collect::<anyhow::Result<_>>()?,
             external_deps_id: value
                 .external_deps_id
-                .map(|id| String::from(DeveloperDocumentId::from(id))),
+                .map(|id| String::from(PublicDocumentId::from(id))),
             component_definition_packages: value
                 .component_definition_packages
                 .into_iter()
-                .map(|(k, v)| Ok((String::from(k), JsonValue::from(ConvexObject::try_from(v)?))))
+                .map(|(k, v)| {
+                    Ok((
+                        String::from(k),
+                        JsonValue::from(DocumentObject::try_from(v)?),
+                    ))
+                })
                 .collect::<anyhow::Result<_>>()?,
             app_auth: value
                 .app_auth
@@ -121,11 +276,7 @@ impl TryFrom<SerializedStartPushResponse> for StartPushResponse {
                 .collect::<anyhow::Result<_>>()?,
             external_deps_id: value
                 .external_deps_id
-                .map(|id| {
-                    anyhow::Ok(ExternalDepsPackageId::from(
-                        id.parse::<DeveloperDocumentId>()?,
-                    ))
-                })
+                .map(|id| anyhow::Ok(ExternalDepsPackageId::from(id.parse::<PublicDocumentId>()?)))
                 .transpose()?,
             component_definition_packages: value
                 .component_definition_packages
@@ -133,7 +284,7 @@ impl TryFrom<SerializedStartPushResponse> for StartPushResponse {
                 .map(|(k, v)| {
                     Ok((
                         k.parse()?,
-                        SourcePackage::try_from(ConvexObject::try_from(v)?)?,
+                        SourcePackage::try_from(DocumentObject::try_from(v)?)?,
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?,
@@ -150,6 +301,16 @@ impl TryFrom<SerializedStartPushResponse> for StartPushResponse {
             app: value.app.try_into()?,
             schema_change: value.schema_change.try_into()?,
         })
+    }
+}
+
+impl AdminKeyCarrier for StartPushRequest {
+    fn admin_key(&self) -> &str {
+        &self.admin_key
+    }
+
+    fn set_admin_key(&mut self, admin_key: String) {
+        self.admin_key = admin_key;
     }
 }
 
@@ -200,8 +361,14 @@ pub struct AnalyzedComponent {
 #[debug_handler]
 pub async fn start_push(
     State(st): State<LocalAppState>,
-    Json(req): Json<StartPushRequest>,
+    Json(mut req): Json<StartPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    if let Some(forwarded) =
+        maybe_forward_deploy_request(&st, "/api/deploy2/start_push", &mut req, true).await?
+    {
+        return Ok(Json(forwarded));
+    }
+
     let _identity = must_be_admin_from_key_with_write_access(
         st.application.app_auth(),
         st.instance_name.clone(),
@@ -226,8 +393,14 @@ pub async fn start_push(
 // a long time on large instances.
 pub async fn evaluate_push(
     MtState(st): MtState<LocalAppState>,
-    Json(req): Json<StartPushRequest>,
+    Json(mut req): Json<StartPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    if let Some(forwarded) =
+        maybe_forward_deploy_request(&st, "/api/deploy2/evaluate_push", &mut req, true).await?
+    {
+        return Ok(Json(forwarded));
+    }
+
     let _identity = must_be_admin_from_key_with_write_access(
         st.application.app_auth(),
         st.instance_name.clone(),
@@ -247,7 +420,7 @@ pub async fn evaluate_push(
 
 const DEFAULT_SCHEMA_TIMEOUT_MS: u32 = 10_000;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaitForSchemaRequest {
     admin_key: String,
@@ -255,10 +428,26 @@ pub struct WaitForSchemaRequest {
     timeout_ms: Option<u32>,
 }
 
+impl AdminKeyCarrier for WaitForSchemaRequest {
+    fn admin_key(&self) -> &str {
+        &self.admin_key
+    }
+
+    fn set_admin_key(&mut self, admin_key: String) {
+        self.admin_key = admin_key;
+    }
+}
+
 pub async fn wait_for_schema(
     MtState(st): MtState<LocalAppState>,
-    Json(req): Json<WaitForSchemaRequest>,
+    Json(mut req): Json<WaitForSchemaRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    if let Some(forwarded) =
+        maybe_forward_deploy_request(&st, "/api/deploy2/wait_for_schema", &mut req, false).await?
+    {
+        return Ok(Json(forwarded));
+    }
+
     let identity = must_be_admin_from_key(
         st.application.app_auth(),
         st.instance_name.clone(),
@@ -277,12 +466,22 @@ pub async fn wait_for_schema(
     Ok(Json(SchemaStatusJson::from(resp)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FinishPushRequest {
     pub admin_key: String,
     start_push: SerializedStartPushResponse,
     pub dry_run: bool,
+}
+
+impl AdminKeyCarrier for FinishPushRequest {
+    fn admin_key(&self) -> &str {
+        &self.admin_key
+    }
+
+    fn set_admin_key(&mut self, admin_key: String) {
+        self.admin_key = admin_key;
+    }
 }
 
 /// Internal version that returns the commit timestamp for use by conductor
@@ -315,12 +514,38 @@ pub async fn finish_push_internal(
     Ok((SerializedFinishPushDiff::try_from(resp)?, Some(ts)))
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializedFinishPushResponse {
+    #[serde(flatten)]
+    diff: SerializedFinishPushDiff,
+    commit_ts: Option<u64>,
+}
+
 pub async fn finish_push(
     MtState(st): MtState<LocalAppState>,
-    Json(req): Json<FinishPushRequest>,
+    Json(mut req): Json<FinishPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    let (diff, _ts) = finish_push_internal(&st, req).await?;
-    Ok(Json(diff))
+    if let Some(forwarded) = maybe_forward_deploy_request::<
+        FinishPushRequest,
+        SerializedFinishPushResponse,
+    >(&st, "/api/deploy2/finish_push", &mut req, true)
+    .await?
+    {
+        if let Some(commit_ts) = forwarded.commit_ts {
+            st.application
+                .database()
+                .wait_for_write_ts(Timestamp::try_from(commit_ts)?)
+                .await;
+        }
+        return Ok(Json(forwarded));
+    }
+
+    let (diff, commit_ts) = finish_push_internal(&st, req).await?;
+    Ok(Json(SerializedFinishPushResponse {
+        diff,
+        commit_ts: commit_ts.map(u64::from),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -358,7 +583,7 @@ pub async fn report_push_completed_handler(
     Ok(Json(()))
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SerializedFinishPushDiff {
     auth_diff: AuthDiff,
@@ -467,5 +692,28 @@ impl TryFrom<SerializedEventRecord> for EventRecord {
             timestamp_unix_ns,
             properties,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::http_origin_from_peer_addr;
+
+    #[test]
+    fn peer_addr_to_http_origin_supports_host_port_pairs() -> anyhow::Result<()> {
+        assert_eq!(
+            http_origin_from_peer_addr("node-p0a:50051")?,
+            "http://node-p0a:3210"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_addr_to_http_origin_supports_urls() -> anyhow::Result<()> {
+        assert_eq!(
+            http_origin_from_peer_addr("http://node-p1a:50051")?,
+            "http://node-p1a:3210"
+        );
+        Ok(())
     }
 }

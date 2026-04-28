@@ -25,12 +25,14 @@ use std::{
 use raft::{
     prelude::*,
     raw_node::RawNode,
+    SnapshotStatus,
     StateRole,
 };
 use slog::o;
 use tokio::sync::mpsc;
 
 use crate::{
+    metrics,
     partition::PartitionId,
     raft_storage::ConvexRaftStorage,
 };
@@ -140,12 +142,14 @@ impl RaftNode {
         engine: Arc<raft_engine::Engine>,
         mailbox: mpsc::UnboundedReceiver<RaftMessage>,
         peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
+        snapshot_provider: Option<Arc<dyn crate::raft_storage::RaftSnapshotProvider>>,
     ) -> anyhow::Result<Self> {
         let storage = ConvexRaftStorage::new(
             config.partition_id,
             engine,
             config.node_id,
             config.peers.clone(),
+            snapshot_provider,
         )?;
 
         // On restart, pick up where we left off (applied index from
@@ -185,7 +189,11 @@ impl RaftNode {
 
     /// Run the Raft loop. This is the main event loop following TiKV's pattern:
     /// tick → receive messages → propose → process ready → advance.
-    pub async fn run(&mut self, mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()>) {
+    pub async fn run(
+        &mut self,
+        mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()>,
+        mut on_snapshot: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) {
         let tick_interval = Duration::from_millis(100);
         let mut last_tick = Instant::now();
 
@@ -232,6 +240,46 @@ impl RaftNode {
 
             // Process Ready state.
             if self.raw_node.has_ready() {
+                let replication_health = {
+                    let status = self.raw_node.status();
+                    status.progress.map(|progress| {
+                        let voter_ids: Vec<u64> = progress.conf().voters().ids().iter().collect();
+                        let configured_voters = voter_ids.len();
+                        let leader_committed = status.hs.commit;
+                        let mut recent_active_voters = 0usize;
+                        let mut lagging_followers = 0usize;
+                        let mut max_follower_lag_entries = 0u64;
+                        let mut total_follower_lag_entries = 0u64;
+
+                        for voter_id in voter_ids {
+                            if voter_id == self.config.node_id {
+                                recent_active_voters += 1;
+                                continue;
+                            }
+                            let Some(peer_progress) = progress.get(voter_id) else {
+                                continue;
+                            };
+                            if peer_progress.recent_active {
+                                recent_active_voters += 1;
+                            }
+                            let lag = leader_committed.saturating_sub(peer_progress.matched);
+                            if lag > 0 {
+                                lagging_followers += 1;
+                            }
+                            max_follower_lag_entries = max_follower_lag_entries.max(lag);
+                            total_follower_lag_entries =
+                                total_follower_lag_entries.saturating_add(lag);
+                        }
+
+                        (
+                            configured_voters,
+                            recent_active_voters,
+                            lagging_followers,
+                            max_follower_lag_entries,
+                            total_follower_lag_entries,
+                        )
+                    })
+                };
                 let mut ready = self.raw_node.ready();
 
                 // Detect leadership changes (TiKV SoftState pattern).
@@ -266,18 +314,66 @@ impl RaftNode {
                     }
                 }
 
+                metrics::log_raft_term(self.config.partition_id, self.raw_node.raft.term);
+                metrics::log_raft_committed_index(
+                    self.config.partition_id,
+                    self.raw_node.raft.raft_log.committed,
+                );
+                metrics::log_raft_applied_index(
+                    self.config.partition_id,
+                    self.raw_node.raft.raft_log.applied,
+                );
+                if let Some((
+                    configured_voters,
+                    recent_active_voters,
+                    lagging_followers,
+                    max_follower_lag_entries,
+                    total_follower_lag_entries,
+                )) = replication_health
+                {
+                    metrics::log_raft_replication_health(
+                        self.config.partition_id,
+                        configured_voters,
+                        recent_active_voters,
+                        lagging_followers,
+                        max_follower_lag_entries,
+                        total_follower_lag_entries,
+                    );
+                } else {
+                    metrics::reset_raft_replication_health(self.config.partition_id);
+                }
+
                 // 1. Send messages to peers.
                 for msg in ready.take_messages() {
                     let to = msg.to;
+                    let is_snapshot = msg.get_msg_type() == MessageType::MsgSnapshot;
                     if let Some(sender) = self.peer_senders.get(&to) {
                         if sender.send(msg).is_err() {
                             tracing::warn!("Failed to send Raft message to node {to}");
+                            if is_snapshot {
+                                self.raw_node.report_snapshot(to, SnapshotStatus::Failure);
+                            }
+                        } else if is_snapshot {
+                            self.raw_node.report_snapshot(to, SnapshotStatus::Finish);
                         }
                     }
                 }
 
-                // 2. Snapshot transfer not yet implemented.
-                // Nodes that fall too far behind must re-bootstrap.
+                // 2. Persist and apply any incoming snapshot before appending entries.
+                if !ready.snapshot().is_empty() {
+                    let snapshot_timer = metrics::raft_snapshot_apply_timer();
+                    let snapshot_bytes = ready.snapshot().get_data().len();
+                    metrics::log_raft_snapshot_apply_bytes(snapshot_bytes);
+                    if let Err(e) = self.storage.apply_snapshot(ready.snapshot()) {
+                        tracing::error!("Failed to persist snapshot: {e}");
+                        drop(snapshot_timer);
+                    } else if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
+                        tracing::error!("Failed to apply snapshot to state machine: {e}");
+                        drop(snapshot_timer);
+                    } else {
+                        snapshot_timer.finish();
+                    }
+                }
 
                 // 3+4. Persist log entries + hard state atomically.
                 // TiKV WriteBatch pattern: entries and hard state go in one
@@ -296,8 +392,15 @@ impl RaftNode {
                 // 5. Send persisted messages.
                 for msg in ready.take_persisted_messages() {
                     let to = msg.to;
+                    let is_snapshot = msg.get_msg_type() == MessageType::MsgSnapshot;
                     if let Some(sender) = self.peer_senders.get(&to) {
-                        let _ = sender.send(msg);
+                        if sender.send(msg).is_err() {
+                            if is_snapshot {
+                                self.raw_node.report_snapshot(to, SnapshotStatus::Failure);
+                            }
+                        } else if is_snapshot {
+                            self.raw_node.report_snapshot(to, SnapshotStatus::Finish);
+                        }
                     }
                 }
 
@@ -399,7 +502,7 @@ impl RaftNode {
 
     /// Process one Ready cycle manually (for testing without the full run
     /// loop). Returns committed entry data.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub(crate) fn process_ready_test(&mut self) -> Vec<Vec<u8>> {
         let mut committed = Vec::new();
         if !self.raw_node.has_ready() {
@@ -421,6 +524,9 @@ impl RaftNode {
             }
         }
 
+        if !ready.snapshot().is_empty() {
+            self.storage.apply_snapshot(ready.snapshot()).unwrap();
+        }
         self.storage.append_entries(ready.entries()).unwrap();
         if let Some(hs) = ready.hs() {
             self.storage.set_hardstate(hs).unwrap();
@@ -465,7 +571,7 @@ mod tests {
 
         let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
 
         // Tick enough times to trigger election.
         for _ in 0..20 {
@@ -488,7 +594,7 @@ mod tests {
 
         let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
 
         // Become leader first.
         for _ in 0..20 {
@@ -531,7 +637,7 @@ mod tests {
 
         let engine = test_engine();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut node = RaftNode::new(config, engine, rx, HashMap::new()).unwrap();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
 
         let observed_leader_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let observed_leader_id_clone = observed_leader_id.clone();

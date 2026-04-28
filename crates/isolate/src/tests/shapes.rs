@@ -16,7 +16,7 @@ use shape_inference::{
 };
 use value::{
     assert_val,
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     val,
     ResolvedDocumentId,
     TableNamespace,
@@ -35,12 +35,12 @@ async fn test_shape_inference_js(rt: TestRuntime) -> anyhow::Result<()> {
         (
             ConvexValue::from(ResolvedDocumentId::new(
                 table_id.tablet_id,
-                DeveloperDocumentId::new(table_id.table_number, InternalId::MIN),
+                PublicDocumentId::new(table_id.table_number, InternalId::MIN),
             )),
             r#"Id<"test">"#,
         ),
         (
-            ConvexValue::from(DeveloperDocumentId::new(table_number, InternalId::MIN)),
+            ConvexValue::from(PublicDocumentId::new(table_number, InternalId::MIN)),
             r#"Id<"test2">"#,
         ),
         (val!(null), "null"),

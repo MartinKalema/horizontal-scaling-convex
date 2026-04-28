@@ -18,11 +18,12 @@ use std::time::{
 use common::{
     backoff::Backoff,
     errors::report_error,
+    http::fetch::build_proxied_reqwest_client,
     runtime::Runtime,
 };
 use database::Database;
 use model::database_globals::DatabaseGlobalsModel;
-use reqwest::Client;
+use reqwest::Url;
 use runtime::prod::ProdRuntime;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -43,6 +44,8 @@ struct BeaconFields {
 pub async fn start_beacon(
     runtime: ProdRuntime,
     database: Database<ProdRuntime>,
+    proxy_url: Option<Url>,
+    client_id: String,
     beacon_tag: String,
     beacon_fields: Option<JsonValue>,
 ) {
@@ -56,7 +59,11 @@ pub async fn start_beacon(
             let mut db_model = DatabaseGlobalsModel::new(&mut tx);
             let globals = db_model.database_globals().await?;
 
-            let client = Client::new();
+            let client = build_proxied_reqwest_client(
+                proxy_url.clone(),
+                client_id.clone(),
+                Default::default(),
+            );
             let migration_version = globals.version;
             let compiled_revision = COMPILED_REVISION.to_string();
             let commit_timestamp = COMMIT_TIMESTAMP.to_string();

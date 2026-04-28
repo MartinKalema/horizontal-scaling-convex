@@ -6,7 +6,7 @@ use sync_types::{
 };
 use value::{
     identifier::Identifier,
-    DeveloperDocumentId,
+    PublicDocumentId,
 };
 
 use super::ComponentName;
@@ -80,7 +80,7 @@ pub enum Reference {
     },
 
     CurrentSystemUdfInComponent {
-        component_id: DeveloperDocumentId,
+        component_id: PublicDocumentId,
     },
 }
 

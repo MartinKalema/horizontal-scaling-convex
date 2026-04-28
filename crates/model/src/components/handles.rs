@@ -41,8 +41,8 @@ use sync_types::{
 };
 use value::{
     ConvexValue,
-    DeveloperDocumentId,
     FieldPath,
+    PublicDocumentId,
     TableName,
     TableNamespace,
 };
@@ -98,7 +98,7 @@ impl<'a, RT: Runtime> FunctionHandlesModel<'a, RT> {
         &mut self,
         handle: FunctionHandle,
     ) -> anyhow::Result<CanonicalizedComponentFunctionPath> {
-        let id = DeveloperDocumentId::from(handle);
+        let id = PublicDocumentId::from(handle);
         let resolved_id = self.tx.resolve_developer_id(&id, TableNamespace::Global)?;
         let Some(document) = self.tx.get(resolved_id).await? else {
             anyhow::bail!(function_handle_not_found());
@@ -159,7 +159,7 @@ impl<'a, RT: Runtime> FunctionHandlesModel<'a, RT> {
         if document.deleted_ts.is_some() {
             anyhow::bail!(function_handle_not_found())
         }
-        Ok(FunctionHandle::new(document.developer_id()))
+        Ok(FunctionHandle::new(document.document_id()))
     }
 
     #[fastrace::trace]

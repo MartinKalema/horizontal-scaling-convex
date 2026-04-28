@@ -4,8 +4,8 @@ use common::{
 };
 use runtime::testing::TestRuntime;
 use value::{
-    DeveloperDocumentId,
     InternalId,
+    PublicDocumentId,
     ResolvedDocumentId,
     TableNamespace,
     TabletId,
@@ -236,7 +236,7 @@ async fn test_delete_index_backfill_existing(rt: TestRuntime) -> anyhow::Result<
     // For delete_index_backfill, we need to pass the index's ResolvedDocumentId,
     // not the backfill document's ID. Create a fake index document ID.
     let index_table_id = tx.bootstrap_tables().index_id;
-    let index_developer_id = DeveloperDocumentId::new(index_table_id.table_number, index_id);
+    let index_developer_id = PublicDocumentId::new(index_table_id.table_number, index_id);
     let index_resolved_id = ResolvedDocumentId::new(index_table_id.tablet_id, index_developer_id);
 
     // Delete the backfill
@@ -257,7 +257,7 @@ async fn test_delete_index_backfill_nonexistent(rt: TestRuntime) -> anyhow::Resu
 
     // Create a fake index document ID that doesn't exist
     let index_table_id = tx.bootstrap_tables().index_id;
-    let fake_developer_id = DeveloperDocumentId::new(index_table_id.table_number, InternalId::MAX);
+    let fake_developer_id = PublicDocumentId::new(index_table_id.table_number, InternalId::MAX);
     let fake_resolved_id = ResolvedDocumentId::new(index_table_id.tablet_id, fake_developer_id);
 
     // Delete non-existent backfill - should not error (method handles missing
@@ -315,7 +315,7 @@ async fn test_multiple_backfills_different_indexes(rt: TestRuntime) -> anyhow::R
 
     // Delete one backfill using the index's ResolvedDocumentId
     let index_table_id = tx.bootstrap_tables().index_id;
-    let index1_developer_id = DeveloperDocumentId::new(index_table_id.table_number, index_id1);
+    let index1_developer_id = PublicDocumentId::new(index_table_id.table_number, index_id1);
     let index1_resolved_id = ResolvedDocumentId::new(index_table_id.tablet_id, index1_developer_id);
 
     IndexBackfillModel::new(&mut tx)

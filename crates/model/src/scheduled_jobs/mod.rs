@@ -47,7 +47,7 @@ use errors::ErrorMetadata;
 use imbl::ordmap;
 use sync_types::Timestamp;
 use value::{
-    id_v6::DeveloperDocumentId,
+    id_v6::PublicDocumentId,
     ConvexArray,
     ConvexValue,
     FieldPath,
@@ -279,7 +279,7 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
         };
         let scheduled_job = ScheduledJobMetadata::new(
             path.clone(),
-            args_id.developer_id,
+            args_id.document_id,
             ScheduledJobState::Pending,
             // Don't set next_ts in the past to avoid scheduler incorrectly logging
             // it is falling behind. We should keep `original_scheduled_ts` intact
@@ -321,7 +321,7 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
                         let scheduled_ts = self.tx.begin_timestamp();
                         ScheduledJobMetadata::new(
                             path,
-                            args_id.developer_id,
+                            args_id.document_id,
                             ScheduledJobState::Canceled,
                             None,
                             Some(*scheduled_ts),
@@ -580,7 +580,7 @@ impl<'a, RT: Runtime> VirtualSchedulerModel<'a, RT> {
         args: ConvexArray,
         ts: UnixTimestamp,
         context: ExecutionContext,
-    ) -> anyhow::Result<DeveloperDocumentId> {
+    ) -> anyhow::Result<PublicDocumentId> {
         let system_id = SchedulerModel::new(self.tx, self.namespace)
             .schedule(path, args, ts, context)
             .await?;
@@ -589,7 +589,7 @@ impl<'a, RT: Runtime> VirtualSchedulerModel<'a, RT> {
             .system_resolved_id_to_virtual_developer_id(system_id)
     }
 
-    pub async fn cancel(&mut self, virtual_id: DeveloperDocumentId) -> anyhow::Result<()> {
+    pub async fn cancel(&mut self, virtual_id: PublicDocumentId) -> anyhow::Result<()> {
         let table_mapping = self.tx.table_mapping().clone();
         let system_id = self
             .tx
