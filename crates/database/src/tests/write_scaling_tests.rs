@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use async_trait::async_trait;
 use common::{
     assert_obj,
@@ -803,6 +804,57 @@ async fn test_local_only_commit_does_not_wait_for_remote_frontier(
 
     let result = tokio::time::timeout(Duration::from_millis(250), node_a.commit(tx)).await?;
     result?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_remote_single_partition_commit_rejects_before_waiting_for_remote_frontier(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_a, "messages", assert_obj!("text" => "seed")).await?;
+    let initial_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed message should publish a delta");
+    node_b
+        .committer_for_test()
+        .apply_replica_delta(initial_delta)
+        .await?;
+
+    // Advance node B's local snapshot beyond partition 0's replicated frontier so
+    // a stale remote frontier would block if we waited before classifying the
+    // write.
+    insert_doc(&node_b, "projects", assert_obj!("name" => "lag-maker")).await?;
+
+    let mut tx = node_b.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "wrong-owner"))
+        .await?;
+    let remote_tablet = tx
+        .table_mapping()
+        .namespace(TableNamespace::Global)
+        .name_to_tablet()("messages".parse()?)?;
+    tx.reads.record_indexed_derived(
+        TabletIndexName::by_id(remote_tablet),
+        IndexedFields::by_id(),
+        Interval::all(),
+    );
+
+    let err = tokio::time::timeout(Duration::from_millis(250), node_b.commit(tx))
+        .await
+        .context(
+            "remote single-partition write should reject before waiting on a stale remote frontier",
+        )?
+        .expect_err("node B should reject a partition-0-only write");
+    assert!(
+        format!("{err:#}").contains("Route this mutation to the correct partition owner"),
+        "expected remote owner rejection, got: {err:#}",
+    );
     Ok(())
 }
 

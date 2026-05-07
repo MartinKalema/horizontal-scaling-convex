@@ -36,6 +36,7 @@ use crate::{
     },
     metrics,
     partition::PartitionId,
+    selective_delivery::SelectiveDeliveryRegistry,
     write_log::WriteSource,
 };
 
@@ -45,6 +46,7 @@ const STREAM_NAME: &str = "CONVEX_COMMITS";
 /// "convex.commits.{partition_id}". The stream subscribes to "convex.commits.>"
 /// to capture all partitions.
 const SUBJECT_BASE: &str = "convex.commits";
+const SYSTEM_TABLE_SUBJECT: &str = "convex.commits.system";
 
 /// Configuration for connecting to NATS.
 #[derive(Clone, Debug)]
@@ -66,6 +68,7 @@ pub struct NatsDistributedLog {
     consumer_name: String,
     /// Subject this node publishes to.
     publish_subject: String,
+    selective_registry: Option<SelectiveDeliveryRegistry>,
 }
 
 impl NatsDistributedLog {
@@ -73,18 +76,11 @@ impl NatsDistributedLog {
         format!("{SUBJECT_BASE}.{}", partition.0)
     }
 
-    async fn subscribe_inner(
+    async fn subscribe_subjects(
         &self,
         from_ts: Timestamp,
-        source_partitions: Option<Vec<PartitionId>>,
+        filter_subjects: Option<Vec<String>>,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
-        let filter_subjects = source_partitions.map(|partitions| {
-            partitions
-                .into_iter()
-                .map(Self::partition_subject)
-                .collect::<Vec<_>>()
-        });
-
         // Create a durable consumer so it survives reconnections.
         // DeliverPolicy::All replays all messages from the stream beginning,
         // and we filter out messages at or before from_ts ourselves.
@@ -201,6 +197,47 @@ impl NatsDistributedLog {
         Ok(Box::pin(stream))
     }
 
+    async fn subscribe_inner(
+        &self,
+        from_ts: Timestamp,
+        source_partitions: Option<Vec<PartitionId>>,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+        let filter_subjects = source_partitions.map(|partitions| {
+            partitions
+                .into_iter()
+                .map(Self::partition_subject)
+                .collect::<Vec<_>>()
+        });
+        self.subscribe_subjects(from_ts, filter_subjects).await
+    }
+
+    pub async fn subscribe_node_targeted(
+        &self,
+        from_ts: Timestamp,
+        node_name: &str,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+        self.subscribe_subjects(
+            from_ts,
+            Some(vec![SelectiveDeliveryRegistry::node_subject(node_name)]),
+        )
+        .await
+    }
+
+    pub async fn subscribe_selective_node(
+        &self,
+        from_ts: Timestamp,
+        node_name: &str,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+        self.subscribe_subjects(
+            from_ts,
+            Some(vec![
+                SelectiveDeliveryRegistry::node_subject(node_name),
+                SYSTEM_TABLE_SUBJECT.to_string(),
+            ]),
+        )
+        .await
+    }
+
     /// Connect to NATS and create/get the JetStream stream.
     pub async fn connect(config: NatsConfig) -> anyhow::Result<Self> {
         // async-nats pulls in rustls which needs a crypto provider.
@@ -210,6 +247,7 @@ impl NatsDistributedLog {
             .await
             .with_context(|| format!("Failed to connect to NATS at {}", config.url))?;
 
+        let registry_client = client.clone();
         let jetstream = jetstream::new(client);
 
         // Create the stream using create_stream (not get_or_create_stream)
@@ -240,6 +278,10 @@ impl NatsDistributedLog {
             Some(id) => format!("{SUBJECT_BASE}.{id}"),
             None => SUBJECT_BASE.to_string(),
         };
+        let selective_registry =
+            SelectiveDeliveryRegistry::from_client(registry_client, consumer_name.clone())
+                .await
+                .ok();
         tracing::info!(
             "Connected to NATS JetStream at {}. Stream '{}': {} messages, {} bytes. Consumer: {}, \
              Publish subject: {}",
@@ -259,6 +301,7 @@ impl NatsDistributedLog {
             stream,
             consumer_name,
             publish_subject,
+            selective_registry,
         })
     }
 }
@@ -385,7 +428,7 @@ impl DistributedLog for NatsDistributedLog {
         // - Second .await waits for the server acknowledgment
         let ack = self
             .jetstream
-            .publish(self.publish_subject.clone(), payload.into())
+            .publish(self.publish_subject.clone(), payload.clone().into())
             .await
             .context("Failed to send publish to NATS")?
             .await
@@ -398,6 +441,51 @@ impl DistributedLog for NatsDistributedLog {
             payload_size,
             ack.sequence,
         );
+        let touched_tables = delta.touched_table_names();
+        if touched_tables.iter().any(TableName::is_system) {
+            let ack = self
+                .jetstream
+                .publish(SYSTEM_TABLE_SUBJECT.to_string(), payload.clone().into())
+                .await
+                .context("Failed to send selective-delivery system-table publish")?
+                .await
+                .context("Failed to get selective-delivery system-table acknowledgment")?;
+            metrics::log_selective_delivery_targeted_deliveries(1);
+            tracing::debug!(
+                "Published selective-delivery system-table delta: ts={}, stream_seq={}",
+                ts,
+                ack.sequence,
+            );
+        } else if let Some(registry) = &self.selective_registry {
+            let interested_nodes = registry
+                .interested_nodes_for_tables(&touched_tables)
+                .into_iter()
+                .filter(|node| node != &self.consumer_name)
+                .collect::<Vec<_>>();
+            metrics::log_selective_delivery_targeted_deliveries(interested_nodes.len());
+            for node in interested_nodes {
+                let ack = self
+                    .jetstream
+                    .publish(
+                        SelectiveDeliveryRegistry::node_subject(&node),
+                        payload.clone().into(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to send selective-delivery publish to {node}")
+                    })?
+                    .await
+                    .with_context(|| {
+                        format!("Failed to get selective-delivery ack for target node {node}")
+                    })?;
+                tracing::debug!(
+                    "Published selective-delivery shadow delta to {}: ts={}, stream_seq={}",
+                    node,
+                    ts,
+                    ack.sequence,
+                );
+            }
+        }
         drop(publish_timer);
         Ok(())
     }

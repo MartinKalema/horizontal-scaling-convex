@@ -6,7 +6,10 @@
 //! whatever transport carries deltas between nodes.
 
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     sync::Arc,
 };
 
@@ -125,6 +128,12 @@ impl DistributedLog for NoopDistributedLog {
     }
 }
 
+impl CommitDelta {
+    pub fn touched_table_names(&self) -> BTreeSet<TableName> {
+        self.tablet_id_to_table_name.values().cloned().collect()
+    }
+}
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use std::sync::Arc;
@@ -198,5 +207,45 @@ pub mod testing {
             let combined = existing_stream.chain(broadcast_stream);
             Ok(Box::pin(combined))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::Arc,
+    };
+
+    use common::types::Timestamp;
+    use value::TableName;
+
+    use crate::{
+        commit_delta::CommitDelta,
+        write_log::WriteSource,
+    };
+
+    #[test]
+    fn touched_table_names_collects_unique_tables() {
+        let messages: TableName = "messages".parse().unwrap();
+        let tasks: TableName = "tasks".parse().unwrap();
+        let mut tablet_id_to_table_name = BTreeMap::new();
+        tablet_id_to_table_name.insert(value::TabletId::MIN, messages.clone());
+        tablet_id_to_table_name.insert(value::TabletId::MAX, tasks.clone());
+        let delta = CommitDelta {
+            ts: Timestamp::MIN,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_name,
+            source_partition: None,
+        };
+
+        assert_eq!(
+            delta.touched_table_names(),
+            [messages, tasks].into_iter().collect()
+        );
     }
 }

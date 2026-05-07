@@ -777,7 +777,8 @@ impl SnapshotManager {
         if let Some(current) = self.replication_write_frontiers.get(&partition) {
             anyhow::ensure!(
                 ts >= *current,
-                "replication write frontier for {partition} went backward from {current:?} to {ts:?}",
+                "replication write frontier for {partition} went backward from {current:?} to \
+                 {ts:?}",
             );
             if ts == *current {
                 return Ok(false);

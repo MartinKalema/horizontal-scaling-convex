@@ -63,7 +63,6 @@ use crate::{
     },
     RouterState,
 };
-
 #[derive(Deserialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UdfPostRequest {
@@ -197,12 +196,18 @@ impl UdfResponse {
     }
 }
 
-async fn wait_for_local_mutation_visibility(st: &RouterState, commit_ts: Timestamp) {
+async fn wait_for_local_mutation_visibility(
+    st: &RouterState,
+    commit_ts: Timestamp,
+    require_replication_frontier: bool,
+) {
     st.database.wait_for_write_ts(commit_ts).await;
-    if let Some(partition_id) = st.partition_id {
-        st.database
-            .wait_for_replication_write_frontier(partition_id, commit_ts)
-            .await;
+    if require_replication_frontier {
+        if let Some(partition_id) = st.partition_id {
+            st.database
+                .wait_for_replication_write_frontier(partition_id, commit_ts)
+                .await;
+        }
     }
 }
 
@@ -315,7 +320,8 @@ async fn maybe_forward_public_mutation(
     let response = match forwarded.result {
         Some(pb::replication::forward_mutation_response::Result::Success(success)) => {
             if matches!(forwarding_mode, ForwardingMode::RaftFollower(_)) {
-                wait_for_local_mutation_visibility(st, Timestamp::try_from(success.ts)?).await;
+                wait_for_local_mutation_visibility(st, Timestamp::try_from(success.ts)?, true)
+                    .await;
             }
             let packed = JsonPackedValue::from_network(success.value).context(
                 ErrorMetadata::bad_request(
@@ -832,7 +838,7 @@ pub async fn public_mutation_post(
     let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
     let response = match udf_result {
         Ok(write_return) => {
-            wait_for_local_mutation_visibility(&st, write_return.ts).await;
+            wait_for_local_mutation_visibility(&st, write_return.ts, false).await;
             UdfResponse::Success {
                 value: export_value(write_return.value.unpack()?, value_format, client_version)?,
                 log_lines: write_return.log_lines,
@@ -926,31 +932,49 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         sync::Arc,
         time::Duration,
     };
 
     use anyhow::Context;
-    use application::test_helpers::ApplicationTestExt;
+    use application::{
+        api::{
+            ApplicationApi,
+            ExecuteQueryTimestamp,
+        },
+        test_helpers::ApplicationTestExt,
+    };
     use axum::body::Body;
     use common::{
         http::{
             ConvexHttpService,
             NoopRouteMapper,
+            RequestDestination,
+            ResolvedHostname,
         },
         runtime::Runtime,
+        types::FunctionCaller,
+        version::ClientVersion,
+    };
+    use database::{
+        partition::PartitionId,
+        raft_partition::RaftPartitionState,
+        two_phase::NodeAddresses,
     };
     use http::{
         Request,
         StatusCode,
     };
     use http_body_util::BodyExt;
+    use keybroker::Identity;
     use metrics::SERVER_VERSION_STR;
     use runtime::prod::ProdRuntime;
     use serde_json::{
         json,
         Value as JsonValue,
     };
+    use sync_types::types::SerializedArgs;
     use tokio::sync::oneshot;
     use tokio_stream::wrappers::TcpListenerStream;
     use tower::ServiceExt;
@@ -960,6 +984,7 @@ mod tests {
             MutationForwarderGrpcClient,
             MutationForwarderService,
         },
+        query_forwarding_api::SelectiveQueryForwardingApi,
         router::router,
         test_helpers::setup_backend_for_test,
         MAX_CONCURRENT_REQUESTS,
@@ -1054,6 +1079,47 @@ mod tests {
             Ok(json!("1")),
         )
         .await
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_http_query_records_recent_delta_interest(rt: ProdRuntime) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        backend.st.application.load_udf_tests_modules().await?;
+
+        let inserted: JsonValue = backend
+            .expect_success(post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "interest" } },
+                }),
+            )?)
+            .await?;
+        let inserted_id = inserted["value"]
+            .as_str()
+            .context("insertObject should return a document id string")?
+            .to_string();
+
+        let _: JsonValue = backend
+            .expect_success(post_request(
+                "/api/query",
+                json!({
+                    "path": "values:getObject",
+                    "args": { "id": inserted_id },
+                }),
+            )?)
+            .await?;
+
+        let interest = backend.st.application.database().delta_interest_tracker();
+        assert!(
+            interest
+                .snapshot()
+                .iter()
+                .any(|table| table.to_string() == "test"),
+            "stateless HTTP query should warm recent delta interest for touched tables",
+        );
+
+        Ok(())
     }
 
     #[convex_macro::prod_rt_test]
@@ -1160,6 +1226,275 @@ mod tests {
             replica_test_docs, 0,
             "replica should not execute the forwarded mutation locally",
         );
+
+        let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_http_mutation_local_partitioned_write_does_not_wait_for_replication_frontier(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        backend.st.application.load_udf_tests_modules().await?;
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId::DEFAULT);
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "backend_partitioned_local_mutation_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let response: JsonValue = tokio::time::timeout(
+            Duration::from_secs(5),
+            expect_success_from_app(
+                &partitioned_app,
+                post_request(
+                    "/api/mutation",
+                    json!({
+                        "path": "values:insertObject",
+                        "args": { "obj": { "hello": "partitioned-local" } },
+                    }),
+                )?,
+            ),
+        )
+        .await
+        .context(
+            "local partitioned mutation should not hang waiting for a replication frontier",
+        )??;
+
+        let inserted_id = response["value"]
+            .as_str()
+            .context("insertObject should return a document id string")?
+            .to_string();
+        let stored: JsonValue = backend
+            .expect_success(post_request(
+                "/api/query",
+                json!({
+                    "path": "values:getObject",
+                    "args": { "id": inserted_id },
+                }),
+            )?)
+            .await?;
+        assert_eq!(stored["value"]["hello"], "partitioned-local");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_query_forwarder_returns_touched_tables(rt: ProdRuntime) -> anyhow::Result<()> {
+        let primary = setup_backend_for_test(rt.clone()).await?;
+        primary.st.application.load_udf_tests_modules().await?;
+
+        let inserted: JsonValue = primary
+            .expect_success(post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "forwarded query" } },
+                }),
+            )?)
+            .await?;
+        let inserted_id = inserted["value"]
+            .as_str()
+            .context("insertObject should return a document id string")?
+            .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_addr = listener.local_addr()?;
+        let forwarder = MutationForwarderService::new(
+            Arc::new(primary.st.application.clone()),
+            primary.st.instance_name.clone(),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _server_handle = rt.spawn("test_query_forwarder", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(forwarder.into_server())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let forwarder_client =
+            MutationForwarderGrpcClient::connect(&format!("http://{grpc_addr}")).await?;
+        let args = SerializedArgs::from_args(vec![json!({ "id": inserted_id })])?;
+        let forwarded = forwarder_client
+            .forward_query(
+                "values:getObject",
+                args.get(),
+                Identity::system(),
+                FunctionCaller::HttpApi(ClientVersion::unknown()),
+                None,
+                None,
+            )
+            .await?;
+
+        let touched_tables = primary
+            .st
+            .application
+            .database()
+            .token_table_names(&forwarded.token)?;
+        assert_eq!(
+            touched_tables
+                .into_iter()
+                .map(|table| table.to_string())
+                .collect::<Vec<_>>(),
+            vec!["test".to_string()]
+        );
+        let value: JsonValue = serde_json::from_str(forwarded.result?.as_str())?;
+        assert_eq!(value["hello"], "forwarded query");
+
+        let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_selective_query_forwarding_api_routes_partitioned_queries(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let primary = setup_backend_for_test(rt.clone()).await?;
+        let selective = setup_backend_for_test(rt.clone()).await?;
+        primary.st.application.load_udf_tests_modules().await?;
+        selective.st.application.load_udf_tests_modules().await?;
+
+        let inserted: JsonValue = primary
+            .expect_success(post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "selective forwarded query" } },
+                }),
+            )?)
+            .await?;
+        let inserted_id = inserted["value"]
+            .as_str()
+            .context("insertObject should return a document id string")?
+            .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_addr = listener.local_addr()?;
+        let forwarder = MutationForwarderService::new(
+            Arc::new(primary.st.application.clone()),
+            primary.st.instance_name.clone(),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _server_handle = rt.spawn("test_selective_query_forwarder", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(forwarder.into_server())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
+            Arc::new(selective.st.application.clone()),
+            selective.st.application.database().clone(),
+            Some(PartitionId(1)),
+            Some(NodeAddresses::from_config(&format!("0={grpc_addr}"))),
+            None,
+            None,
+        ));
+        let query_result = api
+            .execute_public_query(
+                &ResolvedHostname {
+                    instance_name: selective.st.instance_name.clone(),
+                    destination: RequestDestination::ConvexCloud,
+                },
+                common::RequestId::new(),
+                Identity::system(),
+                "values:getObject".parse()?,
+                SerializedArgs::from_args(vec![json!({ "id": inserted_id })])?,
+                FunctionCaller::HttpApi(ClientVersion::unknown()),
+                ExecuteQueryTimestamp::Latest,
+                None,
+            )
+            .await?;
+
+        let value: JsonValue = serde_json::from_str(query_result.result?.as_str())?;
+        assert_eq!(value["hello"], "selective forwarded query");
+
+        let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_selective_query_forwarding_api_routes_authority_partition_follower_queries(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let primary = setup_backend_for_test(rt.clone()).await?;
+        let follower = setup_backend_for_test(rt.clone()).await?;
+        primary.st.application.load_udf_tests_modules().await?;
+        follower.st.application.load_udf_tests_modules().await?;
+
+        let inserted: JsonValue = primary
+            .expect_success(post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "authority follower forwarded query" } },
+                }),
+            )?)
+            .await?;
+        let inserted_id = inserted["value"]
+            .as_str()
+            .context("insertObject should return a document id string")?
+            .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_addr = listener.local_addr()?;
+        let forwarder = MutationForwarderService::new(
+            Arc::new(primary.st.application.clone()),
+            primary.st.instance_name.clone(),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _server_handle = rt.spawn("test_authority_partition_query_forwarder", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(forwarder.into_server())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let mut raft_peer_grpc_urls = BTreeMap::new();
+        raft_peer_grpc_urls.insert(3, format!("http://{grpc_addr}"));
+        let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
+            Arc::new(follower.st.application.clone()),
+            follower.st.application.database().clone(),
+            Some(PartitionId(0)),
+            None,
+            Some(RaftPartitionState::new_for_test(
+                false,
+                3,
+                PartitionId(0),
+                1,
+            )),
+            Some(raft_peer_grpc_urls),
+        ));
+        let query_result = api
+            .execute_public_query(
+                &ResolvedHostname {
+                    instance_name: follower.st.instance_name.clone(),
+                    destination: RequestDestination::ConvexCloud,
+                },
+                common::RequestId::new(),
+                Identity::system(),
+                "values:getObject".parse()?,
+                SerializedArgs::from_args(vec![json!({ "id": inserted_id })])?,
+                FunctionCaller::HttpApi(ClientVersion::unknown()),
+                ExecuteQueryTimestamp::Latest,
+                None,
+            )
+            .await?;
+
+        let value: JsonValue = serde_json::from_str(query_result.result?.as_str())?;
+        assert_eq!(value["hello"], "authority follower forwarded query");
 
         let _ = shutdown_tx.send(());
         Ok(())

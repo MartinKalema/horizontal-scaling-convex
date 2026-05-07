@@ -393,6 +393,136 @@ own for distributed changes.
     tests passed with partitioned nodes no longer consuming their own
     partition's NATS subject
 
+### 2026-05 — Started explicit selective-delivery interest tracking
+
+- **Status:** in progress
+- **Related issue:** `#96`
+- **Why this first:** before we can safely narrow cross-partition delivery, the
+  system needs an explicit notion of what data a node is actually interested
+  in. Today, the subscription/read path still gets its "read anywhere" behavior
+  from a broad remote snapshot, so skipping remote deltas without a real
+  interest model would silently change semantics.
+- **What this slice adds:**
+  - a database-side `DeltaInterestTracker` that aggregates live subscription
+    interests as a node-local set of table names
+  - `Database::subscribe(...)` now resolves a subscription token's read-set
+    into concrete non-system table names before registering the subscription
+  - `SubscriptionsClient` / `SubscriptionManager` now keep those per-subscription
+    table interests and maintain reference counts as subscriptions start and end
+  - a new `database_selective_delivery_interested_tables_info` metric and a
+    `CommitDelta::touched_table_names()` helper for the next transport-side step
+- **What this does not do yet:** it does **not** change runtime fanout or stop
+  delivering any remote deltas. This is the seam the later NATS/changefeed
+  routing work will use.
+- **Validation:**
+  - `cargo check -p local_backend`
+  - `cargo test -p database delta_interest::tests::interest_tracker_ref_counts_tables -- --nocapture`
+  - `cargo test -p database commit_delta::tests::touched_table_names_collects_unique_tables -- --nocapture`
+  - `cargo test -p database subscription::tests::test_log_rewind_invalidates_subscriptions_and_reanchors_manager -- --nocapture`
+
+### 2026-05 — Added selective-delivery shadow control plane
+
+- **Status:** in progress
+- **Related issue:** `#96`
+- **What this slice adds:**
+  - nodes now publish their live table-interest set into a dedicated NATS KV
+    bucket (`convex_delta_interest`) with freshness timestamps
+  - producers can now compute which nodes are interested in a delta's touched
+    tables and shadow-publish those deltas to node-specific subjects
+    (`convex.commits.node.<node>`) in addition to the existing broad partition
+    subject
+  - this gives us a real selective-delivery control plane and transport shape
+    without yet changing the current broad read-anywhere data path
+- **Why this is still shadow mode:** broad remote replication is still required
+  for one-shot cross-partition queries. Live subscriptions tell us what a node
+  is interested in over time, but ad hoc query execution still does not expose
+  the full table set *before* execution. Until the request path can catch up or
+  reroute those cold-table reads safely, switching consumers away from the broad
+  path would change semantics.
+- **Validation:**
+  - `cargo check -p local_backend`
+  - `cargo test -p database selective_delivery::tests::interested_nodes_match_tables_and_skip_stale_entries -- --nocapture`
+  - `cargo test -p database selective_delivery::tests::node_subject_names_are_stable -- --nocapture`
+
+### 2026-05 — Added recent-query interest leases for stateless reads
+
+- **Status:** in progress
+- **Related issue:** `#96`
+- **Why this slice matters:** sync queries already warm table interest after
+  their first execution because they immediately subscribe on the returned
+  token. Plain HTTP queries do not; they learn their table set only after
+  execution and then discard it. That made the control plane under-report real
+  read traffic from stateless query paths.
+- **What this slice adds:**
+  - `DeltaInterestTracker` now supports short-lived recent-interest leases in
+    addition to long-lived subscription ref-counts
+  - the selective-delivery interest publisher prunes expired recent-interest
+    leases before publishing to NATS KV
+  - latest-timestamp public HTTP queries now feed their returned token back
+    into the tracker for a short TTL, so repeated ad hoc reads can warm table
+    interest over time
+- **What this still does not solve:** this improves the signal for selective
+  routing, but it still does not make the *first* cold-table query safe under a
+  fully selective delivery regime. We still need either cold-table catch-up or
+  request rerouting before the active cutover.
+- **Validation:**
+  - `cargo test -p local_backend test_http_query_records_recent_delta_interest -- --nocapture`
+
+### 2026-05 — Added query-forwarder infrastructure for cold-read reroute
+
+- **Status:** in progress
+- **Related issue:** `#96`
+- **What this slice adds:**
+  - the existing gRPC `MutationForwarder` service now also supports forwarding
+    public queries to an authoritative peer
+  - forwarded query responses include the non-system table names touched by the
+    returned token/read-set, so the caller can warm selective-delivery interest
+    from a routed read instead of losing that information
+- **Why this matters:** the remaining `#96` blocker is the first cold-table
+  stateless query. This forwarder gives us the transport primitive for a safe
+  reroute path without forcing us to hard-code the wrong policy prematurely.
+- **What this still does not do:** the public HTTP query handlers do not yet
+  automatically reroute cold reads. We still need to decide the active policy:
+  query reroute target, fallback behavior, and when to prefer reroute versus
+  local execution.
+- **Validation:**
+  - `cargo test -p local_backend test_query_forwarder_returns_touched_tables -- --nocapture`
+  - `cargo check -p local_backend`
+
+### 2026-05 — Completed leader-aware latest-query routing for selective delivery
+
+- **Status:** complete
+- **Related issue:** `#96`
+- **What closed the loop:**
+  - system-table deltas now continue to fan out on a dedicated global NATS
+    subject so deploy/metadata state is never accidentally gated by table
+    interest
+  - latest public queries from non-authority partitions still reroute to the
+    partition-0 authority
+  - latest public queries from partition-0 followers now also reroute to the
+    current Raft leader instead of trying to serve an unsafe local latest read
+- **Why this was necessary:** once user-table deltas became selective, a
+  partition-0 follower could no longer safely answer every latest query from
+  its local snapshot. The remaining full-harness failures were exactly that
+  shape: writes forwarded to the leader succeeded, but immediate reads on a
+  partition-0 follower could still observe stale local state. Leader-aware
+  latest-query forwarding closes that gap without re-broadcasting the old broad
+  replication stream.
+- **Focused validation:**
+  - `cargo check -p local_backend`
+  - `cargo test -p local_backend test_selective_query_forwarding_api_routes_partitioned_queries -- --nocapture`
+  - `cargo test -p local_backend test_selective_query_forwarding_api_routes_authority_partition_follower_queries -- --nocapture`
+  - `cargo test -p local_backend test_http_mutation_local_partitioned_write_does_not_wait_for_replication_frontier -- --nocapture`
+  - `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
+  - `cargo test -p database selective_delivery::tests -- --nocapture`
+  - `cargo test -p database test_remote_single_partition_commit_rejects_before_waiting_for_remote_frontier -- --nocapture`
+- **End-to-end validation:**
+  - rebuilt backend image from branch state
+  - `docker compose --profile cluster down -v --remove-orphans`
+  - `docker compose --profile cluster up -d --pull never`
+  - `bash self-hosted/docker/test.sh`
+  - result: `ALL 77 TESTS PASSED`, `ALL 10 TESTS PASSED`, `ALL SUITES PASSED`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

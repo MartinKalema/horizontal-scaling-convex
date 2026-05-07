@@ -65,6 +65,7 @@ function_runner = { workspace = true }
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
 governor = { workspace = true }
+headers = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 http_client = { workspace = true }

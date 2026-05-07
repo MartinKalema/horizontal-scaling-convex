@@ -1,21 +1,29 @@
-//! gRPC service for forwarding mutations from Replica to Primary.
+//! gRPC service for forwarding public UDFs to an authoritative node.
 //!
 //! The Primary runs a [`MutationForwarderService`] that accepts mutation
 //! requests from Replicas via gRPC.
 //!
-//! The Replica runs a [`MutationForwarderGrpcClient`] that forwards mutations
-//! to the Primary when clients try to execute mutations on a Replica.
+//! The Replica or follower runs a [`MutationForwarderGrpcClient`] that forwards
+//! supported public requests to the authoritative node when local execution is
+//! not appropriate.
 
 use std::sync::Arc;
 
 use anyhow::Context;
-use application::api::ApplicationApi;
+use application::{
+    api::{
+        ApplicationApi,
+        ExecuteQueryTimestamp,
+    },
+    RedactedQueryReturn,
+};
 use common::{
     http::RequestDestination,
     types::FunctionCaller,
     version::ClientVersion,
     RequestId,
 };
+use database::Token;
 use keybroker::Identity;
 use pb::replication::{
     forward_mutation_response,
@@ -26,8 +34,12 @@ use pb::replication::{
     },
     ForwardMutationRequest,
     ForwardMutationResponse,
+    ForwardQueryRequest,
+    ForwardQueryResponse,
     MutationError,
     MutationSuccess,
+    QueryError,
+    QuerySuccess,
 };
 use serde_json::Value as JsonValue;
 use sync_types::types::SerializedArgs;
@@ -37,6 +49,7 @@ use tonic::{
     Response,
     Status,
 };
+use value::JsonPackedValue;
 
 /// gRPC server for mutation forwarding. Runs on the Primary.
 pub struct MutationForwarderService {
@@ -135,6 +148,97 @@ impl MutationForwarder for MutationForwarderService {
             Err(e) => Err(Status::internal(format!("Mutation failed: {e}"))),
         }
     }
+
+    async fn forward_query(
+        &self,
+        request: Request<ForwardQueryRequest>,
+    ) -> Result<Response<ForwardQueryResponse>, Status> {
+        let req = request.into_inner();
+
+        let identity = req
+            .identity
+            .ok_or_else(|| Status::invalid_argument("Missing identity"))
+            .and_then(|proto| {
+                Identity::from_proto_unchecked(proto)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid identity: {e}")))
+            })?;
+
+        let args = SerializedArgs::from_slice(req.args.as_bytes())
+            .map_err(|e| Status::invalid_argument(format!("Invalid args: {e}")))?;
+
+        let path = req
+            .path
+            .parse()
+            .map_err(|e: anyhow::Error| Status::invalid_argument(format!("Invalid path: {e}")))?;
+
+        let caller = req
+            .caller
+            .context("Missing caller")
+            .and_then(FunctionCaller::try_from)
+            .map_err(|e| Status::invalid_argument(format!("Invalid caller: {e:#}")))?;
+
+        let host = common::http::ResolvedHostname {
+            instance_name: self.instance_name.clone(),
+            destination: RequestDestination::ConvexCloud,
+        };
+
+        let ts = match req.ts {
+            Some(ts) => ExecuteQueryTimestamp::At(ts.try_into().map_err(|e: anyhow::Error| {
+                Status::invalid_argument(format!("Invalid ts: {e}"))
+            })?),
+            None => ExecuteQueryTimestamp::Latest,
+        };
+
+        let result = self
+            .api
+            .execute_public_query(
+                &host,
+                RequestId::new(),
+                identity,
+                path,
+                args,
+                caller,
+                ts,
+                Some(req.journal),
+            )
+            .await;
+
+        match result {
+            Ok(ret) => {
+                let token = Some(ret.token.clone().try_into().map_err(|e: anyhow::Error| {
+                    Status::internal(format!("Failed to serialize query token: {e}"))
+                })?);
+                let response = match ret.result {
+                    Ok(value) => ForwardQueryResponse {
+                        token,
+                        journal: ret.journal,
+                        result: Some(pb::replication::forward_query_response::Result::Success(
+                            QuerySuccess {
+                                value: value.as_str().to_string(),
+                                log_lines: Some(ret.log_lines.into()),
+                            },
+                        )),
+                    },
+                    Err(error) => ForwardQueryResponse {
+                        token,
+                        journal: ret.journal,
+                        result: Some(pb::replication::forward_query_response::Result::Error(
+                            QueryError {
+                                error: Some(error.try_into().map_err(|e: anyhow::Error| {
+                                    Status::internal(format!(
+                                        "Failed to serialize query error: {e}"
+                                    ))
+                                })?),
+                                log_lines: Some(ret.log_lines.into()),
+                            },
+                        )),
+                    },
+                };
+                Ok(Response::new(response))
+            },
+            Err(e) => Err(Status::internal(format!("Query failed: {e}"))),
+        }
+    }
 }
 
 /// gRPC client for forwarding mutations from Replica to Primary.
@@ -145,10 +249,15 @@ pub struct MutationForwarderGrpcClient {
 impl MutationForwarderGrpcClient {
     /// Connect to the Primary's gRPC mutation forwarding service.
     pub async fn connect(primary_url: &str) -> anyhow::Result<Self> {
-        let client = TonicMutationForwarderClient::connect(primary_url.to_string())
+        let normalized_url = if primary_url.contains("://") {
+            primary_url.to_string()
+        } else {
+            format!("http://{primary_url}")
+        };
+        let client = TonicMutationForwarderClient::connect(normalized_url.clone())
             .await
-            .with_context(|| format!("Failed to connect to Primary at {primary_url}"))?;
-        tracing::info!("Connected to Primary mutation forwarder at {primary_url}");
+            .with_context(|| format!("Failed to connect to Primary at {normalized_url}"))?;
+        tracing::info!("Connected to Primary mutation forwarder at {normalized_url}");
         Ok(Self { client })
     }
 
@@ -176,5 +285,58 @@ impl MutationForwarderGrpcClient {
             .await
             .context("gRPC mutation forwarding failed")?;
         Ok(response.into_inner())
+    }
+
+    pub async fn forward_query(
+        &self,
+        path: &str,
+        args: &str,
+        identity: Identity,
+        caller: FunctionCaller,
+        ts: Option<u64>,
+        journal: Option<String>,
+    ) -> anyhow::Result<RedactedQueryReturn> {
+        let identity_proto: pb::convex_identity::UncheckedIdentity = identity.into();
+        let request = ForwardQueryRequest {
+            path: path.to_string(),
+            args: args.to_string(),
+            identity: Some(identity_proto),
+            caller: Some(caller.into()),
+            ts,
+            journal,
+        };
+        let response = self
+            .client
+            .clone()
+            .forward_query(Request::new(request))
+            .await
+            .context("gRPC query forwarding failed")?;
+        let response = response.into_inner();
+        let token: Token = response
+            .token
+            .context("Forwarded query response missing token")?
+            .try_into()?;
+        let journal = response.journal;
+        let (result, log_lines) = match response.result {
+            Some(pb::replication::forward_query_response::Result::Success(success)) => (
+                Ok(JsonPackedValue::from_network(success.value)
+                    .context("Forwarded query response contained an invalid packed JSON value")?),
+                success.log_lines.unwrap_or_default().try_into()?,
+            ),
+            Some(pb::replication::forward_query_response::Result::Error(error)) => (
+                Err(error
+                    .error
+                    .context("Forwarded query error missing error payload")?
+                    .try_into()?),
+                error.log_lines.unwrap_or_default().try_into()?,
+            ),
+            None => anyhow::bail!("Forwarded query response missing result"),
+        };
+        Ok(RedactedQueryReturn {
+            result,
+            log_lines,
+            token,
+            journal,
+        })
     }
 }

@@ -257,6 +257,36 @@ pub fn log_replication_write_frontier_ts(source_partition: PartitionId, ts: Time
 }
 
 register_convex_gauge!(
+    DATABASE_SELECTIVE_DELIVERY_INTERESTED_TABLES_INFO,
+    "Number of unique tables currently tracked as selectively interesting on this node"
+);
+pub fn log_selective_delivery_interested_tables(num_tables: usize) {
+    log_gauge(
+        &DATABASE_SELECTIVE_DELIVERY_INTERESTED_TABLES_INFO,
+        num_tables as f64,
+    );
+}
+
+register_convex_counter!(
+    DATABASE_SELECTIVE_DELIVERY_TARGETED_DELIVERIES_TOTAL,
+    "Total number of targeted selective-delivery shadow publishes sent to node-specific subjects"
+);
+pub fn log_selective_delivery_targeted_deliveries(num_deliveries: usize) {
+    log_counter(
+        &DATABASE_SELECTIVE_DELIVERY_TARGETED_DELIVERIES_TOTAL,
+        num_deliveries as u64,
+    );
+}
+
+register_convex_counter!(
+    DATABASE_SELECTIVE_DELIVERY_SHADOW_RECEIVES_TOTAL,
+    "Total number of node-targeted selective-delivery shadow deltas consumed"
+);
+pub fn log_selective_delivery_shadow_receive() {
+    log_counter(&DATABASE_SELECTIVE_DELIVERY_SHADOW_RECEIVES_TOTAL, 1);
+}
+
+register_convex_gauge!(
     DATABASE_LATEST_REPEATABLE_TS_INFO,
     "Latest repeatable timestamp currently visible on this node"
 );

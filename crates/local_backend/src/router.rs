@@ -403,11 +403,19 @@ pub fn router(st: LocalAppState) -> Router {
         // added inside `serve_http`
         .nest("/http/", http_action_routes())
         .with_state(RouterState {
-            api: Arc::new(st.application.clone()),
+            api: Arc::new(crate::query_forwarding_api::SelectiveQueryForwardingApi::new(
+                Arc::new(st.application.clone()),
+                st.application.database().clone(),
+                st.partition_id,
+                st.node_addresses.clone(),
+                st.raft_state.clone(),
+                st.raft_peer_grpc_urls.clone(),
+            )),
             database: st.application.database().clone(),
             runtime: st.application.runtime(),
             replica_mode: st.replica_mode,
             partition_id: st.partition_id,
+            node_addresses: st.node_addresses.clone(),
             raft_state: st.raft_state.clone(),
             raft_peer_grpc_urls: st.raft_peer_grpc_urls.clone(),
             replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
