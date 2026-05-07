@@ -72,6 +72,8 @@ pub struct RaftPartitionState {
     proposal_tx: mpsc::UnboundedSender<RaftMessage>,
     /// Partition ID.
     partition_id: PartitionId,
+    /// This node's ID within the Raft group.
+    node_id: u64,
 }
 
 impl RaftPartitionState {
@@ -88,6 +90,11 @@ impl RaftPartitionState {
     /// Get the partition ID.
     pub fn partition_id(&self) -> PartitionId {
         self.partition_id
+    }
+
+    /// Get this node's ID within the Raft group.
+    pub fn node_id(&self) -> u64 {
+        self.node_id
     }
 
     /// Send a Raft message to the node (proposals or forwarded Raft messages).
@@ -182,6 +189,7 @@ impl RaftPartitionManager {
             leader_id,
             proposal_tx: mailbox_tx.clone(),
             partition_id: config.partition_id,
+            node_id: config.node_id,
         };
         metrics::log_raft_is_leader(config.partition_id, false);
         metrics::log_raft_leader_id(config.partition_id, 0);

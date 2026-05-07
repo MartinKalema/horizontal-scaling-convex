@@ -404,8 +404,12 @@ pub fn router(st: LocalAppState) -> Router {
         .nest("/http/", http_action_routes())
         .with_state(RouterState {
             api: Arc::new(st.application.clone()),
+            database: st.application.database().clone(),
             runtime: st.application.runtime(),
             replica_mode: st.replica_mode,
+            partition_id: st.partition_id,
+            raft_state: st.raft_state.clone(),
+            raft_peer_grpc_urls: st.raft_peer_grpc_urls.clone(),
             replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
         });
 

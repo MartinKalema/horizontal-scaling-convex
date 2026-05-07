@@ -889,6 +889,7 @@ async fn test_replication_frontier_heartbeat_does_not_advance_snapshot_ts(
 
     let snapshot_ts_before = *node_a.now_ts_for_reads();
     let persisted_repeatable_before = *node_a.persisted_max_repeatable_ts_for_test();
+    let write_frontier_before = node_a.replication_write_frontier_for_test(PartitionId(1));
     let projects = run_query(
         node_a.clone(),
         TableNamespace::root_component(),
@@ -930,6 +931,20 @@ async fn test_replication_frontier_heartbeat_does_not_advance_snapshot_ts(
         node_a.replication_frontier_for_test(PartitionId(1)),
         Some(heartbeat_ts),
         "heartbeat should still advance the remote replication frontier",
+    );
+    assert_eq!(
+        node_a.replication_write_frontier_for_test(PartitionId(1)),
+        write_frontier_before,
+        "heartbeat must not advertise newer local strong-read visibility",
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            node_a.wait_for_replication_write_frontier(PartitionId(1), heartbeat_ts),
+        )
+        .await
+        .is_err(),
+        "waiting for local write visibility should stay blocked on a frontier-only heartbeat",
     );
 
     let projects_after = run_query(

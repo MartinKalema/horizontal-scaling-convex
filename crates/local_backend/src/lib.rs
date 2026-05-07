@@ -6,6 +6,7 @@
 
 use std::{
     self,
+    collections::BTreeMap,
     sync::Arc,
     time::Duration,
 };
@@ -134,6 +135,9 @@ pub struct LocalAppState {
     pub replica_mode: bool,
     pub partition_id: Option<database::partition::PartitionId>,
     pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+    pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
+    pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
     /// Raft partition mailbox for receiving Raft messages from peers.
     /// None if Raft is not enabled.
@@ -155,8 +159,12 @@ impl LocalAppState {
 #[derive(Clone)]
 pub struct RouterState {
     pub api: Arc<dyn ApplicationApi>,
+    pub database: database::Database<ProdRuntime>,
     pub runtime: ProdRuntime,
     pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+    pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
 }
 
@@ -424,6 +432,9 @@ pub async fn make_app(
         .node_addresses
         .as_deref()
         .map(database::two_phase::NodeAddresses::from_config);
+    let mut raft_state_for_app = None;
+    let mut raft_peer_http_origins = None;
+    let mut raft_peer_grpc_urls = None;
 
     if !config.disable_beacon {
         let beacon_future = beacon::start_beacon(
@@ -440,7 +451,8 @@ pub async fn make_app(
     // Start the ReplicaDeltaConsumer to tail NATS and apply deltas from other
     // nodes. Runs on:
     //   - Replicas (REPLICATION_MODE=replica): consumes Primary's deltas
-    //   - Partitioned writers (PARTITION_ID set): consumes other partitions' deltas
+    //   - Partitioned writers (PARTITION_ID set): consumes only other
+    //     partitions' deltas, leaving same-partition convergence to Raft
     // Creates a fresh NATS connection dedicated to the consumer.
     let needs_delta_consumer =
         config.replication_mode == "replica" || config.partition_id.is_some();
@@ -448,10 +460,32 @@ pub async fn make_app(
         if let Some(nats_url) = &config.nats_url {
             let nats_url = nats_url.clone();
             let committer = database.committer_client();
+            let remote_partitions = config.partition_id.map(|local_partition| {
+                if let Some(num_partitions) = config.num_partitions {
+                    (0..num_partitions)
+                        .map(database::partition::PartitionId)
+                        .filter(|partition| partition.0 != local_partition)
+                        .collect::<Vec<_>>()
+                } else {
+                    config
+                        .node_addresses
+                        .as_deref()
+                        .map(database::two_phase::NodeAddresses::from_config)
+                        .map(|addresses| {
+                            addresses
+                                .partitions()
+                                .into_iter()
+                                .filter(|partition| partition.0 != local_partition)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                }
+            });
             // In partitioned mode, start consuming from the beginning of the
             // stream. Each node has its own database with independent timestamps,
             // so we can't use the local database timestamp as a lower bound.
-            // The self-delta skip (source_node filter) prevents double-applying.
+            // We explicitly restrict partitioned nodes to other partitions'
+            // subjects so same-partition convergence comes from Raft apply.
             // In replica mode, start from the locally visible snapshot, which
             // may have just been bootstrapped from the latest checkpoint.
             let from_ts = if config.partition_id.is_some() {
@@ -481,8 +515,11 @@ pub async fn make_app(
                     };
                 let consumer_nats_dyn: Arc<dyn database::commit_delta::DistributedLog> =
                     consumer_nats;
-                tracing::info!("ReplicaDeltaConsumer subscribing to NATS...");
-                match consumer_nats_dyn.subscribe(from_ts.into()).await {
+                tracing::info!(?remote_partitions, "ReplicaDeltaConsumer subscribing to NATS...");
+                match consumer_nats_dyn
+                    .subscribe_filtered(from_ts.into(), remote_partitions.clone())
+                    .await
+                {
                     Ok(mut stream) => {
                         tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
                         while let Some(result) = futures::StreamExt::next(&mut stream).await {
@@ -547,12 +584,25 @@ pub async fn make_app(
 
         // Parse peer addresses: "1=host:port,2=host:port,3=host:port"
         let mut peer_addresses = std::collections::HashMap::new();
+        let mut peer_http_origins = BTreeMap::new();
+        let mut peer_grpc_urls = BTreeMap::new();
         let mut peer_ids = Vec::new();
         for pair in raft_peers_str.split(',') {
             let pair = pair.trim();
             if let Some((id_str, addr)) = pair.split_once('=') {
                 if let Ok(id) = id_str.trim().parse::<u64>() {
-                    peer_addresses.insert(id, addr.trim().to_string());
+                    let normalized_grpc_addr = if addr.contains("://") {
+                        addr.trim().to_string()
+                    } else {
+                        format!("http://{}", addr.trim())
+                    };
+                    peer_addresses.insert(id, normalized_grpc_addr.clone());
+                    peer_grpc_urls.insert(id, normalized_grpc_addr);
+                    if let Ok(origin) =
+                        crate::deploy_config2::http_origin_from_peer_addr(addr.trim())
+                    {
+                        peer_http_origins.insert(id, origin);
+                    }
                     peer_ids.push(id);
                 }
             }
@@ -593,6 +643,9 @@ pub async fn make_app(
             Some(snapshot_provider),
         )?;
         let raft_state = manager.state();
+        raft_state_for_app = Some(raft_state.clone());
+        raft_peer_http_origins = Some(peer_http_origins);
+        raft_peer_grpc_urls = Some(peer_grpc_urls);
         let mb_tx = manager.mailbox_tx();
         raft_mailbox_tx = Some(mb_tx);
 
@@ -612,14 +665,18 @@ pub async fn make_app(
                             serde_json::from_slice(data).map_err(|e| {
                                 anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
                             })?;
+                        let proposed_locally = envelope.source_raft_node_id() == Some(raft_node_id);
                         let delta = envelope.to_delta()?;
 
-                        // Leader already applied locally — skip.
-                        // Followers apply via the Committer (same path as NATS).
-                        if !raft_state_for_apply.is_leader() {
+                        // Skip only the entries this node already committed
+                        // locally before proposing them through Raft. Every
+                        // other committed entry must be applied here, even if
+                        // this node later became leader.
+                        if !proposed_locally {
                             tracing::info!(
-                                "Raft follower applying committed delta: ts={}",
+                                "Applying committed Raft delta locally: ts={}, leader_now={}",
                                 u64::from(delta.ts),
+                                raft_state_for_apply.is_leader(),
                             );
                             // apply_replica_delta is async — use block_in_place
                             // since we're in the Raft loop's sync callback.
@@ -653,6 +710,12 @@ pub async fn make_app(
             });
         }
 
+        // Defer leader enforcement until after local database/application
+        // bootstrap is complete, then attach the live Raft state to the
+        // Committer so normal writes propose through Raft and followers reject
+        // non-leader writes.
+        database.attach_raft_state(raft_state.clone()).await?;
+
         // Start transport clients for each peer.
         for client in transport_clients {
             runtime.spawn_background("raft_transport_client", async move {
@@ -678,6 +741,9 @@ pub async fn make_app(
         replica_mode: config.replication_mode == "replica",
         partition_id,
         node_addresses,
+        raft_state: raft_state_for_app,
+        raft_peer_http_origins,
+        raft_peer_grpc_urls,
         replica_mutation_forwarder,
         raft_mailbox_tx,
     };

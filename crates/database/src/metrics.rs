@@ -1,3 +1,7 @@
+use ::search::metrics::{
+    SearchType,
+    SEARCH_TYPE_LABEL,
+};
 use common::{
     identity::IDENTITY_LABEL,
     runtime::Runtime,
@@ -26,10 +30,6 @@ use metrics::{
 use prometheus::{
     VMHistogram,
     VMHistogramVec,
-};
-use ::search::metrics::{
-    SearchType,
-    SEARCH_TYPE_LABEL,
 };
 
 use crate::{
@@ -244,6 +244,19 @@ pub fn log_replication_frontier_ts(source_partition: PartitionId, ts: Timestamp)
 }
 
 register_convex_gauge!(
+    DATABASE_REPLICATION_WRITE_FRONTIER_TS_INFO,
+    "Latest source-partition write timestamp that is safe for local strong reads on this node",
+    &SOURCE_PARTITION_LABELS
+);
+pub fn log_replication_write_frontier_ts(source_partition: PartitionId, ts: Timestamp) {
+    log_gauge_with_labels(
+        &DATABASE_REPLICATION_WRITE_FRONTIER_TS_INFO,
+        u64::from(ts) as f64,
+        vec![source_partition_label(source_partition)],
+    );
+}
+
+register_convex_gauge!(
     DATABASE_LATEST_REPEATABLE_TS_INFO,
     "Latest repeatable timestamp currently visible on this node"
 );
@@ -403,7 +416,10 @@ register_convex_histogram!(
     "Number of participants involved in a 2PC transaction"
 );
 pub fn log_two_phase_participants(num_participants: usize) {
-    log_distribution(&DATABASE_TWO_PHASE_PARTICIPANTS_TOTAL, num_participants as f64);
+    log_distribution(
+        &DATABASE_TWO_PHASE_PARTICIPANTS_TOTAL,
+        num_participants as f64,
+    );
 }
 
 register_convex_histogram!(
@@ -411,7 +427,10 @@ register_convex_histogram!(
     "Number of prepare timestamp allocation attempts for a 2PC transaction"
 );
 pub fn log_two_phase_prepare_attempts(num_attempts: usize) {
-    log_distribution(&DATABASE_TWO_PHASE_PREPARE_ATTEMPTS_TOTAL, num_attempts as f64);
+    log_distribution(
+        &DATABASE_TWO_PHASE_PREPARE_ATTEMPTS_TOTAL,
+        num_attempts as f64,
+    );
 }
 
 register_convex_histogram!(
