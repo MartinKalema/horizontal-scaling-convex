@@ -69,6 +69,138 @@ pub struct NatsDistributedLog {
 }
 
 impl NatsDistributedLog {
+    fn partition_subject(partition: PartitionId) -> String {
+        format!("{SUBJECT_BASE}.{}", partition.0)
+    }
+
+    async fn subscribe_inner(
+        &self,
+        from_ts: Timestamp,
+        source_partitions: Option<Vec<PartitionId>>,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+        let filter_subjects = source_partitions.map(|partitions| {
+            partitions
+                .into_iter()
+                .map(Self::partition_subject)
+                .collect::<Vec<_>>()
+        });
+
+        // Create a durable consumer so it survives reconnections.
+        // DeliverPolicy::All replays all messages from the stream beginning,
+        // and we filter out messages at or before from_ts ourselves.
+        let consumer_name = self.consumer_name.clone();
+        let mut consumer: PullConsumer = self
+            .stream
+            .get_or_create_consumer(
+                &consumer_name,
+                jetstream::consumer::pull::Config {
+                    durable_name: Some(consumer_name.clone()),
+                    deliver_policy: jetstream::consumer::DeliverPolicy::All,
+                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                    filter_subjects: filter_subjects.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Failed to create NATS durable consumer")?;
+        let consumer_info = consumer
+            .info()
+            .await
+            .context("Failed to get NATS consumer info")?
+            .clone();
+        metrics::log_replication_transport_pending_messages(consumer_info.num_pending);
+        metrics::log_replication_transport_stream_sequence(consumer_info.delivered.stream_sequence);
+        metrics::log_replication_transport_consumer_sequence(
+            consumer_info.delivered.consumer_sequence,
+        );
+
+        let from_ts_u64 = u64::from(from_ts);
+        let messages = consumer
+            .messages()
+            .await
+            .context("Failed to start consuming NATS messages")?;
+
+        tracing::info!(
+            ?filter_subjects,
+            "Subscribed to NATS stream '{}' with durable consumer '{}', from_ts={}",
+            STREAM_NAME,
+            consumer_name,
+            from_ts_u64,
+        );
+
+        let self_node_name = consumer_name.clone();
+        let stream = messages.filter_map(move |msg_result| {
+            let node_name = self_node_name.clone();
+            async move {
+                match msg_result {
+                    Ok(msg) => {
+                        metrics::log_replication_transport_message_bytes(
+                            "consume",
+                            msg.payload.len(),
+                        );
+                        match msg.info() {
+                            Ok(info) => {
+                                metrics::log_replication_transport_pending_messages(info.pending);
+                                metrics::log_replication_transport_stream_sequence(
+                                    info.stream_sequence,
+                                );
+                                metrics::log_replication_transport_consumer_sequence(
+                                    info.consumer_sequence,
+                                );
+                                let now_ns = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos()
+                                    as i128;
+                                let published_ns = info.published.unix_timestamp_nanos();
+                                if now_ns >= published_ns {
+                                    metrics::log_replication_transport_lag(
+                                        (now_ns - published_ns) as f64 / 1_000_000_000.0,
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                tracing::debug!("Failed to parse JetStream message info: {e}");
+                            },
+                        }
+                        if let Err(e) = msg.ack().await {
+                            tracing::warn!("Failed to ack NATS message: {e:?}");
+                        }
+                        let envelope: DeltaEnvelope = match serde_json::from_slice(&msg.payload) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::error!("Failed to deserialize delta from NATS: {e}");
+                                return Some(Err(anyhow::anyhow!(
+                                    "Failed to deserialize delta: {e}"
+                                )));
+                            },
+                        };
+                        if envelope.ts <= from_ts_u64 {
+                            return None;
+                        }
+                        // Skip deltas published by this node to avoid double-applying.
+                        if !envelope.source_node.is_empty() && envelope.source_node == node_name {
+                            tracing::debug!("Skipping self-published delta at ts={}", envelope.ts,);
+                            return None;
+                        }
+                        tracing::debug!(
+                            "Received commit delta from NATS: ts={}, source={}",
+                            envelope.ts,
+                            envelope.source_node,
+                        );
+                        Some(envelope.to_delta())
+                    },
+                    Err(e) => {
+                        tracing::error!("NATS message error: {e}");
+                        Some(Err(anyhow::anyhow!("NATS message error: {e}")))
+                    },
+                }
+            }
+        });
+
+        Ok(Box::pin(stream))
+    }
+
     /// Connect to NATS and create/get the JetStream stream.
     pub async fn connect(config: NatsConfig) -> anyhow::Result<Self> {
         // async-nats pulls in rustls which needs a crypto provider.
@@ -149,13 +281,21 @@ pub struct DeltaEnvelope {
     /// Consumers skip deltas from their own node to avoid double-applying.
     #[serde(default)]
     source_node: String,
+    /// Raft node ID that originally proposed this delta, when serialized for
+    /// intra-partition Raft replication.
+    #[serde(default)]
+    source_raft_node_id: Option<u64>,
     /// Partition that originated this replication event.
     #[serde(default)]
     source_partition: Option<u32>,
 }
 
 impl DeltaEnvelope {
-    pub fn from_delta(delta: &CommitDelta, source_node: &str) -> anyhow::Result<Self> {
+    pub fn from_delta(
+        delta: &CommitDelta,
+        source_node: &str,
+        source_raft_node_id: Option<u64>,
+    ) -> anyhow::Result<Self> {
         let document_updates_proto = delta
             .document_updates
             .iter()
@@ -178,6 +318,7 @@ impl DeltaEnvelope {
             document_updates_proto,
             tablet_mapping,
             source_node: source_node.to_string(),
+            source_raft_node_id,
             source_partition: delta.source_partition.map(|partition| partition.0),
         })
     }
@@ -220,6 +361,10 @@ impl DeltaEnvelope {
             source_partition: self.source_partition.map(PartitionId),
         })
     }
+
+    pub fn source_raft_node_id(&self) -> Option<u64> {
+        self.source_raft_node_id
+    }
 }
 
 #[async_trait]
@@ -228,7 +373,7 @@ impl DistributedLog for NatsDistributedLog {
         let ts = u64::from(delta.ts);
         let num_updates = delta.document_updates.len();
 
-        let envelope = DeltaEnvelope::from_delta(&delta, &self.consumer_name)?;
+        let envelope = DeltaEnvelope::from_delta(&delta, &self.consumer_name, None)?;
         let payload = serde_json::to_vec(&envelope).context("Failed to serialize CommitDelta")?;
         let payload_size = payload.len();
         let publish_timer = metrics::replication_transport_publish_timer();
@@ -261,118 +406,14 @@ impl DistributedLog for NatsDistributedLog {
         &self,
         from_ts: Timestamp,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
-        // Create a durable consumer so it survives reconnections.
-        // DeliverPolicy::All replays all messages from the stream beginning,
-        // and we filter out messages at or before from_ts ourselves.
-        let consumer_name = self.consumer_name.clone();
-        let mut consumer: PullConsumer = self
-            .stream
-            .get_or_create_consumer(
-                &consumer_name,
-                jetstream::consumer::pull::Config {
-                    durable_name: Some(consumer_name.clone()),
-                    deliver_policy: jetstream::consumer::DeliverPolicy::All,
-                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                    ..Default::default()
-                },
-            )
-            .await
-            .context("Failed to create NATS durable consumer")?;
-        let consumer_info = consumer
-            .info()
-            .await
-            .context("Failed to get NATS consumer info")?
-            .clone();
-        metrics::log_replication_transport_pending_messages(consumer_info.num_pending);
-        metrics::log_replication_transport_stream_sequence(
-            consumer_info.delivered.stream_sequence,
-        );
-        metrics::log_replication_transport_consumer_sequence(
-            consumer_info.delivered.consumer_sequence,
-        );
+        self.subscribe_inner(from_ts, None).await
+    }
 
-        let from_ts_u64 = u64::from(from_ts);
-        let messages = consumer
-            .messages()
-            .await
-            .context("Failed to start consuming NATS messages")?;
-
-        tracing::info!(
-            "Subscribed to NATS stream '{}' with durable consumer '{}', from_ts={}",
-            STREAM_NAME,
-            consumer_name,
-            from_ts_u64,
-        );
-
-        let self_node_name = consumer_name.clone();
-        let stream = messages.filter_map(move |msg_result| {
-            let node_name = self_node_name.clone();
-            async move {
-                match msg_result {
-                    Ok(msg) => {
-                        metrics::log_replication_transport_message_bytes(
-                            "consume",
-                            msg.payload.len(),
-                        );
-                        match msg.info() {
-                            Ok(info) => {
-                                metrics::log_replication_transport_pending_messages(info.pending);
-                                metrics::log_replication_transport_stream_sequence(
-                                    info.stream_sequence,
-                                );
-                                metrics::log_replication_transport_consumer_sequence(
-                                    info.consumer_sequence,
-                                );
-                                let now_ns = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_nanos() as i128;
-                                let published_ns = info.published.unix_timestamp_nanos();
-                                if now_ns >= published_ns {
-                                    metrics::log_replication_transport_lag(
-                                        (now_ns - published_ns) as f64 / 1_000_000_000.0,
-                                    );
-                                }
-                            },
-                            Err(e) => {
-                                tracing::debug!("Failed to parse JetStream message info: {e}");
-                            },
-                        }
-                        if let Err(e) = msg.ack().await {
-                            tracing::warn!("Failed to ack NATS message: {e:?}");
-                        }
-                        let envelope: DeltaEnvelope = match serde_json::from_slice(&msg.payload) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                tracing::error!("Failed to deserialize delta from NATS: {e}");
-                                return Some(Err(anyhow::anyhow!(
-                                    "Failed to deserialize delta: {e}"
-                                )));
-                            },
-                        };
-                        if envelope.ts <= from_ts_u64 {
-                            return None;
-                        }
-                        // Skip deltas published by this node to avoid double-applying.
-                        if !envelope.source_node.is_empty() && envelope.source_node == node_name {
-                            tracing::debug!("Skipping self-published delta at ts={}", envelope.ts,);
-                            return None;
-                        }
-                        tracing::debug!(
-                            "Received commit delta from NATS: ts={}, source={}",
-                            envelope.ts,
-                            envelope.source_node,
-                        );
-                        Some(envelope.to_delta())
-                    },
-                    Err(e) => {
-                        tracing::error!("NATS message error: {e}");
-                        Some(Err(anyhow::anyhow!("NATS message error: {e}")))
-                    },
-                }
-            }
-        });
-
-        Ok(Box::pin(stream))
+    async fn subscribe_filtered(
+        &self,
+        from_ts: Timestamp,
+        source_partitions: Option<Vec<PartitionId>>,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+        self.subscribe_inner(from_ts, source_partitions).await
     }
 }

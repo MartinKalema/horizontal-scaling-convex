@@ -87,6 +87,36 @@ use crate::{
 
 const INTERNAL_BACKEND_HTTP_PORT: u16 = 3210;
 
+async fn raft_leader_origin(st: &LocalAppState) -> anyhow::Result<Option<String>> {
+    let Some(raft_state) = st.raft_state.as_ref() else {
+        return Ok(None);
+    };
+    if raft_state.is_leader() {
+        return Ok(None);
+    }
+    let peer_http_origins = st.raft_peer_http_origins.as_ref().context(
+        "RAFT_PEERS is required to forward deploy metadata operations to the Raft leader",
+    )?;
+    for _ in 0..50 {
+        let leader_id = raft_state.leader_id();
+        if leader_id != 0 {
+            let leader_origin = peer_http_origins.get(&leader_id).with_context(|| {
+                format!("Missing RAFT_PEERS entry for Raft leader node {leader_id}")
+            })?;
+            return Ok(Some(leader_origin.clone()));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(None)
+}
+
+async fn deploy_target_origin(st: &LocalAppState) -> anyhow::Result<Option<String>> {
+    if let Some(origin) = metadata_owner_origin(st)? {
+        return Ok(Some(origin));
+    }
+    raft_leader_origin(st).await
+}
+
 fn metadata_owner_origin(st: &LocalAppState) -> anyhow::Result<Option<String>> {
     let Some(local_partition) = st.partition_id else {
         return Ok(None);
@@ -104,7 +134,7 @@ fn metadata_owner_origin(st: &LocalAppState) -> anyhow::Result<Option<String>> {
     Ok(Some(http_origin_from_peer_addr(owner_addr)?))
 }
 
-fn http_origin_from_peer_addr(addr: &str) -> anyhow::Result<String> {
+pub(crate) fn http_origin_from_peer_addr(addr: &str) -> anyhow::Result<String> {
     let normalized = if addr.contains("://") {
         addr.to_string()
     } else {
@@ -179,7 +209,7 @@ where
     Req: Serialize + AdminKeyCarrier,
     Resp: DeserializeOwned,
 {
-    let Some(owner_origin) = metadata_owner_origin(st)? else {
+    let Some(target_origin) = deploy_target_origin(st).await? else {
         return Ok(None);
     };
     let identity = if needs_write_access {
@@ -197,11 +227,11 @@ where
         )
         .await?
     };
-    let owner_instance_name = metadata_owner_instance_name(&owner_origin).await?;
-    let owner_admin_key = issue_owner_admin_key(st, &owner_instance_name, &identity)?;
-    req.set_admin_key(owner_admin_key);
+    let target_instance_name = metadata_owner_instance_name(&target_origin).await?;
+    let target_admin_key = issue_owner_admin_key(st, &target_instance_name, &identity)?;
+    req.set_admin_key(target_admin_key);
     Ok(Some(
-        forward_deploy_request(&owner_origin, path, req).await?,
+        forward_deploy_request(&target_origin, path, req).await?,
     ))
 }
 

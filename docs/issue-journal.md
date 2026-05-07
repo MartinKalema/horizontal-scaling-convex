@@ -269,9 +269,135 @@ own for distributed changes.
     on the scraped node, so those names will appear after the next real
     snapshot-apply event on that node
 
+### 2026-04 — Same-partition followers still depend on NATS for application/deploy convergence
+
+- **Status:** open
+- **Related issue:** `#74`
+- **Symptom:** the first safe-looking `#74` attempt added partition-filtered
+  JetStream subscriptions and stopped partitioned nodes from consuming their
+  own partition's NATS subject, on the assumption that same-partition followers
+  already had everything they needed from Raft. The full clean-cluster
+  validation split cleanly:
+  - `77/77` write-scaling tests still passed
+  - the `10`-test Raft failover suite broke immediately
+  - followers in the same partition no longer agreed with the leader after a
+    single write, and they could not take over correctly after the leader was
+    killed
+- **Root Cause:** our current follower state convergence path still relies on
+  same-partition `CommitDelta` delivery over NATS. Removing the local-partition
+  JetStream feed did not just reduce cross-partition fanout; it also stopped
+  same-partition followers from converging application-visible deployment/data
+  state well enough to serve queries and become healthy write leaders during
+  failover. In other words, this codebase is not yet at the point where Raft
+  alone makes a follower query-ready for its partition.
+- **Fix:** roll back the runtime behavior change so partitioned nodes continue
+  consuming all partition subjects for now, keep the filtered-subscribe support
+  in the distributed-log abstraction/NATS transport as dormant groundwork, and
+  treat `#74` as blocked on a precursor: make same-partition followers fully
+  self-sufficient from their own Raft/apply path before we try to trim local
+  partition NATS traffic.
+- **Validation:**
+  - focused cargo pass after rollback:
+    `cargo test -p local_backend test_fresh_replica_bootstraps_from_checkpoint -- --nocapture`
+  - attempted optimization image on a clean cluster:
+    - `77/77` write-scaling tests passed
+    - Raft failover suite failed at follower agreement and post-leader-kill
+      writes
+  - rebuilt rollback image and reran the full clean-cluster harness:
+    `self-hosted/docker/test.sh`
+    Result: all `77` write-scaling tests passed and all `10` Raft failover
+    tests passed
+
+### 2026-05 — Test 29 exposed that replication frontier was not a strong-read fence
+
+- **Status:** fixed
+- **Related issue:** `#74`
+- **Symptom:** Write Scaling Test 29 (`Max Batch Size 200 docs`) failed in a
+  very specific way on the clean cluster:
+  - forwarded `messages:batchWrite(count=200)` returned success via Node A
+  - the immediate local `messages:countBatch(prefix)` on that same node
+    returned `0`
+  - cross-node reads could already see all `200`
+  - the local follower converged to `200` about a second later
+- **Root Cause:** we were treating the per-partition `replication_frontier`
+  like a strong local read fence. That frontier was allowed to advance on
+  idle/empty replication heartbeats, so a same-partition follower could decide
+  "I am fresh enough" before the actual batch write had become query-visible on
+  that node. This is exactly the distinction that TiKV makes between
+  leader-side progress (`resolved-ts`) and follower-safe local read progress
+  (`safe-ts`): observed replication progress is not automatically a safe local
+  strong-read timestamp.
+- **Fix:** split the signal in the snapshot manager:
+  - keep `replication_frontier` for observed/stale-read-style progress and
+    observability
+  - add a separate per-partition `replication_write_frontier` that advances
+    only when a real replicated write is published into the local snapshot/write
+    state
+  - make forwarded follower mutations wait on this write frontier instead of
+    the heartbeat-advancing frontier before returning success to the caller
+- **Validation:**
+  - targeted regression:
+    `cargo test -p database test_replication_frontier_heartbeat_does_not_advance_snapshot_ts -- --nocapture`
+  - focused forwarding proof:
+    `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
+  - fresh image rebuild, clean profile-scoped reset
+    `docker compose --profile cluster down -v --remove-orphans`, cluster
+    restart via `docker compose --profile cluster up -d`, and full harness
+    rerun:
+    `self-hosted/docker/test.sh`
+    Result: all `77` write-scaling tests passed and all `10` Raft failover
+    tests passed, including Test 29
+
+### 2026-05 — Same-partition followers became self-sufficient from Raft/apply
+
+- **Status:** fixed
+- **Related issue:** `#74`
+- **Symptom:** the first partition-filtering attempt had shown that removing a
+  partition's own NATS subject broke failover, which looked like proof that
+  same-partition followers still needed local-partition `CommitDelta` traffic.
+- **Root Cause:** the follower gap was not inherent to the design; it was in
+  our Raft apply path. We were skipping committed Raft entries based on whether
+  the node was *currently* leader instead of whether the entry had originally
+  been proposed locally. After leader changes, a node could become leader and
+  incorrectly skip committed entries that originated on the old leader. NATS
+  happened to mask that bug by delivering the same-partition delta through a
+  second path.
+- **Fix:** make Raft apply origin-aware and then trim NATS fanout:
+  - tag intra-partition Raft-published deltas with the proposing
+    `source_raft_node_id`
+  - apply every committed Raft delta locally unless this exact node already
+    proposed and applied it itself
+  - once same-partition followers were converging correctly from Raft/apply,
+    switch partitioned `ReplicaDeltaConsumer` subscriptions to only the *other*
+    partitions' NATS subjects via `subscribe_filtered(...)`
+- **Why this matches the big databases:** mature systems treat the ordered
+  replicated log as the authoritative path for same-replica convergence, and
+  then layer changefeeds/streaming on top of that. They do not depend on a
+  secondary change stream to make Raft followers query-ready:
+  - etcd/raft requires `Ready` batches to be handled and applied in order
+  - TiKV's apply worker is explicitly responsible for committed Raft entries
+  - CockroachDB followers catch up by replaying the Raft log or loading a
+    snapshot and then replaying later actions
+  - YugabyteDB followers apply committed log entries to their state machine
+- **Validation:**
+  - focused forwarding proof:
+    `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
+  - fresh image rebuild from the filtered-subscribe branch state
+  - clean profile-scoped reset:
+    `docker compose --profile cluster down -v --remove-orphans`
+  - cluster restart:
+    `docker compose --profile cluster up -d`
+  - full clean-cluster harness rerun:
+    `self-hosted/docker/test.sh`
+    Result: all `77` write-scaling tests passed and all `10` Raft failover
+    tests passed with partitioned nodes no longer consuming their own
+    partition's NATS subject
+
 ## Open Issues
 
-None currently tracked in this journal after the latest clean-cluster run.
+- `#74` is no longer blocked on follower self-sufficiency. The current
+  remaining question is how far we want to push selective fanout beyond
+  excluding same-partition NATS traffic.
 
 ## Notes
 

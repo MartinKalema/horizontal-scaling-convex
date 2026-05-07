@@ -636,6 +636,7 @@ impl<RT: Runtime> Committer<RT> {
                             sm.push(commit_ts, snapshot, write_bytes);
                             if let Some(source_partition) = source_partition {
                                 sm.update_replication_frontier(source_partition, commit_ts)?;
+                                sm.update_replication_write_frontier(source_partition, commit_ts)?;
                             }
                             let _ = result.send(Ok(commit_ts));
                         },
@@ -729,6 +730,16 @@ impl<RT: Runtime> Committer<RT> {
                             } else {
                                 commit_id += 1;
                             }
+                        },
+                        Some(CommitterMessage::SetRaftState { raft_state, result }) => {
+                            tracing::info!(
+                                "Committer attached to Raft partition {} (leader={}, leader_id={})",
+                                raft_state.partition_id(),
+                                raft_state.is_leader(),
+                                raft_state.leader_id(),
+                            );
+                            self.raft_state = Some(raft_state);
+                            let _ = result.send(());
                         },
                         Some(CommitterMessage::InstallSnapshot { checkpoint, result }) => {
                             self.install_snapshot(checkpoint, result, commit_id)?;
@@ -1674,7 +1685,8 @@ impl<RT: Runtime> Committer<RT> {
             if raft.is_leader() {
                 let envelope = crate::nats_distributed_log::DeltaEnvelope::from_delta(
                     &delta,
-                    &format!("raft-leader"),
+                    "",
+                    Some(raft.node_id()),
                 );
                 if let Ok(envelope) = envelope {
                     if let Ok(data) = serde_json::to_vec(&envelope) {
@@ -2826,6 +2838,23 @@ impl CommitterClient {
         rx.await.map_err(|_| metrics::shutdown_error())?
     }
 
+    pub async fn set_raft_state(
+        &self,
+        raft_state: crate::raft_partition::RaftPartitionState,
+    ) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::SetRaftState {
+            raft_state,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?;
+        Ok(())
+    }
+
     pub async fn finish_table_summary_bootstrap(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::FinishTableSummaryBootstrap { result: tx };
@@ -3237,6 +3266,10 @@ enum CommitterMessage {
     ApplyReplicaDelta {
         delta: CommitDelta,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
+    },
+    SetRaftState {
+        raft_state: crate::raft_partition::RaftPartitionState,
+        result: oneshot::Sender<()>,
     },
     InstallSnapshot {
         checkpoint: CheckpointData,

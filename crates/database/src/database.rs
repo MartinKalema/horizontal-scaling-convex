@@ -1168,6 +1168,16 @@ impl<RT: Runtime> Database<RT> {
     }
 
     #[cfg(test)]
+    pub(crate) fn replication_write_frontier_for_test(
+        &self,
+        partition: crate::partition::PartitionId,
+    ) -> Option<Timestamp> {
+        self.snapshot_manager
+            .lock()
+            .replication_write_frontier(partition)
+    }
+
+    #[cfg(test)]
     pub(crate) fn persisted_max_repeatable_ts_for_test(&self) -> RepeatableTimestamp {
         self.snapshot_manager.lock().persisted_max_repeatable_ts()
     }
@@ -1216,6 +1226,13 @@ impl<RT: Runtime> Database<RT> {
     /// the apply loop.
     pub fn committer_client(&self) -> CommitterClient {
         self.committer.clone()
+    }
+
+    pub async fn attach_raft_state(
+        &self,
+        raft_state: crate::raft_partition::RaftPartitionState,
+    ) -> anyhow::Result<()> {
+        self.committer.set_raft_state(raft_state).await
     }
 
     pub fn load_documents_in_table<'a>(
@@ -1667,6 +1684,30 @@ impl<RT: Runtime> Database<RT> {
             let fut = self.snapshot_manager.lock().wait_for_higher_ts(pred);
             fut.await;
         }
+    }
+
+    pub async fn wait_for_replication_frontier(
+        &self,
+        partition: crate::partition::PartitionId,
+        write_ts: Timestamp,
+    ) {
+        let fut = self
+            .snapshot_manager
+            .lock()
+            .wait_for_replication_frontier(partition, write_ts);
+        fut.await;
+    }
+
+    pub async fn wait_for_replication_write_frontier(
+        &self,
+        partition: crate::partition::PartitionId,
+        write_ts: Timestamp,
+    ) {
+        let fut = self
+            .snapshot_manager
+            .lock()
+            .wait_for_replication_write_frontier(partition, write_ts);
+        fut.await;
     }
 
     pub async fn begin_system(&self) -> anyhow::Result<Transaction<RT>> {

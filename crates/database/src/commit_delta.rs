@@ -92,6 +92,19 @@ pub trait DistributedLog: Send + Sync + 'static {
         &self,
         from_ts: Timestamp,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>>;
+
+    /// Subscribe to deltas starting after `from_ts`, optionally restricting
+    /// delivery to specific source partitions.
+    ///
+    /// Implementations that do not support filtering can fall back to
+    /// [`subscribe`] and perform any filtering client-side.
+    async fn subscribe_filtered(
+        &self,
+        from_ts: Timestamp,
+        _source_partitions: Option<Vec<PartitionId>>,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+        self.subscribe(from_ts).await
+    }
 }
 
 /// No-op implementation for single-node deployments. `publish` does nothing,

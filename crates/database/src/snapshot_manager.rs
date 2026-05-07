@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::{
         BTreeMap,
         VecDeque,
@@ -92,9 +93,12 @@ pub struct SnapshotManager {
     persisted_max_repeatable_ts: Timestamp,
     versions: VecDeque<(Timestamp, Snapshot)>,
     replication_frontiers: BTreeMap<PartitionId, Timestamp>,
+    replication_write_frontiers: BTreeMap<PartitionId, Timestamp>,
     write_throughput_limiter: WriteThroughputLimiter,
     waiters: Mutex<VecDeque<(Timestamp, oneshot::Sender<()>)>>,
     replication_waiters: Mutex<BTreeMap<PartitionId, VecDeque<(Timestamp, oneshot::Sender<()>)>>>,
+    replication_write_waiters:
+        Mutex<BTreeMap<PartitionId, VecDeque<(Timestamp, oneshot::Sender<()>)>>>,
 }
 
 #[derive(Clone)]
@@ -588,6 +592,10 @@ impl SnapshotManager {
         initial_snapshot: Snapshot,
         replication_frontiers: BTreeMap<PartitionId, Timestamp>,
     ) -> Self {
+        let replication_write_frontiers = replication_frontiers
+            .iter()
+            .map(|(partition, frontier)| (*partition, cmp::min(*frontier, initial_ts)))
+            .collect::<BTreeMap<_, _>>();
         let mut versions = VecDeque::new();
         versions.push_back((initial_ts, initial_snapshot));
         metrics::log_latest_repeatable_ts(initial_ts);
@@ -595,13 +603,18 @@ impl SnapshotManager {
         for (partition, frontier) in &replication_frontiers {
             metrics::log_replication_frontier_ts(*partition, *frontier);
         }
+        for (partition, frontier) in &replication_write_frontiers {
+            metrics::log_replication_write_frontier_ts(*partition, *frontier);
+        }
         Self {
             versions,
             persisted_max_repeatable_ts: initial_ts,
             replication_frontiers,
+            replication_write_frontiers,
             write_throughput_limiter: WriteThroughputLimiter::new(),
             waiters: Mutex::new(VecDeque::new()),
             replication_waiters: Mutex::new(BTreeMap::new()),
+            replication_write_waiters: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -679,6 +692,30 @@ impl SnapshotManager {
         }
     }
 
+    fn notify_replication_write_waiters(&self, partition: PartitionId) {
+        let Some(frontier) = self.replication_write_frontiers.get(&partition).copied() else {
+            return;
+        };
+        let mut waiters = self.replication_write_waiters.lock();
+        let Some(partition_waiters) = waiters.get_mut(&partition) else {
+            return;
+        };
+        let mut i = 0;
+        while i < partition_waiters.len() {
+            if frontier >= partition_waiters[i].0 || partition_waiters[i].1.is_closed() {
+                let waiter = partition_waiters
+                    .swap_remove_back(i)
+                    .expect("checked above");
+                let _ = waiter.1.send(());
+                continue;
+            }
+            i += 1;
+        }
+        if partition_waiters.is_empty() {
+            waiters.remove(&partition);
+        }
+    }
+
     /// Returns a future that blocks until the snapshot manager has advanced
     /// past the given timestamp.
     pub fn wait_for_higher_ts(&self, target_ts: Timestamp) -> impl Future<Output = ()> + use<> {
@@ -708,6 +745,10 @@ impl SnapshotManager {
         self.replication_frontiers.clone()
     }
 
+    pub fn replication_write_frontier(&self, partition: PartitionId) -> Option<Timestamp> {
+        self.replication_write_frontiers.get(&partition).copied()
+    }
+
     pub fn update_replication_frontier(
         &mut self,
         partition: PartitionId,
@@ -728,6 +769,26 @@ impl SnapshotManager {
         Ok(true)
     }
 
+    pub fn update_replication_write_frontier(
+        &mut self,
+        partition: PartitionId,
+        ts: Timestamp,
+    ) -> anyhow::Result<bool> {
+        if let Some(current) = self.replication_write_frontiers.get(&partition) {
+            anyhow::ensure!(
+                ts >= *current,
+                "replication write frontier for {partition} went backward from {current:?} to {ts:?}",
+            );
+            if ts == *current {
+                return Ok(false);
+            }
+        }
+        self.replication_write_frontiers.insert(partition, ts);
+        metrics::log_replication_write_frontier_ts(partition, ts);
+        self.notify_replication_write_waiters(partition);
+        Ok(true)
+    }
+
     pub fn wait_for_replication_frontier(
         &self,
         partition: PartitionId,
@@ -744,6 +805,36 @@ impl SnapshotManager {
         } else {
             let (sender, receiver) = oneshot::channel();
             self.replication_waiters
+                .lock()
+                .entry(partition)
+                .or_default()
+                .push_back((target_ts, sender));
+            Some(receiver)
+        };
+
+        async move {
+            if let Some(receiver) = receiver {
+                _ = receiver.await;
+            }
+        }
+    }
+
+    pub fn wait_for_replication_write_frontier(
+        &self,
+        partition: PartitionId,
+        target_ts: Timestamp,
+    ) -> impl Future<Output = ()> + use<> {
+        self.notify_replication_write_waiters(partition);
+
+        let receiver = if self
+            .replication_write_frontiers
+            .get(&partition)
+            .is_some_and(|frontier| *frontier >= target_ts)
+        {
+            None
+        } else {
+            let (sender, receiver) = oneshot::channel();
+            self.replication_write_waiters
                 .lock()
                 .entry(partition)
                 .or_default()
@@ -893,19 +984,28 @@ impl SnapshotManager {
         snapshot: Snapshot,
         replication_frontiers: BTreeMap<PartitionId, Timestamp>,
     ) {
+        let replication_write_frontiers = replication_frontiers
+            .iter()
+            .map(|(partition, frontier)| (*partition, cmp::min(*frontier, ts)))
+            .collect::<BTreeMap<_, _>>();
         self.versions.clear();
         self.versions.push_back((ts, snapshot));
         self.persisted_max_repeatable_ts = ts;
         self.replication_frontiers = replication_frontiers;
+        self.replication_write_frontiers = replication_write_frontiers;
         metrics::log_latest_repeatable_ts(ts);
         metrics::log_persisted_max_repeatable_ts(ts);
         for (partition, frontier) in &self.replication_frontiers {
             metrics::log_replication_frontier_ts(*partition, *frontier);
         }
+        for (partition, frontier) in &self.replication_write_frontiers {
+            metrics::log_replication_write_frontier_ts(*partition, *frontier);
+        }
         self.notify_waiters();
         let partitions: Vec<_> = self.replication_frontiers.keys().copied().collect();
         for partition in partitions {
             self.notify_replication_waiters(partition);
+            self.notify_replication_write_waiters(partition);
         }
     }
 

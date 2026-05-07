@@ -143,6 +143,8 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
         let forwarder = MutationForwarderService::new(api, st.instance_name.clone());
         let two_pc = two_phase_service::TwoPhaseCommitGrpcService::new(
             st.application.database().committer_client(),
+            st.raft_state.clone(),
+            st.raft_peer_grpc_urls.clone(),
         );
 
         // Add Raft transport server if Raft is enabled.

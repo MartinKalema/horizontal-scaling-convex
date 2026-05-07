@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use application::{
     api::ExecuteQueryTimestamp,
@@ -54,6 +56,7 @@ use value::{
 use crate::{
     args_structs::UdfPostRequestWithComponent,
     authentication::ExtractAuthenticationToken,
+    mutation_forwarder::MutationForwarderGrpcClient,
     parse::{
         parse_export_path,
         parse_udf_path,
@@ -194,6 +197,15 @@ impl UdfResponse {
     }
 }
 
+async fn wait_for_local_mutation_visibility(st: &RouterState, commit_ts: Timestamp) {
+    st.database.wait_for_write_ts(commit_ts).await;
+    if let Some(partition_id) = st.partition_id {
+        st.database
+            .wait_for_replication_write_frontier(partition_id, commit_ts)
+            .await;
+    }
+}
+
 async fn maybe_forward_public_mutation(
     st: &RouterState,
     path: &str,
@@ -202,22 +214,77 @@ async fn maybe_forward_public_mutation(
     identity: keybroker::Identity,
     client_version: &ClientVersion,
 ) -> Result<Option<Result<UdfResponse, HttpResponseError>>, HttpResponseError> {
-    if !st.replica_mode {
-        return Ok(None);
+    enum ForwardingMode {
+        Replica(Arc<MutationForwarderGrpcClient>),
+        RaftFollower(Arc<MutationForwarderGrpcClient>),
     }
 
-    let Some(forwarder) = &st.replica_mutation_forwarder else {
-        return Ok(Some(Err(anyhow::anyhow!(
-            ErrorMetadata::service_unavailable()
-        )
-        .context(
-            "Replica mutation forwarding is not configured. Set PRIMARY_GRPC_URL for replica mode.",
-        )
-        .into())));
+    let forwarding_mode = if st.replica_mode {
+        Some(ForwardingMode::Replica(
+            st.replica_mutation_forwarder
+                .as_ref()
+                .context(
+                    "Replica mutation forwarding is not configured. Set PRIMARY_GRPC_URL for \
+                     replica mode.",
+                )
+                .map_err(|e| {
+                    HttpResponseError::from(
+                        anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(e),
+                    )
+                })?
+                .clone(),
+        ))
+    } else if let Some(raft_state) = st.raft_state.as_ref() {
+        if raft_state.is_leader() {
+            None
+        } else {
+            let leader_id = raft_state.leader_id();
+            if leader_id == 0 {
+                tracing::warn!(
+                    "Skipping follower mutation forwarding because partition has no elected Raft \
+                     leader yet"
+                );
+                return Ok(None);
+            }
+            let Some(leader_grpc_url) = st
+                .raft_peer_grpc_urls
+                .as_ref()
+                .and_then(|urls| urls.get(&leader_id))
+                .cloned()
+            else {
+                tracing::warn!(
+                    "Skipping follower mutation forwarding because RAFT_PEERS is missing leader \
+                     node {leader_id}"
+                );
+                return Ok(None);
+            };
+            match MutationForwarderGrpcClient::connect(&leader_grpc_url).await {
+                Ok(client) => Some(ForwardingMode::RaftFollower(Arc::new(client))),
+                Err(e) => {
+                    tracing::warn!(
+                        "Skipping follower mutation forwarding because leader {} at {} is not \
+                         reachable yet: {:#}",
+                        leader_id,
+                        leader_grpc_url,
+                        e
+                    );
+                    return Ok(None);
+                },
+            }
+        }
+    } else {
+        None
+    };
+
+    let Some(forwarding_mode) = forwarding_mode else {
+        return Ok(None);
+    };
+    let forwarder = match &forwarding_mode {
+        ForwardingMode::Replica(client) | ForwardingMode::RaftFollower(client) => client,
     };
 
     let value_format = format.map(|f| f.parse()).transpose()?;
-    let forwarded = forwarder
+    let forwarded = match forwarder
         .forward(
             path,
             serialized_args.get(),
@@ -225,13 +292,31 @@ async fn maybe_forward_public_mutation(
             &client_version.to_string(),
         )
         .await
-        .map_err(|e| {
-            anyhow::anyhow!(ErrorMetadata::service_unavailable())
+    {
+        Ok(forwarded) => forwarded,
+        Err(e) => match forwarding_mode {
+            ForwardingMode::Replica(_) => {
+                return Ok(Some(Err(anyhow::anyhow!(
+                    ErrorMetadata::service_unavailable()
+                )
                 .context(format!("Failed to forward mutation to primary: {e:#}"))
-        })?;
+                .into())));
+            },
+            ForwardingMode::RaftFollower(_) => {
+                tracing::warn!(
+                    "Skipping follower mutation forwarding because the leader RPC failed: {:#}",
+                    e
+                );
+                return Ok(None);
+            },
+        },
+    };
 
     let response = match forwarded.result {
         Some(pb::replication::forward_mutation_response::Result::Success(success)) => {
+            if matches!(forwarding_mode, ForwardingMode::RaftFollower(_)) {
+                wait_for_local_mutation_visibility(st, Timestamp::try_from(success.ts)?).await;
+            }
             let packed = JsonPackedValue::from_network(success.value).context(
                 ErrorMetadata::bad_request(
                     "InvalidForwardedMutationValue",
@@ -746,9 +831,12 @@ pub async fn public_mutation_post(
         .await?;
     let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
     let response = match udf_result {
-        Ok(write_return) => UdfResponse::Success {
-            value: export_value(write_return.value.unpack()?, value_format, client_version)?,
-            log_lines: write_return.log_lines,
+        Ok(write_return) => {
+            wait_for_local_mutation_visibility(&st, write_return.ts).await;
+            UdfResponse::Success {
+                value: export_value(write_return.value.unpack()?, value_format, client_version)?,
+                log_lines: write_return.log_lines,
+            }
         },
         Err(write_error) => UdfResponse::error(
             write_error.error,
