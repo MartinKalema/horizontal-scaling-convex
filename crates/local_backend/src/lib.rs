@@ -106,6 +106,7 @@ pub mod node_action_callbacks;
 pub mod parse;
 pub mod proxy;
 pub mod public_api;
+pub mod query_forwarding_api;
 pub mod router;
 pub mod scheduling;
 pub mod schema;
@@ -163,6 +164,7 @@ pub struct RouterState {
     pub runtime: ProdRuntime,
     pub replica_mode: bool,
     pub partition_id: Option<database::partition::PartitionId>,
+    pub node_addresses: Option<database::two_phase::NodeAddresses>,
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
     pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
@@ -448,11 +450,116 @@ pub async fn make_app(
         runtime.spawn_background("beacon_worker", beacon_future);
     }
 
+    if let Some(nats_url) = &config.nats_url {
+        let nats_url = nats_url.clone();
+        let registry_node_name = config.name();
+        let delta_interest_tracker = database.delta_interest_tracker();
+        let mut interest_rx = delta_interest_tracker.watch();
+        runtime.spawn_background("selective_delivery_interest_publisher", async move {
+            let registry = match database::selective_delivery::SelectiveDeliveryRegistry::connect(
+                &nats_url,
+                registry_node_name.clone(),
+            )
+            .await
+            {
+                Ok(registry) => registry,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to start selective-delivery interest publisher for {}: {e:#}",
+                        registry_node_name,
+                    );
+                    return;
+                },
+            };
+
+            loop {
+                delta_interest_tracker.prune_expired();
+                let interest_snapshot = interest_rx.borrow().clone();
+                if let Err(e) = registry.publish_local_interest(&interest_snapshot).await {
+                    tracing::warn!(
+                        "Failed to publish selective-delivery interest for {}: {e:#}",
+                        registry_node_name,
+                    );
+                }
+                tokio::select! {
+                    changed = interest_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
+                }
+            }
+        });
+    }
+
+    if config.partition_id == Some(0) {
+        if let Some(nats_url) = &config.nats_url {
+            let nats_url = nats_url.clone();
+            let shadow_node_name = config.name();
+            let shadow_from_ts = *database.now_ts_for_reads();
+            runtime.spawn_background("selective_delivery_shadow_consumer", async move {
+                let consumer = match database::nats_distributed_log::NatsDistributedLog::connect(
+                    database::nats_distributed_log::NatsConfig {
+                        url: nats_url,
+                        consumer_name: Some(format!("{shadow_node_name}-selective-shadow")),
+                        partition_id: None,
+                    },
+                )
+                .await
+                {
+                    Ok(consumer) => consumer,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to start selective-delivery shadow consumer for {}: {e:#}",
+                            shadow_node_name,
+                        );
+                        return;
+                    },
+                };
+
+                match consumer
+                    .subscribe_node_targeted(shadow_from_ts, &shadow_node_name)
+                    .await
+                {
+                    Ok(mut stream) => {
+                        tracing::info!(
+                            "Selective-delivery shadow consumer subscribed for {}",
+                            shadow_node_name
+                        );
+                        while let Some(result) = futures::StreamExt::next(&mut stream).await {
+                            match result {
+                                Ok(delta) => {
+                                    database::log_selective_delivery_shadow_receive();
+                                    tracing::debug!(
+                                        "Selective-delivery shadow delta observed for {} at ts={}",
+                                        shadow_node_name,
+                                        u64::from(delta.ts),
+                                    );
+                                },
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Selective-delivery shadow consumer error for {}: {e:#}",
+                                        shadow_node_name,
+                                    );
+                                },
+                            }
+                        }
+                    },
+                    Err(e) => tracing::warn!(
+                        "Failed to subscribe selective-delivery shadow consumer for {}: {e:#}",
+                        shadow_node_name,
+                    ),
+                }
+            });
+        }
+    }
+
     // Start the ReplicaDeltaConsumer to tail NATS and apply deltas from other
     // nodes. Runs on:
     //   - Replicas (REPLICATION_MODE=replica): consumes Primary's deltas
-    //   - Partitioned writers (PARTITION_ID set): consumes only other
-    //     partitions' deltas, leaving same-partition convergence to Raft
+    //   - Partitioned writers (PARTITION_ID set): consumes only other partitions'
+    //     deltas, leaving same-partition convergence to Raft
     // Creates a fresh NATS connection dedicated to the consumer.
     let needs_delta_consumer =
         config.replication_mode == "replica" || config.partition_id.is_some();
@@ -460,6 +567,9 @@ pub async fn make_app(
         if let Some(nats_url) = &config.nats_url {
             let nats_url = nats_url.clone();
             let committer = database.committer_client();
+            let use_selective_node_targeting = config
+                .partition_id
+                .is_some_and(|local_partition| local_partition != 0);
             let remote_partitions = config.partition_id.map(|local_partition| {
                 if let Some(num_partitions) = config.num_partitions {
                     (0..num_partitions)
@@ -488,18 +598,22 @@ pub async fn make_app(
             // subjects so same-partition convergence comes from Raft apply.
             // In replica mode, start from the locally visible snapshot, which
             // may have just been bootstrapped from the latest checkpoint.
-            let from_ts = if config.partition_id.is_some() {
+            let from_ts = if use_selective_node_targeting {
+                *database.now_ts_for_reads()
+            } else if config.partition_id.is_some() {
                 common::types::Timestamp::MIN
             } else {
                 *database.now_ts_for_reads()
             };
             let consumer_name = config.name();
+            let broad_consumer_name = consumer_name.clone();
+            let broad_nats_url = nats_url.clone();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
                 let consumer_nats =
                     match database::nats_distributed_log::NatsDistributedLog::connect(
                         database::nats_distributed_log::NatsConfig {
-                            url: nats_url,
-                            consumer_name: Some(consumer_name),
+                            url: broad_nats_url,
+                            consumer_name: Some(broad_consumer_name),
                             partition_id: None,
                         },
                     )
@@ -515,16 +629,43 @@ pub async fn make_app(
                     };
                 let consumer_nats_dyn: Arc<dyn database::commit_delta::DistributedLog> =
                     consumer_nats;
-                tracing::info!(?remote_partitions, "ReplicaDeltaConsumer subscribing to NATS...");
-                match consumer_nats_dyn
-                    .subscribe_filtered(from_ts.into(), remote_partitions.clone())
-                    .await
-                {
+                tracing::info!(
+                    use_selective_node_targeting,
+                    ?remote_partitions,
+                    "ReplicaDeltaConsumer subscribing to NATS..."
+                );
+                let subscribe_result = if use_selective_node_targeting {
+                    let selective_consumer =
+                        database::nats_distributed_log::NatsDistributedLog::connect(
+                            database::nats_distributed_log::NatsConfig {
+                                url: nats_url.clone(),
+                                consumer_name: Some(format!("{consumer_name}-selective")),
+                                partition_id: None,
+                            },
+                        )
+                        .await;
+                    match selective_consumer {
+                        Ok(consumer) => {
+                            consumer
+                                .subscribe_selective_node(from_ts.into(), &consumer_name)
+                                .await
+                        },
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    consumer_nats_dyn
+                        .subscribe_filtered(from_ts.into(), remote_partitions.clone())
+                        .await
+                };
+                match subscribe_result {
                     Ok(mut stream) => {
                         tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
                         while let Some(result) = futures::StreamExt::next(&mut stream).await {
                             match result {
                                 Ok(delta) => {
+                                    if use_selective_node_targeting {
+                                        database::log_selective_delivery_shadow_receive();
+                                    }
                                     let ts = delta.ts;
                                     let n = delta.document_updates.len();
                                     match committer.apply_replica_delta(delta).await {

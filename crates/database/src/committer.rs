@@ -2971,6 +2971,29 @@ impl CommitterClient {
 
         // Finish reading everything from persistence.
         let transaction = transaction.finalize()?;
+        let transaction_classification = self.partition_map.as_ref().map(|partition_map| {
+            crate::two_phase_coordinator::classify_transaction(
+                &transaction,
+                partition_map,
+                &write_source,
+            )
+        });
+
+        if let (
+            Some(partition_map),
+            Some(crate::two_phase_coordinator::TransactionClassification::RemoteSinglePartition {
+                owner,
+            }),
+        ) = (&self.partition_map, &transaction_classification)
+        {
+            anyhow::bail!(
+                "Write rejected: this transaction targets only {}, not this node ({}). Route this \
+                 mutation to the correct partition owner.",
+                owner,
+                partition_map.local_partition(),
+            );
+        }
+
         self.wait_for_remote_read_frontiers(
             *transaction.begin_timestamp,
             transaction.reads.read_set(),
@@ -2987,11 +3010,9 @@ impl CommitterClient {
         // Classify: single-partition (fast path) vs cross-partition (2PC).
         // TiDB 1PC optimization: skip 2PC when all writes target one partition.
         if let Some(ref partition_map) = self.partition_map {
-            match crate::two_phase_coordinator::classify_transaction(
-                &transaction,
-                partition_map,
-                &write_source,
-            ) {
+            match transaction_classification
+                .expect("partitioned commit should always classify the finalized transaction")
+            {
                 crate::two_phase_coordinator::TransactionClassification::SinglePartition => {},
                 crate::two_phase_coordinator::TransactionClassification::RemoteSinglePartition {
                     owner,

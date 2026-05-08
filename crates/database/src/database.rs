@@ -2104,18 +2104,74 @@ impl<RT: Runtime> Database<RT> {
     /// N.B. Only use this function for user subscriptions. System subscriptions
     /// should use `subscribe_and_wait_for_invalidation`.
     pub async fn subscribe(&self, token: Token) -> anyhow::Result<Subscription> {
-        self.subscriptions.subscribe(token, false)
+        let interested_tables = Arc::new(self.read_set_table_names(token.reads())?);
+        self.subscriptions
+            .subscribe(token, interested_tables, false)
     }
 
     pub async fn subscribe_and_wait_for_invalidation(
         &self,
         token: Token,
     ) -> anyhow::Result<Option<Timestamp>> {
-        let subscription = self.subscriptions.subscribe(token, true)?;
+        let interested_tables = Arc::new(self.read_set_table_names(token.reads())?);
+        let subscription = self
+            .subscriptions
+            .subscribe(token, interested_tables, true)?;
         let invalid_ts = subscription.wait_for_invalidation().await;
         let current_ts = self.now_ts_for_reads();
         metrics::log_subscription_invalidation_lag(invalid_ts, *current_ts);
         Ok(invalid_ts)
+    }
+
+    pub fn delta_interest_tracker(&self) -> crate::delta_interest::DeltaInterestTracker {
+        self.subscriptions.delta_interest_tracker()
+    }
+
+    pub fn token_table_names(&self, token: &Token) -> anyhow::Result<BTreeSet<TableName>> {
+        self.read_set_table_names(token.reads())
+    }
+
+    pub fn note_recent_delta_interest_for_token(
+        &self,
+        token: &Token,
+        ttl: Duration,
+    ) -> anyhow::Result<()> {
+        let interested_tables = self.token_table_names(token)?;
+        self.subscriptions
+            .delta_interest_tracker()
+            .refresh_recent_tables(&interested_tables, ttl);
+        Ok(())
+    }
+
+    fn read_set_table_names(&self, reads: &crate::ReadSet) -> anyhow::Result<BTreeSet<TableName>> {
+        let snapshot = self.latest_snapshot()?;
+        let table_mapping = snapshot.table_mapping();
+        let mut table_names = BTreeSet::new();
+
+        let mut record_table = |tablet_id| -> anyhow::Result<()> {
+            if !table_mapping.tablet_id_exists(tablet_id)
+                || table_mapping.is_system_tablet(tablet_id)
+            {
+                return Ok(());
+            }
+            let (_, _, table_name) =
+                table_mapping
+                    .get_table_metadata(tablet_id)
+                    .with_context(|| {
+                        format!("Missing table metadata for subscribed tablet {tablet_id}")
+                    })?;
+            table_names.insert(table_name.clone());
+            Ok(())
+        };
+
+        for (index_name, _) in reads.iter_indexed() {
+            record_table(*index_name.table())?;
+        }
+        for (index_name, _) in reads.iter_search() {
+            record_table(*index_name.table())?;
+        }
+
+        Ok(table_names)
     }
 
     fn streaming_export_table_filter(

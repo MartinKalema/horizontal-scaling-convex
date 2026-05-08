@@ -17,6 +17,7 @@ pub mod commit_delta;
 mod committer;
 mod database;
 mod database_index_workers;
+pub mod delta_interest;
 mod execution_size;
 mod metrics;
 pub mod nats_distributed_log;
@@ -35,6 +36,7 @@ pub mod replica;
 mod retention;
 mod search_index_bootstrap;
 mod search_index_workers;
+pub mod selective_delivery;
 pub mod snapshot_checkpointer;
 mod snapshot_manager;
 mod stack_traces;
@@ -88,6 +90,7 @@ pub use indexing::backend_in_memory_indexes::{
     DatabaseIndexSnapshotCache,
     TimestampedIndexCache,
 };
+pub use metrics::log_selective_delivery_shadow_receive;
 pub use patch::PatchValue;
 pub use preloaded::PreloadedIndexRange;
 pub use reads::{

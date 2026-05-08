@@ -103,6 +103,23 @@ impl RaftPartitionState {
             anyhow::anyhow!("Raft node for partition {} not running", self.partition_id)
         })
     }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_test(
+        is_leader: bool,
+        leader_id: u64,
+        partition_id: PartitionId,
+        node_id: u64,
+    ) -> Self {
+        let (proposal_tx, _proposal_rx) = mpsc::unbounded_channel();
+        Self {
+            is_leader: Arc::new(AtomicBool::new(is_leader)),
+            leader_id: Arc::new(AtomicU64::new(leader_id)),
+            proposal_tx,
+            partition_id,
+            node_id,
+        }
+    }
 }
 
 /// Manager for a Raft-enabled partition.

@@ -11,6 +11,7 @@ import "searchlight.proto";
 // from a client, and the Primary executes it locally.
 service MutationForwarder {
   rpc ForwardMutation(ForwardMutationRequest) returns (ForwardMutationResponse);
+  rpc ForwardQuery(ForwardQueryRequest) returns (ForwardQueryResponse);
 }
 
 message ForwardMutationRequest {
@@ -62,6 +63,57 @@ message MutationError {
 
   // Log lines captured during execution.
   repeated string log_lines = 3;
+}
+
+message ForwardQueryRequest {
+  // The function path to execute (e.g., "messages:list").
+  string path = 1;
+
+  // Serialized function arguments as a JSON array string.
+  string args = 2;
+
+  // The authenticated identity of the caller.
+  convex_identity.UncheckedIdentity identity = 3;
+
+  // Caller type for logging and rate limiting.
+  common.FunctionCaller caller = 4;
+
+  // Optional query timestamp. If unset, execute at latest visible time.
+  optional uint64 ts = 5;
+
+  // Optional serialized query journal for reconnect/retry flows.
+  optional string journal = 6;
+}
+
+message ForwardQueryResponse {
+  QueryToken token = 1;
+  optional string journal = 2;
+
+  oneof result {
+    QuerySuccess success = 3;
+    QueryError error = 4;
+  }
+}
+
+message QueryToken {
+  optional uint64 ts = 1;
+  repeated TwoPcIndexedRead indexed_reads = 2;
+  repeated TwoPcSearchRead search_reads = 3;
+}
+
+message QuerySuccess {
+  // The return value as a JSON string.
+  string value = 1;
+
+  // Log lines captured during execution.
+  common.RedactedLogLines log_lines = 2;
+}
+
+message QueryError {
+  common.RedactedJsError error = 1;
+
+  // Log lines captured during execution.
+  common.RedactedLogLines log_lines = 2;
 }
 
 // Two-Phase Commit service for cross-partition writes (Vitess 2PC pattern).
