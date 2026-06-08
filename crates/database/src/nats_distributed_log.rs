@@ -13,6 +13,8 @@ use async_nats::jetstream::{
     self,
     consumer::PullConsumer,
     stream::Stream as JsStream,
+    AckKind,
+    Message as JetStreamMessage,
 };
 use async_trait::async_trait;
 use common::{
@@ -33,6 +35,8 @@ use crate::{
     commit_delta::{
         CommitDelta,
         DistributedLog,
+        ReplicationAck,
+        ReplicationMessage,
     },
     metrics,
     partition::PartitionId,
@@ -80,7 +84,7 @@ impl NatsDistributedLog {
         &self,
         from_ts: Timestamp,
         filter_subjects: Option<Vec<String>>,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
         // Create a durable consumer so it survives reconnections.
         // DeliverPolicy::All replays all messages from the stream beginning,
         // and we filter out messages at or before from_ts ourselves.
@@ -159,24 +163,39 @@ impl NatsDistributedLog {
                                 tracing::debug!("Failed to parse JetStream message info: {e}");
                             },
                         }
-                        if let Err(e) = msg.ack().await {
-                            tracing::warn!("Failed to ack NATS message: {e:?}");
-                        }
                         let envelope: DeltaEnvelope = match serde_json::from_slice(&msg.payload) {
                             Ok(e) => e,
                             Err(e) => {
                                 tracing::error!("Failed to deserialize delta from NATS: {e}");
+                                if let Err(ack_err) = msg.ack_with(AckKind::Term).await {
+                                    tracing::warn!(
+                                        "Failed to terminate poison NATS message after \
+                                         deserialize error: {ack_err:?}"
+                                    );
+                                }
                                 return Some(Err(anyhow::anyhow!(
                                     "Failed to deserialize delta: {e}"
                                 )));
                             },
                         };
                         if envelope.ts <= from_ts_u64 {
+                            if let Err(e) = msg.ack().await {
+                                return Some(Err(anyhow::anyhow!(
+                                    "Failed to ack skipped NATS delta at ts={}: {e:#}",
+                                    envelope.ts
+                                )));
+                            }
                             return None;
                         }
                         // Skip deltas published by this node to avoid double-applying.
                         if !envelope.source_node.is_empty() && envelope.source_node == node_name {
                             tracing::debug!("Skipping self-published delta at ts={}", envelope.ts,);
+                            if let Err(e) = msg.ack().await {
+                                return Some(Err(anyhow::anyhow!(
+                                    "Failed to ack self-published NATS delta at ts={}: {e:#}",
+                                    envelope.ts
+                                )));
+                            }
                             return None;
                         }
                         tracing::debug!(
@@ -184,7 +203,23 @@ impl NatsDistributedLog {
                             envelope.ts,
                             envelope.source_node,
                         );
-                        Some(envelope.to_delta())
+                        let delta = match envelope.to_delta() {
+                            Ok(delta) => delta,
+                            Err(e) => {
+                                tracing::error!("Failed to decode NATS delta envelope: {e:#}");
+                                if let Err(ack_err) = msg.ack_with(AckKind::Term).await {
+                                    tracing::warn!(
+                                        "Failed to terminate poison NATS message after delta \
+                                         decode error: {ack_err:?}"
+                                    );
+                                }
+                                return Some(Err(e));
+                            },
+                        };
+                        Some(Ok(ReplicationMessage::new(
+                            delta,
+                            Box::new(NatsReplicationAck { msg }),
+                        )))
                     },
                     Err(e) => {
                         tracing::error!("NATS message error: {e}");
@@ -201,7 +236,7 @@ impl NatsDistributedLog {
         &self,
         from_ts: Timestamp,
         source_partitions: Option<Vec<PartitionId>>,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
         let filter_subjects = source_partitions.map(|partitions| {
             partitions
                 .into_iter()
@@ -215,7 +250,7 @@ impl NatsDistributedLog {
         &self,
         from_ts: Timestamp,
         node_name: &str,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
         self.subscribe_subjects(
             from_ts,
             Some(vec![SelectiveDeliveryRegistry::node_subject(node_name)]),
@@ -227,7 +262,7 @@ impl NatsDistributedLog {
         &self,
         from_ts: Timestamp,
         node_name: &str,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
         self.subscribe_subjects(
             from_ts,
             Some(vec![
@@ -303,6 +338,34 @@ impl NatsDistributedLog {
             publish_subject,
             selective_registry,
         })
+    }
+}
+
+struct NatsReplicationAck {
+    msg: JetStreamMessage,
+}
+
+#[async_trait]
+impl ReplicationAck for NatsReplicationAck {
+    async fn ack(self: Box<Self>) -> anyhow::Result<()> {
+        self.msg
+            .ack()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to ack NATS replication message: {e}"))
+    }
+
+    async fn nak(self: Box<Self>) -> anyhow::Result<()> {
+        self.msg
+            .ack_with(AckKind::Nak(None))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to NAK NATS replication message: {e}"))
+    }
+
+    async fn term(self: Box<Self>) -> anyhow::Result<()> {
+        self.msg
+            .ack_with(AckKind::Term)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to terminate NATS replication message: {e}"))
     }
 }
 
@@ -493,7 +556,7 @@ impl DistributedLog for NatsDistributedLog {
     async fn subscribe(
         &self,
         from_ts: Timestamp,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
         self.subscribe_inner(from_ts, None).await
     }
 
@@ -501,7 +564,7 @@ impl DistributedLog for NatsDistributedLog {
         &self,
         from_ts: Timestamp,
         source_partitions: Option<Vec<PartitionId>>,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
         self.subscribe_inner(from_ts, source_partitions).await
     }
 }

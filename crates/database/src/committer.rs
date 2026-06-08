@@ -630,7 +630,19 @@ impl<RT: Runtime> Committer<RT> {
                                     err,
                                 );
                             }
-                            self.publish_commit_delta(published_commit.delta);
+                            if let Err(err) = Self::publish_commit_delta(
+                                self.distributed_log.clone(),
+                                published_commit.delta,
+                            )
+                            .await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "publish committed write to replication log",
+                                    err,
+                                );
+                            }
                             let _ = result.send(Ok(commit_ts));
 
                             // When we next get free cycles and there is no ongoing bump,
@@ -884,7 +896,19 @@ impl<RT: Runtime> Committer<RT> {
                                     err,
                                 );
                             }
-                            self.publish_commit_delta(published_commit.delta);
+                            if let Err(err) = Self::publish_commit_delta(
+                                self.distributed_log.clone(),
+                                published_commit.delta,
+                            )
+                            .await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "publish prepared write to replication log",
+                                    err,
+                                );
+                            }
                             if let Err(err) = Self::delete_two_phase_redo(
                                 self.persistence.clone(),
                                 &redo_transaction_id,
@@ -1707,17 +1731,17 @@ impl<RT: Runtime> Committer<RT> {
         anyhow::bail!(message)
     }
 
-    fn publish_commit_delta(&self, delta: CommitDelta) {
-        let distributed_log = self.distributed_log.clone();
+    async fn publish_commit_delta(
+        distributed_log: Arc<dyn DistributedLog>,
+        delta: CommitDelta,
+    ) -> anyhow::Result<()> {
         let delta_ts = delta.ts;
-        tokio_spawn("publish_commit_delta", async move {
-            if let Err(e) = distributed_log.publish(delta).await {
-                tracing::error!(
-                    "Failed to publish commit delta at ts={}: {e:#}",
-                    u64::from(delta_ts)
-                );
-            }
-        });
+        distributed_log.publish(delta).await.with_context(|| {
+            format!(
+                "Failed to publish commit delta at ts={}",
+                u64::from(delta_ts)
+            )
+        })
     }
 
     fn propose_commit_to_raft(&self, delta: &CommitDelta) -> anyhow::Result<RaftCommitWaiter> {
