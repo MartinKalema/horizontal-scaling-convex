@@ -441,6 +441,13 @@ impl<RT: Runtime> Committer<RT> {
         self.queued_snapshots.push_back((commit_id, ts, snapshot));
     }
 
+    fn local_partition_for_two_phase(&self) -> crate::partition::PartitionId {
+        self.partition_map
+            .as_ref()
+            .map(|partition_map| partition_map.local_partition())
+            .unwrap_or(crate::partition::PartitionId(0))
+    }
+
     fn dequeue_snapshot(&mut self, commit_id: usize) {
         let (queued_commit_id, ..) = self
             .queued_snapshots
@@ -463,6 +470,7 @@ impl<RT: Runtime> Committer<RT> {
         distributed_log: Arc<dyn DistributedLog>,
         partition_map: Option<crate::partition::PartitionMap>,
         node_addresses: Option<crate::two_phase::NodeAddresses>,
+        two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> CommitterClient {
@@ -506,10 +514,13 @@ impl<RT: Runtime> Committer<RT> {
             snapshot_reader,
             partition_map: client_partition_map,
             node_addresses,
+            two_phase_decision_log,
         }
     }
 
     async fn go(mut self, mut rx: mpsc::Receiver<CommitterMessage>) -> anyhow::Result<()> {
+        self.recover_two_phase_redo_records().await?;
+
         let mut last_bumped_repeatable_ts = self.runtime.monotonic_now();
         let mut last_replication_frontier_heartbeat = self.runtime.monotonic_now();
         let mut last_replication_frontier_heartbeat_ts = Timestamp::MIN;
@@ -819,7 +830,9 @@ impl<RT: Runtime> Committer<RT> {
                             write_source,
                             result,
                         }) => {
-                            let r = self.handle_prepare(transaction_id, transaction, write_source);
+                            let r = self
+                                .handle_prepare(transaction_id, transaction, write_source)
+                                .await;
                             let _ = result.send(r);
                         },
                         Some(CommitterMessage::PrepareRemote {
@@ -834,7 +847,8 @@ impl<RT: Runtime> Committer<RT> {
                                 transaction,
                                 write_source,
                                 prepare_ts,
-                            );
+                            )
+                            .await;
                             let _ = result.send(r);
                         },
                         Some(CommitterMessage::AllocateCommitTs { result }) => {
@@ -847,6 +861,7 @@ impl<RT: Runtime> Committer<RT> {
                             transaction_id,
                             result,
                         }) => {
+                            let redo_transaction_id = transaction_id.clone();
                             let published_commit = match self.handle_commit_prepared(transaction_id)
                             {
                                 Ok(published_commit) => published_commit,
@@ -870,13 +885,38 @@ impl<RT: Runtime> Committer<RT> {
                                 );
                             }
                             self.publish_commit_delta(published_commit.delta);
+                            if let Err(err) = Self::delete_two_phase_redo(
+                                self.persistence.clone(),
+                                &redo_transaction_id,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "2PC CommitPrepared: committed txn={} but failed to delete \
+                                     redo: {err:#}",
+                                    redo_transaction_id,
+                                );
+                            }
                             let _ = result.send(Ok(commit_ts));
                         },
                         Some(CommitterMessage::RollbackPrepared {
                             transaction_id,
                             result,
                         }) => {
-                            let r = self.handle_rollback_prepared(transaction_id);
+                            let r = self.handle_rollback_prepared(transaction_id.clone());
+                            if r.is_ok()
+                                && let Err(err) = Self::delete_two_phase_redo(
+                                    self.persistence.clone(),
+                                    &transaction_id,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "2PC RollbackPrepared: rolled back txn={} but failed to \
+                                     delete redo: {err:#}",
+                                    transaction_id,
+                                );
+                            }
                             let _ = result.send(r);
                         },
                     }
@@ -1921,13 +1961,19 @@ impl<RT: Runtime> Committer<RT> {
                         .write(&[], chunk, ConflictStrategy::Overwrite)
                         .await?;
                 }
-                for key in PersistenceGlobalKey::all_keys() {
+                for key in PersistenceGlobalKey::checkpoint_keys() {
                     if let Some(value) = checkpoint.globals.get(&String::from(key)) {
                         persistence
                             .write_persistence_global(key, value.clone())
                             .await?;
                     }
                 }
+                persistence
+                    .write_persistence_global(
+                        PersistenceGlobalKey::TwoPhaseRedoRecords,
+                        serde_json::json!({}),
+                    )
+                    .await?;
 
                 let replication_frontiers = checkpoint
                     .globals
@@ -2453,46 +2499,97 @@ impl<RT: Runtime> Committer<RT> {
 
     // ========== 2PC Handlers (Vitess prepare/commit/rollback pattern) ==========
 
-    /// Prepare phase: validate OCC, assign timestamp, stage writes.
-    /// Does NOT publish — the transaction is held in prepared_transactions
-    /// until CommitPrepared or RollbackPrepared arrives.
-    fn handle_prepare(
-        &mut self,
-        transaction_id: crate::two_phase::TwoPhaseTransactionId,
-        transaction: FinalTransaction,
-        write_source: WriteSource,
-    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        tracing::info!(
-            "2PC Prepare: txn={}, {} writes",
-            transaction_id,
-            transaction.writes.coalesced_writes().count(),
-        );
-
-        self.stage_prepared_transaction(
-            transaction_id,
-            *transaction.begin_timestamp,
-            transaction.reads.read_set(),
-            transaction.writes.coalesced_writes().cloned().collect(),
-            &transaction.table_mapping,
-            write_source,
-            None,
-        )
+    async fn load_two_phase_redo_records(
+        persistence: Arc<dyn Persistence>,
+    ) -> anyhow::Result<BTreeMap<String, crate::two_phase::TwoPhaseRedoEntry>> {
+        let Some(value) = persistence
+            .reader()
+            .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+            .await?
+        else {
+            return Ok(BTreeMap::new());
+        };
+        serde_json::from_value(value).context("2PC: Failed to parse durable redo records")
     }
 
-    fn handle_prepare_remote(
+    async fn write_two_phase_redo_records(
+        persistence: Arc<dyn Persistence>,
+        records: &BTreeMap<String, crate::two_phase::TwoPhaseRedoEntry>,
+    ) -> anyhow::Result<()> {
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::TwoPhaseRedoRecords,
+                serde_json::to_value(records).context("2PC: Failed to serialize redo records")?,
+            )
+            .await
+            .context("2PC: Failed to persist redo records")
+    }
+
+    async fn persist_two_phase_redo(
+        persistence: Arc<dyn Persistence>,
+        entry: crate::two_phase::TwoPhaseRedoEntry,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_two_phase_redo_records(persistence.clone()).await?;
+        records.insert(entry.transaction_id.clone(), entry);
+        Self::write_two_phase_redo_records(persistence, &records).await
+    }
+
+    async fn delete_two_phase_redo(
+        persistence: Arc<dyn Persistence>,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_two_phase_redo_records(persistence.clone()).await?;
+        if records.remove(&transaction_id.0).is_some() {
+            Self::write_two_phase_redo_records(persistence, &records).await?;
+        }
+        Ok(())
+    }
+
+    async fn redo_entry_is_already_committed(
+        persistence_reader: Arc<dyn PersistenceReader>,
+        retention_validator: Arc<dyn RetentionValidator>,
+        entry: &crate::two_phase::TwoPhaseRedoEntry,
+        transaction: &crate::two_phase::ParticipantTransaction,
+        prepare_ts: Timestamp,
+    ) -> anyhow::Result<bool> {
+        if transaction.writes.is_empty() {
+            return Ok(false);
+        }
+        let expected: BTreeSet<_> = transaction
+            .writes
+            .iter()
+            .map(|write| InternalDocumentId::new(write.id.tablet_id, write.id.internal_id()))
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut stream = persistence_reader.load_documents(
+            TimestampRange::at(prepare_ts),
+            Order::Asc,
+            1024,
+            retention_validator,
+        );
+        while let Some(doc) = stream.try_next().await? {
+            if expected.contains(&doc.id) {
+                seen.insert(doc.id);
+            }
+        }
+        let already_committed = seen.len() == expected.len();
+        if already_committed {
+            tracing::info!(
+                "2PC Recovery: redo txn={} is already committed at ts={}, deleting redo",
+                entry.transaction_id,
+                u64::from(prepare_ts),
+            );
+        }
+        Ok(already_committed)
+    }
+
+    fn stage_participant_prepared_transaction(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
         transaction: crate::two_phase::ParticipantTransaction,
         write_source: WriteSource,
         prepare_ts: Timestamp,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        tracing::info!(
-            "2PC Remote Prepare: txn={}, {} writes, prepare_ts={}",
-            transaction_id,
-            transaction.writes.len(),
-            u64::from(prepare_ts),
-        );
-
         let mut table_mapping = self
             .snapshot_manager
             .read()
@@ -2509,6 +2606,151 @@ impl<RT: Runtime> Committer<RT> {
             write_source,
             Some(prepare_ts),
         )
+    }
+
+    async fn recover_two_phase_redo_records(&mut self) -> anyhow::Result<()> {
+        let records = Self::load_two_phase_redo_records(self.persistence.clone()).await?;
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "2PC Recovery: rebuilding {} prepared transaction(s) from durable redo",
+            records.len(),
+        );
+        for entry in records.values() {
+            let transaction_id = entry.transaction_id();
+            let prepare_ts = entry.prepare_ts()?;
+            let transaction = entry.participant_transaction().with_context(|| {
+                format!(
+                    "2PC Recovery: failed to decode participant transaction for txn={}",
+                    transaction_id
+                )
+            })?;
+            if entry.partition_id() != self.local_partition_for_two_phase() {
+                tracing::warn!(
+                    "2PC Recovery: ignoring redo txn={} for partition {}, local partition is {}",
+                    transaction_id,
+                    entry.partition_id().0,
+                    self.local_partition_for_two_phase().0,
+                );
+                continue;
+            }
+            if Self::redo_entry_is_already_committed(
+                self.persistence.reader(),
+                self.retention_validator.clone(),
+                entry,
+                &transaction,
+                prepare_ts,
+            )
+            .await?
+            {
+                Self::delete_two_phase_redo(self.persistence.clone(), &transaction_id).await?;
+                continue;
+            }
+
+            self.stage_participant_prepared_transaction(
+                transaction_id.clone(),
+                transaction,
+                entry.write_source(),
+                prepare_ts,
+            )
+            .with_context(|| {
+                format!("2PC Recovery: failed to stage prepared txn={transaction_id}")
+            })?;
+            tracing::info!(
+                "2PC Recovery: restored prepared txn={} at ts={}",
+                transaction_id,
+                u64::from(prepare_ts),
+            );
+        }
+        Ok(())
+    }
+
+    /// Prepare phase: validate OCC, assign timestamp, stage writes.
+    /// Does NOT publish — the transaction is held in prepared_transactions
+    /// until CommitPrepared or RollbackPrepared arrives.
+    async fn handle_prepare(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: FinalTransaction,
+        write_source: WriteSource,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        tracing::info!(
+            "2PC Prepare: txn={}, {} writes",
+            transaction_id,
+            transaction.writes.coalesced_writes().count(),
+        );
+
+        let participant_transaction =
+            crate::two_phase::ParticipantTransaction::from_entire_final_transaction(&transaction)?;
+        let result = self.stage_prepared_transaction(
+            transaction_id.clone(),
+            *transaction.begin_timestamp,
+            transaction.reads.read_set(),
+            transaction.writes.coalesced_writes().cloned().collect(),
+            &transaction.table_mapping,
+            write_source.clone(),
+            None,
+        )?;
+        let redo = crate::two_phase::TwoPhaseRedoEntry::new(
+            &transaction_id,
+            result.prepare_ts,
+            self.local_partition_for_two_phase(),
+            participant_transaction,
+            &write_source,
+        )?;
+        if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo).await {
+            if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                tracing::error!(
+                    "2PC Prepare: failed to rollback in-memory txn={} after redo write failure: \
+                     {rollback_err:#}",
+                    transaction_id,
+                );
+            }
+            return Err(err);
+        }
+        Ok(result)
+    }
+
+    async fn handle_prepare_remote(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        prepare_ts: Timestamp,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        tracing::info!(
+            "2PC Remote Prepare: txn={}, {} writes, prepare_ts={}",
+            transaction_id,
+            transaction.writes.len(),
+            u64::from(prepare_ts),
+        );
+
+        let redo = crate::two_phase::TwoPhaseRedoEntry::new(
+            &transaction_id,
+            prepare_ts,
+            self.local_partition_for_two_phase(),
+            transaction.clone(),
+            &write_source,
+        )?;
+        let result = self.stage_participant_prepared_transaction(
+            transaction_id.clone(),
+            transaction,
+            write_source,
+            prepare_ts,
+        )?;
+        if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo).await {
+            if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                tracing::error!(
+                    "2PC Prepare: failed to rollback in-memory txn={} after redo write failure: \
+                     {rollback_err:#}",
+                    transaction_id,
+                );
+            }
+            return Err(err);
+        }
+        Ok(result)
     }
 
     /// Commit a previously prepared transaction: write to persistence,
@@ -2917,6 +3159,7 @@ pub struct CommitterClient {
     snapshot_reader: Reader<SnapshotManager>,
     partition_map: Option<crate::partition::PartitionMap>,
     node_addresses: Option<crate::two_phase::NodeAddresses>,
+    two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
 }
 
 impl CommitterClient {
@@ -3013,6 +3256,10 @@ impl CommitterClient {
 
     pub(crate) fn node_addresses(&self) -> Option<&crate::two_phase::NodeAddresses> {
         self.node_addresses.as_ref()
+    }
+
+    pub(crate) fn two_phase_decision_log(&self) -> Arc<dyn crate::two_phase::TwoPhaseDecisionLog> {
+        self.two_phase_decision_log.clone()
     }
 
     async fn wait_for_remote_read_frontiers(

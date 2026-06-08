@@ -84,7 +84,7 @@ pub async fn create_checkpoint(
         .context("Failed to load documents for checkpoint")?;
 
     let mut globals = BTreeMap::new();
-    for key in PersistenceGlobalKey::all_keys() {
+    for key in PersistenceGlobalKey::checkpoint_keys() {
         if let Some(value) = persistence.get_persistence_global(key).await? {
             globals.insert(String::from(key), value);
         }

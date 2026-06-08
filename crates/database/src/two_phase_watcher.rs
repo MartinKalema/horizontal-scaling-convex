@@ -17,9 +17,11 @@ use common::runtime::Runtime;
 
 use crate::{
     committer::CommitterClient,
+    partition::PartitionId,
     two_phase::{
         TwoPhaseDecision,
         TwoPhaseTransactionId,
+        TWO_PHASE_DECISION_TTL_SECS,
         TWO_PHASE_KV_BUCKET,
         TWO_PHASE_KV_PREFIX,
     },
@@ -27,7 +29,12 @@ use crate::{
 
 /// Start the transaction watcher as a background task.
 /// Periodically scans NATS KV for unresolved 2PC transactions.
-pub fn start<RT: Runtime>(runtime: RT, committer: CommitterClient, nats_url: String) {
+pub fn start<RT: Runtime>(
+    runtime: RT,
+    committer: CommitterClient,
+    nats_url: String,
+    local_partition: PartitionId,
+) {
     runtime.spawn_background("two_phase_watcher", async move {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -45,7 +52,7 @@ pub fn start<RT: Runtime>(runtime: RT, committer: CommitterClient, nats_url: Str
             .create_key_value(async_nats::jetstream::kv::Config {
                 bucket: TWO_PHASE_KV_BUCKET.to_string(),
                 history: 1,
-                max_age: Duration::from_secs(3600), // 1 hour TTL
+                max_age: Duration::from_secs(TWO_PHASE_DECISION_TTL_SECS),
                 ..Default::default()
             })
             .await
@@ -99,7 +106,10 @@ pub fn start<RT: Runtime>(runtime: RT, committer: CommitterClient, nats_url: Str
                 };
 
                 match decision {
-                    TwoPhaseDecision::Committed { .. } => {
+                    TwoPhaseDecision::Committed { participants, .. } => {
+                        if !participants.contains(&local_partition.0) {
+                            continue;
+                        }
                         // Transaction was committed but the coordinator may have
                         // crashed before sending CommitPrepared to all participants.
                         // Try to commit locally — if already committed, this is a no-op.
@@ -110,13 +120,14 @@ pub fn start<RT: Runtime>(runtime: RT, committer: CommitterClient, nats_url: Str
                                     txn_id,
                                     u64::from(ts),
                                 );
-                                // Clean up the decision record.
-                                let _ = kv.delete(&key).await;
                             },
                             Err(e) => {
                                 // "unknown transaction" means it was already committed.
                                 if e.to_string().contains("unknown transaction") {
-                                    let _ = kv.delete(&key).await;
+                                    tracing::debug!(
+                                        "2PC Watcher: committed txn={} already resolved locally",
+                                        txn_id,
+                                    );
                                 } else {
                                     tracing::debug!(
                                         "2PC Watcher: CommitPrepared for {txn_id} not ready: {e:#}"
@@ -125,12 +136,18 @@ pub fn start<RT: Runtime>(runtime: RT, committer: CommitterClient, nats_url: Str
                             },
                         }
                     },
-                    TwoPhaseDecision::RolledBack { .. } => {
+                    TwoPhaseDecision::RolledBack { participants, .. } => {
+                        if !participants.contains(&local_partition.0) {
+                            continue;
+                        }
                         // Transaction was rolled back but cleanup may be incomplete.
                         match committer.rollback_prepared(txn_id.clone()).await {
                             Ok(()) | Err(_) => {
-                                // Either rolled back or already gone — clean up.
-                                let _ = kv.delete(&key).await;
+                                tracing::debug!(
+                                    "2PC Watcher: rolled back txn={} locally or it was already \
+                                     gone",
+                                    txn_id,
+                                );
                             },
                         }
                     },

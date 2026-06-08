@@ -17,6 +17,10 @@ use common::{
     bootstrap_model::index::database_index::IndexedFields,
     interval::Interval,
     pause::PauseController,
+    persistence::{
+        Persistence,
+        PersistenceGlobalKey,
+    },
     query::{
         Order,
         Query,
@@ -86,9 +90,13 @@ use crate::{
         TimestampOracle,
     },
     two_phase::{
+        testing::InMemoryTwoPhaseDecisionLog,
         NodeAddresses,
+        NoopTwoPhaseDecisionLog,
         ParticipantTransaction,
         TwoPhaseCommitGrpcClient,
+        TwoPhaseDecision,
+        TwoPhaseDecisionLog,
         TwoPhaseTransactionId,
     },
     Database,
@@ -112,12 +120,32 @@ async fn create_node_with_options(
     node_addresses: Option<NodeAddresses>,
     timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
 ) -> anyhow::Result<Database<TestRuntime>> {
+    create_node_with_options_and_decision_log(
+        rt,
+        distributed_log,
+        partition_map,
+        node_addresses,
+        timestamp_oracle,
+        Arc::new(NoopTwoPhaseDecisionLog),
+    )
+    .await
+}
+
+async fn create_node_with_options_and_decision_log(
+    rt: &TestRuntime,
+    distributed_log: Arc<InMemoryDistributedLog>,
+    partition_map: Option<PartitionMap>,
+    node_addresses: Option<NodeAddresses>,
+    timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
+    two_phase_decision_log: Arc<dyn TwoPhaseDecisionLog>,
+) -> anyhow::Result<Database<TestRuntime>> {
     create_node_with_persistence(
         rt,
         Arc::new(TestPersistence::new()),
         distributed_log,
         partition_map,
         node_addresses,
+        two_phase_decision_log,
         timestamp_oracle,
     )
     .await
@@ -129,6 +157,7 @@ async fn create_node_with_persistence(
     distributed_log: Arc<InMemoryDistributedLog>,
     partition_map: Option<PartitionMap>,
     node_addresses: Option<NodeAddresses>,
+    two_phase_decision_log: Arc<dyn TwoPhaseDecisionLog>,
     timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
 ) -> anyhow::Result<Database<TestRuntime>> {
     let searcher: Arc<dyn search::Searcher> = Arc::new(SearcherStub {});
@@ -146,6 +175,7 @@ async fn create_node_with_persistence(
         false,
         partition_map,
         node_addresses,
+        two_phase_decision_log,
         timestamp_oracle,
         None,
     )
@@ -214,7 +244,7 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
             .ok_or_else(|| Status::invalid_argument("Prepare missing transaction payload"))?;
         let transaction = ParticipantTransaction::try_from(transaction)
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare payload: {e:#}")))?;
-        let prepare_ts = req
+        let prepare_ts: Timestamp = req
             .prepare_ts
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
@@ -286,6 +316,42 @@ impl TwoPhaseCommitService for FailingPrepareGrpcService {
         Err(Status::failed_precondition(
             "rollback_prepared should not be called after a failed prepare",
         ))
+    }
+}
+
+struct FailingCommitAfterPrepareGrpcService;
+
+#[tonic::async_trait]
+impl TwoPhaseCommitService for FailingCommitAfterPrepareGrpcService {
+    async fn prepare(
+        &self,
+        request: Request<TwoPcPrepareRequest>,
+    ) -> Result<Response<TwoPcPrepareResponse>, Status> {
+        let req = request.into_inner();
+        let prepare_ts: Timestamp = req
+            .prepare_ts
+            .try_into()
+            .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
+
+        Ok(Response::new(TwoPcPrepareResponse {
+            prepare_ts: u64::from(prepare_ts),
+        }))
+    }
+
+    async fn commit_prepared(
+        &self,
+        _request: Request<TwoPcCommitRequest>,
+    ) -> Result<Response<TwoPcCommitResponse>, Status> {
+        Err(Status::unavailable(
+            "forced commit failure after durable decision",
+        ))
+    }
+
+    async fn rollback_prepared(
+        &self,
+        _request: Request<TwoPcRollbackRequest>,
+    ) -> Result<Response<TwoPcRollbackResponse>, Status> {
+        Ok(Response::new(TwoPcRollbackResponse {}))
     }
 }
 
@@ -868,6 +934,7 @@ async fn test_replication_frontier_persists_across_restart(rt: TestRuntime) -> a
         log.clone(),
         Some(partitioned_map(PartitionId(0))),
         None,
+        Arc::new(NoopTwoPhaseDecisionLog),
         None,
     )
     .await?;
@@ -909,6 +976,7 @@ async fn test_replication_frontier_persists_across_restart(rt: TestRuntime) -> a
         log,
         Some(partitioned_map(PartitionId(0))),
         None,
+        Arc::new(NoopTwoPhaseDecisionLog),
         None,
     )
     .await?;
@@ -917,6 +985,89 @@ async fn test_replication_frontier_persists_across_restart(rt: TestRuntime) -> a
         Some(persisted_frontier),
     );
 
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_prepared_participant_recovers_from_redo_after_restart(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let tp = Arc::new(TestPersistence::new());
+    let node = create_node_with_persistence(
+        &rt,
+        tp.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "recovered-from-redo"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("prepared_redo_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source.clone(),
+            prepare_ts,
+        )
+        .await?;
+    node.shutdown().await?;
+
+    let restarted = create_node_with_persistence(
+        &rt,
+        tp.clone(),
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let committed_ts = restarted
+        .committer_for_test()
+        .commit_prepared(txn_id)
+        .await?;
+    assert_eq!(committed_ts, prepare_ts);
+
+    let projects = run_query(
+        restarted.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 1);
+
+    let redo = tp
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+        .await?;
+    assert_eq!(redo, Some(serde_json::json!({})));
     Ok(())
 }
 
@@ -1276,6 +1427,20 @@ fn test_cross_partition_commit_uses_remote_prepare_over_grpc() -> anyhow::Result
             .apply_replica_delta(remote_seed_delta)
             .await?;
         insert_doc(&node_a, "messages", assert_obj!("text" => "seed")).await?;
+        let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(CommitDelta {
+                ts: heartbeat_ts,
+                document_writes: Arc::new(Vec::new()),
+                document_updates: Vec::new(),
+                index_writes: Arc::new(Vec::new()),
+                write_source: WriteSource::new("cross_partition_commit_grpc_test"),
+                write_bytes: 0,
+                tablet_id_to_table_name: Default::default(),
+                source_partition: Some(PartitionId(1)),
+            })
+            .await?;
 
         let initial_delta_count = log.deltas().len();
 
@@ -1330,9 +1495,10 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
     let rt = td.rt();
     td.run_until(async move {
         let log = Arc::new(InMemoryDistributedLog::new());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
         let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
         let failing_server = start_two_pc_server(FailingPrepareGrpcService).await?;
-        let node_a = create_node_with_options(
+        let node_a = create_node_with_options_and_decision_log(
             &rt,
             log.clone(),
             Some(partitioned_map(PartitionId(0))),
@@ -1341,6 +1507,7 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
                 failing_server.addr()
             ))),
             Some(tso.clone()),
+            decision_log.clone(),
         )
         .await?;
         let _remote_participant = create_node_with_options(
@@ -1376,6 +1543,18 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
             format!("{err:#}").contains("forced prepare failure"),
             "expected remote prepare failure, got: {err:#}",
         );
+        let decisions = decision_log.decisions();
+        assert_eq!(decisions.len(), 1);
+        let decision = decisions
+            .values()
+            .next()
+            .expect("rollback decision should be durable");
+        match decision {
+            TwoPhaseDecision::RolledBack { participants, .. } => {
+                assert_eq!(participants, &vec![0]);
+            },
+            other => panic!("expected rollback decision, got {other:?}"),
+        }
 
         let mut retry_tx = node_a.begin(Identity::system()).await?;
         UserFacingModel::new(&mut retry_tx, TableNamespace::test_user())
@@ -1384,6 +1563,102 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
         node_a.commit(retry_tx).await?;
 
         failing_server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_commit_decision_survives_failed_participant_commit() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+        )
+        .await?;
+        let server = start_two_pc_server(FailingCommitAfterPrepareGrpcService).await?;
+
+        let node_a = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(tso),
+            decision_log.clone(),
+        )
+        .await?;
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let remote_seed_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(remote_seed_delta)
+            .await?;
+        insert_doc(&node_a, "messages", assert_obj!("text" => "seed")).await?;
+        let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(CommitDelta {
+                ts: heartbeat_ts,
+                document_writes: Arc::new(Vec::new()),
+                document_updates: Vec::new(),
+                index_writes: Arc::new(Vec::new()),
+                write_source: WriteSource::new("commit_decision_recovery_test"),
+                write_bytes: 0,
+                tablet_id_to_table_name: Default::default(),
+                source_partition: Some(PartitionId(1)),
+            })
+            .await?;
+
+        let mut tx = node_a.begin(Identity::system()).await?;
+        let mut model = TestFacingModel::new(&mut tx);
+        model
+            .insert(
+                &"messages".parse()?,
+                assert_obj!("text" => "local-before-commit-failure"),
+            )
+            .await?;
+        model
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "remote-before-commit-failure"),
+            )
+            .await?;
+
+        let err = node_a
+            .commit(tx)
+            .await
+            .expect_err("remote commit failure should leave durable decision for recovery");
+        assert!(
+            format!("{err:#}").contains("forced commit failure after durable decision"),
+            "expected forced commit failure, got: {err:#}",
+        );
+
+        let decisions = decision_log.decisions();
+        assert_eq!(decisions.len(), 1);
+        let decision = decisions
+            .values()
+            .next()
+            .expect("commit decision should remain for watcher recovery");
+        match decision {
+            TwoPhaseDecision::Committed { participants, .. } => {
+                assert_eq!(participants, &vec![0, 1]);
+            },
+            other => panic!("expected commit decision, got {other:?}"),
+        }
+
+        server.shutdown().await?;
         Ok(())
     })
 }

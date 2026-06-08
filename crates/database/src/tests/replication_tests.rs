@@ -43,6 +43,7 @@ async fn test_primary_commit_publishes_delta(rt: TestRuntime) -> anyhow::Result<
         false,
         None,
         None,
+        Arc::new(crate::two_phase::NoopTwoPhaseDecisionLog),
         None,
         None,
     )
