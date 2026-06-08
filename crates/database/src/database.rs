@@ -987,6 +987,7 @@ impl<RT: Runtime> Database<RT> {
         replica_mode: bool,
         partition_map: Option<crate::partition::PartitionMap>,
         node_addresses: Option<crate::two_phase::NodeAddresses>,
+        two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> anyhow::Result<Self> {
@@ -1101,6 +1102,7 @@ impl<RT: Runtime> Database<RT> {
             committer_distributed_log,
             partition_map,
             node_addresses,
+            two_phase_decision_log,
             timestamp_oracle,
             raft_state,
         );
@@ -2018,7 +2020,7 @@ impl<RT: Runtime> Database<RT> {
             create_checkpoint(self.reader.as_ref(), ts, self.retention_validator()).await?;
 
         let mut globals = BTreeMap::new();
-        for key in PersistenceGlobalKey::all_keys() {
+        for key in PersistenceGlobalKey::checkpoint_keys() {
             if let Some(value) = self.reader.get_persistence_global(key).await? {
                 globals.insert(String::from(key), value);
             }

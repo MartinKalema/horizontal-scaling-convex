@@ -221,6 +221,17 @@ pub async fn make_app(
         None
     };
 
+    let two_phase_decision_log: Arc<dyn database::two_phase::TwoPhaseDecisionLog> =
+        if config.partition_id.is_some() {
+            if let Some(nats_url) = &config.nats_url {
+                Arc::new(database::two_phase::NatsTwoPhaseDecisionLog::connect(nats_url).await?)
+            } else {
+                Arc::new(database::two_phase::NoopTwoPhaseDecisionLog)
+            }
+        } else {
+            Arc::new(database::two_phase::NoopTwoPhaseDecisionLog)
+        };
+
     let replica_mutation_forwarder = if config.replication_mode == "replica" {
         match config.primary_grpc_url.as_deref() {
             Some(primary_grpc_url) => Some(Arc::new(
@@ -259,6 +270,7 @@ pub async fn make_app(
             .node_addresses
             .as_deref()
             .map(database::two_phase::NodeAddresses::from_config),
+        two_phase_decision_log,
         timestamp_oracle,
         None, // raft_state: set after Raft node starts, not during Database::load
     )
@@ -693,12 +705,13 @@ pub async fn make_app(
     }
 
     // Start the 2PC Transaction Watcher for crash recovery.
-    if config.partition_id.is_some() {
+    if let Some(partition_id) = config.partition_id {
         if let Some(nats_url) = &config.nats_url {
             database::two_phase_watcher::start(
                 runtime.clone(),
                 database.committer_client(),
                 nats_url.clone(),
+                database::partition::PartitionId(partition_id),
             );
             tracing::info!("Started 2PC Transaction Watcher");
         }

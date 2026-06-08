@@ -165,6 +165,10 @@ pub enum PersistenceGlobalKey {
     /// Latest snapshot of all tables' summaries, cached to speed up startup.
     TableSummary,
 
+    /// Node-local durable redo records for unresolved 2PC prepared
+    /// transactions. This must not be copied into checkpoints.
+    TwoPhaseRedoRecords,
+
     /// Internal id of _tables.by_id index, for bootstrapping.
     TablesByIdIndex,
     /// Internal id of _tables table, for bootstrapping.
@@ -193,6 +197,7 @@ impl From<PersistenceGlobalKey> for String {
             PersistenceGlobalKey::MaxRepeatableTimestamp => "max_repeatable_ts".to_string(),
             PersistenceGlobalKey::ReplicationFrontiers => "replication_frontiers".to_string(),
             PersistenceGlobalKey::TableSummary => "table_summary".to_string(),
+            PersistenceGlobalKey::TwoPhaseRedoRecords => "two_phase_redo_records".to_string(),
             PersistenceGlobalKey::TablesByIdIndex => "tables_by_id".to_string(),
             PersistenceGlobalKey::IndexByIdIndex => "index_by_id".to_string(),
             // NB: For compatibility, these are referred to as "table_id"s, not "tablet_id"s.
@@ -213,6 +218,7 @@ impl FromStr for PersistenceGlobalKey {
             "max_repeatable_ts" => Ok(Self::MaxRepeatableTimestamp),
             "replication_frontiers" => Ok(Self::ReplicationFrontiers),
             "table_summary" => Ok(Self::TableSummary),
+            "two_phase_redo_records" => Ok(Self::TwoPhaseRedoRecords),
             "tables_by_id" => Ok(Self::TablesByIdIndex),
             "tables_table_id" => Ok(Self::TablesTabletId),
             "index_by_id" => Ok(Self::IndexByIdIndex),
@@ -225,6 +231,13 @@ impl FromStr for PersistenceGlobalKey {
 impl PersistenceGlobalKey {
     pub fn all_keys() -> Vec<Self> {
         enum_iterator::all().collect()
+    }
+
+    pub fn checkpoint_keys() -> Vec<Self> {
+        Self::all_keys()
+            .into_iter()
+            .filter(|key| *key != Self::TwoPhaseRedoRecords)
+            .collect()
     }
 }
 

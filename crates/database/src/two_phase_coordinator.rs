@@ -28,6 +28,7 @@ use crate::{
         NodeAddresses,
         ParticipantTransaction,
         TwoPhaseCommitGrpcClient,
+        TwoPhaseDecision,
         TwoPhaseTransactionId,
     },
     write_log::WriteSource,
@@ -212,6 +213,27 @@ async fn commit_participant(
     }
 }
 
+async fn write_decision_record(
+    local_committer: &CommitterClient,
+    transaction_id: &TwoPhaseTransactionId,
+    decision: &TwoPhaseDecision,
+) -> anyhow::Result<()> {
+    local_committer
+        .two_phase_decision_log()
+        .write_decision(transaction_id, decision)
+        .await
+}
+
+async fn delete_decision_record(
+    local_committer: &CommitterClient,
+    transaction_id: &TwoPhaseTransactionId,
+) -> anyhow::Result<()> {
+    local_committer
+        .two_phase_decision_log()
+        .delete_decision(transaction_id)
+        .await
+}
+
 fn is_retryable_prepare_ts_error(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.to_string().contains("2PC Prepare assigned ts="))
@@ -286,6 +308,22 @@ pub async fn coordinate_two_phase_commit(
                         participant,
                         txn_id,
                     );
+                    let retryable_prepare_ts_error =
+                        is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES;
+                    if !retryable_prepare_ts_error && !prepared_participants.is_empty() {
+                        let decision = TwoPhaseDecision::RolledBack {
+                            reason: err.to_string(),
+                            participants: prepared_participants.iter().map(|p| p.0).collect(),
+                        };
+                        write_decision_record(local_committer, &txn_id, &decision)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "2PC Coordinator: failed to write rollback decision for \
+                                     txn={txn_id}"
+                                )
+                            })?;
+                    }
                     for prepared in prepared_participants.iter().rev().copied() {
                         if let Err(rollback_err) = rollback_participant(
                             local_committer,
@@ -305,7 +343,7 @@ pub async fn coordinate_two_phase_commit(
                         }
                     }
 
-                    if is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES {
+                    if retryable_prepare_ts_error {
                         metrics::log_two_phase_prepare_retry();
                         tracing::info!(
                             "2PC Coordinator: retrying txn={} with a newer prepare timestamp \
@@ -329,6 +367,16 @@ pub async fn coordinate_two_phase_commit(
         if retry_prepare {
             continue;
         }
+
+        let decision = TwoPhaseDecision::Committed {
+            commit_ts: u64::from(prepare_ts),
+            participants: prepared_participants.iter().map(|p| p.0).collect(),
+        };
+        write_decision_record(local_committer, &txn_id, &decision)
+            .await
+            .with_context(|| {
+                format!("2PC Coordinator: failed to write commit decision for txn={txn_id}")
+            })?;
 
         let mut commit_results = Vec::new();
         for participant in &prepared_participants {
@@ -367,6 +415,12 @@ pub async fn coordinate_two_phase_commit(
         );
         metrics::log_two_phase_prepare_attempts(prepare_attempts);
         metrics::log_two_phase_decision("commit");
+        if let Err(err) = delete_decision_record(local_committer, &txn_id).await {
+            tracing::warn!(
+                "2PC Coordinator: committed txn={} but failed to delete durable decision: {err:#}",
+                txn_id,
+            );
+        }
         timer.finish();
         return Ok(prepare_ts);
     }
