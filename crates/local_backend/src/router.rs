@@ -406,6 +406,7 @@ pub fn router(st: LocalAppState) -> Router {
             api: Arc::new(crate::query_forwarding_api::SelectiveQueryForwardingApi::new(
                 Arc::new(st.application.clone()),
                 st.application.database().clone(),
+                st.replica_mode,
                 st.partition_id,
                 st.node_addresses.clone(),
                 st.raft_state.clone(),

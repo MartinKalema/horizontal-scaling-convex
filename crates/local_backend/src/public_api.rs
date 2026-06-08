@@ -947,6 +947,10 @@ mod tests {
     };
     use axum::body::Body;
     use common::{
+        components::{
+            CanonicalizedComponentFunctionPath,
+            ComponentPath,
+        },
         http::{
             ConvexHttpService,
             NoopRouteMapper,
@@ -962,6 +966,7 @@ mod tests {
         raft_partition::RaftPartitionState,
         two_phase::NodeAddresses,
     };
+    use headers::authorization::Credentials;
     use http::{
         Request,
         StatusCode,
@@ -1395,6 +1400,7 @@ mod tests {
         let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
             Arc::new(selective.st.application.clone()),
             selective.st.application.database().clone(),
+            false,
             Some(PartitionId(1)),
             Some(NodeAddresses::from_config(&format!("0={grpc_addr}"))),
             None,
@@ -1467,6 +1473,7 @@ mod tests {
         let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
             Arc::new(follower.st.application.clone()),
             follower.st.application.database().clone(),
+            false,
             Some(PartitionId(0)),
             None,
             Some(RaftPartitionState::new_for_test(
@@ -1497,6 +1504,133 @@ mod tests {
         assert_eq!(value["hello"], "authority follower forwarded query");
 
         let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_selective_api_rejects_any_function_on_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt.clone()).await?;
+        let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
+            Arc::new(backend.st.application.clone()),
+            backend.st.application.database().clone(),
+            false,
+            Some(PartitionId(1)),
+            None,
+            None,
+            None,
+        ));
+
+        let err = api
+            .execute_any_function(
+                &ResolvedHostname {
+                    instance_name: backend.st.instance_name.clone(),
+                    destination: RequestDestination::ConvexCloud,
+                },
+                common::RequestId::new(),
+                Identity::system(),
+                CanonicalizedComponentFunctionPath {
+                    component: ComponentPath::root(),
+                    udf_path: super::parse_udf_path("values:intMutation")?,
+                },
+                SerializedArgs::from_args(vec![json!({})])?,
+                FunctionCaller::HttpApi(ClientVersion::unknown()),
+            )
+            .await
+            .expect_err("non-authority partitions must not execute any-function locally");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Any function execution cannot execute locally"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("partition 1 is not the cluster coordinator partition 0"),
+            "{msg}"
+        );
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_public_function_endpoint_rejects_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "backend_any_function_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/function")
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .header("Host", "localhost")
+            .header("Authorization", backend.admin_auth_header.0.encode())
+            .body(Body::from(serde_json::to_vec(&json!({
+                "path": "values:intMutation",
+                "args": {},
+            }))?))?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("ServiceUnavailable"), "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_selective_api_rejects_public_action_on_replica(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt.clone()).await?;
+        let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
+            Arc::new(backend.st.application.clone()),
+            backend.st.application.database().clone(),
+            true,
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let err = api
+            .execute_public_action(
+                &ResolvedHostname {
+                    instance_name: backend.st.instance_name.clone(),
+                    destination: RequestDestination::ConvexCloud,
+                },
+                common::RequestId::new(),
+                Identity::system(),
+                "values:intAction".parse()?,
+                SerializedArgs::from_args(vec![json!({})])?,
+                FunctionCaller::HttpApi(ClientVersion::unknown()),
+            )
+            .await
+            .expect_err("replicas must not execute public actions locally");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Public action cannot execute locally"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("replicas do not own global request surfaces"),
+            "{msg}"
+        );
+
         Ok(())
     }
 
