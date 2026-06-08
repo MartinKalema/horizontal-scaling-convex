@@ -541,19 +541,30 @@ pub async fn make_app(
                         );
                         while let Some(result) = futures::StreamExt::next(&mut stream).await {
                             match result {
-                                Ok(delta) => {
+                                Ok(message) => {
+                                    let (delta, ack) = message.into_parts();
                                     database::log_selective_delivery_shadow_receive();
                                     tracing::debug!(
                                         "Selective-delivery shadow delta observed for {} at ts={}",
                                         shadow_node_name,
                                         u64::from(delta.ts),
                                     );
+                                    if let Err(e) = ack.ack().await {
+                                        tracing::warn!(
+                                            "Selective-delivery shadow consumer failed to ack for \
+                                             {} at ts={}: {e:#}",
+                                            shadow_node_name,
+                                            u64::from(delta.ts),
+                                        );
+                                        break;
+                                    }
                                 },
                                 Err(e) => {
                                     tracing::warn!(
                                         "Selective-delivery shadow consumer error for {}: {e:#}",
                                         shadow_node_name,
                                     );
+                                    break;
                                 },
                             }
                         }
@@ -674,25 +685,30 @@ pub async fn make_app(
                         tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
                         while let Some(result) = futures::StreamExt::next(&mut stream).await {
                             match result {
-                                Ok(delta) => {
+                                Ok(message) => {
                                     if use_selective_node_targeting {
                                         database::log_selective_delivery_shadow_receive();
                                     }
-                                    let ts = delta.ts;
-                                    let n = delta.document_updates.len();
-                                    match committer.apply_replica_delta(delta).await {
-                                        Ok(_) => tracing::info!(
+                                    match database::replica::apply_replication_message(
+                                        &committer, message,
+                                    )
+                                    .await
+                                    {
+                                        Ok((ts, n)) => tracing::info!(
                                             "Applied replica delta: ts={}, {} updates",
                                             u64::from(ts),
                                             n
                                         ),
-                                        Err(e) => tracing::error!(
-                                            "Failed to apply delta at ts={}: {e:#}",
-                                            u64::from(ts)
-                                        ),
+                                        Err(e) => {
+                                            tracing::error!("Failed to apply NATS delta: {e:#}");
+                                            break;
+                                        },
                                     }
                                 },
-                                Err(e) => tracing::error!("Error reading NATS delta: {e:#}"),
+                                Err(e) => {
+                                    tracing::error!("Error reading NATS delta: {e:#}");
+                                    break;
+                                },
                             }
                         }
                         tracing::warn!("ReplicaDeltaConsumer stream ended");
