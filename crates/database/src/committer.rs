@@ -344,6 +344,14 @@ fn checkpoint_index_entries(
     index_entries
 }
 
+type RaftCommitWaiter = Option<oneshot::Receiver<bool>>;
+
+struct PublishedCommit {
+    commit_ts: Timestamp,
+    raft_commit_waiter: RaftCommitWaiter,
+    delta: CommitDelta,
+}
+
 pub struct Committer<RT: Runtime> {
     // Internal staged commits for conflict checking.
     pending_writes: PendingWrites,
@@ -584,9 +592,34 @@ impl<RT: Runtime> Committer<RT> {
                             let _guard = publish_commit_span.set_local_parent();
                             let commit_ts = pending_write.must_commit_ts();
                             self.dequeue_snapshot(pending_commit_id);
-                            self.publish_commit(
+                            let published_commit = match self.publish_commit(
                                 pending_write, write_bytes, document_writes, index_writes,
-                            );
+                            ) {
+                                Ok(published_commit) => published_commit,
+                                Err(err) => {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "publish committed write",
+                                        err,
+                                    );
+                                },
+                            };
+                            drop(_guard);
+                            if let Err(err) = Self::wait_for_raft_commit(
+                                published_commit.raft_commit_waiter,
+                                published_commit.commit_ts,
+                            )
+                            .await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "replicate committed write through Raft",
+                                    err,
+                                );
+                            }
+                            self.publish_commit_delta(published_commit.delta);
                             let _ = result.send(Ok(commit_ts));
 
                             // When we next get free cycles and there is no ongoing bump,
@@ -814,8 +847,30 @@ impl<RT: Runtime> Committer<RT> {
                             transaction_id,
                             result,
                         }) => {
-                            let r = self.handle_commit_prepared(transaction_id);
-                            let _ = result.send(r);
+                            let published_commit = match self.handle_commit_prepared(transaction_id)
+                            {
+                                Ok(published_commit) => published_commit,
+                                Err(err) => {
+                                    let _ = result.send(Err(err));
+                                    continue;
+                                },
+                            };
+                            let commit_ts = published_commit.commit_ts;
+                            if let Err(err) = Self::wait_for_raft_commit(
+                                published_commit.raft_commit_waiter,
+                                commit_ts,
+                            )
+                            .await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "replicate prepared write through Raft",
+                                    err,
+                                );
+                            }
+                            self.publish_commit_delta(published_commit.delta);
+                            let _ = result.send(Ok(commit_ts));
                         },
                         Some(CommitterMessage::RollbackPrepared {
                             transaction_id,
@@ -1578,6 +1633,95 @@ impl<RT: Runtime> Committer<RT> {
         Ok(())
     }
 
+    async fn wait_for_raft_commit(
+        raft_commit_waiter: RaftCommitWaiter,
+        commit_ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        let Some(raft_commit_waiter) = raft_commit_waiter else {
+            return Ok(());
+        };
+        match raft_commit_waiter.await {
+            Ok(true) => Ok(()),
+            Ok(false) => anyhow::bail!(
+                "Raft rejected commit at ts={} before quorum commit",
+                u64::from(commit_ts),
+            ),
+            Err(_) => anyhow::bail!(
+                "Raft proposal result channel closed before commit at ts={} reached quorum",
+                u64::from(commit_ts),
+            ),
+        }
+    }
+
+    fn fail_committed_write(
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        commit_ts: Timestamp,
+        operation: &'static str,
+        err: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let message = format!(
+            "Failed to {operation} after local persistence commit at ts={}: {err:#}",
+            u64::from(commit_ts),
+        );
+        let _ = result.send(Err(anyhow::anyhow!(message.clone())));
+        anyhow::bail!(message)
+    }
+
+    fn publish_commit_delta(&self, delta: CommitDelta) {
+        let distributed_log = self.distributed_log.clone();
+        let delta_ts = delta.ts;
+        tokio_spawn("publish_commit_delta", async move {
+            if let Err(e) = distributed_log.publish(delta).await {
+                tracing::error!(
+                    "Failed to publish commit delta at ts={}: {e:#}",
+                    u64::from(delta_ts)
+                );
+            }
+        });
+    }
+
+    fn propose_commit_to_raft(&self, delta: &CommitDelta) -> anyhow::Result<RaftCommitWaiter> {
+        let Some(ref raft) = self.raft_state else {
+            return Ok(None);
+        };
+        if !raft.is_leader() {
+            anyhow::bail!(
+                "Raft leadership lost before proposing commit at ts={} for partition {}",
+                u64::from(delta.ts),
+                raft.partition_id(),
+            );
+        }
+        let envelope =
+            crate::nats_distributed_log::DeltaEnvelope::from_delta(delta, "", Some(raft.node_id()))
+                .with_context(|| {
+                    format!(
+                        "Failed to wrap commit delta at ts={} for Raft proposal",
+                        u64::from(delta.ts),
+                    )
+                })?;
+        let data = serde_json::to_vec(&envelope).with_context(|| {
+            format!(
+                "Failed to serialize commit delta at ts={} for Raft proposal",
+                u64::from(delta.ts),
+            )
+        })?;
+        let (tx, rx) = oneshot::channel();
+        raft.send(crate::raft_node::RaftMessage::Propose(
+            crate::raft_node::RaftProposal {
+                data,
+                result_tx: tx,
+            },
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to propose commit at ts={} to Raft partition {}",
+                u64::from(delta.ts),
+                raft.partition_id(),
+            )
+        })?;
+        Ok(Some(rx))
+    }
+
     /// After writing the new rows to persistence, mark the commit as complete
     /// and allow the updated rows to be read by other transactions.
     #[fastrace::trace]
@@ -1587,7 +1731,7 @@ impl<RT: Runtime> Committer<RT> {
         write_bytes: u64,
         document_writes: Arc<Vec<DocumentLogEntry>>,
         index_writes: Arc<Vec<PersistenceIndexEntry>>,
-    ) {
+    ) -> anyhow::Result<PublishedCommit> {
         let apply_timer = metrics::commit_apply_timer();
         let commit_ts = pending_write.must_commit_ts();
 
@@ -1653,6 +1797,7 @@ impl<RT: Runtime> Committer<RT> {
         // Publish the new version of our database metadata and the index.
         let mut snapshot_manager = self.snapshot_manager.write();
         snapshot_manager.push(commit_ts, new_snapshot, write_bytes);
+        drop(snapshot_manager);
         let mut tablet_id_to_table_name = std::collections::BTreeMap::new();
         for update in &document_updates {
             let tablet_id = update.id.tablet_id;
@@ -1678,42 +1823,13 @@ impl<RT: Runtime> Committer<RT> {
                 .map(|partition_map| partition_map.local_partition()),
         };
 
-        // Propose delta to Raft for intra-partition replication (if Raft enabled).
-        // TiKV pattern: leader proposes pre-computed writes to Raft after local commit.
-        // Followers receive the committed entry and apply via apply_replica_delta.
-        if let Some(ref raft) = self.raft_state {
-            if raft.is_leader() {
-                let envelope = crate::nats_distributed_log::DeltaEnvelope::from_delta(
-                    &delta,
-                    "",
-                    Some(raft.node_id()),
-                );
-                if let Ok(envelope) = envelope {
-                    if let Ok(data) = serde_json::to_vec(&envelope) {
-                        let (tx, _rx) = tokio::sync::oneshot::channel();
-                        let _ = raft.send(crate::raft_node::RaftMessage::Propose(
-                            crate::raft_node::RaftProposal {
-                                data,
-                                result_tx: tx,
-                            },
-                        ));
-                    }
-                }
-            }
-        }
-
-        let distributed_log = self.distributed_log.clone();
-        let delta_ts = commit_ts;
-        tokio_spawn("publish_commit_delta", async move {
-            if let Err(e) = distributed_log.publish(delta).await {
-                tracing::error!(
-                    "Failed to publish commit delta at ts={}: {e:#}",
-                    u64::from(delta_ts)
-                );
-            }
-        });
-
+        let raft_commit_waiter = self.propose_commit_to_raft(&delta)?;
         apply_timer.finish();
+        Ok(PublishedCommit {
+            commit_ts,
+            raft_commit_waiter,
+            delta,
+        })
     }
 
     fn install_snapshot(
@@ -2400,7 +2516,7 @@ impl<RT: Runtime> Committer<RT> {
     fn handle_commit_prepared(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
-    ) -> anyhow::Result<Timestamp> {
+    ) -> anyhow::Result<PublishedCommit> {
         let prepared = self
             .prepared_transactions
             .remove(&transaction_id)
@@ -2439,9 +2555,7 @@ impl<RT: Runtime> Committer<RT> {
             prepared.write_bytes,
             prepared.document_writes,
             prepared.index_writes,
-        );
-
-        Ok(prepared.commit_ts)
+        )
     }
 
     /// Rollback a previously prepared transaction: remove from PendingWrites.
@@ -3356,9 +3470,39 @@ fn is_retryable_system_generated_id_conflict(
 mod tests {
     use std::str::FromStr;
 
+    use runtime::testing::TestRuntime;
+    use sync_types::Timestamp;
+    use tokio::sync::oneshot;
     use value::TableName;
 
-    use super::is_retryable_system_generated_id_conflict;
+    use super::{
+        is_retryable_system_generated_id_conflict,
+        Committer,
+    };
+
+    #[tokio::test]
+    async fn raft_commit_waiter_accepts_committed_proposal() -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        tx.send(true).unwrap();
+
+        Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1)).await
+    }
+
+    #[tokio::test]
+    async fn raft_commit_waiter_rejects_failed_proposal() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(false).unwrap();
+
+        let err = Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Raft rejected commit"));
+    }
+
+    #[tokio::test]
+    async fn raft_commit_waiter_allows_non_raft_commit() -> anyhow::Result<()> {
+        Committer::<TestRuntime>::wait_for_raft_commit(None, Timestamp::must(1)).await
+    }
 
     #[test]
     fn retryable_system_generated_id_conflict_matches_udf_config_table() {
