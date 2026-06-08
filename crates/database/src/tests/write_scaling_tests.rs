@@ -40,6 +40,7 @@ use common::{
     },
 };
 use keybroker::Identity;
+use parking_lot::Mutex;
 use pb::replication::{
     two_phase_commit_service_server::{
         TwoPhaseCommitService,
@@ -359,7 +360,7 @@ struct FailingTimestampOracle;
 
 #[async_trait]
 impl TimestampOracle for FailingTimestampOracle {
-    async fn next_ts(&self) -> anyhow::Result<Timestamp> {
+    async fn next_ts_at_or_after(&self, _min_ts: Timestamp) -> anyhow::Result<Timestamp> {
         anyhow::bail!("TSO unavailable during idle heartbeat test");
     }
 
@@ -369,6 +370,58 @@ impl TimestampOracle for FailingTimestampOracle {
 
     async fn advance_committed_ts(&self, _ts: Timestamp) -> anyhow::Result<()> {
         anyhow::bail!("TSO unavailable during idle heartbeat test");
+    }
+}
+
+struct RecordingTimestampOracle {
+    state: Mutex<RecordingTimestampOracleState>,
+}
+
+struct RecordingTimestampOracleState {
+    last_assigned: Timestamp,
+    max_committed: Timestamp,
+    requested_floors: Vec<Timestamp>,
+}
+
+impl RecordingTimestampOracle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RecordingTimestampOracleState {
+                last_assigned: Timestamp::MIN,
+                max_committed: Timestamp::MIN,
+                requested_floors: Vec::new(),
+            }),
+        }
+    }
+
+    fn requested_floors(&self) -> Vec<Timestamp> {
+        self.state.lock().requested_floors.clone()
+    }
+}
+
+#[async_trait]
+impl TimestampOracle for RecordingTimestampOracle {
+    async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp> {
+        let mut state = self.state.lock();
+        state.requested_floors.push(min_ts);
+        let next = std::cmp::max(
+            min_ts,
+            std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?),
+        );
+        state.last_assigned = next;
+        Ok(next)
+    }
+
+    async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
+        Ok(self.state.lock().max_committed)
+    }
+
+    async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
+        let mut state = self.state.lock();
+        if ts > state.max_committed {
+            state.max_committed = ts;
+        }
+        Ok(())
     }
 }
 
@@ -1659,6 +1712,59 @@ fn test_commit_decision_survives_failed_participant_commit() -> anyhow::Result<(
         }
 
         server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_tso_request_includes_local_replica_floor() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso = Arc::new(RecordingTimestampOracle::new());
+        let node = create_node_with_options(
+            &rt,
+            log,
+            Some(partitioned_map(PartitionId(0))),
+            None,
+            Some(tso.clone()),
+        )
+        .await?;
+
+        let replica_floor = Timestamp::try_from(
+            u64::from(*node.now_ts_for_reads())
+                .checked_add(10_000)
+                .context("test timestamp overflow")?,
+        )?;
+        node.committer_for_test()
+            .apply_replica_delta(CommitDelta {
+                ts: replica_floor,
+                document_writes: Arc::new(Vec::new()),
+                document_updates: Vec::new(),
+                index_writes: Arc::new(Vec::new()),
+                write_source: WriteSource::new("tso_local_floor_test"),
+                write_bytes: 0,
+                tablet_id_to_table_name: Default::default(),
+                source_partition: Some(PartitionId(1)),
+            })
+            .await?;
+
+        let expected_floor = replica_floor.succ()?;
+        let commit_ts = insert_doc(&node, "messages", assert_obj!("text" => "after-floor")).await?;
+        let requested_floors = tso.requested_floors();
+
+        assert!(
+            commit_ts >= expected_floor,
+            "commit_ts={commit_ts} should be at or above local floor {expected_floor}",
+        );
+        assert_eq!(
+            requested_floors.last().copied(),
+            Some(expected_floor),
+            "TSO must reserve at the committer's local floor instead of returning a lower value \
+             and letting the committer bump it outside the reserved range",
+        );
+
         Ok(())
     })
 }

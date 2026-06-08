@@ -31,7 +31,8 @@ use parking_lot::Mutex;
 
 /// Trait for assigning globally unique, monotonically increasing timestamps.
 ///
-/// Each Committer calls `next_ts()` before committing a transaction.
+/// Each Committer calls `next_ts_at_or_after()` before committing a
+/// transaction.
 /// The implementation must guarantee that no two calls — across any node
 /// in the cluster — ever return the same timestamp.
 #[async_trait]
@@ -39,7 +40,17 @@ pub trait TimestampOracle: Send + Sync + 'static {
     /// Get the next globally unique timestamp.
     /// Must be monotonically increasing within each node.
     /// Must not overlap with timestamps from other nodes.
-    async fn next_ts(&self) -> anyhow::Result<Timestamp>;
+    async fn next_ts(&self) -> anyhow::Result<Timestamp> {
+        self.next_ts_at_or_after(Timestamp::MIN).await
+    }
+
+    /// Get the next globally unique timestamp at or above `min_ts`.
+    ///
+    /// `min_ts` is the caller's local safety floor, usually derived from the
+    /// local write log, restored snapshot, and last assigned timestamp. Global
+    /// TSOs must include this floor in their reservation, rather than allowing
+    /// callers to bump a returned timestamp outside the reserved range.
+    async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp>;
 
     /// Get the current maximum committed timestamp across all nodes.
     /// Used for read-after-write consistency.
@@ -76,11 +87,11 @@ impl<RT: Runtime> LocalTimestampOracle<RT> {
 
 #[async_trait]
 impl<RT: Runtime> TimestampOracle for LocalTimestampOracle<RT> {
-    async fn next_ts(&self) -> anyhow::Result<Timestamp> {
+    async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp> {
         let mut state = self.state.lock();
         let system_ts = self.runtime.generate_timestamp()?;
         let next = std::cmp::max(
-            system_ts,
+            std::cmp::max(system_ts, min_ts),
             std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?),
         );
         state.last_assigned = next;
@@ -226,7 +237,9 @@ impl BatchTimestampOracle {
             );
 
             let new_lower = batch_lower_bound(current_value, min_next);
-            let new_upper = new_lower + self.batch_size;
+            let new_upper = new_lower
+                .checked_add(self.batch_size)
+                .context("TSO: Reserved batch upper bound overflow")?;
             let new_value = new_upper.to_be_bytes().to_vec();
 
             // Atomic compare-and-swap: only succeeds if no other node
@@ -255,9 +268,10 @@ impl BatchTimestampOracle {
 
 #[async_trait]
 impl TimestampOracle for BatchTimestampOracle {
-    async fn next_ts(&self) -> anyhow::Result<Timestamp> {
+    async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp> {
         let committed_floor = self.max_committed_ts().await?;
-        let min_next = u64::from(committed_floor.succ()?);
+        let min_next_ts = std::cmp::max(min_ts, committed_floor.succ()?);
+        let min_next = u64::from(min_next_ts);
 
         loop {
             let candidate = {
@@ -398,9 +412,12 @@ pub mod testing {
 
     #[async_trait]
     impl TimestampOracle for InMemoryTimestampOracle {
-        async fn next_ts(&self) -> anyhow::Result<Timestamp> {
+        async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp> {
             let mut state = self.state.lock();
-            let next = std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?);
+            let next = std::cmp::max(
+                min_ts,
+                std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?),
+            );
             state.last_assigned = next;
             Ok(next)
         }
@@ -435,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_batch_fast_forwards_to_committed_floor() {
+    fn reserved_batch_fast_forwards_to_requested_floor() {
         let (ts, next_current) =
             next_ts_from_reserved_batch(100, 200, 150).expect("candidate within batch");
         assert_eq!(ts, 150);
@@ -449,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_batch_starts_above_committed_floor_when_counter_lags() {
+    fn reserve_batch_starts_above_requested_floor_when_counter_lags() {
         assert_eq!(batch_lower_bound(1000, 1001), 1001);
         assert_eq!(batch_lower_bound(1000, 1500), 1500);
         assert_eq!(batch_lower_bound(2000, 1500), 2000);

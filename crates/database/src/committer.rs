@@ -3103,6 +3103,7 @@ impl<RT: Runtime> Committer<RT> {
 
     fn next_commit_ts(&mut self) -> anyhow::Result<Timestamp> {
         let _timer = next_commit_ts_seconds();
+        let local_floor = self.local_commit_floor()?;
 
         // When a global TSO is configured (TiDB PD pattern), draw timestamps
         // from it instead of the local clock. This ensures globally unique,
@@ -3114,40 +3115,34 @@ impl<RT: Runtime> Committer<RT> {
             let ts = block_in_place(|| {
                 let rt = tokio::runtime::Handle::current();
                 if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                    futures::executor::block_on(tso.next_ts())
+                    futures::executor::block_on(tso.next_ts_at_or_after(local_floor))
                 } else {
-                    rt.block_on(tso.next_ts())
+                    rt.block_on(tso.next_ts_at_or_after(local_floor))
                 }
             })?;
-            // Still enforce local monotonicity against snapshot and last_assigned.
-            let log_floor = self.log.max_ts().succ()?;
-            let latest_ts = self.snapshot_manager.read().latest_ts();
-            let max = cmp::max(
+            anyhow::ensure!(
+                ts >= local_floor,
+                "TSO returned ts={} below requested local floor {}",
                 ts,
-                cmp::max(
-                    log_floor,
-                    cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
-                ),
+                local_floor,
             );
-            self.last_assigned_ts = max;
-            return Ok(max);
+            self.last_assigned_ts = ts;
+            return Ok(ts);
         }
 
         // Single-node mode: existing behavior (local clock + monotonic counter).
-        let log_floor = self.log.max_ts().succ()?;
-        let latest_ts = self.snapshot_manager.read().latest_ts();
-        let max = cmp::max(
-            log_floor,
-            cmp::max(
-                latest_ts.succ()?,
-                cmp::max(
-                    self.runtime.generate_timestamp()?,
-                    self.last_assigned_ts.succ()?,
-                ),
-            ),
-        );
+        let max = cmp::max(local_floor, self.runtime.generate_timestamp()?);
         self.last_assigned_ts = max;
         Ok(max)
+    }
+
+    fn local_commit_floor(&self) -> anyhow::Result<Timestamp> {
+        let log_floor = self.log.max_ts().succ()?;
+        let latest_ts = self.snapshot_manager.read().latest_ts();
+        Ok(cmp::max(
+            log_floor,
+            cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
+        ))
     }
 
     fn next_max_repeatable_ts(&mut self) -> anyhow::Result<Timestamp> {
