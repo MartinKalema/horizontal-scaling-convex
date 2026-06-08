@@ -949,6 +949,7 @@ mod tests {
     use common::{
         components::{
             CanonicalizedComponentFunctionPath,
+            ComponentId,
             ComponentPath,
         },
         http::{
@@ -968,6 +969,7 @@ mod tests {
     };
     use headers::authorization::Credentials;
     use http::{
+        Method,
         Request,
         StatusCode,
     };
@@ -1630,6 +1632,186 @@ mod tests {
             msg.contains("replicas do not own global request surfaces"),
             "{msg}"
         );
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_selective_api_rejects_admin_and_subscription_surfaces_on_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt.clone()).await?;
+        let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
+            Arc::new(backend.st.application.clone()),
+            backend.st.application.database().clone(),
+            false,
+            Some(PartitionId(1)),
+            None,
+            None,
+            None,
+        ));
+        let host = ResolvedHostname {
+            instance_name: backend.st.instance_name.clone(),
+            destination: RequestDestination::ConvexCloud,
+        };
+        let path = CanonicalizedComponentFunctionPath {
+            component: ComponentPath::root(),
+            udf_path: super::parse_udf_path("values:intQuery")?,
+        };
+
+        let admin_query_err = api
+            .execute_admin_query(
+                &host,
+                common::RequestId::new(),
+                Identity::system(),
+                path.clone(),
+                SerializedArgs::from_args(vec![json!({})])?,
+                FunctionCaller::HttpApi(ClientVersion::unknown()),
+                ExecuteQueryTimestamp::Latest,
+                None,
+            )
+            .await
+            .expect_err("non-authority partitions must not execute admin queries locally");
+        assert!(
+            format!("{admin_query_err:#}").contains("Admin query cannot execute locally"),
+            "{admin_query_err:#}"
+        );
+
+        let admin_mutation_err = api
+            .execute_admin_mutation(
+                &host,
+                common::RequestId::new(),
+                Identity::system(),
+                path,
+                SerializedArgs::from_args(vec![json!({})])?,
+                FunctionCaller::HttpApi(ClientVersion::unknown()),
+                None,
+                None,
+            )
+            .await
+            .expect_err("non-authority partitions must not execute admin mutations locally");
+        assert!(
+            format!("{admin_mutation_err:#}").contains("Admin mutation cannot execute locally"),
+            "{admin_mutation_err:#}"
+        );
+
+        let subscription_err = match api.subscription_client(&host).await {
+            Ok(_) => {
+                panic!("non-authority partitions must not create subscription clients locally")
+            },
+            Err(e) => e,
+        };
+        assert!(
+            format!("{subscription_err:#}").contains("Subscription setup cannot execute locally"),
+            "{subscription_err:#}"
+        );
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_selective_api_rejects_file_and_timestamp_surfaces_on_replica(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt.clone()).await?;
+        let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
+            Arc::new(backend.st.application.clone()),
+            backend.st.application.database().clone(),
+            true,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let host = ResolvedHostname {
+            instance_name: backend.st.instance_name.clone(),
+            destination: RequestDestination::ConvexCloud,
+        };
+
+        let timestamp_err = api
+            .latest_timestamp(&host, common::RequestId::new())
+            .await
+            .expect_err("replicas must not allocate latest query timestamps locally");
+        assert!(
+            format!("{timestamp_err:#}").contains("Latest timestamp cannot execute locally"),
+            "{timestamp_err:#}"
+        );
+
+        let file_auth_err = api
+            .check_store_file_authorization(
+                &host,
+                common::RequestId::new(),
+                "not-a-real-token",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("replicas must not validate file upload tokens locally");
+        assert!(
+            format!("{file_auth_err:#}")
+                .contains("File upload authorization cannot execute locally"),
+            "{file_auth_err:#}"
+        );
+
+        let file_read_err = match api
+            .get_file(
+                &host,
+                common::RequestId::new(),
+                "http://localhost".into(),
+                ComponentId::Root,
+                model::file_storage::FileStorageId::LegacyStorageId(
+                    "00000000-0000-0000-0000-000000000000".parse()?,
+                ),
+            )
+            .await
+        {
+            Ok(_) => panic!("replicas must not read file storage through local application state"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{file_read_err:#}").contains("File read cannot execute locally"),
+            "{file_read_err:#}"
+        );
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_migrated_global_endpoints_reject_replica_mode(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let mut replica_state = backend.st.clone();
+        replica_state.replica_mode = true;
+        let replica_app = ConvexHttpService::new(
+            router(replica_state),
+            "backend_migrated_global_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for (method, uri) in [
+            (Method::POST, "/api/query_ts"),
+            (Method::POST, "/api/storage/upload?token=not-a-real-token"),
+            (Method::GET, "/http/anything"),
+        ] {
+            let req = Request::builder()
+                .uri(uri)
+                .method(method)
+                .header("Host", "localhost")
+                .body(Body::empty())?;
+            let (parts, body) = replica_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(body.contains("ServiceUnavailable"), "{body}");
+        }
 
         Ok(())
     }
