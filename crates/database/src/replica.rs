@@ -244,4 +244,30 @@ mod tests {
         assert_eq!(counts.term.load(Ordering::SeqCst), 0);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn apply_failure_naks_then_redelivered_message_can_ack() -> anyhow::Result<()> {
+        let counts = Arc::new(AckCounts::default());
+        let ts = Timestamp::try_from(42u64)?;
+
+        let first_attempt =
+            apply_replication_message_with(test_message(ts, counts.clone()), |_delta| async move {
+                anyhow::bail!("transient apply failure")
+            })
+            .await;
+        assert!(first_attempt.is_err());
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+
+        let (applied_ts, _) =
+            apply_replication_message_with(test_message(ts, counts.clone()), |delta| async move {
+                Ok(delta.ts)
+            })
+            .await?;
+        assert_eq!(applied_ts, ts);
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.term.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
 }
