@@ -576,8 +576,8 @@ async fn prepare_schema_with_dropped_index_does_not_remove_it(
     .await
 }
 
-// The index will instead be enabled when push_config is eventually called by
-// the CLI.
+// The index will instead be enabled when the deploy config commit eventually
+// runs.
 #[convex_macro::test_runtime]
 async fn prepare_schema_with_added_index_does_not_enable_it_after_backfill(
     rt: TestRuntime,

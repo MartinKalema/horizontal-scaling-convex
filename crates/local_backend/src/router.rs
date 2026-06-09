@@ -82,9 +82,7 @@ use crate::{
     },
     deploy_config::{
         self,
-        get_config,
         get_config_hashes,
-        push_config,
     },
     environment_variables::{
         list_environment_variables,
@@ -123,10 +121,6 @@ use crate::{
     scheduling::{
         cancel_all_jobs,
         cancel_job,
-    },
-    schema::{
-        prepare_schema,
-        schema_state,
     },
     snapshot_export::{
         cancel_export,
@@ -405,18 +399,16 @@ pub fn router(st: BackendAppState) -> Router {
         .with_state(admin_state.clone());
 
     let deploy_push_routes = Router::new()
-        .route("/push_config", post(push_config))
-        .route("/prepare_schema", post(prepare_schema))
-        .route("/deploy2/start_push", post(deploy_config::start_push))
-        .route("/deploy2/evaluate_push", post(deploy_config::evaluate_push))
+        .route("/deploy/start_push", post(deploy_config::start_push))
+        .route("/deploy/evaluate_push", post(deploy_config::evaluate_push))
         .route("/run_test_function", post(run_test_function))
         .route(
-            "/deploy2/wait_for_schema",
+            "/deploy/wait_for_schema",
             post(deploy_config::wait_for_schema),
         )
-        .route("/deploy2/finish_push", post(deploy_config::finish_push))
+        .route("/deploy/finish_push", post(deploy_config::finish_push))
         .route(
-            "/deploy2/report_push_completed",
+            "/deploy/report_push_completed",
             post(deploy_config::report_push_completed_handler),
         )
         .layer(
@@ -430,9 +422,7 @@ pub fn router(st: BackendAppState) -> Router {
     let deploy_state = DeployRouterState::from(&st);
     let deploy_routes = Router::new()
         .merge(deploy_push_routes)
-        .route("/get_config", post(get_config))
         .route("/get_config_hashes", post(get_config_hashes))
-        .route("/schema_state/{schema_id}", get(schema_state))
         .layer(cli_cors())
         .layer(axum::middleware::from_fn_with_state(
             deploy_state.clone(),
@@ -885,37 +875,34 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
-    async fn test_deploy_api_rejects_non_authority_partition(
-        rt: ProdRuntime,
-    ) -> anyhow::Result<()> {
+    async fn test_legacy_deploy_routes_are_not_registered(rt: ProdRuntime) -> anyhow::Result<()> {
         let backend = setup_backend_for_test(rt).await?;
-        let mut partitioned_state = backend.st.clone();
-        partitioned_state.partition_id = Some(PartitionId(1));
-        let partitioned_app = ConvexHttpService::new(
-            router(partitioned_state),
-            "deploy_api_authority_test",
+        let app = ConvexHttpService::new(
+            router(backend.st.clone()),
+            "legacy_deploy_routes_test",
             SERVER_VERSION_STR.to_string(),
             MAX_CONCURRENT_REQUESTS,
             Duration::from_secs(125),
             NoopRouteMapper,
         );
 
-        let req = Request::builder()
-            .uri("/api/push_config")
-            .method("POST")
-            .header("Host", "localhost")
-            .header("Content-Type", "application/json")
-            .body(Body::from("{}"))?;
-        let (parts, body) = partitioned_app
-            .router()
-            .clone()
-            .oneshot(req)
-            .await?
-            .into_parts();
-        let bytes = body.collect().await?.to_bytes();
-        let body = String::from_utf8_lossy(&bytes);
-        assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert!(body.contains("ServiceUnavailable"), "{body}");
+        for (method, path) in [
+            ("POST", "/api/get_config"),
+            ("POST", "/api/push_config"),
+            ("POST", "/api/prepare_schema"),
+            ("GET", "/api/schema_state/not-a-real-schema-id"),
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .method(method)
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))?;
+            let (parts, body) = app.router().clone().oneshot(req).await?.into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{path}: {body}");
+        }
 
         Ok(())
     }
@@ -960,44 +947,6 @@ mod tests {
         let bytes = body.collect().await?.to_bytes();
         let body = String::from_utf8_lossy(&bytes);
         assert_eq!(parts.status, StatusCode::OK, "{body}");
-
-        Ok(())
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_schema_state_rejects_non_authority_partition(
-        rt: ProdRuntime,
-    ) -> anyhow::Result<()> {
-        let backend = setup_backend_for_test(rt).await?;
-        let admin_header = backend.admin_auth_header.0.encode();
-
-        let mut partitioned_state = backend.st.clone();
-        partitioned_state.partition_id = Some(PartitionId(1));
-        let partitioned_app = ConvexHttpService::new(
-            router(partitioned_state),
-            "schema_state_authority_test",
-            SERVER_VERSION_STR.to_string(),
-            MAX_CONCURRENT_REQUESTS,
-            Duration::from_secs(125),
-            NoopRouteMapper,
-        );
-
-        let req = Request::builder()
-            .uri("/api/schema_state/not-a-real-schema-id")
-            .method("GET")
-            .header("Host", "localhost")
-            .header("Authorization", admin_header)
-            .body(Body::empty())?;
-        let (parts, body) = partitioned_app
-            .router()
-            .clone()
-            .oneshot(req)
-            .await?
-            .into_parts();
-        let bytes = body.collect().await?.to_bytes();
-        let body = String::from_utf8_lossy(&bytes);
-        assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert!(body.contains("ServiceUnavailable"), "{body}");
 
         Ok(())
     }
@@ -1307,7 +1256,7 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
-    async fn test_deploy2_routes_use_explicit_forwarding_authority(
+    async fn test_deploy_routes_use_explicit_forwarding_authority(
         rt: ProdRuntime,
     ) -> anyhow::Result<()> {
         let backend = setup_backend_for_test(rt).await?;
@@ -1322,7 +1271,7 @@ mod tests {
         partitioned_state.partition_id = Some(PartitionId(1));
         let partitioned_app = ConvexHttpService::new(
             router(partitioned_state),
-            "deploy2_authority_exemption_test",
+            "deploy_authority_exemption_test",
             SERVER_VERSION_STR.to_string(),
             MAX_CONCURRENT_REQUESTS,
             Duration::from_secs(125),
@@ -1330,7 +1279,7 @@ mod tests {
         );
 
         let req = Request::builder()
-            .uri("/api/deploy2/report_push_completed")
+            .uri("/api/deploy/report_push_completed")
             .method("POST")
             .header("Host", "localhost")
             .header("Content-Type", "application/json")

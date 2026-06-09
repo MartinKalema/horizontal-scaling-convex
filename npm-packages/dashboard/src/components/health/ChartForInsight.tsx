@@ -62,7 +62,12 @@ function InsightsLineChart<T extends Record<string, any>>({
 }) {
   const { from } = useInsightsPeriod();
   const auditLogs = useDeploymentAuditLogs(toNumericUTC(from), {
-    actions: ["push_config", "push_config_with_components"],
+    actions: [
+      "deploy",
+      "deploy_with_components",
+      "push_config",
+      "push_config_with_components",
+    ],
   });
   const deploysByHour = auditLogs?.map(
     (log) => {

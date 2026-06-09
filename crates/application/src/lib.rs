@@ -2042,7 +2042,7 @@ impl<RT: Runtime> Application<RT> {
                 config_metadata,
                 schema,
             },
-            vec![DeploymentAuditLogEvent::PushConfig { config_diff }],
+            vec![DeploymentAuditLogEvent::Deploy { config_diff }],
         ))
     }
 

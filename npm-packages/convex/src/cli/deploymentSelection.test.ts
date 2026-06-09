@@ -9,7 +9,7 @@ import {
   bigBrainAPIMaybeThrows,
 } from "./lib/utils/utils.js";
 import { readGlobalConfig } from "./lib/utils/globalConfig.js";
-import { deployToDeployment } from "./lib/deploy2.js";
+import { deployToDeployment } from "./lib/deployProtocol.js";
 import { runPush } from "./lib/components.js";
 import { readProjectConfig, getAuthKitConfig } from "./lib/config.js";
 import { gitBranchFromEnvironment } from "./lib/envvars.js";
@@ -95,8 +95,9 @@ vi.mock("@sentry/node", () => ({
 }));
 
 // Deploy-specific mocks
-vi.mock("./lib/deploy2.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./lib/deploy2.js")>();
+vi.mock("./lib/deployProtocol.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./lib/deployProtocol.js")>();
   return {
     ...actual,
     deployToDeployment: vi.fn(),

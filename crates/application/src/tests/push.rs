@@ -81,7 +81,7 @@ async fn test_max_size_push_no_components(rt: TestRuntime) -> anyhow::Result<()>
     let application = Application::new_for_tests(&rt).await?;
     for _ in 0..2 {
         application
-            .push_config_no_components(
+            .deploy_config_no_components(
                 Identity::system(),
                 ConfigFile {
                     auth_info: None,
@@ -149,7 +149,7 @@ async fn test_change_node_version_no_components(rt: TestRuntime) -> anyhow::Resu
     assert!(node_version.is_none());
 
     application
-        .push_config_no_components(
+        .deploy_config_no_components(
             Identity::system(),
             ConfigFile {
                 auth_info: None,

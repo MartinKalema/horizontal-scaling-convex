@@ -4,19 +4,12 @@ use std::{
 };
 
 use anyhow::Context;
-use application::{
-    deploy_config::{
-        EvaluatePushResponse,
-        FinishPushDiff,
-        ModuleJson,
-        NodeDependencyJson,
-        PushAnalytics,
-        PushMetrics,
-        SchemaStatusJson,
-        StartPushRequest,
-        StartPushResponse,
-    },
-    Application,
+use application::deploy_config::{
+    EvaluatePushResponse,
+    FinishPushDiff,
+    SchemaStatusJson,
+    StartPushRequest,
+    StartPushResponse,
 };
 use axum::{
     debug_handler,
@@ -38,7 +31,6 @@ use common::{
         HttpResponseError,
     },
     types::Timestamp,
-    version::Version,
 };
 use database::partition::PartitionId;
 use errors::{
@@ -69,13 +61,7 @@ use model::{
         type_checking::SerializedCheckedComponent,
         types::SerializedEvaluatedComponentDefinition,
     },
-    config::{
-        types::{
-            ConfigFile,
-            ModuleConfig,
-        },
-        ConfigModel,
-    },
+    config::ConfigModel,
     external_packages::types::ExternalDepsPackageId,
     modules::module_versions::SerializedAnalyzedModule,
     source_packages::{
@@ -83,7 +69,6 @@ use model::{
         SourcePackageModel,
     },
 };
-use runtime::prod::ProdRuntime;
 use serde::{
     de::DeserializeOwned,
     Deserialize,
@@ -102,10 +87,8 @@ use crate::{
     admin::{
         must_be_admin_from_key,
         must_be_admin_from_key_with_write_access,
-        must_be_admin_with_write_access,
     },
     DeployRouterState,
-    EmptyResponse,
 };
 
 #[derive(Deserialize)]
@@ -113,13 +96,7 @@ use crate::{
 pub struct GetConfigRequest {
     pub admin_key: String,
 }
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetConfigResponse {
-    pub config: JsonValue,
-    pub modules: Vec<ModuleJson>,
-    pub udf_server_version: Option<String>,
-}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetConfigHashesResponse {
@@ -129,138 +106,12 @@ pub struct GetConfigHashesResponse {
     pub node_version: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ClientPushMetrics {
-    pub typecheck: f64,
-    pub bundle: f64,
-    pub schema_push: f64,
-    pub code_pull: f64,
-    pub total_before_push: f64,
-    pub module_diff_stats: Option<ModuleDiffStats>,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ModuleDiffStats {
-    updated: ModuleDiffStat,
-    added: ModuleDiffStat,
-    identical: ModuleDiffStat,
-    num_dropped: usize,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ModuleDiffStat {
-    count: usize,
-    size: usize,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-#[expect(dead_code)]
-pub struct BundledModuleInfoJson {
-    name: String,
-    platform: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConfigJson {
-    pub config: ConfigFile,
-    pub modules: Vec<ModuleJson>,
-    pub admin_key: String,
-    pub udf_server_version: String,
-    // None when there is no schema file.
-    pub schema_id: Option<String>,
-    pub push_metrics: Option<ClientPushMetrics>,
-    // Use for external node dependencies
-    pub node_dependencies: Option<Vec<NodeDependencyJson>>,
-    // Additional information about the names of the bundled modules.
-    // We can use that for stats as well provide better debug messages.
-    pub bundled_module_infos: Option<Vec<BundledModuleInfoJson>>,
-    // Version of Node.js to use in the node executor.
-    pub node_version: Option<String>,
-}
-
-pub struct ConfigStats {
-    pub num_node_modules: usize,
-    pub size_node_modules: usize,
-    pub num_v8_modules: usize,
-    pub size_v8_modules: usize,
-}
-
-static NODE_ENVIRONMENT: &str = "node";
-impl ConfigJson {
-    pub fn stats(&self) -> ConfigStats {
-        let num_node_modules = self
-            .modules
-            .iter()
-            .filter(|module| module.environment.as_deref() == Some(NODE_ENVIRONMENT))
-            .count();
-        let size_node_modules = self
-            .modules
-            .iter()
-            .filter(|module| module.environment.as_deref() == Some(NODE_ENVIRONMENT))
-            .fold(0, |acc, e| {
-                acc + e.source.len() + e.source_map.as_ref().map_or(0, |sm| sm.len())
-            });
-        let size_v8_modules = self
-            .modules
-            .iter()
-            .filter(|module| module.environment.as_deref() != Some(NODE_ENVIRONMENT))
-            .fold(0, |acc, e| {
-                acc + e.source.len() + e.source_map.as_ref().map_or(0, |sm| sm.len())
-            });
-        let num_v8_modules = self
-            .modules
-            .iter()
-            .filter(|module| module.environment.as_deref() != Some(NODE_ENVIRONMENT))
-            .count();
-        ConfigStats {
-            num_v8_modules,
-            num_node_modules,
-            size_v8_modules,
-            size_node_modules,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModuleHashJson {
     path: String,
     hash: String,
     environment: Option<String>,
-}
-
-pub async fn get_config(
-    MtState(st): MtState<DeployRouterState>,
-    Json(req): Json<GetConfigRequest>,
-) -> Result<impl IntoResponse, HttpResponseError> {
-    let identity = must_be_admin_from_key(
-        st.application.app_auth(),
-        st.instance_name.clone(),
-        req.admin_key,
-    )
-    .await?;
-
-    let mut tx = st.application.begin(identity).await?;
-    let component = ComponentId::Root; // This endpoint is only used pre-components.
-    let (config, modules, udf_config) = ConfigModel::new(&mut tx, component)
-        .get_with_module_source(st.application.modules_cache())
-        .await?;
-    let config = DocumentObject::try_from(config)?.to_internal_json();
-
-    let modules = modules.into_iter().map(|m| m.into()).collect();
-    let udf_server_version = udf_config.map(|config| format!("{}", config.server_version));
-    // Should this be committed?
-    st.application.commit(tx, "get_config").await?;
-    Ok(Json(GetConfigResponse {
-        config,
-        modules,
-        udf_server_version,
-    }))
 }
 
 pub async fn get_config_hashes(
@@ -302,67 +153,6 @@ pub async fn get_config_hashes(
         udf_server_version,
         node_version,
     }))
-}
-
-#[debug_handler]
-pub async fn push_config(
-    State(st): State<DeployRouterState>,
-    Json(req): Json<ConfigJson>,
-) -> Result<impl IntoResponse, HttpResponseError> {
-    push_config_handler(&st.application, req)
-        .await
-        .map_err(|e| e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}")))?;
-
-    Ok(Json(EmptyResponse {}))
-}
-
-#[fastrace::trace]
-pub async fn push_config_handler(
-    application: &Application<ProdRuntime>,
-    config: ConfigJson,
-) -> anyhow::Result<(Identity, PushAnalytics, PushMetrics)> {
-    let identity = application
-        .app_auth()
-        .check_key(config.admin_key, application.instance_name())
-        .await
-        .context("bad admin key error")?;
-
-    must_be_admin_with_write_access(&identity)?;
-
-    let modules: Vec<ModuleConfig> = config
-        .modules
-        .into_iter()
-        .map(|m| m.try_into())
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let udf_server_version = Version::parse(&config.udf_server_version).context(
-        ErrorMetadata::bad_request("InvalidVersion", "The function version is invalid"),
-    )?;
-    let node_version = config
-        .node_version
-        .clone()
-        .map(|v| v.parse())
-        .transpose()
-        .context(ErrorMetadata::bad_request(
-            "InvalidNodeVersion",
-            format!(
-                "The node version `{}` is invalid",
-                config.node_version.unwrap_or_default()
-            ),
-        ))?;
-
-    let (analytics, metrics) = application
-        .push_config_no_components(
-            identity.clone(),
-            config.config,
-            modules,
-            udf_server_version,
-            config.schema_id,
-            config.node_dependencies,
-            node_version,
-        )
-        .await?;
-    Ok((identity, analytics, metrics))
 }
 
 const INTERNAL_BACKEND_HTTP_PORT: u16 = 3210;
@@ -674,7 +464,7 @@ pub async fn start_push(
     Json(mut req): Json<StartPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     if let Some(forwarded) =
-        maybe_forward_deploy_request(&st, "/api/deploy2/start_push", &mut req, true).await?
+        maybe_forward_deploy_request(&st, "/api/deploy/start_push", &mut req, true).await?
     {
         return Ok(Json(forwarded));
     }
@@ -706,7 +496,7 @@ pub async fn evaluate_push(
     Json(mut req): Json<StartPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     if let Some(forwarded) =
-        maybe_forward_deploy_request(&st, "/api/deploy2/evaluate_push", &mut req, true).await?
+        maybe_forward_deploy_request(&st, "/api/deploy/evaluate_push", &mut req, true).await?
     {
         return Ok(Json(forwarded));
     }
@@ -753,7 +543,7 @@ pub async fn wait_for_schema(
     Json(mut req): Json<WaitForSchemaRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     if let Some(forwarded) =
-        maybe_forward_deploy_request(&st, "/api/deploy2/wait_for_schema", &mut req, false).await?
+        maybe_forward_deploy_request(&st, "/api/deploy/wait_for_schema", &mut req, false).await?
     {
         return Ok(Json(forwarded));
     }
@@ -839,7 +629,7 @@ pub async fn finish_push(
     if let Some(forwarded) = maybe_forward_deploy_request::<
         FinishPushRequest,
         SerializedFinishPushResponse,
-    >(&st, "/api/deploy2/finish_push", &mut req, true)
+    >(&st, "/api/deploy/finish_push", &mut req, true)
     .await?
     {
         if let Some(commit_ts) = forwarded.commit_ts {

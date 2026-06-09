@@ -65,7 +65,7 @@ own for distributed changes.
   cross-partition commit, and rollback on participant failure; `cargo check`
   for `local_backend`.
 
-### 2026-04 — Forwarded `deploy2` requests failed auth on the metadata owner
+### 2026-04 — Forwarded deploy protocol requests failed auth on the metadata owner
 
 - **Status:** fixed
 - **Symptom:** deploys sent to a non-owner node failed once that node forwarded

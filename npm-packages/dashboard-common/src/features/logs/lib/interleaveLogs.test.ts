@@ -23,7 +23,7 @@ function createDeploymentAuditLogEvent(
   return {
     _id: "" as Id<"_deployment_audit_log">,
     _creationTime: creationTime,
-    action: "push_config",
+    action: "deploy",
     metadata: {
       auth: {
         added: [],

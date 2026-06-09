@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
 NODE_A_URL="http://127.0.0.1:3210"
 NODE_B_URL="http://127.0.0.1:3220"
 NODE_C_URL="http://127.0.0.1:3230"
@@ -64,8 +67,8 @@ echo "  Admin keys generated."
 # Deploy functions to Node A (leader deploys, followers replicate).
 DEPLOY_DIR=$(mktemp -d)
 mkdir -p "$DEPLOY_DIR/convex"
-cat > "$DEPLOY_DIR/package.json" << 'EOF'
-{ "name": "raft-test", "version": "1.0.0", "dependencies": { "convex": "^1" } }
+cat > "$DEPLOY_DIR/package.json" << EOF
+{ "name": "raft-test", "version": "1.0.0", "dependencies": { "convex": "file:$REPO_ROOT/npm-packages/convex" } }
 EOF
 
 cat > "$DEPLOY_DIR/convex/messages.ts" << 'TSEOF'
