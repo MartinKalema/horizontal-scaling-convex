@@ -33,8 +33,8 @@ use sync_types::{
 
 use crate::{
     AdminRouterState,
+    BackendAppState,
     ImportExportRouterState,
-    LocalAppState,
     RouterState,
 };
 
@@ -107,7 +107,7 @@ pub struct ExtractIdentity(pub Identity);
 
 impl<S> FromRequestParts<S> for ExtractIdentity
 where
-    LocalAppState: FromMtState<S>,
+    BackendAppState: FromMtState<S>,
     S: Send + Sync + Clone + 'static,
 {
     type Rejection = HttpResponseError;
@@ -118,7 +118,7 @@ where
     ) -> Result<Self, Self::Rejection> {
         let token: AuthenticationToken =
             parts.extract::<ExtractAuthenticationToken>().await?.into();
-        let st = LocalAppState::from_request_parts(parts, st).await?;
+        let st = BackendAppState::from_request_parts(parts, st).await?;
 
         Ok(Self(
             st.application

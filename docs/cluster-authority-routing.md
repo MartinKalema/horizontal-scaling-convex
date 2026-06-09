@@ -44,8 +44,8 @@ instead of the broad application assembly state.
 
 | Route surface | Authority rule |
 | --- | --- |
-| `/api/deploy2/*` | Explicit forwarding. Deploy metadata handlers forward to partition 0 and then to the Raft leader where needed. `report_push_completed` is local observability. |
-| `/api/get_config`, `/api/get_config_hashes` | Any-node safe deploy introspection. The current CLI reads target-node module/config hashes before the modern `deploy2` push so each node can materialize its local module view. |
+| `/api/deploy2/*` | Explicit forwarding. Deploy protocol handlers forward to partition 0 and then to the Raft leader where needed. `report_push_completed` is local observability. The `deploy2` path is the external wire-protocol path and is preserved for client compatibility. |
+| `/api/get_config`, `/api/get_config_hashes` | Any-node safe deploy introspection. The current CLI reads target-node module/config hashes before the modern deploy protocol push so each node can materialize its local module view. |
 | `/api/push_config`, `/api/prepare_schema`, `/api/run_test_function`, `/api/schema_state/*` | Coordinator owner unless a narrower forwarding path is added. |
 
 ## Admin `AdminRouterState` Routes
@@ -93,10 +93,10 @@ Snapshot import/export and streaming import/export routes use a dedicated
 
 ## Final Router Shape
 
-The application assembly state currently named `LocalAppState` remains only for
-constructing the local backend and serving local-process surfaces such as health
-checks, static assets, and server bootstrap wiring. It is no longer used as a
-broad `/api` route state.
+`BackendAppState` is the application assembly state used only for constructing
+the local backend and serving local-process surfaces such as health checks,
+static assets, and server bootstrap wiring. It is no longer used as a broad
+`/api` route state.
 
 Every externally reachable clustered `/api` route is now mounted through an
 explicit smaller route state:

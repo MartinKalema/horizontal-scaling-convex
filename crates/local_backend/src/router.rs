@@ -85,7 +85,7 @@ use crate::{
         get_config_hashes,
         push_config,
     },
-    deploy_config2,
+    deploy_protocol,
     environment_variables::{
         list_environment_variables,
         platform_router,
@@ -170,9 +170,9 @@ use crate::{
     subs::sync,
     ActionCallbackRouterState,
     AdminRouterState,
+    BackendAppState,
     DeployRouterState,
     ImportExportRouterState,
-    LocalAppState,
     RouterState,
 };
 
@@ -364,7 +364,7 @@ struct PublicApiDoc;
 )]
 struct DashboardApiDoc;
 
-pub fn router(st: LocalAppState) -> Router {
+pub fn router(st: BackendAppState) -> Router {
     let browser_routes = Router::new()
         // Called by the browser (and optionally authenticated by a cookie or `Authorization`
         // header). Passes version in the URL because websockets can't do it in header.
@@ -407,20 +407,20 @@ pub fn router(st: LocalAppState) -> Router {
     let deploy_push_routes = Router::new()
         .route("/push_config", post(push_config))
         .route("/prepare_schema", post(prepare_schema))
-        .route("/deploy2/start_push", post(deploy_config2::start_push))
+        .route("/deploy2/start_push", post(deploy_protocol::start_push))
         .route(
             "/deploy2/evaluate_push",
-            post(deploy_config2::evaluate_push),
+            post(deploy_protocol::evaluate_push),
         )
         .route("/run_test_function", post(run_test_function))
         .route(
             "/deploy2/wait_for_schema",
-            post(deploy_config2::wait_for_schema),
+            post(deploy_protocol::wait_for_schema),
         )
-        .route("/deploy2/finish_push", post(deploy_config2::finish_push))
+        .route("/deploy2/finish_push", post(deploy_protocol::finish_push))
         .route(
             "/deploy2/report_push_completed",
-            post(deploy_config2::report_push_completed_handler),
+            post(deploy_protocol::report_push_completed_handler),
         )
         .layer(
             ServiceBuilder::new()
@@ -688,13 +688,13 @@ where
 
 pub fn health_check_routes<S>(version: String) -> Router<S>
 where
-    LocalAppState: FromMtState<S>,
+    BackendAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
         .route(
             "/instance_name",
-            get(|MtState(st): MtState<LocalAppState>| async move { st.instance_name.clone() }),
+            get(|MtState(st): MtState<BackendAppState>| async move { st.instance_name.clone() }),
         )
         .route("/instance_version", get(|| async move { version }))
         .route(

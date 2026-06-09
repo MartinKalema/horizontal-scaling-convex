@@ -157,7 +157,7 @@ impl RouteAuthorityRule {
 
 const ANY_NODE_STATIC_SCHEMA: &str = "static schema or deploy-introspection route";
 const EXPLICIT_DEPLOY_FORWARDING: &str =
-    "deploy2 handlers forward to the metadata owner and Raft leader before mutating state";
+    "deploy protocol handlers forward to the metadata owner and Raft leader before mutating state";
 const COORDINATOR_GLOBAL_STATE: &str =
     "route touches deployment-global state and must run on partition 0 / Raft leader";
 
@@ -178,16 +178,18 @@ pub(crate) const LOCAL_BACKEND_API_ROUTE_AUTHORITIES: &[RouteAuthorityRule] = &[
         "deploy config read",
         "/get_config",
         RouteAuthorityClass::AnyNodeSafe,
-        "CLI reads the target node before deploy2 push so each node can materialize local modules",
+        "CLI reads the target node before the deploy protocol push so each node can materialize \
+         local modules",
     ),
     RouteAuthorityRule::exact(
         "deploy config hash read",
         "/get_config_hashes",
         RouteAuthorityClass::AnyNodeSafe,
-        "CLI reads the target node before deploy2 push so each node can materialize local modules",
+        "CLI reads the target node before the deploy protocol push so each node can materialize \
+         local modules",
     ),
     RouteAuthorityRule::prefix(
-        "deploy2 metadata operation",
+        "deploy protocol metadata operation",
         "/deploy2/",
         RouteAuthorityClass::ExplicitForwarding,
         EXPLICIT_DEPLOY_FORWARDING,
