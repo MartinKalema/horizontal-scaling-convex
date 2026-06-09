@@ -7,12 +7,19 @@ closed otherwise.
 
 ## Authority Classes
 
+The code-level registry for unmigrated local-backend routes lives in
+`crates/local_backend/src/route_authority.rs`. It is intentionally typed so new
+routes choose an authority class in code, not only in prose.
+
 | Class | Meaning | Current handling |
 | --- | --- | --- |
 | Any-node safe | The route is static, health-only, or purely local observability. | Serve locally. |
 | Partition owner | The route writes user data owned by one table partition. | Public mutations use the existing partition enforcement and mutation forwarding path. |
+| Partition leader | The route writes Raft-protected partition state. | Serve only on that partition's Raft leader or through leader forwarding. |
 | Coordinator owner | The route touches deployment-global metadata or APIs without partition-specific ownership. | Serve only on partition 0 / Raft leader; replicas and non-owner partitions reject with `ServiceUnavailable`. |
+| Follower-safe read | The route is read-only and the node can prove its applied frontier is fresh enough for the requested timestamp. | Not generally available yet outside purpose-built read paths. |
 | Explicit forwarding | The route has a purpose-built owner forwarding path. | The local handler may run on any node because it forwards first. |
+| External side-effect owner | The route triggers external storage, import/export, or delivery side effects. | Needs a job/side-effect owner and idempotency model before it can run broadly. |
 | Not yet safe | The route can mutate/read authoritative state but has no routing protocol. | Reject on non-authority nodes until forwarding is added. |
 
 ## Migrated `RouterState` Routes
@@ -30,17 +37,18 @@ authority checks.
 | `/api/storage/*` | Coordinator owner until file metadata and storage authorization have explicit clustered routing. |
 | `/api/sync`, `/{client_version}/sync` | Coordinator owner for subscription setup until follower-safe subscription ownership is implemented. |
 
-## Legacy `LocalAppState` Routes
+## Unmigrated `LocalAppState` Routes
 
-Legacy `/api` routes bypass `ApplicationApi`, so they are protected by the
-legacy authority middleware in `router.rs`.
+Unmigrated `/api` routes bypass `ApplicationApi`, so they are classified by
+`route_authority.rs` and protected by the unmigrated-route authority middleware
+in `router.rs`.
 
 | Route surface | Authority rule |
 | --- | --- |
 | `/api/deploy2/*` | Explicit forwarding. Deploy metadata handlers forward to partition 0 and then to the Raft leader where needed. `report_push_completed` is local observability. |
 | `/api/dashboard_openapi.json`, `/api/v1/openapi.json` | Any-node safe static schemas. |
 | `/api/get_config`, `/api/get_config_hashes` | Any-node safe deploy introspection. The current CLI reads target-node module/config hashes before the modern `deploy2` push so each node can materialize its local module view. |
-| Dashboard, platform, import/export, streaming import/export, log sinks, internal action callbacks, and mutating legacy CLI routes such as `/api/push_config` | Coordinator owner unless a narrower forwarding path is added. |
+| Dashboard, platform, import/export, streaming import/export, log sinks, internal action callbacks, and mutating old CLI routes such as `/api/push_config` | Coordinator owner unless a narrower forwarding path is added. |
 
 ## Adding A Route
 

@@ -36,8 +36,6 @@ use common::{
         MAX_PUSH_BYTES,
     },
 };
-use database::partition::PartitionId;
-use errors::ErrorMetadata;
 use http::{
     Method,
     StatusCode,
@@ -121,6 +119,7 @@ use crate::{
         vector_search,
     },
     public_api::public_api_router,
+    route_authority::ensure_unmigrated_local_app_state_api_authority,
     scheduling::{
         cancel_all_jobs,
         cancel_job,
@@ -173,81 +172,12 @@ use crate::{
     RouterState,
 };
 
-const CLUSTER_COORDINATOR_PARTITION: PartitionId = PartitionId(0);
-
-fn legacy_api_route_is_any_node_safe(path: &str) -> bool {
-    matches!(
-        path,
-        "/api/dashboard_openapi.json"
-            | "/dashboard_openapi.json"
-            | "/api/v1/openapi.json"
-            | "/v1/openapi.json"
-            | "/api/get_config"
-            | "/get_config"
-            | "/api/get_config_hashes"
-            | "/get_config_hashes"
-    )
-}
-
-fn legacy_api_route_has_explicit_forwarding(path: &str) -> bool {
-    path.starts_with("/api/deploy2/") || path.starts_with("/deploy2/")
-}
-
-fn unsupported_legacy_cluster_surface_error(surface: &str, reason: String) -> anyhow::Error {
-    anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(format!(
-        "Legacy API route {surface} cannot execute locally on this clustered node: {reason}. \
-         Route the request to the authoritative node or add an explicit forwarding path for this \
-         surface."
-    ))
-}
-
-fn ensure_legacy_cluster_coordinator_authority(
-    st: &LocalAppState,
-    surface: &str,
-) -> anyhow::Result<()> {
-    if legacy_api_route_is_any_node_safe(surface)
-        || legacy_api_route_has_explicit_forwarding(surface)
-    {
-        return Ok(());
-    }
-    if !st.replica_mode && st.partition_id.is_none() {
-        return Ok(());
-    }
-    if st.replica_mode {
-        return Err(unsupported_legacy_cluster_surface_error(
-            surface,
-            "replicas do not own global legacy request surfaces".to_string(),
-        ));
-    }
-    let Some(partition_id) = st.partition_id else {
-        return Ok(());
-    };
-    if partition_id != CLUSTER_COORDINATOR_PARTITION {
-        return Err(unsupported_legacy_cluster_surface_error(
-            surface,
-            format!(
-                "partition {} is not the cluster coordinator partition {}",
-                partition_id.0, CLUSTER_COORDINATOR_PARTITION.0
-            ),
-        ));
-    }
-    if let Some(raft_state) = st.raft_state.as_ref()
-        && !raft_state.is_leader()
-    {
-        return Err(unsupported_legacy_cluster_surface_error(
-            surface,
-            "the coordinator partition is running as a Raft follower".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-async fn legacy_cluster_authority_middleware(
+async fn unmigrated_local_app_state_api_authority_middleware(
     State(st): State<LocalAppState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    ensure_legacy_cluster_coordinator_authority(&st, req.uri().path())?;
+    ensure_unmigrated_local_app_state_api_authority(&st, req.uri().path())?;
     Ok(next.run(req).await)
 }
 
@@ -461,7 +391,7 @@ pub fn router(st: LocalAppState) -> Router {
         .nest("/v1", platform_routes)
         .layer(axum::middleware::from_fn_with_state(
             st.clone(),
-            legacy_cluster_authority_middleware,
+            unmigrated_local_app_state_api_authority_middleware,
         ));
 
     // Endpoints migrated to use the RouterState trait instead of application.
@@ -828,7 +758,7 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
-    async fn test_legacy_api_rejects_non_authority_partition(
+    async fn test_unmigrated_api_rejects_non_authority_partition(
         rt: ProdRuntime,
     ) -> anyhow::Result<()> {
         let backend = setup_backend_for_test(rt).await?;
@@ -836,7 +766,7 @@ mod tests {
         partitioned_state.partition_id = Some(PartitionId(1));
         let partitioned_app = ConvexHttpService::new(
             router(partitioned_state),
-            "legacy_authority_test",
+            "unmigrated_authority_test",
             SERVER_VERSION_STR.to_string(),
             MAX_CONCURRENT_REQUESTS,
             Duration::from_secs(125),
@@ -864,7 +794,7 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
-    async fn test_deploy2_routes_bypass_legacy_authority_middleware(
+    async fn test_deploy2_routes_bypass_unmigrated_authority_middleware(
         rt: ProdRuntime,
     ) -> anyhow::Result<()> {
         let backend = setup_backend_for_test(rt).await?;

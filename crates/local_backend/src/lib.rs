@@ -107,6 +107,7 @@ pub mod parse;
 pub mod proxy;
 pub mod public_api;
 pub mod query_forwarding_api;
+pub mod route_authority;
 pub mod router;
 pub mod scheduling;
 pub mod schema;
