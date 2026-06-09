@@ -66,8 +66,8 @@ use crate::{
         must_be_admin,
         must_be_admin_with_write_access,
     },
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
+    AdminRouterState,
 };
 
 /// Status of a log stream
@@ -145,7 +145,7 @@ impl TryFrom<DatadogSinkPostArgs> for DatadogConfig {
 }
 
 pub async fn add_datadog_sink(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(args): Json<DatadogSinkPostArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -163,7 +163,7 @@ pub async fn add_datadog_sink(
 }
 
 pub async fn regenerate_webhook_secret(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     tracing::info!(
@@ -206,7 +206,7 @@ pub struct WebhookSinkPostArgs {
 }
 
 pub async fn add_webhook_sink(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(args): Json<WebhookSinkPostArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -287,7 +287,7 @@ impl TryFrom<AxiomSinkPostArgs> for AxiomConfig {
 }
 
 pub async fn add_axiom_sink(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(args): Json<AxiomSinkPostArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -321,7 +321,7 @@ async fn add_axiom_sink_inner(
 }
 
 pub async fn add_sentry_sink(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(args): Json<SerializedSentryConfig>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -343,7 +343,7 @@ pub struct LogSinkDeleteArgs {
 }
 
 pub async fn delete_log_sink(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(LogSinkDeleteArgs { sink_type }): Json<LogSinkDeleteArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -400,7 +400,7 @@ impl From<LogStreamType> for SinkType {
     ),
 )]
 pub async fn delete_log_stream(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -640,7 +640,7 @@ async fn ensure_log_sink_does_not_exist(
     ),
 )]
 pub async fn create_log_stream(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(args): Json<CreateLogStreamArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -781,7 +781,7 @@ pub enum RotateLogStreamSecretResponse {
     ),
 )]
 pub async fn rotate_webhook_secret(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -998,7 +998,7 @@ fn log_sink_to_log_stream_config(sink: LogSinkWithId) -> Option<LogStreamConfig>
     ),
 )]
 pub async fn list_log_streams(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin(&identity)?;
@@ -1032,7 +1032,7 @@ pub async fn list_log_streams(
     ),
 )]
 pub async fn get_log_stream(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -1178,7 +1178,7 @@ pub enum UpdateLogStreamArgs {
     ),
 )]
 pub async fn update_log_stream(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Path(id): Path<String>,
     Json(args): Json<UpdateLogStreamArgs>,
@@ -1406,7 +1406,7 @@ pub async fn update_log_stream(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    AdminRouterState: FromRef<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new()

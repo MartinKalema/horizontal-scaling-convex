@@ -53,7 +53,7 @@ use crate::{
         must_be_admin_from_key,
         must_be_admin_with_write_access,
     },
-    authentication::ExtractIdentity,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
     public_api::{
         export_value,
         UdfResponse,
@@ -63,8 +63,8 @@ use crate::{
         delete_scheduled_functions_table,
     },
     schema::IndexMetadataResponse,
+    AdminRouterState,
     DeployRouterState,
-    LocalAppState,
 };
 
 #[derive(Deserialize, ToSchema)]
@@ -98,7 +98,7 @@ pub struct ShapesArgs {
     responses((status = 200, body = serde_json::Value)),
 )]
 pub async fn shapes2(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(ShapesArgs { component }): Query<ShapesArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -139,7 +139,7 @@ pub async fn shapes2(
     responses((status = 200)),
 )]
 pub async fn delete_tables(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(DeleteTableArgs {
         table_names,
@@ -170,7 +170,7 @@ pub async fn delete_tables(
     responses((status = 200)),
 )]
 pub async fn delete_component(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(DeleteComponentArgs { component_id }): Json<DeleteComponentArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -207,7 +207,7 @@ struct GetIndexesResponse {
     responses((status = 200, body = GetIndexesResponse)),
 )]
 pub async fn get_indexes(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(GetIndexesArgs { component_id }): Query<GetIndexesArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -245,7 +245,7 @@ pub struct GetSourceCodeArgs {
     responses((status = 200, body = String)),
 )]
 pub async fn get_source_code(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(GetSourceCodeArgs { path, component }): Query<GetSourceCodeArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -274,7 +274,7 @@ pub async fn get_source_code(
 )]
 #[debug_handler]
 pub async fn check_admin_key(
-    State(_st): State<LocalAppState>,
+    State(_st): State<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -342,14 +342,14 @@ pub async fn run_test_function(
     Ok(Json(response))
 }
 
-pub fn local_only_dashboard_router() -> OpenApiRouter<crate::LocalAppState> {
+pub fn local_only_dashboard_router() -> OpenApiRouter<crate::AdminRouterState> {
     OpenApiRouter::new().routes(utoipa_axum::routes!(check_admin_key))
 }
 
 // Routes with the same handlers for the local backend + closed source backend
 pub fn common_dashboard_api_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromMtState<S>,
+    AdminRouterState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new()

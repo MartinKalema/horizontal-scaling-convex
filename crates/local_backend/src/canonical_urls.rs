@@ -33,8 +33,8 @@ use crate::{
         must_be_admin,
         must_be_admin_with_write_access,
     },
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
+    AdminRouterState,
 };
 
 #[derive(Deserialize, ToSchema)]
@@ -66,7 +66,7 @@ pub struct UpdateCanonicalUrlRequest {
     ),
 )]
 pub async fn update_canonical_url(
-    State(st): State<LocalAppState>,
+    State(st): State<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(request): Json<UpdateCanonicalUrlRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -128,7 +128,7 @@ pub struct GetCanonicalUrlsResponse {
     ),
 )]
 pub async fn get_canonical_urls(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin(&identity)?;
@@ -164,7 +164,7 @@ pub async fn get_canonical_urls(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    AdminRouterState: FromRef<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new().routes(utoipa_axum::routes!(

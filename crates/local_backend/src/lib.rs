@@ -198,6 +198,39 @@ impl From<&LocalAppState> for DeployRouterState {
     }
 }
 
+#[derive(Clone)]
+pub struct AdminRouterState {
+    pub origin: ConvexOrigin,
+    pub site_origin: ConvexSite,
+    pub instance_name: String,
+    pub application: Application<ProdRuntime>,
+    pub zombify_rx: async_broadcast::Receiver<()>,
+    pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+}
+
+impl From<&LocalAppState> for AdminRouterState {
+    fn from(st: &LocalAppState) -> Self {
+        Self {
+            origin: st.origin.clone(),
+            site_origin: st.site_origin.clone(),
+            instance_name: st.instance_name.clone(),
+            application: st.application.clone(),
+            zombify_rx: st.zombify_rx.clone(),
+            replica_mode: st.replica_mode,
+            partition_id: st.partition_id,
+            raft_state: st.raft_state.clone(),
+        }
+    }
+}
+
+impl axum::extract::FromRef<LocalAppState> for AdminRouterState {
+    fn from_ref(st: &LocalAppState) -> Self {
+        Self::from(st)
+    }
+}
+
 #[derive(Serialize)]
 pub struct EmptyResponse {}
 
