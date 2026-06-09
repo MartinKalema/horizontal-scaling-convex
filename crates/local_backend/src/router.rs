@@ -119,7 +119,7 @@ use crate::{
         vector_search,
     },
     public_api::public_api_router,
-    route_authority::ensure_unmigrated_local_app_state_api_authority,
+    route_authority::ensure_local_backend_api_authority,
     scheduling::{
         cancel_all_jobs,
         cancel_job,
@@ -168,6 +168,7 @@ use crate::{
         replace_tables,
     },
     subs::sync,
+    DeployRouterState,
     LocalAppState,
     RouterState,
 };
@@ -177,7 +178,16 @@ async fn unmigrated_local_app_state_api_authority_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    ensure_unmigrated_local_app_state_api_authority(&st, req.uri().path())?;
+    ensure_local_backend_api_authority(&st, req.uri().path())?;
+    Ok(next.run(req).await)
+}
+
+async fn deploy_api_authority_middleware(
+    State(st): State<DeployRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    ensure_local_backend_api_authority(&st, req.uri().path())?;
     Ok(next.run(req).await)
 }
 
@@ -326,7 +336,7 @@ pub fn router(st: LocalAppState) -> Router {
         }))
         .layer(ServiceBuilder::new());
 
-    let cli_routes = Router::new()
+    let deploy_push_routes = Router::new()
         .route("/push_config", post(push_config))
         .route("/prepare_schema", post(prepare_schema))
         .route("/deploy2/start_push", post(deploy_config2::start_push))
@@ -351,10 +361,21 @@ pub fn router(st: LocalAppState) -> Router {
                 }))
                 .layer(RequestDecompressionLayer::new())
                 .layer(DefaultBodyLimit::max(*MAX_PUSH_BYTES)),
-        )
+        );
+    let deploy_state = DeployRouterState::from(&st);
+    let deploy_routes = Router::new()
+        .merge(deploy_push_routes)
         .route("/get_config", post(get_config))
         .route("/get_config_hashes", post(get_config_hashes))
         .route("/schema_state/{schema_id}", get(schema_state))
+        .layer(cli_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            deploy_state.clone(),
+            deploy_api_authority_middleware,
+        ))
+        .with_state(deploy_state);
+
+    let cli_routes = Router::new()
         .route("/stream_udf_execution", get(stream_udf_execution))
         .route("/stream_function_logs", get(stream_function_logs))
         .merge(import_routes())
@@ -392,7 +413,8 @@ pub fn router(st: LocalAppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             st.clone(),
             unmigrated_local_app_state_api_authority_middleware,
-        ));
+        ))
+        .merge(deploy_routes);
 
     // Endpoints migrated to use the RouterState trait instead of application.
     let (public_routes, public_openapi) = OpenApiRouter::with_openapi(PublicApiDoc::openapi())
@@ -758,7 +780,7 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
-    async fn test_unmigrated_api_rejects_non_authority_partition(
+    async fn test_deploy_api_rejects_non_authority_partition(
         rt: ProdRuntime,
     ) -> anyhow::Result<()> {
         let backend = setup_backend_for_test(rt).await?;
@@ -794,7 +816,89 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
-    async fn test_deploy2_routes_bypass_unmigrated_authority_middleware(
+    async fn test_deploy_config_hashes_allow_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+        let admin_key = admin_header
+            .to_str()?
+            .strip_prefix("Convex ")
+            .context("admin auth header must use the Convex scheme")?
+            .to_string();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "deploy_config_hashes_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/get_config_hashes")
+            .method("POST")
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "adminKey": admin_key,
+            }))?))?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_schema_state_rejects_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "schema_state_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/schema_state/not-a-real-schema-id")
+            .method("GET")
+            .header("Host", "localhost")
+            .header("Authorization", admin_header)
+            .body(Body::empty())?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("ServiceUnavailable"), "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_deploy2_routes_use_explicit_forwarding_authority(
         rt: ProdRuntime,
     ) -> anyhow::Result<()> {
         let backend = setup_backend_for_test(rt).await?;

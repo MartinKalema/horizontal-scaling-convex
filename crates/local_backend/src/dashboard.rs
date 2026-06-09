@@ -63,6 +63,7 @@ use crate::{
         delete_scheduled_functions_table,
     },
     schema::IndexMetadataResponse,
+    DeployRouterState,
     LocalAppState,
 };
 
@@ -303,7 +304,7 @@ pub struct RunTestFunctionArgs {
 )]
 #[debug_handler]
 pub async fn run_test_function(
-    State(st): State<LocalAppState>,
+    State(st): State<DeployRouterState>,
     ExtractRequestId(request_id): ExtractRequestId,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req): Json<RunTestFunctionArgs>,

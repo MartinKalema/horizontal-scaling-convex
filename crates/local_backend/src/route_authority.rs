@@ -1,9 +1,49 @@
-use database::partition::PartitionId;
+use database::{
+    partition::PartitionId,
+    raft_partition::RaftPartitionState,
+};
 use errors::ErrorMetadata;
 
-use crate::LocalAppState;
+use crate::{
+    DeployRouterState,
+    LocalAppState,
+};
 
 pub(crate) const CLUSTER_COORDINATOR_PARTITION: PartitionId = PartitionId(0);
+
+pub(crate) trait ClusterAuthorityContext {
+    fn replica_mode(&self) -> bool;
+    fn partition_id(&self) -> Option<PartitionId>;
+    fn raft_state(&self) -> Option<&RaftPartitionState>;
+}
+
+impl ClusterAuthorityContext for LocalAppState {
+    fn replica_mode(&self) -> bool {
+        self.replica_mode
+    }
+
+    fn partition_id(&self) -> Option<PartitionId> {
+        self.partition_id
+    }
+
+    fn raft_state(&self) -> Option<&RaftPartitionState> {
+        self.raft_state.as_ref()
+    }
+}
+
+impl ClusterAuthorityContext for DeployRouterState {
+    fn replica_mode(&self) -> bool {
+        self.replica_mode
+    }
+
+    fn partition_id(&self) -> Option<PartitionId> {
+        self.partition_id
+    }
+
+    fn raft_state(&self) -> Option<&RaftPartitionState> {
+        self.raft_state.as_ref()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteAuthorityClass {
@@ -89,9 +129,9 @@ const ANY_NODE_STATIC_SCHEMA: &str = "static schema or deploy-introspection rout
 const EXPLICIT_DEPLOY_FORWARDING: &str =
     "deploy2 handlers forward to the metadata owner and Raft leader before mutating state";
 const COORDINATOR_GLOBAL_STATE: &str =
-    "unmigrated route touches deployment-global state and must run on partition 0 / Raft leader";
+    "route touches deployment-global state and must run on partition 0 / Raft leader";
 
-pub(crate) const UNMIGRATED_LOCAL_APP_STATE_API_ROUTE_AUTHORITIES: &[RouteAuthorityRule] = &[
+pub(crate) const LOCAL_BACKEND_API_ROUTE_AUTHORITIES: &[RouteAuthorityRule] = &[
     RouteAuthorityRule::exact(
         "dashboard OpenAPI schema",
         "/dashboard_openapi.json",
@@ -159,7 +199,7 @@ pub(crate) const UNMIGRATED_LOCAL_APP_STATE_API_ROUTE_AUTHORITIES: &[RouteAuthor
         COORDINATOR_GLOBAL_STATE,
     ),
     RouteAuthorityRule::exact(
-        "unmigrated deploy config push",
+        "deploy config push",
         "/push_config",
         RouteAuthorityClass::CoordinatorOwner,
         COORDINATOR_GLOBAL_STATE,
@@ -328,54 +368,52 @@ pub(crate) const UNMIGRATED_LOCAL_APP_STATE_API_ROUTE_AUTHORITIES: &[RouteAuthor
     ),
 ];
 
-pub(crate) fn normalize_unmigrated_api_path(path: &str) -> &str {
+pub(crate) fn normalize_local_backend_api_path(path: &str) -> &str {
     path.strip_prefix("/api")
         .filter(|stripped| stripped.starts_with('/'))
         .unwrap_or(path)
 }
 
-pub(crate) fn classify_unmigrated_local_app_state_api_route(
-    path: &str,
-) -> Option<&'static RouteAuthorityRule> {
-    let normalized_path = normalize_unmigrated_api_path(path);
-    UNMIGRATED_LOCAL_APP_STATE_API_ROUTE_AUTHORITIES
+pub(crate) fn classify_local_backend_api_route(path: &str) -> Option<&'static RouteAuthorityRule> {
+    let normalized_path = normalize_local_backend_api_path(path);
+    LOCAL_BACKEND_API_ROUTE_AUTHORITIES
         .iter()
         .find(|rule| rule.matcher.matches(normalized_path))
 }
 
-fn unsupported_unmigrated_cluster_surface_error(
+fn unsupported_local_backend_cluster_surface_error(
     surface: &str,
     class: RouteAuthorityClass,
     reason: String,
 ) -> anyhow::Error {
     anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(format!(
-        "Unmigrated LocalAppState API route {surface} ({}) cannot execute locally on this \
-         clustered node: {reason}. Route the request to the authoritative node, add an explicit \
-         forwarding path, or migrate the route to RouterState.",
+        "Local backend API route {surface} ({}) cannot execute locally on this clustered node: \
+         {reason}. Route the request to the authoritative node, add an explicit forwarding path, \
+         or migrate the route to RouterState.",
         class.label()
     ))
 }
 
 fn ensure_cluster_coordinator_authority(
-    st: &LocalAppState,
+    st: &impl ClusterAuthorityContext,
     surface: &str,
     class: RouteAuthorityClass,
 ) -> anyhow::Result<()> {
-    if !st.replica_mode && st.partition_id.is_none() {
+    if !st.replica_mode() && st.partition_id().is_none() {
         return Ok(());
     }
-    if st.replica_mode {
-        return Err(unsupported_unmigrated_cluster_surface_error(
+    if st.replica_mode() {
+        return Err(unsupported_local_backend_cluster_surface_error(
             surface,
             class,
             "replicas do not own deployment-global request surfaces".to_string(),
         ));
     }
-    let Some(partition_id) = st.partition_id else {
+    let Some(partition_id) = st.partition_id() else {
         return Ok(());
     };
     if partition_id != CLUSTER_COORDINATOR_PARTITION {
-        return Err(unsupported_unmigrated_cluster_surface_error(
+        return Err(unsupported_local_backend_cluster_surface_error(
             surface,
             class,
             format!(
@@ -384,10 +422,10 @@ fn ensure_cluster_coordinator_authority(
             ),
         ));
     }
-    if let Some(raft_state) = st.raft_state.as_ref()
+    if let Some(raft_state) = st.raft_state()
         && !raft_state.is_leader()
     {
-        return Err(unsupported_unmigrated_cluster_surface_error(
+        return Err(unsupported_local_backend_cluster_surface_error(
             surface,
             class,
             "the coordinator partition is running as a Raft follower".to_string(),
@@ -396,11 +434,11 @@ fn ensure_cluster_coordinator_authority(
     Ok(())
 }
 
-pub(crate) fn ensure_unmigrated_local_app_state_api_authority(
-    st: &LocalAppState,
+pub(crate) fn ensure_local_backend_api_authority(
+    st: &impl ClusterAuthorityContext,
     path: &str,
 ) -> anyhow::Result<()> {
-    let (surface, class) = if let Some(rule) = classify_unmigrated_local_app_state_api_route(path) {
+    let (surface, class) = if let Some(rule) = classify_local_backend_api_route(path) {
         (rule.surface, rule.class)
     } else {
         (path, RouteAuthorityClass::FailClosed)
@@ -414,7 +452,7 @@ pub(crate) fn ensure_unmigrated_local_app_state_api_authority(
         | RouteAuthorityClass::PartitionLeader
         | RouteAuthorityClass::FollowerSafeRead
         | RouteAuthorityClass::ExternalSideEffectOwner
-        | RouteAuthorityClass::FailClosed => Err(unsupported_unmigrated_cluster_surface_error(
+        | RouteAuthorityClass::FailClosed => Err(unsupported_local_backend_cluster_surface_error(
             surface,
             class,
             format!("the {class:?} authority class has no local execution strategy yet"),
@@ -425,31 +463,31 @@ pub(crate) fn ensure_unmigrated_local_app_state_api_authority(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_unmigrated_local_app_state_api_route,
-        normalize_unmigrated_api_path,
+        classify_local_backend_api_route,
+        normalize_local_backend_api_path,
         RouteAuthorityClass,
-        UNMIGRATED_LOCAL_APP_STATE_API_ROUTE_AUTHORITIES,
+        LOCAL_BACKEND_API_ROUTE_AUTHORITIES,
     };
 
     fn class_for(path: &str) -> Option<RouteAuthorityClass> {
-        classify_unmigrated_local_app_state_api_route(path).map(|rule| rule.class)
+        classify_local_backend_api_route(path).map(|rule| rule.class)
     }
 
     #[test]
     fn test_normalizes_nested_api_prefix() {
         assert_eq!(
-            normalize_unmigrated_api_path("/api/push_config"),
+            normalize_local_backend_api_path("/api/push_config"),
             "/push_config"
         );
         assert_eq!(
-            normalize_unmigrated_api_path("/push_config"),
+            normalize_local_backend_api_path("/push_config"),
             "/push_config"
         );
-        assert_eq!(normalize_unmigrated_api_path("/apiary"), "/apiary");
+        assert_eq!(normalize_local_backend_api_path("/apiary"), "/apiary");
     }
 
     #[test]
-    fn test_unmigrated_api_route_authority_registry_classifies_core_surfaces() {
+    fn test_local_backend_api_route_authority_registry_classifies_core_surfaces() {
         assert_eq!(
             class_for("/api/get_config_hashes"),
             Some(RouteAuthorityClass::AnyNodeSafe)
@@ -478,8 +516,8 @@ mod tests {
     }
 
     #[test]
-    fn test_unmigrated_api_route_authority_rules_are_documented() {
-        assert!(UNMIGRATED_LOCAL_APP_STATE_API_ROUTE_AUTHORITIES
+    fn test_local_backend_api_route_authority_rules_are_documented() {
+        assert!(LOCAL_BACKEND_API_ROUTE_AUTHORITIES
             .iter()
             .all(|rule| !rule.surface.is_empty() && !rule.rationale.is_empty()));
     }

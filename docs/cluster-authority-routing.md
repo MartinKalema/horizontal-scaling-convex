@@ -7,7 +7,7 @@ closed otherwise.
 
 ## Authority Classes
 
-The code-level registry for unmigrated local-backend routes lives in
+The code-level registry for local-backend route authority lives in
 `crates/local_backend/src/route_authority.rs`. It is intentionally typed so new
 routes choose an authority class in code, not only in prose.
 
@@ -37,6 +37,17 @@ authority checks.
 | `/api/storage/*` | Coordinator owner until file metadata and storage authorization have explicit clustered routing. |
 | `/api/sync`, `/{client_version}/sync` | Coordinator owner for subscription setup until follower-safe subscription ownership is implemented. |
 
+## Deploy `DeployRouterState` Routes
+
+Deploy and CLI config routes use a smaller cluster-aware `DeployRouterState`
+instead of the full `LocalAppState` route tree.
+
+| Route surface | Authority rule |
+| --- | --- |
+| `/api/deploy2/*` | Explicit forwarding. Deploy metadata handlers forward to partition 0 and then to the Raft leader where needed. `report_push_completed` is local observability. |
+| `/api/get_config`, `/api/get_config_hashes` | Any-node safe deploy introspection. The current CLI reads target-node module/config hashes before the modern `deploy2` push so each node can materialize its local module view. |
+| `/api/push_config`, `/api/prepare_schema`, `/api/run_test_function`, `/api/schema_state/*` | Coordinator owner unless a narrower forwarding path is added. |
+
 ## Unmigrated `LocalAppState` Routes
 
 Unmigrated `/api` routes bypass `ApplicationApi`, so they are classified by
@@ -45,10 +56,8 @@ in `router.rs`.
 
 | Route surface | Authority rule |
 | --- | --- |
-| `/api/deploy2/*` | Explicit forwarding. Deploy metadata handlers forward to partition 0 and then to the Raft leader where needed. `report_push_completed` is local observability. |
 | `/api/dashboard_openapi.json`, `/api/v1/openapi.json` | Any-node safe static schemas. |
-| `/api/get_config`, `/api/get_config_hashes` | Any-node safe deploy introspection. The current CLI reads target-node module/config hashes before the modern `deploy2` push so each node can materialize its local module view. |
-| Dashboard, platform, import/export, streaming import/export, log sinks, internal action callbacks, and mutating old CLI routes such as `/api/push_config` | Coordinator owner unless a narrower forwarding path is added. |
+| Dashboard, platform, import/export, streaming import/export, log sinks, and internal action callbacks | Coordinator owner unless a narrower forwarding path is added. |
 
 ## Adding A Route
 

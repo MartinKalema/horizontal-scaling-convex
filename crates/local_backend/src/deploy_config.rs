@@ -55,8 +55,8 @@ use crate::{
         must_be_admin_from_key,
         must_be_admin_with_write_access,
     },
+    DeployRouterState,
     EmptyResponse,
-    LocalAppState,
 };
 
 #[derive(Deserialize)]
@@ -186,7 +186,7 @@ pub struct ModuleHashJson {
 }
 
 pub async fn get_config(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<DeployRouterState>,
     Json(req): Json<GetConfigRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let identity = must_be_admin_from_key(
@@ -215,7 +215,7 @@ pub async fn get_config(
 }
 
 pub async fn get_config_hashes(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<DeployRouterState>,
     Json(req): Json<GetConfigRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let identity = must_be_admin_from_key(
@@ -257,7 +257,7 @@ pub async fn get_config_hashes(
 
 #[debug_handler]
 pub async fn push_config(
-    State(st): State<LocalAppState>,
+    State(st): State<DeployRouterState>,
     Json(req): Json<ConfigJson>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     push_config_handler(&st.application, req)
