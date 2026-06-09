@@ -24,8 +24,8 @@ use utoipa_axum::router::OpenApiRouter;
 
 use crate::{
     admin::must_be_admin,
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
+    AdminRouterState,
 };
 
 #[derive(Serialize, ToSchema)]
@@ -64,7 +64,7 @@ pub enum DeploymentInfoResponse {
     ),
 )]
 pub async fn get_deployment_info(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin(&identity)?;
@@ -93,7 +93,7 @@ pub async fn get_deployment_info(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    AdminRouterState: FromRef<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new().routes(utoipa_axum::routes!(get_deployment_info))

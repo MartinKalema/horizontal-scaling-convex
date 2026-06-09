@@ -32,6 +32,7 @@ use sync_types::{
 };
 
 use crate::{
+    AdminRouterState,
     LocalAppState,
     RouterState,
 };
@@ -128,6 +129,37 @@ where
 
 impl From<ExtractIdentity> for Identity {
     fn from(identity: ExtractIdentity) -> Self {
+        identity.0
+    }
+}
+
+pub struct ExtractAdminIdentity(pub Identity);
+
+impl<S> FromRequestParts<S> for ExtractAdminIdentity
+where
+    AdminRouterState: FromMtState<S>,
+    S: Send + Sync + Clone + 'static,
+{
+    type Rejection = HttpResponseError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        st: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let token: AuthenticationToken =
+            parts.extract::<ExtractAuthenticationToken>().await?.into();
+        let st = AdminRouterState::from_request_parts(parts, st).await?;
+
+        Ok(Self(
+            st.application
+                .authenticate(token, st.application.runtime().system_time())
+                .await?,
+        ))
+    }
+}
+
+impl From<ExtractAdminIdentity> for Identity {
+    fn from(identity: ExtractAdminIdentity) -> Self {
         identity.0
     }
 }

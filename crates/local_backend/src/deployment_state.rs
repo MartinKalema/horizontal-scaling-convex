@@ -16,8 +16,8 @@ use utoipa_axum::router::OpenApiRouter;
 
 use crate::{
     admin::must_be_admin_with_write_access,
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
+    AdminRouterState,
 };
 
 /// Pause deployment
@@ -41,7 +41,7 @@ use crate::{
     ),
 )]
 pub async fn pause_deployment(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -84,7 +84,7 @@ pub async fn pause_deployment(
     ),
 )]
 pub async fn unpause_deployment(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -111,7 +111,7 @@ pub async fn unpause_deployment(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    AdminRouterState: FromRef<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new()

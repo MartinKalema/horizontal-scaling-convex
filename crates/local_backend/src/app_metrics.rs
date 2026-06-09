@@ -22,8 +22,8 @@ use serde::Deserialize;
 use sync_types::UdfPath;
 
 use crate::{
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
+    AdminRouterState,
 };
 
 #[derive(Deserialize)]
@@ -38,7 +38,7 @@ pub(crate) struct UdfRateQueryArgs {
 }
 
 pub(crate) async fn udf_rate(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(UdfRateQueryArgs {
         component_path,
@@ -68,7 +68,7 @@ pub(crate) struct TopKQueryArgs {
 }
 
 pub(crate) async fn failure_percentage_top_k(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(TopKQueryArgs { window, k }): Query<TopKQueryArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -86,7 +86,7 @@ pub(crate) async fn failure_percentage_top_k(
 }
 
 pub(crate) async fn cache_hit_percentage_top_k(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(TopKQueryArgs { window, k }): Query<TopKQueryArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -104,7 +104,7 @@ pub(crate) async fn cache_hit_percentage_top_k(
 }
 
 pub(crate) async fn function_call_count_top_k(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(TopKQueryArgs { window, k }): Query<TopKQueryArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -131,7 +131,7 @@ pub(crate) struct CacheHitPercentageQueryArgs {
     udf_type: Option<String>,
 }
 pub(crate) async fn cache_hit_percentage(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(query_args): Query<CacheHitPercentageQueryArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -161,7 +161,7 @@ pub(crate) struct LatencyPercentilesQueryArgs {
     udf_type: Option<String>,
 }
 pub(crate) async fn latency_percentiles(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(query_args): Query<LatencyPercentilesQueryArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -191,7 +191,7 @@ pub(crate) struct TableRateQueryArgs {
     window: String,
 }
 pub(crate) async fn table_rate(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(query_args): Query<TableRateQueryArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -245,7 +245,7 @@ pub(crate) struct ScheduledJobLagArgs {
     window: String,
 }
 pub(crate) async fn scheduled_job_lag(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(query_args): Query<ScheduledJobLagArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -264,7 +264,7 @@ pub(crate) struct FunctionConcurrencyArgs {
     window: String,
 }
 pub(crate) async fn function_concurrency(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(query_args): Query<FunctionConcurrencyArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {

@@ -48,6 +48,17 @@ instead of the full `LocalAppState` route tree.
 | `/api/get_config`, `/api/get_config_hashes` | Any-node safe deploy introspection. The current CLI reads target-node module/config hashes before the modern `deploy2` push so each node can materialize its local module view. |
 | `/api/push_config`, `/api/prepare_schema`, `/api/run_test_function`, `/api/schema_state/*` | Coordinator owner unless a narrower forwarding path is added. |
 
+## Admin `AdminRouterState` Routes
+
+Dashboard and platform admin routes use a smaller cluster-aware
+`AdminRouterState` instead of the full `LocalAppState` route tree.
+
+| Route surface | Authority rule |
+| --- | --- |
+| `/api/dashboard_openapi.json`, `/api/v1/openapi.json` | Any-node safe static schemas. |
+| Dashboard admin routes, environment variables, canonical URLs, scheduled job cancellation, and app metrics | Coordinator owner because these routes read or write deployment-global metadata and function-log state. |
+| `/api/v1/*` platform admin routes, including deployment info/state, canonical URLs, environment variables, and platform log-stream configuration | Coordinator owner unless a narrower follower-safe read or forwarding path is added. |
+
 ## Unmigrated `LocalAppState` Routes
 
 Unmigrated `/api` routes bypass `ApplicationApi`, so they are classified by
@@ -56,8 +67,7 @@ in `router.rs`.
 
 | Route surface | Authority rule |
 | --- | --- |
-| `/api/dashboard_openapi.json`, `/api/v1/openapi.json` | Any-node safe static schemas. |
-| Dashboard, platform, import/export, streaming import/export, log sinks, and internal action callbacks | Coordinator owner unless a narrower forwarding path is added. |
+| Import/export, streaming import/export, deprecated `/api/logs/*` log-sink routes, and internal action callbacks | Coordinator owner unless a narrower forwarding path is added. |
 
 ## Adding A Route
 
