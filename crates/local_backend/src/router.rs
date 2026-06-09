@@ -176,15 +176,6 @@ use crate::{
     RouterState,
 };
 
-async fn unmigrated_local_app_state_api_authority_middleware(
-    State(st): State<LocalAppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Result<impl IntoResponse, HttpResponseError> {
-    ensure_local_backend_api_authority(&st, req.uri().path())?;
-    Ok(next.run(req).await)
-}
-
 async fn deploy_api_authority_middleware(
     State(st): State<DeployRouterState>,
     req: axum::extract::Request,
@@ -530,10 +521,6 @@ pub fn router(st: LocalAppState) -> Router {
         .with_state(admin_state);
 
     let api_routes = Router::new()
-        .layer(axum::middleware::from_fn_with_state(
-            st.clone(),
-            unmigrated_local_app_state_api_authority_middleware,
-        ))
         .merge(observability_routes)
         .nest("/logs", log_sink_routes)
         .merge(snapshot_import_routes)
@@ -909,7 +896,7 @@ mod tests {
         partitioned_state.partition_id = Some(PartitionId(1));
         let partitioned_app = ConvexHttpService::new(
             router(partitioned_state),
-            "unmigrated_authority_test",
+            "deploy_api_authority_test",
             SERVER_VERSION_STR.to_string(),
             MAX_CONCURRENT_REQUESTS,
             Duration::from_secs(125),

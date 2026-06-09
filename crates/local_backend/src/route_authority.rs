@@ -9,7 +9,6 @@ use crate::{
     AdminRouterState,
     DeployRouterState,
     ImportExportRouterState,
-    LocalAppState,
 };
 
 pub(crate) const CLUSTER_COORDINATOR_PARTITION: PartitionId = PartitionId(0);
@@ -18,20 +17,6 @@ pub(crate) trait ClusterAuthorityContext {
     fn replica_mode(&self) -> bool;
     fn partition_id(&self) -> Option<PartitionId>;
     fn raft_state(&self) -> Option<&RaftPartitionState>;
-}
-
-impl ClusterAuthorityContext for LocalAppState {
-    fn replica_mode(&self) -> bool {
-        self.replica_mode
-    }
-
-    fn partition_id(&self) -> Option<PartitionId> {
-        self.partition_id
-    }
-
-    fn raft_state(&self) -> Option<&RaftPartitionState> {
-        self.raft_state.as_ref()
-    }
 }
 
 impl ClusterAuthorityContext for DeployRouterState {
