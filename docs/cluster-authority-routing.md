@@ -20,7 +20,7 @@ routes choose an authority class in code, not only in prose.
 | Follower-safe read | The route is read-only and the node can prove its applied frontier is fresh enough for the requested timestamp. | Not generally available yet outside purpose-built read paths. |
 | Explicit forwarding | The route has a purpose-built owner forwarding path. | The local handler may run on any node because it forwards first. |
 | External side-effect owner | The route triggers external storage, import/export, or delivery side effects. | Needs a job/side-effect owner and idempotency model before it can run broadly. |
-| Not yet safe | The route can mutate/read authoritative state but has no routing protocol. | Reject on non-authority nodes until forwarding is added. |
+| Fail closed | The route can mutate/read authoritative state but has no routing protocol. | Reject on non-authority nodes until forwarding is added. |
 
 ## Migrated `RouterState` Routes
 
@@ -91,20 +91,29 @@ Snapshot import/export and streaming import/export routes use a dedicated
 | `/api/streaming_import/*` | Coordinator owner because streaming import writes schemas, tables, indexes, and bulk row mutations until per-table/partition fanout and idempotency are introduced. |
 | `/api/document_deltas`, `/api/list_snapshot`, `/api/json_schemas`, `/api/test_streaming_export_connection`, `/api/get_tables_and_columns`, `/api/get_table_column_names` | Coordinator owner until streaming export has a follower-safe snapshot/frontier proof or explicit export owner forwarding. |
 
-## Unmigrated `LocalAppState` Routes
+## Final Router Shape
 
-Unmigrated `/api` routes bypass `ApplicationApi`, so they are classified by
-`route_authority.rs` and protected by the unmigrated-route authority middleware
-in `router.rs`.
+`LocalAppState` remains the root object used to assemble the local backend and
+to serve local-process surfaces such as health checks, static assets, and
+server bootstrap wiring. It is no longer used as a broad `/api` route state.
 
-| Route surface | Authority rule |
+Every externally reachable clustered `/api` route is now mounted through an
+explicit smaller route state:
+
+| Route state | Route families |
 | --- | --- |
-| None after the route-family migrations above. The temporary guard remains only until the final cleanup removes the empty `LocalAppState` API route tree. |
+| `RouterState` | Public API, browser API, sync, HTTP actions, and storage public surfaces. |
+| `DeployRouterState` | Deploy and CLI config surfaces. |
+| `AdminRouterState` | Dashboard, platform admin, app metrics, log observability, and log sink surfaces. |
+| `ActionCallbackRouterState` | Internal node action callback surfaces. |
+| `ImportExportRouterState` | Snapshot and streaming import/export surfaces. |
 
 ## Adding A Route
 
 Every new local-backend route must choose one authority class before it is
 exposed in a clustered build. If the route touches deployment metadata, file
 metadata, subscriptions, function execution, imports, exports, or log sinks, do
-not default to local execution on followers or non-owner partitions. Add an
-explicit forwarding path or let the route fail closed on non-authority nodes.
+not default to local execution on followers or non-owner partitions. Mount the
+route on the narrowest explicit route state, add the matching authority
+middleware, and either provide an explicit forwarding path or let the route
+fail closed on non-authority nodes.
