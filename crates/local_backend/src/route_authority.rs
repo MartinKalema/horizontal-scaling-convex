@@ -5,6 +5,7 @@ use database::{
 use errors::ErrorMetadata;
 
 use crate::{
+    ActionCallbackRouterState,
     AdminRouterState,
     DeployRouterState,
     LocalAppState,
@@ -47,6 +48,20 @@ impl ClusterAuthorityContext for DeployRouterState {
 }
 
 impl ClusterAuthorityContext for AdminRouterState {
+    fn replica_mode(&self) -> bool {
+        self.replica_mode
+    }
+
+    fn partition_id(&self) -> Option<PartitionId> {
+        self.partition_id
+    }
+
+    fn raft_state(&self) -> Option<&RaftPartitionState> {
+        self.raft_state.as_ref()
+    }
+}
+
+impl ClusterAuthorityContext for ActionCallbackRouterState {
     fn replica_mode(&self) -> bool {
         self.replica_mode
     }

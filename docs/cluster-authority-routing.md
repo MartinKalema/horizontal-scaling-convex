@@ -59,6 +59,15 @@ Dashboard and platform admin routes use a smaller cluster-aware
 | Dashboard admin routes, environment variables, canonical URLs, scheduled job cancellation, and app metrics | Coordinator owner because these routes read or write deployment-global metadata and function-log state. |
 | `/api/v1/*` platform admin routes, including deployment info/state, canonical URLs, environment variables, and platform log-stream configuration | Coordinator owner unless a narrower follower-safe read or forwarding path is added. |
 
+## Internal Action Callback `ActionCallbackRouterState` Routes
+
+Internal action callbacks use a dedicated `ActionCallbackRouterState` instead
+of the full `LocalAppState` route tree.
+
+| Route surface | Authority rule |
+| --- | --- |
+| `/api/actions/*` internal query, mutation, action, scheduling, vector search, function-handle, and storage callbacks | Coordinator owner until callback reads and side effects have a narrower partition/index/storage ownership model or explicit forwarding path. |
+
 ## Unmigrated `LocalAppState` Routes
 
 Unmigrated `/api` routes bypass `ApplicationApi`, so they are classified by
@@ -67,7 +76,7 @@ in `router.rs`.
 
 | Route surface | Authority rule |
 | --- | --- |
-| Import/export, streaming import/export, deprecated `/api/logs/*` log-sink routes, and internal action callbacks | Coordinator owner unless a narrower forwarding path is added. |
+| Import/export, streaming import/export, and deprecated `/api/logs/*` log-sink routes | Coordinator owner unless a narrower forwarding path is added. |
 
 ## Adding A Route
 
