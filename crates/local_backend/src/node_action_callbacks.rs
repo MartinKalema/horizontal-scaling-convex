@@ -5,7 +5,10 @@ use std::{
 
 use anyhow::Context;
 use axum::{
-    extract::FromRequestParts,
+    extract::{
+        FromRequestParts,
+        State,
+    },
     response::IntoResponse,
     RequestPartsExt,
 };
@@ -76,7 +79,7 @@ use crate::{
         export_value,
         UdfResponse,
     },
-    LocalAppState,
+    ActionCallbackRouterState,
 };
 
 #[derive(Deserialize, Debug)]
@@ -96,7 +99,7 @@ pub struct NodeCallbackUdfPostRequest {
 /// other Convex functions (i.e. actions calling into mutations)
 #[fastrace::trace]
 pub async fn internal_query_post(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -150,7 +153,7 @@ pub async fn internal_query_post(
 /// other Convex functions (i.e. actions calling into mutations)
 #[fastrace::trace]
 pub async fn internal_mutation_post(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -209,7 +212,7 @@ pub async fn internal_mutation_post(
 /// other Convex functions (i.e. actions calling into actions)
 #[fastrace::trace]
 pub async fn internal_action_post(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -277,7 +280,7 @@ pub struct ScheduleJobResponse {
 }
 
 pub async fn schedule_job(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -327,7 +330,7 @@ pub struct CancelDeveloperJobRequest {
 }
 
 pub async fn cancel_developer_job(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id: _,
@@ -359,7 +362,7 @@ pub struct CreateFunctionHandleResponse {
 }
 
 pub async fn create_function_handle(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -390,7 +393,7 @@ pub async fn create_function_handle(
 }
 
 pub async fn vector_search(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -448,7 +451,7 @@ pub async fn vector_search(
 }
 
 pub async fn storage_generate_upload_url(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -468,7 +471,7 @@ pub struct GetParams {
 }
 
 pub async fn storage_get_url(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -485,7 +488,7 @@ pub async fn storage_get_url(
 }
 
 pub async fn storage_get_metadata(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -521,7 +524,7 @@ pub async fn storage_get_metadata(
 }
 
 pub async fn storage_delete(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ActionCallbackRouterState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -539,7 +542,7 @@ pub async fn storage_delete(
 pub static CONVEX_ACTIONS_CALLBACK_TOKEN: &str = "Convex-Action-Callback-Token";
 
 async fn check_actions_token(
-    st: &LocalAppState,
+    st: &ActionCallbackRouterState,
     headers: &HeaderMap,
 ) -> anyhow::Result<(SystemTime, ComponentId)> {
     let value = headers
@@ -569,14 +572,11 @@ fn get_encoded_span(headers: &HeaderMap) -> anyhow::Result<EncodedSpan> {
     ))
 }
 
-pub async fn action_callbacks_middleware<S>(
-    MtState(st): MtState<LocalAppState>,
+pub async fn action_callbacks_middleware(
+    State(st): State<ActionCallbackRouterState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
-) -> Result<impl IntoResponse, HttpResponseError>
-where
-    LocalAppState: FromMtState<S>,
-{
+) -> Result<impl IntoResponse, HttpResponseError> {
     // Validate we have an valid token in order to call any methods in this
     // actions_callback router.
     check_actions_token(&st, req.headers()).await?;
@@ -597,7 +597,7 @@ pub struct ExtractActionIdentity {
 
 impl<S> FromRequestParts<S> for ExtractActionIdentity
 where
-    LocalAppState: FromMtState<S>,
+    ActionCallbackRouterState: FromMtState<S>,
     S: Send + Sync + Clone + 'static,
 {
     type Rejection = HttpResponseError;
@@ -606,7 +606,7 @@ where
         parts: &mut axum::http::request::Parts,
         st: &S,
     ) -> Result<Self, Self::Rejection> {
-        let st = LocalAppState::from_request_parts(parts, st).await?;
+        let st = ActionCallbackRouterState::from_request_parts(parts, st).await?;
         let token: AuthenticationToken =
             parts.extract::<ExtractAuthenticationToken>().await?.into();
 

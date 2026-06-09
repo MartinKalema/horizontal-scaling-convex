@@ -168,6 +168,7 @@ use crate::{
         replace_tables,
     },
     subs::sync,
+    ActionCallbackRouterState,
     AdminRouterState,
     DeployRouterState,
     LocalAppState,
@@ -207,6 +208,16 @@ async fn platform_api_authority_middleware(
     next: axum::middleware::Next,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let nested_path = format!("/v1{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
+
+async fn action_callback_api_authority_middleware(
+    State(st): State<ActionCallbackRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/actions{}", req.uri().path());
     ensure_local_backend_api_authority(&st, &nested_path)?;
     Ok(next.run(req).await)
 }
@@ -406,6 +417,13 @@ pub fn router(st: LocalAppState) -> Router {
         .route("/stream_function_logs", get(stream_function_logs))
         .merge(import_routes())
         .layer(cli_cors());
+    let action_callback_state = ActionCallbackRouterState::from(&st);
+    let action_callback_routes = action_callback_routes(action_callback_state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            action_callback_state.clone(),
+            action_callback_api_authority_middleware,
+        ))
+        .with_state(action_callback_state);
 
     let snapshot_export_routes = Router::new()
         .route("/request/zip", post(request_zip_export))
@@ -437,7 +455,6 @@ pub fn router(st: LocalAppState) -> Router {
     let api_routes = Router::new()
         .merge(cli_routes)
         .merge(streaming_export_routes())
-        .nest("/actions", action_callback_routes(st.clone()))
         .nest("/export", snapshot_export_routes)
         .nest("/logs", log_sink_routes())
         .nest("/streaming_import", streaming_import_routes())
@@ -445,6 +462,7 @@ pub fn router(st: LocalAppState) -> Router {
             st.clone(),
             unmigrated_local_app_state_api_authority_middleware,
         ))
+        .nest("/actions", action_callback_routes)
         .merge(dashboard_routes)
         .nest("/v1", platform_routes)
         .merge(deploy_routes);
@@ -524,11 +542,9 @@ pub fn storage_api_routes() -> Router<RouterState> {
 // IMPORTANT NOTE: Those routes are proxied by Usher. Any changes to the router,
 // such as adding or removing a route, or changing limits, also need to be
 // applied to `crates_private/usher/src/proxy.rs`.
-pub fn action_callback_routes<S>(state: S) -> Router<S>
-where
-    LocalAppState: FromMtState<S>,
-    S: Send + Sync + Clone + 'static,
-{
+pub fn action_callback_routes(
+    state: ActionCallbackRouterState,
+) -> Router<ActionCallbackRouterState> {
     Router::new()
         .route("/query", post(internal_query_post))
         .route("/mutation", post(internal_mutation_post))
@@ -544,7 +560,10 @@ where
         .route("/storage_delete", post(storage_delete))
         // All routes above this line get the increased limit
         .layer(DefaultBodyLimit::max(*MAX_BACKEND_RPC_REQUEST_SIZE))
-        .layer(axum::middleware::from_fn_with_state(state, action_callbacks_middleware::<S>))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            action_callbacks_middleware,
+        ))
 }
 
 pub fn import_routes<S>() -> Router<S>
@@ -726,9 +745,12 @@ mod tests {
     use anyhow::Context;
     use axum::body::Body;
     use axum_extra::headers::authorization::Credentials;
-    use common::http::{
-        ConvexHttpService,
-        NoopRouteMapper,
+    use common::{
+        components::ComponentId,
+        http::{
+            ConvexHttpService,
+            NoopRouteMapper,
+        },
     };
     use database::partition::PartitionId;
     use http::{
@@ -1072,6 +1094,59 @@ mod tests {
         let body = String::from_utf8_lossy(&bytes);
         assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(body.contains("ServiceUnavailable"), "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_action_callbacks_reject_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let callback_token = backend
+            .st
+            .application
+            .key_broker()
+            .issue_action_token(ComponentId::test_user());
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "action_callback_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for path in [
+            "/api/actions/mutation",
+            "/api/actions/schedule_job",
+            "/api/actions/storage_delete",
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .method("POST")
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .header("Convex-Action-Callback-Token", callback_token.clone())
+                .body(Body::from("{}"))?;
+            let (parts, body) = partitioned_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                parts.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {body}"
+            );
+            assert!(body.contains("ServiceUnavailable"), "{path}: {body}");
+        }
 
         Ok(())
     }
