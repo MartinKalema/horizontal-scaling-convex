@@ -2,8 +2,12 @@ use anyhow::Context;
 use application::deploy_config::ModuleJson;
 use axum::{
     debug_handler,
-    extract::State,
+    extract::{
+        FromRequestParts,
+        State,
+    },
     response::IntoResponse,
+    RequestPartsExt,
 };
 use common::{
     bootstrap_model::{
@@ -38,6 +42,7 @@ use common::{
         },
         HttpResponseError,
     },
+    runtime::Runtime,
     types::IndexDiff,
 };
 use database::{
@@ -65,9 +70,28 @@ use crate::{
         must_be_admin,
         must_be_admin_from_key_with_write_access,
     },
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractAuthenticationToken,
+    DeployRouterState,
 };
+
+pub struct ExtractDeployIdentity(pub keybroker::Identity);
+
+impl FromRequestParts<DeployRouterState> for ExtractDeployIdentity {
+    type Rejection = HttpResponseError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        st: &DeployRouterState,
+    ) -> Result<Self, Self::Rejection> {
+        let token: sync_types::AuthenticationToken =
+            parts.extract::<ExtractAuthenticationToken>().await?.into();
+        Ok(Self(
+            st.application
+                .authenticate(token, st.application.runtime().system_time())
+                .await?,
+        ))
+    }
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -239,7 +263,7 @@ impl PrepareSchemaResponse {
 
 #[debug_handler]
 pub async fn prepare_schema(
-    State(st): State<LocalAppState>,
+    State(st): State<DeployRouterState>,
     Json(req): Json<PrepareSchemaArgs>,
 ) -> Result<Json<PrepareSchemaResponse>, HttpResponseError> {
     let (response, _) = prepare_schema_handler(st, req).await?;
@@ -247,7 +271,7 @@ pub async fn prepare_schema(
 }
 
 pub async fn prepare_schema_handler(
-    st: LocalAppState,
+    st: DeployRouterState,
     req: PrepareSchemaArgs,
 ) -> Result<(Json<PrepareSchemaResponse>, bool), HttpResponseError> {
     let bundle = req.bundle.try_into()?;
@@ -350,9 +374,9 @@ impl From<SchemaState> for SchemaStateJson {
 
 /// Gets the current state of the indexes and schema.
 pub async fn schema_state(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<DeployRouterState>,
     Path(schema_id): Path<String>,
-    ExtractIdentity(identity): ExtractIdentity,
+    ExtractDeployIdentity(identity): ExtractDeployIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin(&identity)?;
     let mut tx = st.application.begin(identity.clone()).await?;

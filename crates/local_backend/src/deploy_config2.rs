@@ -82,12 +82,12 @@ use crate::{
         must_be_admin_from_key,
         must_be_admin_from_key_with_write_access,
     },
-    LocalAppState,
+    DeployRouterState,
 };
 
 const INTERNAL_BACKEND_HTTP_PORT: u16 = 3210;
 
-async fn raft_leader_origin(st: &LocalAppState) -> anyhow::Result<Option<String>> {
+async fn raft_leader_origin(st: &DeployRouterState) -> anyhow::Result<Option<String>> {
     let Some(raft_state) = st.raft_state.as_ref() else {
         return Ok(None);
     };
@@ -110,14 +110,14 @@ async fn raft_leader_origin(st: &LocalAppState) -> anyhow::Result<Option<String>
     Ok(None)
 }
 
-async fn deploy_target_origin(st: &LocalAppState) -> anyhow::Result<Option<String>> {
+async fn deploy_target_origin(st: &DeployRouterState) -> anyhow::Result<Option<String>> {
     if let Some(origin) = metadata_owner_origin(st)? {
         return Ok(Some(origin));
     }
     raft_leader_origin(st).await
 }
 
-fn metadata_owner_origin(st: &LocalAppState) -> anyhow::Result<Option<String>> {
+fn metadata_owner_origin(st: &DeployRouterState) -> anyhow::Result<Option<String>> {
     let Some(local_partition) = st.partition_id else {
         return Ok(None);
     };
@@ -172,7 +172,7 @@ async fn metadata_owner_instance_name(owner_origin: &str) -> anyhow::Result<Stri
 }
 
 fn issue_owner_admin_key(
-    st: &LocalAppState,
+    st: &DeployRouterState,
     owner_instance_name: &str,
     identity: &Identity,
 ) -> anyhow::Result<String> {
@@ -200,7 +200,7 @@ fn issue_owner_admin_key(
 }
 
 async fn maybe_forward_deploy_request<Req, Resp>(
-    st: &LocalAppState,
+    st: &DeployRouterState,
     path: &str,
     req: &mut Req,
     needs_write_access: bool,
@@ -390,7 +390,7 @@ pub struct AnalyzedComponent {
 
 #[debug_handler]
 pub async fn start_push(
-    State(st): State<LocalAppState>,
+    State(st): State<DeployRouterState>,
     Json(mut req): Json<StartPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     if let Some(forwarded) =
@@ -422,7 +422,7 @@ pub async fn start_push(
 // what will be the effects of a large push without starting work that can take
 // a long time on large instances.
 pub async fn evaluate_push(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<DeployRouterState>,
     Json(mut req): Json<StartPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     if let Some(forwarded) =
@@ -469,7 +469,7 @@ impl AdminKeyCarrier for WaitForSchemaRequest {
 }
 
 pub async fn wait_for_schema(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<DeployRouterState>,
     Json(mut req): Json<WaitForSchemaRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     if let Some(forwarded) =
@@ -516,7 +516,7 @@ impl AdminKeyCarrier for FinishPushRequest {
 
 /// Internal version that returns the commit timestamp for use by conductor
 pub async fn finish_push_internal(
-    st: &LocalAppState,
+    st: &DeployRouterState,
     req: FinishPushRequest,
 ) -> anyhow::Result<(SerializedFinishPushDiff, Option<common::types::Timestamp>)> {
     let identity = must_be_admin_from_key_with_write_access(
@@ -553,7 +553,7 @@ pub struct SerializedFinishPushResponse {
 }
 
 pub async fn finish_push(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<DeployRouterState>,
     Json(mut req): Json<FinishPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     if let Some(forwarded) = maybe_forward_deploy_request::<
@@ -586,7 +586,7 @@ pub struct ReportPushCompletedRequest {
 }
 
 pub async fn report_push_completed(
-    st: LocalAppState,
+    st: DeployRouterState,
     req: ReportPushCompletedRequest,
 ) -> anyhow::Result<Vec<SpanRecord>> {
     let _identity = must_be_admin_from_key_with_write_access(
@@ -605,7 +605,7 @@ pub async fn report_push_completed(
 
 #[debug_handler]
 pub async fn report_push_completed_handler(
-    State(st): State<LocalAppState>,
+    State(st): State<DeployRouterState>,
     Json(req): Json<ReportPushCompletedRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let spans = report_push_completed(st, req).await?;

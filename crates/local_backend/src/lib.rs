@@ -171,6 +171,33 @@ pub struct RouterState {
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
 }
 
+#[derive(Clone)]
+pub struct DeployRouterState {
+    pub instance_name: String,
+    pub instance_secret: InstanceSecret,
+    pub application: Application<ProdRuntime>,
+    pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+    pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
+}
+
+impl From<&LocalAppState> for DeployRouterState {
+    fn from(st: &LocalAppState) -> Self {
+        Self {
+            instance_name: st.instance_name.clone(),
+            instance_secret: st.instance_secret,
+            application: st.application.clone(),
+            replica_mode: st.replica_mode,
+            partition_id: st.partition_id,
+            node_addresses: st.node_addresses.clone(),
+            raft_state: st.raft_state.clone(),
+            raft_peer_http_origins: st.raft_peer_http_origins.clone(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct EmptyResponse {}
 
