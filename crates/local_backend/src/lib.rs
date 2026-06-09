@@ -93,7 +93,6 @@ pub mod config;
 pub mod custom_headers;
 pub mod dashboard;
 pub mod deploy_config;
-pub mod deploy_protocol;
 pub mod deployment_info;
 pub mod deployment_state;
 pub mod environment_variables;
@@ -868,7 +867,7 @@ pub async fn make_app(
                     peer_addresses.insert(id, normalized_grpc_addr.clone());
                     peer_grpc_urls.insert(id, normalized_grpc_addr);
                     if let Ok(origin) =
-                        crate::deploy_protocol::http_origin_from_peer_addr(addr.trim())
+                        crate::deploy_config::http_origin_from_peer_addr(addr.trim())
                     {
                         peer_http_origins.insert(id, origin);
                     }

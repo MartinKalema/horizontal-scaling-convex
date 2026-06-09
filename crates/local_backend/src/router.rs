@@ -81,11 +81,11 @@ use crate::{
         run_test_function,
     },
     deploy_config::{
+        self,
         get_config,
         get_config_hashes,
         push_config,
     },
-    deploy_protocol,
     environment_variables::{
         list_environment_variables,
         platform_router,
@@ -407,20 +407,17 @@ pub fn router(st: BackendAppState) -> Router {
     let deploy_push_routes = Router::new()
         .route("/push_config", post(push_config))
         .route("/prepare_schema", post(prepare_schema))
-        .route("/deploy2/start_push", post(deploy_protocol::start_push))
-        .route(
-            "/deploy2/evaluate_push",
-            post(deploy_protocol::evaluate_push),
-        )
+        .route("/deploy2/start_push", post(deploy_config::start_push))
+        .route("/deploy2/evaluate_push", post(deploy_config::evaluate_push))
         .route("/run_test_function", post(run_test_function))
         .route(
             "/deploy2/wait_for_schema",
-            post(deploy_protocol::wait_for_schema),
+            post(deploy_config::wait_for_schema),
         )
-        .route("/deploy2/finish_push", post(deploy_protocol::finish_push))
+        .route("/deploy2/finish_push", post(deploy_config::finish_push))
         .route(
             "/deploy2/report_push_completed",
-            post(deploy_protocol::report_push_completed_handler),
+            post(deploy_config::report_push_completed_handler),
         )
         .layer(
             ServiceBuilder::new()
