@@ -59,6 +59,17 @@ Dashboard and platform admin routes use a smaller cluster-aware
 | Dashboard admin routes, environment variables, canonical URLs, scheduled job cancellation, and app metrics | Coordinator owner because these routes read or write deployment-global metadata and function-log state. |
 | `/api/v1/*` platform admin routes, including deployment info/state, canonical URLs, environment variables, and platform log-stream configuration | Coordinator owner unless a narrower follower-safe read or forwarding path is added. |
 
+## Log And Observability `AdminRouterState` Routes
+
+Log sink configuration and function-log observability routes use
+`AdminRouterState` instead of the full `LocalAppState` route tree.
+
+| Route surface | Authority rule |
+| --- | --- |
+| Deprecated `/api/logs/*` log-sink routes | Coordinator owner because they mutate deployment-global log sink configuration and can trigger external delivery side effects. |
+| `/api/v1/*` platform log-stream routes such as `create_log_stream`, `update_log_stream`, `delete_log_stream`, and webhook secret rotation | Coordinator owner because they mutate deployment-global log-stream configuration. |
+| `/api/stream_udf_execution`, `/api/stream_function_logs`, and `/api/app_metrics/*` | Coordinator owner because these read deployment-global function-log and app-metrics state. They are not documented as local-node-only metrics; any future local-node metrics should be named and documented as local. |
+
 ## Internal Action Callback `ActionCallbackRouterState` Routes
 
 Internal action callbacks use a dedicated `ActionCallbackRouterState` instead
@@ -88,7 +99,7 @@ in `router.rs`.
 
 | Route surface | Authority rule |
 | --- | --- |
-| Deprecated `/api/logs/*` log-sink routes | Coordinator owner unless a narrower forwarding path is added. |
+| None after the route-family migrations above. The temporary guard remains only until the final cleanup removes the empty `LocalAppState` API route tree. |
 
 ## Adding A Route
 

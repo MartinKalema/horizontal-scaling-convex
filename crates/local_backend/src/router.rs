@@ -203,6 +203,16 @@ async fn admin_api_authority_middleware(
     Ok(next.run(req).await)
 }
 
+async fn log_sink_api_authority_middleware(
+    State(st): State<AdminRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/logs{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
+
 async fn platform_api_authority_middleware(
     State(st): State<AdminRouterState>,
     req: axum::extract::Request,
@@ -442,10 +452,22 @@ pub fn router(st: LocalAppState) -> Router {
         ))
         .with_state(deploy_state);
 
-    let cli_routes = Router::new()
+    let observability_routes = Router::new()
         .route("/stream_udf_execution", get(stream_udf_execution))
         .route("/stream_function_logs", get(stream_function_logs))
-        .layer(cli_cors());
+        .layer(cli_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin_api_authority_middleware,
+        ))
+        .with_state(admin_state.clone());
+
+    let log_sink_routes = log_sink_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            admin_state.clone(),
+            log_sink_api_authority_middleware,
+        ))
+        .with_state(admin_state.clone());
 
     let import_export_state = ImportExportRouterState::from(&st);
     let snapshot_import_routes = import_routes()
@@ -508,12 +530,12 @@ pub fn router(st: LocalAppState) -> Router {
         .with_state(admin_state);
 
     let api_routes = Router::new()
-        .merge(cli_routes)
-        .nest("/logs", log_sink_routes())
         .layer(axum::middleware::from_fn_with_state(
             st.clone(),
             unmigrated_local_app_state_api_authority_middleware,
         ))
+        .merge(observability_routes)
+        .nest("/logs", log_sink_routes)
         .merge(snapshot_import_routes)
         .merge(streaming_export_routes)
         .nest("/export", snapshot_export_routes)
@@ -1218,6 +1240,61 @@ mod tests {
             ("POST", "/api/export/request/zip", ""),
             ("GET", "/api/streaming_import/get_schema", ""),
             ("GET", "/api/document_deltas?cursor=0", ""),
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .method(method)
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .header("Authorization", admin_header.clone())
+                .body(Body::from(body))?;
+            let (parts, body) = partitioned_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                parts.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {body}"
+            );
+            assert!(body.contains("ServiceUnavailable"), "{path}: {body}");
+        }
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_log_observability_routes_reject_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "log_observability_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for (method, path, body) in [
+            ("POST", "/api/logs/datadog_sink", "{}"),
+            ("POST", "/api/v1/create_log_stream", "{}"),
+            ("GET", "/api/stream_udf_execution?cursor=0", ""),
+            ("GET", "/api/stream_function_logs?cursor=0", ""),
+            (
+                "GET",
+                "/api/app_metrics/function_concurrency?window=%7B%7D",
+                "",
+            ),
         ] {
             let req = Request::builder()
                 .uri(path)

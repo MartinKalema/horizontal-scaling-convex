@@ -557,6 +557,14 @@ mod tests {
             class_for("/api/logs/datadog_sink"),
             Some(RouteAuthorityClass::CoordinatorOwner)
         );
+        assert_eq!(
+            class_for("/api/stream_function_logs"),
+            Some(RouteAuthorityClass::CoordinatorOwner)
+        );
+        assert_eq!(
+            class_for("/api/app_metrics/function_concurrency"),
+            Some(RouteAuthorityClass::CoordinatorOwner)
+        );
         assert_eq!(class_for("/api/unregistered_route"), None);
     }
 
