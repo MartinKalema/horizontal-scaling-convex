@@ -40,7 +40,7 @@ authority checks.
 ## Deploy `DeployRouterState` Routes
 
 Deploy and CLI config routes use a smaller cluster-aware `DeployRouterState`
-instead of the full `LocalAppState` route tree.
+instead of the broad application assembly state.
 
 | Route surface | Authority rule |
 | --- | --- |
@@ -51,7 +51,7 @@ instead of the full `LocalAppState` route tree.
 ## Admin `AdminRouterState` Routes
 
 Dashboard and platform admin routes use a smaller cluster-aware
-`AdminRouterState` instead of the full `LocalAppState` route tree.
+`AdminRouterState` instead of the broad application assembly state.
 
 | Route surface | Authority rule |
 | --- | --- |
@@ -62,7 +62,7 @@ Dashboard and platform admin routes use a smaller cluster-aware
 ## Log And Observability `AdminRouterState` Routes
 
 Log sink configuration and function-log observability routes use
-`AdminRouterState` instead of the full `LocalAppState` route tree.
+`AdminRouterState` instead of the broad application assembly state.
 
 | Route surface | Authority rule |
 | --- | --- |
@@ -73,7 +73,7 @@ Log sink configuration and function-log observability routes use
 ## Internal Action Callback `ActionCallbackRouterState` Routes
 
 Internal action callbacks use a dedicated `ActionCallbackRouterState` instead
-of the full `LocalAppState` route tree.
+of the broad application assembly state.
 
 | Route surface | Authority rule |
 | --- | --- |
@@ -82,7 +82,7 @@ of the full `LocalAppState` route tree.
 ## Import/Export `ImportExportRouterState` Routes
 
 Snapshot import/export and streaming import/export routes use a dedicated
-`ImportExportRouterState` instead of the full `LocalAppState` route tree.
+`ImportExportRouterState` instead of the broad application assembly state.
 
 | Route surface | Authority rule |
 | --- | --- |
@@ -93,9 +93,10 @@ Snapshot import/export and streaming import/export routes use a dedicated
 
 ## Final Router Shape
 
-`LocalAppState` remains the root object used to assemble the local backend and
-to serve local-process surfaces such as health checks, static assets, and
-server bootstrap wiring. It is no longer used as a broad `/api` route state.
+The application assembly state currently named `LocalAppState` remains only for
+constructing the local backend and serving local-process surfaces such as health
+checks, static assets, and server bootstrap wiring. It is no longer used as a
+broad `/api` route state.
 
 Every externally reachable clustered `/api` route is now mounted through an
 explicit smaller route state:
