@@ -65,6 +65,7 @@ const RECENT_QUERY_INTEREST_TTL: Duration = Duration::from_secs(60);
 pub struct SelectiveQueryForwardingApi {
     inner: Arc<dyn application::api::ApplicationApi>,
     database: Database<ProdRuntime>,
+    replica_mode: bool,
     partition_id: Option<PartitionId>,
     node_addresses: Option<NodeAddresses>,
     raft_state: Option<RaftPartitionState>,
@@ -75,6 +76,7 @@ impl SelectiveQueryForwardingApi {
     pub fn new(
         inner: Arc<dyn application::api::ApplicationApi>,
         database: Database<ProdRuntime>,
+        replica_mode: bool,
         partition_id: Option<PartitionId>,
         node_addresses: Option<NodeAddresses>,
         raft_state: Option<RaftPartitionState>,
@@ -83,6 +85,7 @@ impl SelectiveQueryForwardingApi {
         Self {
             inner,
             database,
+            replica_mode,
             partition_id,
             node_addresses,
             raft_state,
@@ -142,6 +145,46 @@ impl SelectiveQueryForwardingApi {
         {
             tracing::debug!("Failed to record recent query interest: {e:#}");
         }
+    }
+
+    fn unsupported_cluster_surface_error(&self, surface: &str, reason: String) -> anyhow::Error {
+        anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(format!(
+            "{surface} cannot execute locally on this clustered node: {reason}. Route the request \
+             to the authoritative node or add an explicit forwarding path for this surface."
+        ))
+    }
+
+    fn ensure_cluster_coordinator_authority(&self, surface: &str) -> anyhow::Result<()> {
+        if !self.replica_mode && self.partition_id.is_none() {
+            return Ok(());
+        }
+        if self.replica_mode {
+            return Err(self.unsupported_cluster_surface_error(
+                surface,
+                "replicas do not own global request surfaces".to_string(),
+            ));
+        }
+        let Some(partition_id) = self.partition_id else {
+            return Ok(());
+        };
+        if partition_id != SELECTIVE_QUERY_AUTHORITY_PARTITION {
+            return Err(self.unsupported_cluster_surface_error(
+                surface,
+                format!(
+                    "partition {} is not the cluster coordinator partition {}",
+                    partition_id.0, SELECTIVE_QUERY_AUTHORITY_PARTITION.0
+                ),
+            ));
+        }
+        if let Some(raft_state) = self.raft_state.as_ref()
+            && !raft_state.is_leader()
+        {
+            return Err(self.unsupported_cluster_surface_error(
+                surface,
+                "the coordinator partition is running as a Raft follower".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +251,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         ts: application::api::ExecuteQueryTimestamp,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<application::RedactedQueryReturn> {
+        self.ensure_cluster_coordinator_authority("Admin query")?;
         self.inner
             .execute_admin_query(host, request_id, identity, path, args, caller, ts, journal)
             .await
@@ -253,6 +297,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
     ) -> anyhow::Result<
         Result<application::RedactedMutationReturn, application::RedactedMutationError>,
     > {
+        self.ensure_cluster_coordinator_authority("Admin mutation")?;
         self.inner
             .execute_admin_mutation(
                 host,
@@ -277,6 +322,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         caller: FunctionCaller,
     ) -> anyhow::Result<Result<application::RedactedActionReturn, application::RedactedActionError>>
     {
+        self.ensure_cluster_coordinator_authority("Public action")?;
         self.inner
             .execute_public_action(host, request_id, identity, path, args, caller)
             .await
@@ -292,6 +338,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         caller: FunctionCaller,
     ) -> anyhow::Result<Result<application::RedactedActionReturn, application::RedactedActionError>>
     {
+        self.ensure_cluster_coordinator_authority("Admin action")?;
         self.inner
             .execute_admin_action(host, request_id, identity, path, args, caller)
             .await
@@ -306,6 +353,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         caller: FunctionCaller,
         response_streamer: HttpActionResponseStreamer,
     ) -> anyhow::Result<()> {
+        self.ensure_cluster_coordinator_authority("HTTP action")?;
         self.inner
             .execute_http_action(
                 host,
@@ -327,6 +375,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         args: SerializedArgs,
         caller: FunctionCaller,
     ) -> anyhow::Result<Result<application::FunctionReturn, application::FunctionError>> {
+        self.ensure_cluster_coordinator_authority("Any function execution")?;
         self.inner
             .execute_any_function(host, request_id, identity, path, args, caller)
             .await
@@ -337,6 +386,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         host: &ResolvedHostname,
         request_id: RequestId,
     ) -> anyhow::Result<RepeatableTimestamp> {
+        self.ensure_cluster_coordinator_authority("Latest timestamp")?;
         self.inner.latest_timestamp(host, request_id).await
     }
 
@@ -347,6 +397,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         token: &str,
         validity: Duration,
     ) -> anyhow::Result<ComponentId> {
+        self.ensure_cluster_coordinator_authority("File upload authorization")?;
         self.inner
             .check_store_file_authorization(host, request_id, token, validity)
             .await
@@ -363,6 +414,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         expected_sha256: Option<Sha256Digest>,
         body: BoxStream<'_, anyhow::Result<Bytes>>,
     ) -> anyhow::Result<PublicDocumentId> {
+        self.ensure_cluster_coordinator_authority("File upload")?;
         self.inner
             .store_file(
                 host,
@@ -386,6 +438,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         file_storage_id: FileStorageId,
         range: (Bound<u64>, Bound<u64>),
     ) -> anyhow::Result<FileStream> {
+        self.ensure_cluster_coordinator_authority("File range read")?;
         self.inner
             .get_file_range(host, request_id, origin, component, file_storage_id, range)
             .await
@@ -399,6 +452,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         component: ComponentId,
         file_storage_id: FileStorageId,
     ) -> anyhow::Result<FileStream> {
+        self.ensure_cluster_coordinator_authority("File read")?;
         self.inner
             .get_file(host, request_id, origin, component, file_storage_id)
             .await
@@ -408,6 +462,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         &self,
         host: &ResolvedHostname,
     ) -> anyhow::Result<Box<dyn SubscriptionClient>> {
+        self.ensure_cluster_coordinator_authority("Subscription setup")?;
         self.inner.subscription_client(host).await
     }
 
