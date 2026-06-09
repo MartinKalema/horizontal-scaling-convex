@@ -53,8 +53,8 @@ use crate::{
         must_be_admin,
         must_be_admin_with_write_access,
     },
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractImportExportIdentity,
+    ImportExportRouterState,
 };
 
 #[derive(Deserialize)]
@@ -65,8 +65,8 @@ pub struct AirbyteImportArgs {
 }
 
 pub async fn import_airbyte_records(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(AirbyteImportArgs { tables, messages }): Json<AirbyteImportArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -93,8 +93,8 @@ pub async fn import_airbyte_records(
 }
 
 pub async fn apply_fivetran_operations(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(rows): Json<Vec<BatchWriteRow>>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -112,8 +112,8 @@ pub async fn apply_fivetran_operations(
 }
 
 pub async fn get_schema(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
     let schema = st
@@ -127,8 +127,8 @@ pub async fn get_schema(
 }
 
 pub async fn fivetran_create_table(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(CreateTableArgs { table_definition }): Json<CreateTableArgs>,
 ) -> Result<StatusCode, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -147,8 +147,8 @@ pub struct ClearTableArgs {
 }
 
 pub async fn clear_tables(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(ClearTableArgs { table_names }): Json<ClearTableArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -195,8 +195,8 @@ pub async fn clear_tables(
 /// (and `fivetran.deleted` when using soft deletes) to efficiently find the
 /// rows to delete.
 pub async fn fivetran_truncate_table(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(TruncateTableArgs {
         table_name,
         delete_before,
@@ -249,8 +249,8 @@ pub struct ReplaceTableArgs {
 }
 
 pub async fn replace_tables(
-    MtState(_st): MtState<LocalAppState>,
-    ExtractIdentity(_identity): ExtractIdentity,
+    MtState(_st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(_identity): ExtractImportExportIdentity,
     Json(ReplaceTableArgs { _table_names: _ }): Json<ReplaceTableArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     // Disabled until we figure out how to make schema validation and indexes
@@ -271,8 +271,8 @@ pub struct AddIndexesArgs {
 }
 
 pub async fn add_primary_key_indexes(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(AddIndexesArgs { indexes }): Json<AddIndexesArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -308,8 +308,8 @@ pub struct IndexesReadyResponse {
 }
 
 pub async fn primary_key_indexes_ready(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(IndexesReadyArgs { tables }): Json<IndexesReadyArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin(&identity)?;

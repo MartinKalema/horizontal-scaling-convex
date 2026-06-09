@@ -68,6 +68,18 @@ of the full `LocalAppState` route tree.
 | --- | --- |
 | `/api/actions/*` internal query, mutation, action, scheduling, vector search, function-handle, and storage callbacks | Coordinator owner until callback reads and side effects have a narrower partition/index/storage ownership model or explicit forwarding path. |
 
+## Import/Export `ImportExportRouterState` Routes
+
+Snapshot import/export and streaming import/export routes use a dedicated
+`ImportExportRouterState` instead of the full `LocalAppState` route tree.
+
+| Route surface | Authority rule |
+| --- | --- |
+| `/api/import`, `/api/import/*`, `/api/perform_import`, `/api/cancel_import` | Coordinator owner because snapshot imports mutate deployment-global schema/table state and object-upload job state. |
+| `/api/export/*` | Coordinator owner because snapshot export jobs, expiration changes, cancellation, and archive retrieval need a consistent deployment-global export owner. |
+| `/api/streaming_import/*` | Coordinator owner because streaming import writes schemas, tables, indexes, and bulk row mutations until per-table/partition fanout and idempotency are introduced. |
+| `/api/document_deltas`, `/api/list_snapshot`, `/api/json_schemas`, `/api/test_streaming_export_connection`, `/api/get_tables_and_columns`, `/api/get_table_column_names` | Coordinator owner until streaming export has a follower-safe snapshot/frontier proof or explicit export owner forwarding. |
+
 ## Unmigrated `LocalAppState` Routes
 
 Unmigrated `/api` routes bypass `ApplicationApi`, so they are classified by
@@ -76,7 +88,7 @@ in `router.rs`.
 
 | Route surface | Authority rule |
 | --- | --- |
-| Import/export, streaming import/export, and deprecated `/api/logs/*` log-sink routes | Coordinator owner unless a narrower forwarding path is added. |
+| Deprecated `/api/logs/*` log-sink routes | Coordinator owner unless a narrower forwarding path is added. |
 
 ## Adding A Route
 

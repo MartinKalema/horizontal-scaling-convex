@@ -90,30 +90,30 @@ use value::{
 
 use crate::{
     admin::must_be_admin,
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractImportExportIdentity,
+    ImportExportRouterState,
 };
 
 #[fastrace::trace]
 pub async fn document_deltas_get(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ImportExportRouterState>,
     Query(args): Query<DocumentDeltasArgs>,
-    ExtractIdentity(identity): ExtractIdentity,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     _document_deltas(st, args, identity).await
 }
 
 #[fastrace::trace]
 pub async fn document_deltas_post(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(args): Json<DocumentDeltasArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     _document_deltas(st, args, identity).await
 }
 
 pub async fn _document_deltas(
-    st: LocalAppState,
+    st: ImportExportRouterState,
     args: DocumentDeltasArgs,
     identity: Identity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -192,24 +192,24 @@ pub async fn _document_deltas(
 
 #[fastrace::trace]
 pub async fn list_snapshot_get(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ImportExportRouterState>,
     Query(query_args): Query<ListSnapshotArgs>,
-    ExtractIdentity(identity): ExtractIdentity,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     _list_snapshot(st, query_args, identity).await
 }
 
 #[fastrace::trace]
 pub async fn list_snapshot_post(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(args): Json<ListSnapshotArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     _list_snapshot(st, args, identity).await
 }
 
 async fn _list_snapshot(
-    st: LocalAppState,
+    st: ImportExportRouterState,
     args: ListSnapshotArgs,
     identity: Identity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -307,8 +307,8 @@ async fn _list_snapshot(
 
 /// Confirms that streaming export is enabled
 pub async fn test_streaming_export_connection(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     st.application
         .ensure_streaming_export_enabled(identity.clone())
@@ -325,8 +325,8 @@ pub async fn test_streaming_export_connection(
 /// TODO(nicolas): Remove this endpoint (replaced by
 /// get_table_column_names)
 pub async fn get_tables_and_columns(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     st.application
         .ensure_streaming_export_enabled(identity.clone())
@@ -358,8 +358,8 @@ pub async fn get_tables_and_columns(
 /// It’s ok for the list of columns to be incomplete since Fivetran can handle
 /// extra fields during an export.
 pub async fn get_table_column_names(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     st.application
         .ensure_streaming_export_enabled(identity.clone())
@@ -458,9 +458,9 @@ pub struct JsonSchemaArgs {
 /// component, { "waitlist": { "users": { "type": "object", "properties": { ...
 /// } } } }
 pub async fn json_schemas(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<ImportExportRouterState>,
     Query(query_args): Query<JsonSchemaArgs>,
-    ExtractIdentity(identity): ExtractIdentity,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     st.application
         .ensure_streaming_export_enabled(identity.clone())

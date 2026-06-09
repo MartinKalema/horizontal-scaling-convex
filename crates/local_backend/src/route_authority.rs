@@ -8,6 +8,7 @@ use crate::{
     ActionCallbackRouterState,
     AdminRouterState,
     DeployRouterState,
+    ImportExportRouterState,
     LocalAppState,
 };
 
@@ -62,6 +63,20 @@ impl ClusterAuthorityContext for AdminRouterState {
 }
 
 impl ClusterAuthorityContext for ActionCallbackRouterState {
+    fn replica_mode(&self) -> bool {
+        self.replica_mode
+    }
+
+    fn partition_id(&self) -> Option<PartitionId> {
+        self.partition_id
+    }
+
+    fn raft_state(&self) -> Option<&RaftPartitionState> {
+        self.raft_state.as_ref()
+    }
+}
+
+impl ClusterAuthorityContext for ImportExportRouterState {
     fn replica_mode(&self) -> bool {
         self.replica_mode
     }
