@@ -250,6 +250,25 @@ impl From<&LocalAppState> for ActionCallbackRouterState {
     }
 }
 
+#[derive(Clone)]
+pub struct ImportExportRouterState {
+    pub application: Application<ProdRuntime>,
+    pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+}
+
+impl From<&LocalAppState> for ImportExportRouterState {
+    fn from(st: &LocalAppState) -> Self {
+        Self {
+            application: st.application.clone(),
+            replica_mode: st.replica_mode,
+            partition_id: st.partition_id,
+            raft_state: st.raft_state.clone(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct EmptyResponse {}
 

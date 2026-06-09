@@ -42,9 +42,9 @@ use value::PublicDocumentId;
 
 use crate::{
     admin::must_be_admin_with_write_access,
-    authentication::ExtractIdentity,
+    authentication::ExtractImportExportIdentity,
     custom_headers::ContentDispositionAttachment,
-    LocalAppState,
+    ImportExportRouterState,
 };
 
 // Export GETs are immutable. Browser can cache for a long time.
@@ -60,8 +60,8 @@ pub struct RequestZipExport {
 
 #[fastrace::trace]
 pub async fn request_zip_export(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Query(RequestZipExport {
         include_storage,
         component,
@@ -88,8 +88,8 @@ pub struct ZipExportRequest {
 }
 
 pub async fn get_zip_export(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Path(ZipExportRequest { id }): Path<ZipExportRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -129,8 +129,8 @@ pub struct SetExportExpirationPathArgs {
 
 #[fastrace::trace]
 pub async fn set_export_expiration(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Path(SetExportExpirationPathArgs { snapshot_id }): Path<SetExportExpirationPathArgs>,
     Json(SetExportExpirationRequest { expiration_ts_ns }): Json<SetExportExpirationRequest>,
 ) -> Result<StatusCode, HttpResponseError> {
@@ -153,8 +153,8 @@ pub async fn set_export_expiration(
 
 #[fastrace::trace]
 pub async fn cancel_export(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Path(SetExportExpirationPathArgs { snapshot_id }): Path<SetExportExpirationPathArgs>,
 ) -> Result<StatusCode, HttpResponseError> {
     // This route is accessed directly from the admin dashboard

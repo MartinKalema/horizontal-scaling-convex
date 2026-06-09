@@ -44,8 +44,8 @@ use value::{
 
 use crate::{
     admin::must_be_admin_with_write_access,
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractImportExportIdentity,
+    ImportExportRouterState,
 };
 
 #[derive(Deserialize)]
@@ -126,8 +126,8 @@ fn parse_format_arg(
 }
 
 pub async fn import(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Query(ImportQueryArgs {
         table_name,
         component_path,
@@ -162,8 +162,8 @@ pub struct StartUploadResponse {
 }
 
 pub async fn import_start_upload(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
     let token = st
@@ -176,8 +176,8 @@ pub async fn import_start_upload(
 }
 
 pub async fn import_upload_part(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Query(ImportUploadPartArgs {
         upload_token,
         part_number,
@@ -213,8 +213,8 @@ pub struct ImportFinishUploadResponse {
 }
 
 pub async fn import_finish_upload(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(ImportFinishUploadArgs {
         import:
             ImportQueryArgs {
@@ -256,8 +256,8 @@ pub struct PerformImportArgs {
 }
 
 pub async fn perform_import(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(PerformImportArgs { import_id }): Json<PerformImportArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin_with_write_access(&identity)?;
@@ -276,8 +276,8 @@ pub struct CancelImportArgs {
 }
 
 pub async fn cancel_import(
-    MtState(st): MtState<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
+    MtState(st): MtState<ImportExportRouterState>,
+    ExtractImportExportIdentity(identity): ExtractImportExportIdentity,
     Json(CancelImportArgs { import_id }): Json<CancelImportArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let import_id = PublicDocumentId::decode(&import_id).context(ErrorMetadata::bad_request(

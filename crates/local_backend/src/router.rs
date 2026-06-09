@@ -171,6 +171,7 @@ use crate::{
     ActionCallbackRouterState,
     AdminRouterState,
     DeployRouterState,
+    ImportExportRouterState,
     LocalAppState,
     RouterState,
 };
@@ -218,6 +219,35 @@ async fn action_callback_api_authority_middleware(
     next: axum::middleware::Next,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let nested_path = format!("/actions{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
+
+async fn import_export_api_authority_middleware(
+    State(st): State<ImportExportRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    ensure_local_backend_api_authority(&st, req.uri().path())?;
+    Ok(next.run(req).await)
+}
+
+async fn snapshot_export_api_authority_middleware(
+    State(st): State<ImportExportRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/export{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
+
+async fn streaming_import_api_authority_middleware(
+    State(st): State<ImportExportRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/streaming_import{}", req.uri().path());
     ensure_local_backend_api_authority(&st, &nested_path)?;
     Ok(next.run(req).await)
 }
@@ -415,8 +445,39 @@ pub fn router(st: LocalAppState) -> Router {
     let cli_routes = Router::new()
         .route("/stream_udf_execution", get(stream_udf_execution))
         .route("/stream_function_logs", get(stream_function_logs))
-        .merge(import_routes())
         .layer(cli_cors());
+
+    let import_export_state = ImportExportRouterState::from(&st);
+    let snapshot_import_routes = import_routes()
+        .layer(cli_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            import_export_state.clone(),
+            import_export_api_authority_middleware,
+        ))
+        .with_state(import_export_state.clone());
+    let streaming_export_routes = streaming_export_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            import_export_state.clone(),
+            import_export_api_authority_middleware,
+        ))
+        .with_state(import_export_state.clone());
+    let snapshot_export_routes = Router::new()
+        .route("/request/zip", post(request_zip_export))
+        .route("/zip/{id}", get(get_zip_export))
+        .route("/set_expiration/{snapshot_id}", post(set_export_expiration))
+        .route("/cancel/{snapshot_id}", post(cancel_export))
+        .layer(axum::middleware::from_fn_with_state(
+            import_export_state.clone(),
+            snapshot_export_api_authority_middleware,
+        ))
+        .with_state(import_export_state.clone());
+    let streaming_import_routes = streaming_import_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            import_export_state.clone(),
+            streaming_import_api_authority_middleware,
+        ))
+        .with_state(import_export_state.clone());
+
     let action_callback_state = ActionCallbackRouterState::from(&st);
     let action_callback_routes = action_callback_routes(action_callback_state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -424,12 +485,6 @@ pub fn router(st: LocalAppState) -> Router {
             action_callback_api_authority_middleware,
         ))
         .with_state(action_callback_state);
-
-    let snapshot_export_routes = Router::new()
-        .route("/request/zip", post(request_zip_export))
-        .route("/zip/{id}", get(get_zip_export))
-        .route("/set_expiration/{snapshot_id}", post(set_export_expiration))
-        .route("/cancel/{snapshot_id}", post(cancel_export));
 
     let (platform_routes, platform_openapi) =
         OpenApiRouter::with_openapi(PlatformApiDoc::openapi())
@@ -454,14 +509,15 @@ pub fn router(st: LocalAppState) -> Router {
 
     let api_routes = Router::new()
         .merge(cli_routes)
-        .merge(streaming_export_routes())
-        .nest("/export", snapshot_export_routes)
         .nest("/logs", log_sink_routes())
-        .nest("/streaming_import", streaming_import_routes())
         .layer(axum::middleware::from_fn_with_state(
             st.clone(),
             unmigrated_local_app_state_api_authority_middleware,
         ))
+        .merge(snapshot_import_routes)
+        .merge(streaming_export_routes)
+        .nest("/export", snapshot_export_routes)
+        .nest("/streaming_import", streaming_import_routes)
         .nest("/actions", action_callback_routes)
         .merge(dashboard_routes)
         .nest("/v1", platform_routes)
@@ -566,11 +622,7 @@ pub fn action_callback_routes(
         ))
 }
 
-pub fn import_routes<S>() -> Router<S>
-where
-    LocalAppState: FromMtState<S>,
-    S: Clone + Send + Sync + 'static,
-{
+pub fn import_routes() -> Router<ImportExportRouterState> {
     Router::new()
         .route("/import", post(import))
         .route("/import/start_upload", post(import_start_upload))
@@ -652,11 +704,7 @@ where
 // IMPORTANT NOTE: Those routes are proxied by Usher. Any changes to the router,
 // such as adding or removing a route, or changing limits, also need to be
 // applied to `crates_private/usher/src/proxy.rs`.
-pub fn streaming_import_routes<S>() -> Router<S>
-where
-    LocalAppState: FromMtState<S>,
-    S: Clone + Send + Sync + 'static,
-{
+pub fn streaming_import_routes() -> Router<ImportExportRouterState> {
     Router::new()
         .route(
             "/import_airbyte_records",
@@ -680,11 +728,7 @@ where
 // IMPORTANT NOTE: Those routes are proxied by Usher. Any changes to the router,
 // such as adding or removing a route, or changing limits, also need to be
 // applied to `crates_private/usher/src/proxy.rs`.
-pub fn streaming_export_routes<S>() -> Router<S>
-where
-    LocalAppState: FromMtState<S>,
-    S: Clone + Send + Sync + 'static,
-{
+pub fn streaming_export_routes() -> Router<ImportExportRouterState> {
     Router::new()
         .route("/document_deltas", get(document_deltas_get))
         .route("/document_deltas", post(document_deltas_post))
@@ -1132,6 +1176,56 @@ mod tests {
                 .header("Content-Type", "application/json")
                 .header("Convex-Action-Callback-Token", callback_token.clone())
                 .body(Body::from("{}"))?;
+            let (parts, body) = partitioned_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                parts.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {body}"
+            );
+            assert!(body.contains("ServiceUnavailable"), "{path}: {body}");
+        }
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_import_export_routes_reject_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "import_export_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for (method, path, body) in [
+            ("POST", "/api/import/start_upload", ""),
+            ("POST", "/api/export/request/zip", ""),
+            ("GET", "/api/streaming_import/get_schema", ""),
+            ("GET", "/api/document_deltas?cursor=0", ""),
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .method(method)
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .header("Authorization", admin_header.clone())
+                .body(Body::from(body))?;
             let (parts, body) = partitioned_app
                 .router()
                 .clone()
