@@ -694,7 +694,7 @@ mod tests {
             document_writes: Arc::new(Vec::new()),
             document_updates: Vec::new(),
             index_writes: Arc::new(Vec::new()),
-            write_source: WriteSource::new("replication_frontier_heartbeat_test"),
+            write_source: WriteSource::new("remote_read_frontier_heartbeat_test"),
             write_bytes: 0,
             tablet_id_to_table_name: Default::default(),
             source_partition: Some(PartitionId(1)),

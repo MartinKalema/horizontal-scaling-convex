@@ -129,7 +129,7 @@ own for distributed changes.
   of shutting the node down. A targeted regression test covers the exact
   failing-oracle path.
 - **Validation:**
-  - `cargo test -p database test_idle_replication_frontier_heartbeat_tso_failure_is_nonfatal`
+  - `cargo test -p database test_idle_remote_read_frontier_heartbeat_tso_failure_is_nonfatal`
   - fresh image build and push:
     `ghcr.io/martinkalema/convex-horizontal-scaling:backend-heartbeat-nonfatal-c2410ab-20260424-101611-dirty`
   - pushed digest:
@@ -337,7 +337,7 @@ own for distributed changes.
     the heartbeat-advancing frontier before returning success to the caller
 - **Validation:**
   - targeted regression:
-    `cargo test -p database test_replication_frontier_heartbeat_does_not_advance_snapshot_ts -- --nocapture`
+    `cargo test -p database test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts -- --nocapture`
   - focused forwarding proof:
     `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
   - fresh image rebuild, clean profile-scoped reset
