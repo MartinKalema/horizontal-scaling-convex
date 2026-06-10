@@ -18,6 +18,7 @@ use axum::{
         post,
         put,
     },
+    Json,
     Router,
 };
 use common::{
@@ -41,6 +42,7 @@ use http::{
     StatusCode,
 };
 use metrics::SERVER_VERSION_STR;
+use serde::Serialize;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{
@@ -169,6 +171,17 @@ use crate::{
     ImportExportRouterState,
     RouterState,
 };
+
+const BUILD_GIT_SHA: &str = env!("VERGEN_GIT_SHA");
+const BUILD_GIT_COMMIT_TIMESTAMP: &str = env!("VERGEN_GIT_COMMIT_TIMESTAMP");
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildInfo {
+    server_version: String,
+    git_sha: &'static str,
+    git_commit_timestamp: &'static str,
+}
 
 async fn deploy_api_authority_middleware(
     State(st): State<DeployRouterState>,
@@ -698,12 +711,31 @@ where
     BackendAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
+    let instance_version = version.clone();
+    let build_info = BuildInfo {
+        server_version: version,
+        git_sha: BUILD_GIT_SHA,
+        git_commit_timestamp: BUILD_GIT_COMMIT_TIMESTAMP,
+    };
     Router::new()
         .route(
             "/instance_name",
             get(|MtState(st): MtState<BackendAppState>| async move { st.instance_name.clone() }),
         )
-        .route("/instance_version", get(|| async move { version }))
+        .route(
+            "/instance_version",
+            get(move || {
+                let instance_version = instance_version.clone();
+                async move { instance_version }
+            }),
+        )
+        .route(
+            "/build_info",
+            get(move || {
+                let build_info = build_info.clone();
+                async move { Json(build_info) }
+            }),
+        )
         .route(
             "/",
             get(|| async { "This Convex deployment is running. See https://docs.convex.dev/." }),
