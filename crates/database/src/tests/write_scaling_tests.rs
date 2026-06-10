@@ -72,6 +72,7 @@ use tonic::{
     Status,
 };
 use value::{
+    assert_val,
     PublicDocumentId,
     ResolvedDocumentId,
     TableName,
@@ -569,8 +570,8 @@ where
     })
 }
 
-/// Vitess Single mode pattern: writes to non-owned tables must be rejected
-/// with a clear error identifying the correct partition owner.
+/// Partitioned nodes should still fail closed when ownership routing is
+/// impossible because the cluster has no owner address map.
 #[convex_macro::test_runtime]
 async fn test_partition_enforcement(rt: TestRuntime) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
@@ -596,20 +597,28 @@ async fn test_partition_enforcement(rt: TestRuntime) -> anyhow::Result<()> {
     )
     .await?;
 
-    // Node A writing to projects (owned by partition 1) — must fail.
+    // Node A writing to projects (owned by partition 1) must fail closed when
+    // NODE_ADDRESSES is absent.
     let result_a = insert_doc(&node_a, "projects", assert_obj!("name" => "wrong")).await;
-    assert!(result_a.is_err(), "Node A should reject write to projects");
+    assert!(result_a.is_err(), "Node A should fail closed for projects");
     assert!(
-        result_a.unwrap_err().to_string().contains("partition-1"),
-        "Error should mention the owning partition"
+        result_a
+            .unwrap_err()
+            .to_string()
+            .contains("NODE_ADDRESSES is required"),
+        "Error should explain that owner routing is not configured"
     );
 
-    // Node B writing to messages (owned by partition 0) — must fail.
+    // Node B writing to messages (owned by partition 0) must fail closed for
+    // the same reason.
     let result_b = insert_doc(&node_b, "messages", assert_obj!("text" => "wrong")).await;
-    assert!(result_b.is_err(), "Node B should reject write to messages");
+    assert!(result_b.is_err(), "Node B should fail closed for messages");
     assert!(
-        result_b.unwrap_err().to_string().contains("partition-0"),
-        "Error should mention the owning partition"
+        result_b
+            .unwrap_err()
+            .to_string()
+            .contains("NODE_ADDRESSES is required"),
+        "Error should explain that owner routing is not configured"
     );
 
     // Correct-partition writes succeed.
@@ -617,6 +626,84 @@ async fn test_partition_enforcement(rt: TestRuntime) -> anyhow::Result<()> {
     insert_doc(&node_b, "projects", assert_obj!("name" => "correct")).await?;
 
     Ok(())
+}
+
+#[test]
+fn test_remote_single_partition_write_routes_to_owner_over_grpc() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+        )
+        .await?;
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+            node_b.committer_for_test(),
+        ))
+        .await?;
+
+        let node_a = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(tso),
+        )
+        .await?;
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let remote_seed_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(remote_seed_delta)
+            .await?;
+
+        let initial_delta_count = log.deltas().len();
+        let commit_ts = insert_doc(
+            &node_a,
+            "projects",
+            assert_obj!("name" => "routed-without-client-topology"),
+        )
+        .await?;
+
+        let deltas = log.deltas();
+        let commit_deltas: Vec<_> = deltas[initial_delta_count..]
+            .iter()
+            .filter(|delta| delta.ts == commit_ts)
+            .collect();
+        assert_eq!(
+            commit_deltas.len(),
+            1,
+            "remote single-partition routing should publish exactly the owner participant delta",
+        );
+        assert_eq!(commit_deltas[0].source_partition, Some(PartitionId(1)));
+
+        let projects = run_query(
+            node_b.clone(),
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        assert_eq!(projects.len(), 2);
+        assert!(
+            projects.iter().any(|project| project.value().0.get("name")
+                == Some(&assert_val!("routed-without-client-topology"))),
+            "owner should contain the write submitted to the non-owner node",
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    })
 }
 
 /// Jepsen sequential: write A, B, C sequentially from one client.

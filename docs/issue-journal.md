@@ -541,6 +541,25 @@ own for distributed changes.
   - `cargo check -p database`
   - `cargo check -p local_backend`
 
+### 2026-06 — Routed remote single-partition mutations through the owner
+
+- **Status:** complete
+- **Related issue:** `#163`
+- **What this fixes:** a mutation received by a healthy non-owner partition
+  could execute user code locally and then fail at commit time with "route this
+  mutation to the correct partition owner." That leaked partition topology to
+  clients.
+- **Behavior:** once a finalized transaction is classified as targeting a
+  single remote owner, the committer now uses the existing participant gRPC path
+  as a one-participant 2PC route. Local-owner writes still use the fast path,
+  cross-partition writes still use 2PC, and clusters without `NODE_ADDRESSES`
+  still fail closed instead of guessing.
+- **Validation:**
+  - `cargo test -p database test_partition_enforcement -- --nocapture`
+  - `cargo test -p database test_remote_single_partition_write_routes_to_owner_over_grpc -- --nocapture`
+  - `cargo test -p database test_cross_partition_commit_uses_remote_prepare_over_grpc -- --nocapture`
+  - `cargo check -p database`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current
