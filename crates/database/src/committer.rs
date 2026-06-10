@@ -894,8 +894,14 @@ impl<RT: Runtime> Committer<RT> {
                                 span_commit_id = None;
                             }
                         },
-                        Some(CommitterMessage::ApplyReplicaDelta { delta, result }) => {
-                            if let Err(e) = self.apply_replica_delta(delta, result, commit_id) {
+                        Some(CommitterMessage::ApplyReplicaDelta {
+                            delta,
+                            mode,
+                            result,
+                        }) => {
+                            if let Err(e) =
+                                self.apply_replica_delta(delta, mode, result, commit_id)
+                            {
                                 tracing::error!("Failed to queue replica delta for apply: {e:#}");
                             } else {
                                 commit_id += 1;
@@ -2352,6 +2358,7 @@ impl<RT: Runtime> Committer<RT> {
     fn apply_replica_delta(
         &mut self,
         delta: CommitDelta,
+        mode: ReplicaDeltaApplyMode,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> anyhow::Result<()> {
@@ -2420,31 +2427,16 @@ impl<RT: Runtime> Committer<RT> {
             remap
         };
 
-        // Classify each update as user-relevant or node-local.
+        // Classify each update for the selected replication scope.
         //
-        // CockroachDB GLOBAL table locality pattern: system tables are split
-        // into two categories (see pkg/sql/catalog/systemschema/system.go):
+        // Cross-partition NATS replication follows CockroachDB GLOBAL table
+        // locality: user data and globally needed deployment metadata are
+        // replicated, while node-local system state is filtered out.
         //
-        //   GLOBAL (replicated via Raft to all nodes):
-        //     system.descriptor, system.namespace, system.users, system.zones,
-        //     system.settings, system.role_members — schema and auth metadata
-        //     needed by every node to serve queries.
-        //
-        //   NODE-LOCAL (per-range operational state):
-        //     system.lease, system.sqlliveness, system.jobs,
-        //     system.statement_statistics — ephemeral per-node state.
-        //
-        // YugabyteDB uses a dedicated system catalog tablet (Raft-replicated)
-        // for pg_class, pg_attribute, pg_proc (stored procedures/functions).
-        // TiDB stores all metadata in TiKV (Raft-replicated) with schema
-        // version polling via tidb_schema_lease.
-        //
-        // Categories for Convex:
-        //   1. _tables entries for user tables → Phase 1 (table creation)
-        //   2. _index entries for user tables → Phase 2 (index creation)
-        //   3. User table document data → Phase 2 (data replication)
-        //   4. GLOBAL deployment tables → Phase 2 (function/schema replication)
-        //   5. Everything else (node-local system data) → SKIP
+        // Same-partition Raft replication is different: followers are HA
+        // copies that may become leader, so they must apply the full
+        // authoritative state, including system tables intentionally skipped
+        // by cross-partition read replicas.
         //
         // The key insight: we classify by what the data DESCRIBES, not by
         // which system table it's stored in. An _index entry creating
@@ -2483,54 +2475,67 @@ impl<RT: Runtime> Committer<RT> {
             let primary_tablet = update.id.tablet_id;
             let table_name = delta.tablet_id_to_table_name.get(&primary_tablet);
 
-            if table_name.map(|n| n == tables_table_name).unwrap_or(false) {
-                // _tables entry: kept for Phase 1 (user table creation).
-                // System table entries will be skipped in Phase 1 by the
-                // table_exists check.
-                tables_updates.push(update);
-            } else if table_name.map(|n| n == index_table_name).unwrap_or(false) {
-                // _index entry: check if it describes a user table index
-                // or a GLOBAL deployment table index.
-                let is_replicated_index = update.new_document.as_ref().map_or(false, |doc| {
-                    doc.value()
-                        .0
-                        .get(&"table_id".parse::<common::types::FieldName>().unwrap())
-                        .and_then(|v| {
-                            if let value::ConvexValue::String(s) = v {
-                                let tid: Result<value::TabletId, _> = s.parse();
-                                tid.ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .map_or(false, |tid| {
-                            delta
-                                .tablet_id_to_table_name
-                                .get(&tid)
-                                .map_or(false, |name| {
-                                    !name.is_system() || is_global_deployment_table(name)
-                                })
-                        })
-                });
-                if is_replicated_index {
-                    other_updates.push(update);
-                } else {
-                    skipped_system += 1;
-                }
-            } else if table_name.map(|n| !n.is_system()).unwrap_or(false) {
-                // User table data: replicate.
-                other_updates.push(update);
-            } else if table_name
-                .map(|n| is_global_deployment_table(n))
-                .unwrap_or(false)
-            {
-                // GLOBAL deployment system table: replicate.
-                // These contain function code and config needed by every node
-                // to execute queries and mutations (CockroachDB GLOBAL pattern).
-                other_updates.push(update);
-            } else {
-                // Node-local system data: skip.
-                skipped_system += 1;
+            match mode {
+                ReplicaDeltaApplyMode::FullRaftState => {
+                    if table_name.map(|n| n == tables_table_name).unwrap_or(false) {
+                        tables_updates.push(update);
+                    } else {
+                        other_updates.push(update);
+                    }
+                },
+                ReplicaDeltaApplyMode::CrossPartitionReplica => {
+                    if table_name.map(|n| n == tables_table_name).unwrap_or(false) {
+                        // _tables entry: kept for Phase 1 (user table creation).
+                        // System table entries will be skipped in Phase 1 by the
+                        // table_exists check.
+                        tables_updates.push(update);
+                    } else if table_name.map(|n| n == index_table_name).unwrap_or(false) {
+                        // _index entry: check if it describes a user table index
+                        // or a GLOBAL deployment table index.
+                        let is_replicated_index =
+                            update.new_document.as_ref().map_or(false, |doc| {
+                                doc.value()
+                                    .0
+                                    .get(&"table_id".parse::<common::types::FieldName>().unwrap())
+                                    .and_then(|v| {
+                                        if let value::ConvexValue::String(s) = v {
+                                            let tid: Result<value::TabletId, _> = s.parse();
+                                            tid.ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .map_or(false, |tid| {
+                                        delta.tablet_id_to_table_name.get(&tid).map_or(
+                                            false,
+                                            |name| {
+                                                !name.is_system()
+                                                    || is_global_deployment_table(name)
+                                            },
+                                        )
+                                    })
+                            });
+                        if is_replicated_index {
+                            other_updates.push(update);
+                        } else {
+                            skipped_system += 1;
+                        }
+                    } else if table_name.map(|n| !n.is_system()).unwrap_or(false) {
+                        // User table data: replicate.
+                        other_updates.push(update);
+                    } else if table_name
+                        .map(|n| is_global_deployment_table(n))
+                        .unwrap_or(false)
+                    {
+                        // GLOBAL deployment system table: replicate.
+                        // These contain function code and config needed by every node
+                        // to execute queries and mutations (CockroachDB GLOBAL pattern).
+                        other_updates.push(update);
+                    } else {
+                        // Node-local system data: skip for cross-partition replicas.
+                        skipped_system += 1;
+                    }
+                },
             }
         }
         if skipped_system > 0 {
@@ -3913,11 +3918,35 @@ impl CommitterClient {
     }
 
     /// Send a replica delta through the Committer's apply loop.
-    /// Called by the ReplicaSnapshotUpdater to feed NATS deltas into the
-    /// single-writer state machine.
+    /// Called by the NATS replica consumer to feed cross-partition deltas into
+    /// the single-writer state machine. This path intentionally filters
+    /// node-local system tables that are not part of cross-partition read
+    /// replication.
     pub async fn apply_replica_delta(&self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
+        self.apply_delta_with_mode(delta, ReplicaDeltaApplyMode::CrossPartitionReplica)
+            .await
+    }
+
+    /// Apply a same-partition Raft commit delta through the Committer's apply
+    /// loop. Unlike cross-partition NATS replication, Raft followers are HA
+    /// copies that can become leader, so this path applies full partition
+    /// state including system tables.
+    pub async fn apply_raft_commit_delta(&self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
+        self.apply_delta_with_mode(delta, ReplicaDeltaApplyMode::FullRaftState)
+            .await
+    }
+
+    async fn apply_delta_with_mode(
+        &self,
+        delta: CommitDelta,
+        mode: ReplicaDeltaApplyMode,
+    ) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::ApplyReplicaDelta { delta, result: tx };
+        let message = CommitterMessage::ApplyReplicaDelta {
+            delta,
+            mode,
+            result: tx,
+        };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -4452,6 +4481,12 @@ impl CommitterClient {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplicaDeltaApplyMode {
+    CrossPartitionReplica,
+    FullRaftState,
+}
+
 enum CommitterMessage {
     Commit {
         queue_timer: Timer<VMHistogram>,
@@ -4465,6 +4500,7 @@ enum CommitterMessage {
     /// Goes through the same serial apply loop as local commits.
     ApplyReplicaDelta {
         delta: CommitDelta,
+        mode: ReplicaDeltaApplyMode,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     ApplyRaftPreparedRedo {

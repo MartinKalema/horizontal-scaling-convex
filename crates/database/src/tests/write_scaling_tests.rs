@@ -123,6 +123,8 @@ use crate::{
         TwoPhaseTransactionId,
     },
     Database,
+    SystemMetadataModel,
+    TableModel,
     TestFacingModel,
     UserFacingModel,
     WriteSource,
@@ -308,6 +310,22 @@ async fn insert_doc(
     db.commit(tx).await
 }
 
+async fn insert_global_system_doc(
+    db: &Database<TestRuntime>,
+    table: &str,
+    fields: common::value::DocumentObject,
+) -> anyhow::Result<common::types::Timestamp> {
+    let table_name: TableName = table.parse()?;
+    let mut tx = db.begin(Identity::system()).await?;
+    TableModel::new(&mut tx)
+        .insert_table_metadata_for_test(TableNamespace::Global, &table_name)
+        .await?;
+    SystemMetadataModel::new_global(&mut tx)
+        .insert(&table_name, fields)
+        .await?;
+    db.commit(tx).await
+}
+
 async fn persisted_document_log_count(tp: &Arc<TestPersistence>) -> anyhow::Result<usize> {
     Ok(tp
         .load_documents(
@@ -319,6 +337,23 @@ async fn persisted_document_log_count(tp: &Arc<TestPersistence>) -> anyhow::Resu
         .try_collect::<Vec<_>>()
         .await?
         .len())
+}
+
+async fn global_table_scan_or_empty(
+    db: Database<TestRuntime>,
+    table: &str,
+) -> anyhow::Result<Vec<common::document::ResolvedDocument>> {
+    match run_query(
+        db,
+        TableNamespace::Global,
+        Query::full_table_scan(table.parse()?, Order::Asc),
+    )
+    .await
+    {
+        Ok(results) => Ok(results),
+        Err(err) if format!("{err:#}").contains("cannot find table") => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
 }
 
 struct TestTwoPhaseCommitGrpcService {
@@ -1726,6 +1761,55 @@ async fn test_replica_delta_fails_for_unmapped_user_table(rt: TestRuntime) -> an
             .replication_frontier_for_test(PartitionId(1))
             .is_some_and(|frontier| frontier > Timestamp::MIN),
         "retry after metadata should apply and advance the frontier",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_delta_apply_preserves_full_system_state(rt: TestRuntime) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let leader = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let nats_replica = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+    let raft_follower =
+        create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+
+    insert_global_system_doc(
+        &leader,
+        "_environment_variables",
+        assert_obj!("name" => "RAFT_FULL_STATE_TEST", "value" => "enabled"),
+    )
+    .await?;
+    let system_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("system metadata commit should publish a delta");
+
+    nats_replica
+        .committer_for_test()
+        .apply_replica_delta(system_delta.clone())
+        .await?;
+    let cross_partition_docs =
+        global_table_scan_or_empty(nats_replica, "_environment_variables").await?;
+    assert!(
+        cross_partition_docs.is_empty(),
+        "cross-partition NATS apply should continue filtering node-local system state",
+    );
+
+    raft_follower
+        .committer_for_test()
+        .apply_raft_commit_delta(system_delta)
+        .await?;
+    let raft_docs = global_table_scan_or_empty(raft_follower, "_environment_variables").await?;
+    assert_eq!(
+        raft_docs.len(),
+        1,
+        "same-partition Raft apply must preserve full system state for failover",
+    );
+    assert_eq!(
+        raft_docs[0].value().0.get("name"),
+        Some(&assert_val!("RAFT_FULL_STATE_TEST")),
     );
 
     Ok(())

@@ -1016,7 +1016,7 @@ pub async fn make_app(
                                     common::runtime::block_in_place(|| {
                                         let rt = tokio::runtime::Handle::current();
                                         rt.block_on(async {
-                                            committer.apply_replica_delta(delta).await.map_err(
+                                            committer.apply_raft_commit_delta(delta).await.map_err(
                                                 |e| {
                                                     anyhow::anyhow!(
                                                         "Raft state-machine apply failed: {e:#}"
