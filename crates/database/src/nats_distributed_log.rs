@@ -51,6 +51,7 @@ const STREAM_NAME: &str = "CONVEX_COMMITS";
 /// to capture all partitions.
 const SUBJECT_BASE: &str = "convex.commits";
 const SYSTEM_TABLE_SUBJECT: &str = "convex.commits.system";
+const FRONTIER_HEARTBEAT_SUBJECT: &str = "convex.commits.frontier_heartbeat";
 
 /// Configuration for connecting to NATS.
 #[derive(Clone, Debug)]
@@ -78,6 +79,21 @@ pub struct NatsDistributedLog {
 impl NatsDistributedLog {
     fn partition_subject(partition: PartitionId) -> String {
         format!("{SUBJECT_BASE}.{}", partition.0)
+    }
+
+    fn selective_node_subjects(node_name: &str) -> Vec<String> {
+        vec![
+            SelectiveDeliveryRegistry::node_subject(node_name),
+            SYSTEM_TABLE_SUBJECT.to_string(),
+            FRONTIER_HEARTBEAT_SUBJECT.to_string(),
+        ]
+    }
+
+    fn is_frontier_heartbeat_delta(delta: &CommitDelta) -> bool {
+        delta.source_partition.is_some()
+            && delta.document_writes.is_empty()
+            && delta.document_updates.is_empty()
+            && delta.index_writes.is_empty()
     }
 
     async fn subscribe_subjects(
@@ -263,14 +279,8 @@ impl NatsDistributedLog {
         from_ts: Timestamp,
         node_name: &str,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
-        self.subscribe_subjects(
-            from_ts,
-            Some(vec![
-                SelectiveDeliveryRegistry::node_subject(node_name),
-                SYSTEM_TABLE_SUBJECT.to_string(),
-            ]),
-        )
-        .await
+        self.subscribe_subjects(from_ts, Some(Self::selective_node_subjects(node_name)))
+            .await
     }
 
     /// Connect to NATS and create/get the JetStream stream.
@@ -519,6 +529,23 @@ impl DistributedLog for NatsDistributedLog {
                 ts,
                 ack.sequence,
             );
+        } else if Self::is_frontier_heartbeat_delta(&delta) {
+            let ack = self
+                .jetstream
+                .publish(
+                    FRONTIER_HEARTBEAT_SUBJECT.to_string(),
+                    payload.clone().into(),
+                )
+                .await
+                .context("Failed to send selective-delivery frontier heartbeat publish")?
+                .await
+                .context("Failed to get selective-delivery frontier heartbeat acknowledgment")?;
+            metrics::log_selective_delivery_targeted_deliveries(1);
+            tracing::debug!(
+                "Published selective-delivery frontier heartbeat: ts={}, stream_seq={}",
+                ts,
+                ack.sequence,
+            );
         } else if let Some(registry) = &self.selective_registry {
             let interested_nodes = registry
                 .interested_nodes_for_tables(&touched_tables)
@@ -566,5 +593,56 @@ impl DistributedLog for NatsDistributedLog {
         source_partitions: Option<Vec<PartitionId>>,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
         self.subscribe_inner(from_ts, source_partitions).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common::types::Timestamp;
+
+    use super::{
+        NatsDistributedLog,
+        FRONTIER_HEARTBEAT_SUBJECT,
+        SYSTEM_TABLE_SUBJECT,
+    };
+    use crate::{
+        commit_delta::CommitDelta,
+        partition::PartitionId,
+        selective_delivery::SelectiveDeliveryRegistry,
+        write_log::WriteSource,
+    };
+
+    #[test]
+    fn selective_node_subscriptions_include_frontier_heartbeats() {
+        assert_eq!(
+            NatsDistributedLog::selective_node_subjects("node-b"),
+            vec![
+                SelectiveDeliveryRegistry::node_subject("node-b"),
+                SYSTEM_TABLE_SUBJECT.to_string(),
+                FRONTIER_HEARTBEAT_SUBJECT.to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn empty_source_partition_delta_is_frontier_heartbeat() -> anyhow::Result<()> {
+        let heartbeat = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("replication_frontier_heartbeat_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        };
+        assert!(NatsDistributedLog::is_frontier_heartbeat_delta(&heartbeat));
+
+        let mut no_source = heartbeat.clone();
+        no_source.source_partition = None;
+        assert!(!NatsDistributedLog::is_frontier_heartbeat_delta(&no_source));
+        Ok(())
     }
 }

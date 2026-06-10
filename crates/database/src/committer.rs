@@ -50,6 +50,7 @@ use common::{
         COMMIT_TRACE_THRESHOLD,
         MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY,
         MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY,
+        REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
         REPLICATION_FRONTIER_HEARTBEAT_INTERVAL,
         TRANSACTION_WARN_READ_SET_INTERVALS,
     },
@@ -3473,8 +3474,33 @@ impl CommitterClient {
             begin_ts,
             required,
         );
-        join_all(waits).await;
-        Ok(())
+        let started = tokio::time::Instant::now();
+        let wait_all = join_all(waits);
+        let timeout = tokio::time::sleep(*REMOTE_READ_FRONTIER_WAIT_TIMEOUT);
+        futures::pin_mut!(wait_all, timeout);
+        select_biased! {
+            _ = wait_all.fuse() => {
+                metrics::log_remote_read_frontier_wait_seconds(
+                    "success",
+                    started.elapsed().as_secs_f64(),
+                );
+                Ok(())
+            },
+            _ = timeout.fuse() => {
+                metrics::log_remote_read_frontier_wait_seconds(
+                    "timeout",
+                    started.elapsed().as_secs_f64(),
+                );
+                metrics::log_remote_read_frontier_wait_timeout();
+                anyhow::bail!(
+                    "Timed out after {:?} waiting for remote read frontiers to reach begin_ts={} \
+                     on partitions {:?}",
+                    *REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
+                    begin_ts,
+                    required,
+                )
+            },
+        }
     }
 
     pub fn commit<RT: Runtime>(

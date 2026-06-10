@@ -256,6 +256,27 @@ pub fn log_replication_write_frontier_ts(source_partition: PartitionId, ts: Time
     );
 }
 
+register_convex_histogram!(
+    DATABASE_REMOTE_READ_FRONTIER_WAIT_SECONDS,
+    "Time spent waiting for remote read frontiers before a read/commit can proceed",
+    &OUTCOME_LABELS
+);
+pub fn log_remote_read_frontier_wait_seconds(outcome: &'static str, seconds: f64) {
+    log_distribution_with_labels(
+        &DATABASE_REMOTE_READ_FRONTIER_WAIT_SECONDS,
+        seconds,
+        vec![outcome_label(outcome)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_REMOTE_READ_FRONTIER_WAIT_TIMEOUTS_TOTAL,
+    "Number of remote replication frontier waits that timed out"
+);
+pub fn log_remote_read_frontier_wait_timeout() {
+    log_counter(&DATABASE_REMOTE_READ_FRONTIER_WAIT_TIMEOUTS_TOTAL, 1);
+}
+
 register_convex_gauge!(
     DATABASE_SELECTIVE_DELIVERY_INTERESTED_TABLES_INFO,
     "Number of unique tables currently tracked as selectively interesting on this node"
