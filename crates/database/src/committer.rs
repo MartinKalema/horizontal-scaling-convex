@@ -3534,21 +3534,6 @@ impl CommitterClient {
             )
         });
 
-        if let (
-            Some(partition_map),
-            Some(crate::two_phase_coordinator::TransactionClassification::RemoteSinglePartition {
-                owner,
-            }),
-        ) = (&partition_map, &transaction_classification)
-        {
-            anyhow::bail!(
-                "Write rejected: this transaction targets only {}, not this node ({}). Route this \
-                 mutation to the correct partition owner.",
-                owner,
-                partition_map.local_partition(),
-            );
-        }
-
         self.wait_for_remote_read_frontiers(
             *transaction.begin_timestamp,
             transaction.reads.read_set(),
@@ -3572,12 +3557,19 @@ impl CommitterClient {
                 crate::two_phase_coordinator::TransactionClassification::RemoteSinglePartition {
                     owner,
                 } => {
-                    anyhow::bail!(
-                        "Write rejected: this transaction targets only {}, not this node ({}). \
-                         Route this mutation to the correct partition owner.",
+                    tracing::info!(
+                        "Remote single-partition transaction targets {}; routing from local {} \
+                         through the 2PC owner path",
                         owner,
                         partition_map.local_partition(),
                     );
+                    return crate::two_phase_coordinator::coordinate_two_phase_commit(
+                        self,
+                        transaction,
+                        write_source,
+                        partition_map,
+                    )
+                    .await;
                 },
                 crate::two_phase_coordinator::TransactionClassification::CrossPartition {
                     ..

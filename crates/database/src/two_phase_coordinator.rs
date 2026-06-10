@@ -41,8 +41,9 @@ pub enum TransactionClassification {
     /// All writes target a single partition — use the normal fast path (TiDB
     /// 1PC).
     SinglePartition,
-    /// All writes target a single remote partition. This should be rejected by
-    /// the receiving node instead of running 2PC locally.
+    /// All writes target a single remote partition. Route the finalized
+    /// transaction to that owner instead of exposing partition topology to the
+    /// client.
     RemoteSinglePartition { owner: PartitionId },
     /// Writes span multiple partitions — use 2PC.
     CrossPartition {
@@ -240,7 +241,8 @@ fn is_retryable_prepare_ts_error(err: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("2PC Prepare assigned ts="))
 }
 
-/// Execute the 2PC protocol for a cross-partition transaction.
+/// Execute the 2PC protocol for a transaction that cannot commit on the local
+/// fast path.
 pub async fn coordinate_two_phase_commit(
     local_committer: &CommitterClient,
     transaction: FinalTransaction,
@@ -248,11 +250,18 @@ pub async fn coordinate_two_phase_commit(
     partition_map: &PartitionMap,
 ) -> anyhow::Result<Timestamp> {
     let timer = metrics::two_phase_coordinator_timer();
-    let TransactionClassification::CrossPartition { partitions: _ } =
-        classify_transaction(&transaction, partition_map, &write_source)
-    else {
-        anyhow::bail!("2PC coordinator called for a single-partition transaction");
-    };
+    match classify_transaction(&transaction, partition_map, &write_source) {
+        TransactionClassification::SinglePartition => {
+            anyhow::bail!("2PC coordinator called for a local single-partition transaction");
+        },
+        TransactionClassification::RemoteSinglePartition { owner } => {
+            tracing::info!(
+                "2PC Coordinator: routing single-partition transaction to remote owner {}",
+                owner,
+            );
+        },
+        TransactionClassification::CrossPartition { partitions: _ } => {},
+    }
 
     let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
     let txn_id = TwoPhaseTransactionId::new();
