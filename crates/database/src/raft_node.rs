@@ -193,7 +193,7 @@ impl RaftNode {
         &mut self,
         mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()>,
         mut on_snapshot: impl FnMut(&[u8]) -> anyhow::Result<()>,
-    ) {
+    ) -> anyhow::Result<()> {
         let tick_interval = Duration::from_millis(100);
         let mut last_tick = Instant::now();
 
@@ -222,12 +222,12 @@ impl RaftNode {
                     },
                     Ok(RaftMessage::Shutdown) => {
                         tracing::info!("Raft node {} shutting down", self.config.node_id);
-                        return;
+                        return Ok(());
                     },
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         tracing::info!("Raft mailbox closed, shutting down");
-                        return;
+                        return Ok(());
                     },
                 }
             }
@@ -367,6 +367,7 @@ impl RaftNode {
                     if let Err(e) = self.storage.apply_snapshot(ready.snapshot()) {
                         tracing::error!("Failed to persist snapshot: {e}");
                         drop(snapshot_timer);
+                        return Err(e);
                     } else if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
                         tracing::error!("Failed to apply snapshot to state machine: {e}");
                         drop(snapshot_timer);
@@ -384,9 +385,11 @@ impl RaftNode {
                         .append_entries_and_hardstate(ready.entries(), hs)
                     {
                         tracing::error!("Failed to persist entries+hardstate: {e}");
+                        return Err(e);
                     }
                 } else if let Err(e) = self.storage.append_entries(ready.entries()) {
                     tracing::error!("Failed to persist entries: {e}");
+                    return Err(e);
                 }
 
                 // 5. Send persisted messages.
@@ -418,6 +421,7 @@ impl RaftNode {
                             if let Ok(cs) = self.raw_node.apply_conf_change(&cc) {
                                 if let Err(e) = self.storage.set_conf_state(cs) {
                                     tracing::error!("Failed to persist conf state: {e}");
+                                    return Err(e);
                                 }
                             }
                         },
@@ -446,6 +450,7 @@ impl RaftNode {
                     hs.set_commit(commit);
                     if let Err(e) = self.storage.set_hardstate(&hs) {
                         tracing::error!("Failed to persist commit index: {e}");
+                        return Err(e);
                     }
                 }
 
@@ -503,10 +508,10 @@ impl RaftNode {
     /// Process one Ready cycle manually (for testing without the full run
     /// loop). Returns committed entry data.
     #[cfg(test)]
-    pub(crate) fn process_ready_test(&mut self) -> Vec<Vec<u8>> {
+    pub(crate) fn try_process_ready_test(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
         let mut committed = Vec::new();
         if !self.raw_node.has_ready() {
-            return committed;
+            return Ok(committed);
         }
         let mut ready = self.raw_node.ready();
 
@@ -525,11 +530,13 @@ impl RaftNode {
         }
 
         if !ready.snapshot().is_empty() {
-            self.storage.apply_snapshot(ready.snapshot()).unwrap();
+            self.storage.apply_snapshot(ready.snapshot())?;
         }
-        self.storage.append_entries(ready.entries()).unwrap();
         if let Some(hs) = ready.hs() {
-            self.storage.set_hardstate(hs).unwrap();
+            self.storage
+                .append_entries_and_hardstate(ready.entries(), hs)?;
+        } else {
+            self.storage.append_entries(ready.entries())?;
         }
         for entry in ready.take_committed_entries() {
             if !entry.data.is_empty() {
@@ -543,7 +550,12 @@ impl RaftNode {
             }
         }
         self.raw_node.advance_apply();
-        committed
+        Ok(committed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_ready_test(&mut self) -> Vec<Vec<u8>> {
+        self.try_process_ready_test().unwrap()
     }
 }
 
@@ -622,6 +634,46 @@ mod tests {
             committed_data.iter().any(|d| d == b"test mutation"),
             "Proposed data should be committed. Got: {:?}",
             committed_data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ready_persistence_failure_returns_before_advance() {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+
+        let engine = test_engine();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
+
+        for _ in 0..20 {
+            node.raw_node.tick();
+        }
+        node.process_ready_test();
+        assert!(node.is_leader());
+
+        let persisted_last_index = node.storage.last_index().unwrap();
+        node.raw_node
+            .propose(vec![], b"must not persist".to_vec())
+            .unwrap();
+        node.storage.fail_next_write_for_test();
+
+        let err = node
+            .try_process_ready_test()
+            .expect_err("Ready processing should fail on raft-engine write failure");
+        assert!(
+            format!("{err:#}").contains("injected raft-engine write failure"),
+            "unexpected error: {err:#}",
+        );
+        assert_eq!(
+            node.storage.last_index().unwrap(),
+            persisted_last_index,
+            "failed Ready processing must not persist the proposed entry",
         );
     }
 
