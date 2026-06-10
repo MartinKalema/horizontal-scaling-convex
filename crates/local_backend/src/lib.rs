@@ -766,91 +766,93 @@ pub async fn make_app(
                 *database.now_ts_for_reads()
             };
             let consumer_name = config.name();
-            let broad_consumer_name = consumer_name.clone();
-            let broad_nats_url = nats_url.clone();
+            let consumer_runtime = runtime.clone();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
-                let consumer_nats =
-                    match database::nats_distributed_log::NatsDistributedLog::connect(
-                        database::nats_distributed_log::NatsConfig {
-                            url: broad_nats_url,
-                            consumer_name: Some(broad_consumer_name),
-                            partition_id: None,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(n) => Arc::new(n),
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to connect NATS for ReplicaDeltaConsumer: {e:#}"
-                            );
-                            return;
-                        },
-                    };
-                let consumer_nats_dyn: Arc<dyn database::commit_delta::DistributedLog> =
-                    consumer_nats;
-                tracing::info!(
-                    use_selective_node_targeting,
-                    ?remote_partitions,
-                    "ReplicaDeltaConsumer subscribing to NATS..."
-                );
-                let subscribe_result = if use_selective_node_targeting {
-                    let selective_consumer =
-                        database::nats_distributed_log::NatsDistributedLog::connect(
+                let mut backoff = Duration::from_millis(250);
+                loop {
+                    tracing::info!(
+                        use_selective_node_targeting,
+                        ?remote_partitions,
+                        "ReplicaDeltaConsumer subscribing to NATS..."
+                    );
+                    let subscribe_result = if use_selective_node_targeting {
+                        match database::nats_distributed_log::NatsDistributedLog::connect(
                             database::nats_distributed_log::NatsConfig {
                                 url: nats_url.clone(),
                                 consumer_name: Some(format!("{consumer_name}-selective")),
                                 partition_id: None,
                             },
                         )
-                        .await;
-                    match selective_consumer {
-                        Ok(consumer) => {
-                            consumer
-                                .subscribe_selective_node(from_ts.into(), &consumer_name)
-                                .await
-                        },
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    consumer_nats_dyn
-                        .subscribe_filtered(from_ts.into(), remote_partitions.clone())
                         .await
-                };
-                match subscribe_result {
-                    Ok(mut stream) => {
-                        tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
-                        while let Some(result) = futures::StreamExt::next(&mut stream).await {
-                            match result {
-                                Ok(message) => {
+                        {
+                            Ok(consumer) => {
+                                consumer
+                                    .subscribe_selective_node(from_ts.into(), &consumer_name)
+                                    .await
+                            },
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        match database::nats_distributed_log::NatsDistributedLog::connect(
+                            database::nats_distributed_log::NatsConfig {
+                                url: nats_url.clone(),
+                                consumer_name: Some(consumer_name.clone()),
+                                partition_id: None,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(consumer) => {
+                                let consumer_nats_dyn: Arc<
+                                    dyn database::commit_delta::DistributedLog,
+                                > = Arc::new(consumer);
+                                consumer_nats_dyn
+                                    .subscribe_filtered(from_ts.into(), remote_partitions.clone())
+                                    .await
+                            },
+                            Err(e) => Err(e),
+                        }
+                    };
+                    match subscribe_result {
+                        Ok(stream) => {
+                            tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
+                            let result = database::replica::consume_replication_stream(
+                                stream,
+                                committer.clone(),
+                                |ts, n| {
                                     if use_selective_node_targeting {
                                         database::log_selective_delivery_shadow_receive();
                                     }
-                                    match database::replica::apply_replication_message(
-                                        &committer, message,
-                                    )
-                                    .await
-                                    {
-                                        Ok((ts, n)) => tracing::info!(
-                                            "Applied replica delta: ts={}, {} updates",
-                                            u64::from(ts),
-                                            n
-                                        ),
-                                        Err(e) => {
-                                            tracing::error!("Failed to apply NATS delta: {e:#}");
-                                            break;
-                                        },
-                                    }
+                                    tracing::info!(
+                                        "Applied replica delta: ts={}, {} updates",
+                                        u64::from(ts),
+                                        n
+                                    );
                                 },
-                                Err(e) => {
-                                    tracing::error!("Error reading NATS delta: {e:#}");
-                                    break;
-                                },
+                            )
+                            .await;
+                            if let Err(e) = result {
+                                tracing::error!(
+                                    "ReplicaDeltaConsumer stream failed; restarting after {:?}: \
+                                     {e:#}",
+                                    backoff,
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "ReplicaDeltaConsumer stream ended; restarting after {:?}",
+                                    backoff,
+                                );
                             }
-                        }
-                        tracing::warn!("ReplicaDeltaConsumer stream ended");
-                    },
-                    Err(e) => tracing::error!("Failed to subscribe to NATS: {e:#}"),
+                        },
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to subscribe to NATS; retrying after {:?}: {e:#}",
+                                backoff,
+                            );
+                        },
+                    }
+                    consumer_runtime.wait(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
             });
             tracing::info!("Started ReplicaDeltaConsumer for replication");
