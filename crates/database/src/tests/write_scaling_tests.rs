@@ -1383,10 +1383,15 @@ async fn test_replica_preserves_global_table_numbers_for_embedded_ids(
         .await?;
 
     let mut tx = node_b.begin(Identity::system()).await?;
+    let replica_user_id =
+        tx.resolve_developer_id(&user_public_id, TableNamespace::root_component())?;
     assert_eq!(
-        tx.resolve_developer_id(&user_public_id, TableNamespace::root_component())?,
-        user_id,
+        replica_user_id, user_id,
         "replica must resolve the source node's public user ID without table-number translation",
+    );
+    assert!(
+        tx.get(replica_user_id).await?.is_some(),
+        "replica should support a client round-trip lookup with the source public ID",
     );
     drop(tx);
 
