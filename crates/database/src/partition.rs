@@ -25,6 +25,10 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    sync::{
+        Arc,
+        RwLock,
+    },
 };
 
 use value::TableName;
@@ -156,6 +160,22 @@ impl PlacementMetadata {
         }
     }
 
+    pub fn from_partition_map(
+        partition_map: &PartitionMap,
+        source: PlacementMetadataSource,
+    ) -> Self {
+        Self {
+            source,
+            version: partition_map.placement_version(),
+            num_partitions: partition_map.num_partitions(),
+            rules: partition_map
+                .assignments()
+                .iter()
+                .map(|(table, owner)| (PlacementTarget::Table(table.clone()), *owner))
+                .collect(),
+        }
+    }
+
     pub fn source(&self) -> PlacementMetadataSource {
         self.source
     }
@@ -194,6 +214,92 @@ impl PlacementMetadata {
             num_partitions: self.num_partitions,
             placement_version: self.version,
         }
+    }
+}
+
+/// Refreshable placement state shared by routing components.
+///
+/// Callers take a `PartitionMap` snapshot before classifying or coordinating a
+/// transaction. That keeps a single transaction internally consistent even if a
+/// newer placement version is installed concurrently.
+#[derive(Clone, Debug)]
+pub struct PlacementState {
+    local_partition: PartitionId,
+    metadata: Arc<RwLock<PlacementMetadata>>,
+}
+
+impl PlacementState {
+    pub fn new(local_partition: PartitionId, metadata: PlacementMetadata) -> anyhow::Result<Self> {
+        Self::validate_local_partition(local_partition, metadata.num_partitions())?;
+        Ok(Self {
+            local_partition,
+            metadata: Arc::new(RwLock::new(metadata)),
+        })
+    }
+
+    pub fn from_partition_map(partition_map: PartitionMap) -> Self {
+        let metadata = PlacementMetadata::from_partition_map(
+            &partition_map,
+            PlacementMetadataSource::StaticConfig,
+        );
+        Self {
+            local_partition: partition_map.local_partition(),
+            metadata: Arc::new(RwLock::new(metadata)),
+        }
+    }
+
+    pub fn partition_map(&self) -> PartitionMap {
+        self.metadata
+            .read()
+            .expect("placement metadata lock poisoned")
+            .into_partition_map(self.local_partition)
+    }
+
+    pub fn refresh(&self, metadata: PlacementMetadata) -> anyhow::Result<()> {
+        Self::validate_local_partition(self.local_partition, metadata.num_partitions())?;
+        let mut current = self
+            .metadata
+            .write()
+            .expect("placement metadata lock poisoned");
+        anyhow::ensure!(
+            metadata.version() >= current.version(),
+            "Refusing to refresh placement metadata from {} down to {}",
+            current.version(),
+            metadata.version(),
+        );
+        *current = metadata;
+        Ok(())
+    }
+
+    pub fn placement_version(&self) -> PlacementVersion {
+        self.metadata
+            .read()
+            .expect("placement metadata lock poisoned")
+            .version()
+    }
+
+    pub fn local_partition(&self) -> PartitionId {
+        self.local_partition
+    }
+
+    pub fn num_partitions(&self) -> u32 {
+        self.metadata
+            .read()
+            .expect("placement metadata lock poisoned")
+            .num_partitions()
+    }
+
+    fn validate_local_partition(
+        local_partition: PartitionId,
+        num_partitions: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            local_partition.0 < num_partitions,
+            "Local partition {} is outside placement metadata with {} partitions",
+            local_partition,
+            num_partitions,
+        );
+        Ok(())
     }
 }
 
@@ -490,6 +596,66 @@ mod tests {
             target: PlacementTarget::Table("projects".parse().unwrap()),
             owner: PartitionId(1),
         }));
+    }
+
+    #[test]
+    fn test_placement_state_refreshes_to_newer_metadata() -> anyhow::Result<()> {
+        let state = PlacementState::new(
+            PartitionId(1),
+            PlacementMetadata::from_static_config(StaticPlacementConfig {
+                table_assignments: "messages=0,projects=1",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(1),
+            }),
+        )?;
+
+        state.refresh(PlacementMetadata::from_static_config(
+            StaticPlacementConfig {
+                table_assignments: "messages=1,projects=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(2),
+            },
+        ))?;
+
+        let map = state.partition_map();
+        assert_eq!(state.placement_version(), PlacementVersion::new(2));
+        assert_eq!(
+            map.partition_for_table(&"messages".parse().unwrap()),
+            PartitionId(1),
+        );
+        assert_eq!(
+            map.partition_for_table(&"projects".parse().unwrap()),
+            PartitionId(0),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_placement_state_rejects_version_downgrade() -> anyhow::Result<()> {
+        let state = PlacementState::new(
+            PartitionId(0),
+            PlacementMetadata::from_static_config(StaticPlacementConfig {
+                table_assignments: "messages=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(3),
+            }),
+        )?;
+
+        let err = state
+            .refresh(PlacementMetadata::from_static_config(
+                StaticPlacementConfig {
+                    table_assignments: "messages=1",
+                    num_partitions: 2,
+                    placement_version: PlacementVersion::new(2),
+                },
+            ))
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Refusing to refresh placement metadata"));
+        assert_eq!(state.placement_version(), PlacementVersion::new(3));
+        Ok(())
     }
 
     #[test]
