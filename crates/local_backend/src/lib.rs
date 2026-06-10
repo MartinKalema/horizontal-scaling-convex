@@ -272,6 +272,21 @@ impl From<&BackendAppState> for ImportExportRouterState {
 #[derive(Serialize)]
 pub struct EmptyResponse {}
 
+fn replica_delta_consumer_start_ts(
+    local_snapshot_ts: common::types::Timestamp,
+    partition_id: Option<u32>,
+) -> common::types::Timestamp {
+    if partition_id.is_some() {
+        // Partitioned nodes compare remote origin timestamps against this value
+        // inside the NATS consumer. Until we have per-source durable replay
+        // checkpoints, replay every remote partition delta instead of using a
+        // local snapshot timestamp as a cross-node lower bound.
+        common::types::Timestamp::MIN
+    } else {
+        local_snapshot_ts
+    }
+}
+
 pub async fn make_app(
     runtime: ProdRuntime,
     config: LocalConfig,
@@ -740,19 +755,15 @@ pub async fn make_app(
                 }
             });
             // In partitioned mode, start consuming from the beginning of the
-            // stream. Each node has its own database with independent timestamps,
-            // so we can't use the local database timestamp as a lower bound.
-            // We explicitly restrict partitioned nodes to other partitions'
-            // subjects so same-partition convergence comes from Raft apply.
-            // In replica mode, start from the locally visible snapshot, which
-            // may have just been bootstrapped from the latest checkpoint.
-            let from_ts = if use_selective_node_targeting {
-                *database.now_ts_for_reads()
-            } else if config.partition_id.is_some() {
-                common::types::Timestamp::MIN
-            } else {
-                *database.now_ts_for_reads()
-            };
+            // stream. Each node has its own database with independent local
+            // apply timestamps, so local snapshot timestamps are not safe lower
+            // bounds for remote origin deltas. We explicitly restrict
+            // partitioned nodes to other partitions' subjects so same-partition
+            // convergence comes from Raft apply. In replica mode, start from the
+            // locally visible snapshot, which may have just been bootstrapped
+            // from the latest checkpoint.
+            let from_ts =
+                replica_delta_consumer_start_ts(*database.now_ts_for_reads(), config.partition_id);
             let consumer_name = config.name();
             let broad_consumer_name = consumer_name.clone();
             let broad_nats_url = nats_url.clone();
@@ -1079,6 +1090,7 @@ mod tests {
         query::Order,
         shutdown::ShutdownSignal,
         testing::TestPersistence,
+        types::Timestamp,
     };
     use futures::TryStreamExt;
     use keybroker::Identity;
@@ -1095,6 +1107,26 @@ mod tests {
         config::LocalConfig,
         make_app,
     };
+
+    #[test]
+    fn partitioned_replica_consumers_do_not_start_from_local_snapshot_ts() -> anyhow::Result<()> {
+        let local_snapshot_ts = Timestamp::try_from(1_000_000u64)?;
+
+        assert_eq!(
+            super::replica_delta_consumer_start_ts(local_snapshot_ts, Some(0)),
+            Timestamp::MIN,
+        );
+        assert_eq!(
+            super::replica_delta_consumer_start_ts(local_snapshot_ts, Some(1)),
+            Timestamp::MIN,
+        );
+        assert_eq!(
+            super::replica_delta_consumer_start_ts(local_snapshot_ts, None),
+            local_snapshot_ts,
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn test_fresh_replica_bootstraps_from_checkpoint() -> anyhow::Result<()> {
