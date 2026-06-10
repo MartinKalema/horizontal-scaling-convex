@@ -95,6 +95,7 @@ use crate::{
         PlacementVersion,
         StaticPlacementConfig,
     },
+    raft_partition::RaftPartitionState,
     table_number_allocator::{
         testing::InMemoryTableNumberAllocator,
         TableNumberAllocator,
@@ -625,6 +626,72 @@ async fn test_partition_enforcement(rt: TestRuntime) -> anyhow::Result<()> {
     // Correct-partition writes succeed.
     insert_doc(&node_a, "messages", assert_obj!("text" => "correct")).await?;
     insert_doc(&node_b, "projects", assert_obj!("name" => "correct")).await?;
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_failed_raft_proposal_does_not_publish_or_persist(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let persistence = Arc::new(TestPersistence::new());
+    let node = create_node_with_persistence(
+        &rt,
+        persistence.clone(),
+        log.clone(),
+        None,
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+
+    insert_doc(&node, "messages", assert_obj!("text" => "seed")).await?;
+    node.attach_raft_state(RaftPartitionState::new_for_test(true, 1, PartitionId(0), 1))
+        .await?;
+
+    let err = insert_doc(&node, "messages", assert_obj!("text" => "must-not-commit"))
+        .await
+        .expect_err("dead Raft proposal channel should reject before local persistence");
+    assert!(
+        format!("{err:#}").contains("Raft node for partition partition-0 not running"),
+        "unexpected error: {err:#}",
+    );
+
+    let visible_messages = run_query(
+        node,
+        TableNamespace::root_component(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        visible_messages.len(),
+        1,
+        "failed Raft proposal must not become visible locally",
+    );
+
+    let restarted = create_node_with_persistence(
+        &rt,
+        persistence,
+        log,
+        None,
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let persisted_messages = run_query(
+        restarted,
+        TableNamespace::root_component(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        persisted_messages.len(),
+        1,
+        "failed Raft proposal must not be resurrected from persistence",
+    );
 
     Ok(())
 }
