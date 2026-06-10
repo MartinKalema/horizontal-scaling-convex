@@ -7,10 +7,16 @@
 //! The coordinator uses the database-layer gRPC client to reach remote
 //! partitions.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use database::{
-    partition::PlacementVersion,
+    partition::{
+        PlacementMetadataStore,
+        PlacementVersion,
+    },
     raft_partition::RaftPartitionState,
     two_phase::{
         ParticipantTransaction,
@@ -44,6 +50,7 @@ pub struct TwoPhaseCommitGrpcService {
     committer: CommitterClient,
     raft_state: Option<RaftPartitionState>,
     raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+    placement_metadata_store: Option<Arc<dyn PlacementMetadataStore>>,
 }
 
 impl TwoPhaseCommitGrpcService {
@@ -51,11 +58,13 @@ impl TwoPhaseCommitGrpcService {
         committer: CommitterClient,
         raft_state: Option<RaftPartitionState>,
         raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+        placement_metadata_store: Option<Arc<dyn PlacementMetadataStore>>,
     ) -> Self {
         Self {
             committer,
             raft_state,
             raft_peer_grpc_urls,
+            placement_metadata_store,
         }
     }
 
@@ -96,6 +105,47 @@ impl TwoPhaseCommitGrpcService {
             })?;
         Ok(Some(client))
     }
+
+    async fn refresh_placement_metadata(&self) -> Result<(), Status> {
+        let Some(store) = self.placement_metadata_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(metadata) = store.load().await.map_err(|e| {
+            Status::unavailable(format!(
+                "Failed to refresh placement metadata before Prepare retry: {e:#}"
+            ))
+        })?
+        else {
+            return Ok(());
+        };
+        self.committer
+            .refresh_placement_metadata(metadata)
+            .map_err(|e| {
+                Status::failed_precondition(format!(
+                    "Refreshed placement metadata but local state is still invalid: {e:#}"
+                ))
+            })
+    }
+
+    async fn ensure_placement_version(
+        &self,
+        placement_version: PlacementVersion,
+    ) -> Result<(), Status> {
+        match self.committer.ensure_placement_version(placement_version) {
+            Ok(()) => Ok(()),
+            Err(original_err) => {
+                self.refresh_placement_metadata().await?;
+                self.committer
+                    .ensure_placement_version(placement_version)
+                    .map_err(|e| {
+                        Status::failed_precondition(format!(
+                            "Prepare rejected after placement metadata refresh: {e:#}. Original \
+                             rejection: {original_err:#}"
+                        ))
+                    })
+            },
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -116,9 +166,7 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
         let placement_version = PlacementVersion::from(req.placement_version);
-        self.committer
-            .ensure_placement_version(placement_version)
-            .map_err(|e| Status::failed_precondition(format!("Prepare rejected: {e:#}")))?;
+        self.ensure_placement_version(placement_version).await?;
 
         if let Some(client) = self.leader_client().await? {
             let result = client

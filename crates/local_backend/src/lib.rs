@@ -140,6 +140,7 @@ pub struct BackendAppState {
     pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
     pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
+    pub placement_metadata_store: Option<Arc<dyn database::partition::PlacementMetadataStore>>,
     /// Raft partition mailbox for receiving Raft messages from peers.
     /// None if Raft is not enabled.
     pub raft_mailbox_tx:
@@ -340,6 +341,19 @@ pub async fn make_app(
     } else {
         None
     };
+    let static_placement_metadata = config.partition_id.map(|_| {
+        let partition_map_str = config.partition_map.as_deref().unwrap_or("");
+        let num_partitions = config.num_partitions.unwrap_or(1);
+        database::partition::PlacementMetadata::from_static_config(
+            database::partition::StaticPlacementConfig {
+                table_assignments: partition_map_str,
+                num_partitions,
+                placement_version: database::partition::PlacementVersion::new(
+                    config.partition_map_version.unwrap_or_default(),
+                ),
+            },
+        )
+    });
 
     let database = Database::load(
         persistence.clone(),
@@ -356,18 +370,10 @@ pub async fn make_app(
         distributed_log.clone(),
         config.replication_mode == "replica",
         config.partition_id.map(|id| {
-            let partition_map_str = config.partition_map.as_deref().unwrap_or("");
-            let num_partitions = config.num_partitions.unwrap_or(1);
-            database::partition::PlacementMetadata::from_static_config(
-                database::partition::StaticPlacementConfig {
-                    table_assignments: partition_map_str,
-                    num_partitions,
-                    placement_version: database::partition::PlacementVersion::new(
-                        config.partition_map_version.unwrap_or_default(),
-                    ),
-                },
-            )
-            .into_partition_map(database::partition::PartitionId(id))
+            static_placement_metadata
+                .as_ref()
+                .expect("partitioned startup should have placement metadata")
+                .into_partition_map(database::partition::PartitionId(id))
         }),
         config
             .node_addresses
@@ -378,6 +384,22 @@ pub async fn make_app(
         None, // raft_state: set after Raft node starts, not during Database::load
     )
     .await?;
+
+    let placement_metadata_store: Option<Arc<dyn database::partition::PlacementMetadataStore>> =
+        if let (Some(bootstrap_metadata), Some(nats_url)) = (
+            static_placement_metadata.clone(),
+            config.nats_url.as_deref(),
+        ) {
+            let store: Arc<dyn database::partition::PlacementMetadataStore> =
+                Arc::new(database::partition::NatsPlacementMetadataStore::connect(nats_url).await?);
+            let authoritative_metadata = store.ensure_initialized(bootstrap_metadata).await?;
+            database
+                .committer_client()
+                .refresh_placement_metadata(authoritative_metadata)?;
+            Some(store)
+        } else {
+            None
+        };
 
     if config.replication_mode == "replica" && persistence_was_fresh {
         let checkpoint_path = config.checkpoint_storage_path.as_ref().ok_or_else(|| {
@@ -1018,6 +1040,7 @@ pub async fn make_app(
         raft_peer_http_origins,
         raft_peer_grpc_urls,
         replica_mutation_forwarder,
+        placement_metadata_store,
         raft_mailbox_tx,
     };
 
