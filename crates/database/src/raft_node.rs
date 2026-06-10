@@ -371,6 +371,7 @@ impl RaftNode {
                     } else if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
                         tracing::error!("Failed to apply snapshot to state machine: {e}");
                         drop(snapshot_timer);
+                        return Err(e);
                     } else {
                         snapshot_timer.finish();
                     }
@@ -429,6 +430,7 @@ impl RaftNode {
                             // Normal entry — apply to state machine.
                             if let Err(e) = on_committed(&entry.data) {
                                 tracing::error!("Failed to apply committed entry: {e}");
+                                return Err(e);
                             }
 
                             // Notify the proposer if this was our proposal.
@@ -467,6 +469,7 @@ impl RaftNode {
                     if !entry.data.is_empty() && entry.get_entry_type() == EntryType::EntryNormal {
                         if let Err(e) = on_committed(&entry.data) {
                             tracing::error!("Failed to apply light committed entry: {e}");
+                            return Err(e);
                         }
                     }
                 }
@@ -508,7 +511,10 @@ impl RaftNode {
     /// Process one Ready cycle manually (for testing without the full run
     /// loop). Returns committed entry data.
     #[cfg(test)]
-    pub(crate) fn try_process_ready_test(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
+    pub(crate) fn try_process_ready_test_with_apply(
+        &mut self,
+        mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
         let mut committed = Vec::new();
         if !self.raw_node.has_ready() {
             return Ok(committed);
@@ -540,17 +546,24 @@ impl RaftNode {
         }
         for entry in ready.take_committed_entries() {
             if !entry.data.is_empty() {
+                on_committed(&entry.data)?;
                 committed.push(entry.data.to_vec());
             }
         }
         let mut light_rd = self.raw_node.advance(ready);
         for entry in light_rd.take_committed_entries() {
             if !entry.data.is_empty() {
+                on_committed(&entry.data)?;
                 committed.push(entry.data.to_vec());
             }
         }
         self.raw_node.advance_apply();
         Ok(committed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_process_ready_test(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.try_process_ready_test_with_apply(|_| Ok(()))
     }
 
     #[cfg(test)]
@@ -674,6 +687,46 @@ mod tests {
             node.storage.last_index().unwrap(),
             persisted_last_index,
             "failed Ready processing must not persist the proposed entry",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_state_machine_apply_failure_returns_before_advance_apply() {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+
+        let engine = test_engine();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
+
+        for _ in 0..20 {
+            node.raw_node.tick();
+        }
+        node.process_ready_test();
+        assert!(node.is_leader());
+
+        node.raw_node
+            .propose(vec![], b"poison entry".to_vec())
+            .unwrap();
+        let applied_before = node.raw_node.raft.raft_log.applied;
+
+        let err = node
+            .try_process_ready_test_with_apply(|_| {
+                anyhow::bail!("injected state machine apply failure")
+            })
+            .expect_err("Ready processing should fail on state-machine apply failure");
+        assert!(
+            format!("{err:#}").contains("injected state machine apply failure"),
+            "unexpected error: {err:#}",
+        );
+        assert_eq!(
+            node.raw_node.raft.raft_log.applied, applied_before,
+            "failed state-machine apply must not advance the Raft applied index",
         );
     }
 
