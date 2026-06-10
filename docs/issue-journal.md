@@ -714,6 +714,26 @@ own for distributed changes.
   - `cargo check -p database`
   - `cargo check -p local_backend`
 
+### 2026-06 — Split Raft full-state apply from cross-partition replica filtering
+
+- **Status:** complete
+- **Related issue:** `#157`
+- **What this fixes:** same-partition Raft followers were applying committed
+  leader deltas through the same filtered path used by cross-partition NATS
+  read replicas. That path intentionally drops node-local system tables, but a
+  Raft follower must have the full authoritative partition state before it can
+  safely become leader.
+- **Behavior:** the committer now distinguishes cross-partition replica apply
+  from same-partition Raft apply. NATS-delivered deltas keep the existing
+  user/global-deployment filtering. Raft committed deltas use full-state apply,
+  preserving system-table updates needed for failover while still flowing
+  through the same serialized committer/persistence pipeline.
+- **Validation:**
+  - `cargo test -p database test_raft_delta_apply_preserves_full_system_state -- --nocapture`
+  - `cargo test -p database test_raft_ -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current
