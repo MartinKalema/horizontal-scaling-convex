@@ -1346,6 +1346,59 @@ async fn test_replica_delta_redelivery_is_idempotent(rt: TestRuntime) -> anyhow:
 }
 
 #[convex_macro::test_runtime]
+async fn test_replica_delta_fails_for_unmapped_user_table(rt: TestRuntime) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "metadata")).await?;
+    let table_metadata_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("first project insert should publish table metadata");
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "data")).await?;
+    let data_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("second project insert should publish data");
+
+    let err = node_a
+        .committer_for_test()
+        .apply_replica_delta(data_delta.clone())
+        .await
+        .expect_err("data delta should fail until table metadata is available");
+    assert!(
+        format!("{err:#}").contains("is not mapped locally"),
+        "unexpected error: {err:#}",
+    );
+    assert_eq!(
+        node_a.replication_frontier_for_test(PartitionId(1)),
+        Some(Timestamp::MIN),
+        "failed delta must not advance remote read frontier",
+    );
+
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(table_metadata_delta)
+        .await?;
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(data_delta)
+        .await?;
+    assert!(
+        node_a
+            .replication_frontier_for_test(PartitionId(1))
+            .is_some_and(|frontier| frontier > Timestamp::MIN),
+        "retry after metadata should apply and advance the frontier",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_prepared_participant_recovers_from_redo_after_restart(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {

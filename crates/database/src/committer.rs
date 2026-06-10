@@ -2486,12 +2486,15 @@ impl<RT: Runtime> Committer<RT> {
                 Some(t) => *t,
                 None => {
                     let table_name = delta.tablet_id_to_table_name.get(&primary_tablet);
-                    tracing::debug!(
-                        "Skipping update for unmapped table {:?} (TabletId {:?})",
+                    let err = anyhow::anyhow!(
+                        "Cannot apply replica delta at ts={} because table {:?} (TabletId {:?}) \
+                         is not mapped locally; retry after table metadata is available",
+                        u64::from(remote_ts),
                         table_name,
                         primary_tablet,
                     );
-                    continue;
+                    let _ = result.send(Err(err));
+                    return Ok(());
                 },
             };
             let remapped = DocumentUpdate {
