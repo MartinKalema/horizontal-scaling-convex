@@ -18,8 +18,11 @@ use common::{
     interval::Interval,
     pause::PauseController,
     persistence::{
+        NoopRetentionValidator,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceReader,
+        TimestampRange,
     },
     query::{
         Order,
@@ -39,6 +42,7 @@ use common::{
         Timestamp,
     },
 };
+use futures::TryStreamExt;
 use keybroker::Identity;
 use parking_lot::Mutex;
 use pb::replication::{
@@ -235,6 +239,19 @@ async fn insert_doc(
         .insert(&table_name, fields)
         .await?;
     db.commit(tx).await
+}
+
+async fn persisted_document_log_count(tp: &Arc<TestPersistence>) -> anyhow::Result<usize> {
+    Ok(tp
+        .load_documents(
+            TimestampRange::all(),
+            Order::Asc,
+            100_000,
+            Arc::new(NoopRetentionValidator),
+        )
+        .try_collect::<Vec<_>>()
+        .await?
+        .len())
 }
 
 struct TestTwoPhaseCommitGrpcService {
@@ -1054,6 +1071,99 @@ async fn test_replication_frontier_persists_across_restart(rt: TestRuntime) -> a
     assert_eq!(
         restarted.replication_frontier_for_test(PartitionId(1)),
         Some(persisted_frontier),
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_replica_delta_redelivery_is_idempotent(rt: TestRuntime) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a_persistence = Arc::new(TestPersistence::new());
+    let node_a = create_node_with_persistence(
+        &rt,
+        node_a_persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "redelivered")).await?;
+    let delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("project insert should publish a delta");
+    let remote_ts = delta.ts;
+
+    let first_apply_ts = node_a
+        .committer_for_test()
+        .apply_replica_delta(delta.clone())
+        .await?;
+    let docs_after_first_apply = persisted_document_log_count(&node_a_persistence).await?;
+    let snapshot_ts_after_first_apply = *node_a.now_ts_for_reads();
+
+    let duplicate_apply_ts = node_a
+        .committer_for_test()
+        .apply_replica_delta(delta.clone())
+        .await?;
+
+    assert_eq!(
+        duplicate_apply_ts, remote_ts,
+        "duplicates should ACK as skipped without allocating a new local apply timestamp",
+    );
+    assert_eq!(
+        persisted_document_log_count(&node_a_persistence).await?,
+        docs_after_first_apply,
+        "redelivered delta must not append duplicate document log entries",
+    );
+    assert_eq!(
+        *node_a.now_ts_for_reads(),
+        snapshot_ts_after_first_apply,
+        "redelivered delta must not publish a new snapshot",
+    );
+    assert!(
+        first_apply_ts >= remote_ts,
+        "initial apply should use the remote timestamp as its floor",
+    );
+
+    let applied_frontiers = node_a_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDeltaWatermarks)
+        .await?
+        .expect("replica applied frontier should be persisted");
+    let applied_frontiers = crate::snapshot_manager::partition_timestamp_map_from_json(
+        applied_frontiers,
+        "applied delta watermarks",
+    )?;
+    assert_eq!(applied_frontiers.get(&PartitionId(1)), Some(&remote_ts));
+
+    let restarted = create_node_with_persistence(
+        &rt,
+        node_a_persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let duplicate_after_restart_ts = restarted
+        .committer_for_test()
+        .apply_replica_delta(delta)
+        .await?;
+    assert_eq!(
+        duplicate_after_restart_ts, remote_ts,
+        "restart should reload the applied frontier and skip redelivery",
+    );
+    assert_eq!(
+        persisted_document_log_count(&node_a_persistence).await?,
+        docs_after_first_apply,
+        "redelivered delta after restart must not append duplicate document log entries",
     );
 
     Ok(())

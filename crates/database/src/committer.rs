@@ -156,6 +156,8 @@ use crate::{
         BootstrappedSearchIndexes,
     },
     snapshot_manager::{
+        partition_timestamp_map_from_json,
+        partition_timestamp_map_to_json,
         replication_frontiers_to_json,
         SnapshotManager,
         TableSummaries,
@@ -214,17 +216,20 @@ enum PersistenceWrite {
     /// and replicated — flow through one sequential log.
     ReplicaDelta {
         commit_ts: Timestamp,
+        remote_ts: Timestamp,
         snapshot: Snapshot,
         remapped_updates: Vec<common::document::DocumentUpdate>,
         write_source: WriteSource,
         write_bytes: u64,
         source_partition: Option<crate::partition::PartitionId>,
+        applied_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
     ReplicationFrontierHeartbeat {
         commit_ts: Timestamp,
         source_partition: crate::partition::PartitionId,
+        applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -232,6 +237,7 @@ enum PersistenceWrite {
         snapshot_ts: Timestamp,
         snapshot: Snapshot,
         replication_frontiers: BTreeMap<crate::partition::PartitionId, Timestamp>,
+        applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -402,6 +408,12 @@ pub struct Committer<RT: Runtime> {
     // When set, the Committer rejects writes if this node is not the Raft leader.
     // None means no Raft (existing behavior — always accept writes).
     raft_state: Option<crate::raft_partition::RaftPartitionState>,
+
+    // Durable idempotency frontier for replicated transport messages.
+    // Unlike `SnapshotManager::replication_frontiers`, this map is keyed by
+    // the origin partition's commit timestamp, not this node's local apply
+    // timestamp.
+    applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -474,6 +486,7 @@ impl<RT: Runtime> Committer<RT> {
         two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
+        applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
         let conflict_checker = PendingWrites::new();
@@ -499,6 +512,7 @@ impl<RT: Runtime> Committer<RT> {
             prepared_transactions: std::collections::HashMap::new(),
             queued_snapshots: VecDeque::new(),
             raft_state,
+            applied_delta_watermarks,
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -673,11 +687,13 @@ impl<RT: Runtime> Committer<RT> {
                         },
                         PersistenceWrite::ReplicaDelta {
                             commit_ts,
+                            remote_ts,
                             snapshot,
                             remapped_updates,
                             write_source,
                             write_bytes,
                             source_partition,
+                            applied_delta_watermarks,
                             result,
                             ..
                         } => {
@@ -691,20 +707,37 @@ impl<RT: Runtime> Committer<RT> {
                             if !writes.is_empty() {
                                 self.log.append(commit_ts, writes, write_source);
                             }
+                            if let Some(frontiers) = applied_delta_watermarks {
+                                self.persistence
+                                    .write_persistence_global(
+                                        PersistenceGlobalKey::AppliedDeltaWatermarks,
+                                        partition_timestamp_map_to_json(&frontiers),
+                                    )
+                                    .await?;
+                            }
                             let mut sm = self.snapshot_manager.write();
                             sm.push(commit_ts, snapshot, write_bytes);
                             if let Some(source_partition) = source_partition {
                                 sm.update_replication_frontier(source_partition, commit_ts)?;
                                 sm.update_replication_write_frontier(source_partition, commit_ts)?;
+                                self.applied_delta_watermarks
+                                    .insert(source_partition, remote_ts);
                             }
                             let _ = result.send(Ok(commit_ts));
                         },
                         PersistenceWrite::ReplicationFrontierHeartbeat {
                             commit_ts,
                             source_partition,
+                            applied_delta_watermarks,
                             result,
                             ..
                         } => {
+                            self.persistence
+                                .write_persistence_global(
+                                    PersistenceGlobalKey::AppliedDeltaWatermarks,
+                                    partition_timestamp_map_to_json(&applied_delta_watermarks),
+                                )
+                                .await?;
                             self.publish_replication_frontier_progress(
                                 commit_ts,
                                 source_partition,
@@ -715,6 +748,7 @@ impl<RT: Runtime> Committer<RT> {
                             snapshot_ts,
                             snapshot,
                             replication_frontiers,
+                            applied_delta_watermarks,
                             result,
                             ..
                         } => {
@@ -723,6 +757,7 @@ impl<RT: Runtime> Committer<RT> {
                             self.queued_snapshots.clear();
                             self.log.reset(snapshot_ts);
                             self.last_assigned_ts = snapshot_ts;
+                            self.applied_delta_watermarks = applied_delta_watermarks;
                             self.snapshot_manager.write().replace(
                                 snapshot_ts,
                                 snapshot,
@@ -2029,11 +2064,20 @@ impl<RT: Runtime> Committer<RT> {
                             })
                             .unwrap_or_default()
                     });
+                let applied_delta_watermarks = checkpoint
+                    .globals
+                    .get(&String::from(PersistenceGlobalKey::AppliedDeltaWatermarks))
+                    .map(|value| {
+                        partition_timestamp_map_from_json(value.clone(), "applied delta watermarks")
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
 
                 Ok(PersistenceWrite::InstallSnapshot {
                     snapshot_ts: checkpoint_ts,
                     snapshot: db_snapshot.snapshot,
                     replication_frontiers,
+                    applied_delta_watermarks,
                     result,
                     commit_id,
                 })
@@ -2080,6 +2124,20 @@ impl<RT: Runtime> Committer<RT> {
         // prepare. We therefore use the remote commit timestamp as a floor and
         // only bump above it when local monotonicity requires it.
         let remote_ts = delta.ts;
+        if let Some(source_partition) = delta.source_partition
+            && self
+                .applied_delta_watermarks
+                .get(&source_partition)
+                .is_some_and(|frontier| *frontier >= remote_ts)
+        {
+            tracing::info!(
+                "Skipping duplicate replica delta: source_partition={}, remote_ts={}",
+                source_partition.0,
+                u64::from(remote_ts),
+            );
+            let _ = result.send(Ok(remote_ts));
+            return Ok(());
+        }
         let latest_ts = self.snapshot_manager.read().latest_ts();
         let commit_ts = cmp::max(
             remote_ts,
@@ -2253,6 +2311,13 @@ impl<RT: Runtime> Committer<RT> {
                 }
                 frontiers
             };
+            let updated_applied_delta_watermarks = {
+                let mut frontiers = self.applied_delta_watermarks.clone();
+                frontiers.insert(source_partition, remote_ts);
+                frontiers
+            };
+            self.applied_delta_watermarks
+                .insert(source_partition, remote_ts);
             let persistence = self.persistence.clone();
             self.persistence_writes.push_back(
                 async move {
@@ -2265,6 +2330,7 @@ impl<RT: Runtime> Committer<RT> {
                     Ok(PersistenceWrite::ReplicationFrontierHeartbeat {
                         commit_ts,
                         source_partition,
+                        applied_delta_watermarks: updated_applied_delta_watermarks,
                         result,
                         commit_id,
                     })
@@ -2474,6 +2540,15 @@ impl<RT: Runtime> Committer<RT> {
             }
             frontiers
         });
+        let updated_applied_delta_watermarks = delta.source_partition.map(|source_partition| {
+            let mut frontiers = self.applied_delta_watermarks.clone();
+            frontiers.insert(source_partition, remote_ts);
+            frontiers
+        });
+        if let Some(source_partition) = delta.source_partition {
+            self.applied_delta_watermarks
+                .insert(source_partition, remote_ts);
+        }
 
         let persistence = self.persistence.clone();
         self.enqueue_snapshot(commit_id, commit_ts, snapshot.clone());
@@ -2482,6 +2557,7 @@ impl<RT: Runtime> Committer<RT> {
             let doc_writes = document_writes.clone();
             let idx_writes = index_writes.clone();
             let replication_frontiers = updated_replication_frontiers.clone();
+            let applied_delta_watermarks = updated_applied_delta_watermarks.clone();
             let source_partition = delta.source_partition;
             async move {
                 // Write to persistence (so function runner can load modules).
@@ -2508,11 +2584,13 @@ impl<RT: Runtime> Committer<RT> {
 
                 Ok(PersistenceWrite::ReplicaDelta {
                     commit_ts,
+                    remote_ts,
                     snapshot,
                     remapped_updates: all_remapped_updates,
                     write_source: delta.write_source,
                     write_bytes: delta.write_bytes,
                     source_partition,
+                    applied_delta_watermarks,
                     result,
                     commit_id,
                 })
