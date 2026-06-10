@@ -693,6 +693,27 @@ own for distributed changes.
   - `cargo test -p database prepare -- --nocapture`
   - `cargo check -p local_backend`
 
+### 2026-06 — Resolved abandoned 2PC prepares with durable rollback decisions
+
+- **Status:** complete
+- **Related issue:** `#158`
+- **What this fixes:** prepared 2PC participants could be abandoned if the
+  coordinator disappeared after `Prepare` or if rollback RPC delivery failed
+  during a prepare-abort path. `PREPARE_TIMEOUT_SECS` existed, but the watcher
+  only scanned existing decision records and never created a durable rollback
+  decision for orphaned redo records.
+- **Behavior:** prepare redo records now include the full participant set and
+  prepare wall-clock time. Prepare requests carry that participant set to
+  remote nodes. Failed prepare paths write a durable rollback decision before
+  sending rollback RPCs, and the watcher scans local redo records for timed-out
+  prepares, writes a rollback decision if none exists, and resolves the local
+  participant from that decision.
+- **Validation:**
+  - `cargo test -p database rollback_decision -- --nocapture`
+  - `cargo test -p database prepare -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

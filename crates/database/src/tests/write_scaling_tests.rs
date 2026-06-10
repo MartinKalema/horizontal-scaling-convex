@@ -6,7 +6,13 @@
 //! pattern).
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
     time::Duration,
 };
 
@@ -271,6 +277,10 @@ fn partitioned_map_with_users_and_tasks(local_partition: PartitionId) -> Partiti
     PartitionMap::from_config("users=0,tasks=1", local_partition, 2)
 }
 
+fn three_partitioned_map(local_partition: PartitionId) -> PartitionMap {
+    PartitionMap::from_config("messages=0,projects=1,tasks=2", local_partition, 3)
+}
+
 async fn insert_doc_get_id(
     db: &Database<TestRuntime>,
     table: &str,
@@ -344,7 +354,13 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
 
         let result = self
             .committer
-            .prepare_remote(txn_id, transaction, req.write_source.into(), prepare_ts)
+            .prepare_remote(
+                txn_id,
+                transaction,
+                req.write_source.into(),
+                prepare_ts,
+                req.participants.iter().copied().map(PartitionId).collect(),
+            )
             .await
             .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
 
@@ -444,6 +460,109 @@ impl TwoPhaseCommitService for FailingCommitAfterPrepareGrpcService {
         &self,
         _request: Request<TwoPcRollbackRequest>,
     ) -> Result<Response<TwoPcRollbackResponse>, Status> {
+        Ok(Response::new(TwoPcRollbackResponse {}))
+    }
+}
+
+struct FailingRollbackAfterPrepareGrpcService {
+    db: Database<TestRuntime>,
+    committer: CommitterClient,
+    local_partition: PartitionId,
+    fail_next_rollback: AtomicBool,
+}
+
+impl FailingRollbackAfterPrepareGrpcService {
+    fn new(db: Database<TestRuntime>, local_partition: PartitionId) -> Self {
+        Self {
+            committer: db.committer_for_test(),
+            db,
+            local_partition,
+            fail_next_rollback: AtomicBool::new(true),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl TwoPhaseCommitService for FailingRollbackAfterPrepareGrpcService {
+    async fn prepare(
+        &self,
+        request: Request<TwoPcPrepareRequest>,
+    ) -> Result<Response<TwoPcPrepareResponse>, Status> {
+        let req = request.into_inner();
+        let txn_id = TwoPhaseTransactionId(req.transaction_id);
+        let prepare_ts: Timestamp = req
+            .prepare_ts
+            .try_into()
+            .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
+        let write_source = WriteSource::new(req.write_source);
+        let mut tx =
+            self.db.begin(Identity::system()).await.map_err(|e| {
+                Status::internal(format!("Failed to begin local prepare tx: {e:#}"))
+            })?;
+        TestFacingModel::new(&mut tx)
+            .insert(
+                &"projects"
+                    .parse()
+                    .map_err(|e| Status::internal(format!("Invalid test table name: {e:#}")))?,
+                assert_obj!("name" => "prepared-before-rollback-rpc-failure"),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to build local prepare tx: {e:#}")))?;
+        let final_tx = tx
+            .finalize()
+            .map_err(|e| Status::internal(format!("Failed to finalize local prepare tx: {e:#}")))?;
+        let write_indexes: Vec<_> = final_tx
+            .writes
+            .coalesced_writes()
+            .enumerate()
+            .map(|(index, _)| index)
+            .collect();
+        let partition_map = three_partitioned_map(self.local_partition);
+        let transaction = ParticipantTransaction::from_final_transaction(
+            &final_tx,
+            self.local_partition,
+            &write_indexes,
+            &partition_map,
+            &write_source,
+        )
+        .map_err(|e| Status::internal(format!("Failed to build local participant tx: {e:#}")))?;
+        let result = self
+            .committer
+            .prepare_remote(
+                txn_id,
+                transaction,
+                write_source,
+                prepare_ts,
+                req.participants.iter().copied().map(PartitionId).collect(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
+        Ok(Response::new(TwoPcPrepareResponse {
+            prepare_ts: u64::from(result.prepare_ts),
+        }))
+    }
+
+    async fn commit_prepared(
+        &self,
+        _request: Request<TwoPcCommitRequest>,
+    ) -> Result<Response<TwoPcCommitResponse>, Status> {
+        Err(Status::failed_precondition(
+            "commit_prepared should not be called during rollback test",
+        ))
+    }
+
+    async fn rollback_prepared(
+        &self,
+        request: Request<TwoPcRollbackRequest>,
+    ) -> Result<Response<TwoPcRollbackResponse>, Status> {
+        if self.fail_next_rollback.swap(false, Ordering::SeqCst) {
+            return Err(Status::unavailable("forced rollback RPC failure"));
+        }
+        let req = request.into_inner();
+        self.committer
+            .rollback_prepared(TwoPhaseTransactionId(req.transaction_id))
+            .await
+            .map_err(|e| Status::internal(format!("RollbackPrepared failed: {e:#}")))?;
         Ok(Response::new(TwoPcRollbackResponse {}))
     }
 }
@@ -1659,6 +1778,7 @@ async fn test_prepared_participant_recovers_from_redo_after_restart(
             participant_tx,
             write_source.clone(),
             prepare_ts,
+            vec![PartitionId(1)],
         )
         .await?;
     node.shutdown().await?;
@@ -1843,7 +1963,13 @@ async fn test_raft_commit_delta_cleans_prepared_redo_on_follower(
         .await?;
     source
         .committer_for_test()
-        .prepare_remote(txn_id.clone(), participant_tx, write_source, prepare_ts)
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
         .await?;
     source.committer_for_test().commit_prepared(txn_id).await?;
 
@@ -2245,6 +2371,7 @@ fn test_remote_prepare_over_grpc_is_idempotent() -> anyhow::Result<()> {
                 write_source.clone(),
                 prepare_ts,
                 partition_map.placement_version(),
+                &[PartitionId(1)],
             )
             .await?;
         let second = client
@@ -2254,6 +2381,7 @@ fn test_remote_prepare_over_grpc_is_idempotent() -> anyhow::Result<()> {
                 write_source,
                 prepare_ts,
                 partition_map.placement_version(),
+                &[PartitionId(1)],
             )
             .await?;
 
@@ -2330,6 +2458,7 @@ fn test_remote_prepare_rejects_stale_placement_version() -> anyhow::Result<()> {
                 write_source,
                 prepare_ts,
                 stale_map.placement_version(),
+                &[PartitionId(1)],
             )
             .await
             .unwrap_err();
@@ -2554,6 +2683,186 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
         node_a.commit(retry_tx).await?;
 
         failing_server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[convex_macro::test_runtime]
+async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "abandoned-prepare"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("abandoned_prepare_timeout_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+
+    let resolved = crate::two_phase_watcher::rollback_expired_local_prepares(
+        &node.committer_for_test(),
+        PartitionId(1),
+        Duration::ZERO,
+    )
+    .await?;
+    assert_eq!(resolved, 1);
+
+    let decisions = decision_log.decisions();
+    let decision = decisions
+        .get(&txn_id.0)
+        .expect("watcher should write a durable rollback decision");
+    match decision {
+        TwoPhaseDecision::RolledBack { participants, .. } => {
+            assert_eq!(participants, &vec![1]);
+        },
+        other => panic!("expected rollback decision, got {other:?}"),
+    }
+
+    insert_doc(
+        &node,
+        "projects",
+        assert_obj!("name" => "after-abandoned-rollback"),
+    )
+    .await
+    .context("timed-out prepare should no longer block conflicting writes")?;
+    Ok(())
+}
+
+#[test]
+fn test_rollback_decision_survives_failed_rollback_rpc_for_watcher() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(three_partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+            decision_log.clone(),
+        )
+        .await?;
+        let rollback_failing_server = start_two_pc_server(
+            FailingRollbackAfterPrepareGrpcService::new(node_b.clone(), PartitionId(1)),
+        )
+        .await?;
+        let prepare_failing_server = start_two_pc_server(FailingPrepareGrpcService).await?;
+        let node_a = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(three_partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!(
+                "1={},2={}",
+                rollback_failing_server.addr(),
+                prepare_failing_server.addr(),
+            ))),
+            Some(tso),
+            decision_log.clone(),
+        )
+        .await?;
+
+        let mut tx = node_a.begin(Identity::system()).await?;
+        let mut model = TestFacingModel::new(&mut tx);
+        model
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "prepared-before-rollback-rpc-failure"),
+            )
+            .await?;
+        model
+            .insert(
+                &"tasks".parse()?,
+                assert_obj!("title" => "force-later-prepare-failure"),
+            )
+            .await?;
+
+        let err = node_a
+            .commit(tx)
+            .await
+            .expect_err("second participant prepare failure should abort the 2PC transaction");
+        assert!(
+            format!("{err:#}").contains("forced prepare failure"),
+            "expected forced prepare failure, got: {err:#}",
+        );
+
+        let decisions = decision_log.decisions();
+        assert_eq!(decisions.len(), 1);
+        let (txn_id, decision) = decisions
+            .iter()
+            .next()
+            .expect("rollback decision should survive failed rollback RPC");
+        match decision {
+            TwoPhaseDecision::RolledBack { participants, .. } => {
+                assert!(
+                    participants.contains(&1),
+                    "rollback decision must include the prepared remote participant",
+                );
+                assert!(
+                    !participants.contains(&2),
+                    "rollback decision must not include the participant whose prepare failed",
+                );
+            },
+            other => panic!("expected rollback decision, got {other:?}"),
+        }
+
+        crate::two_phase_watcher::resolve_decision_for_local_partition(
+            &node_b.committer_for_test(),
+            PartitionId(1),
+            TwoPhaseTransactionId(txn_id.clone()),
+            decision.clone(),
+        )
+        .await;
+        insert_doc(
+            &node_b,
+            "projects",
+            assert_obj!("name" => "after-watcher-rollback"),
+        )
+        .await
+        .context("watcher recovery should clear the prepared remote participant")?;
+
+        rollback_failing_server.shutdown().await?;
+        prepare_failing_server.shutdown().await?;
         Ok(())
     })
 }

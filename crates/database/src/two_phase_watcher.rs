@@ -21,11 +21,126 @@ use crate::{
     two_phase::{
         TwoPhaseDecision,
         TwoPhaseTransactionId,
+        PREPARE_TIMEOUT_SECS,
         TWO_PHASE_DECISION_TTL_SECS,
         TWO_PHASE_KV_BUCKET,
         TWO_PHASE_KV_PREFIX,
     },
 };
+
+/// Apply an existing durable 2PC decision to this local participant.
+pub async fn resolve_decision_for_local_partition(
+    committer: &CommitterClient,
+    local_partition: PartitionId,
+    txn_id: TwoPhaseTransactionId,
+    decision: TwoPhaseDecision,
+) {
+    match decision {
+        TwoPhaseDecision::Committed { participants, .. } => {
+            if !participants.contains(&local_partition.0) {
+                return;
+            }
+            // Transaction was committed but the coordinator may have crashed
+            // before sending CommitPrepared to all participants. Try to commit
+            // locally — if already committed, this is a no-op.
+            match committer.commit_prepared(txn_id.clone()).await {
+                Ok(ts) => {
+                    tracing::info!(
+                        "2PC Watcher: resolved committed txn={} at ts={}",
+                        txn_id,
+                        u64::from(ts),
+                    );
+                },
+                Err(e) => {
+                    // "unknown transaction" means it was already committed or
+                    // this participant never prepared.
+                    if e.to_string().contains("unknown transaction") {
+                        tracing::debug!(
+                            "2PC Watcher: committed txn={} already resolved locally",
+                            txn_id,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "2PC Watcher: CommitPrepared for {txn_id} not ready: {e:#}"
+                        );
+                    }
+                },
+            }
+        },
+        TwoPhaseDecision::RolledBack { participants, .. } => {
+            if !participants.contains(&local_partition.0) {
+                return;
+            }
+            // Transaction was rolled back but cleanup may be incomplete.
+            match committer.rollback_prepared(txn_id.clone()).await {
+                Ok(()) | Err(_) => {
+                    tracing::debug!(
+                        "2PC Watcher: rolled back txn={} locally or it was already gone",
+                        txn_id,
+                    );
+                },
+            }
+        },
+    }
+}
+
+/// Resolve local prepared transactions that no longer have a coordinator
+/// decision. The watcher writes an authoritative rollback decision first, then
+/// applies that decision locally. The create-if-absent write prevents a timeout
+/// rollback from overwriting a coordinator's committed decision.
+pub async fn rollback_expired_local_prepares(
+    committer: &CommitterClient,
+    local_partition: PartitionId,
+    timeout: Duration,
+) -> anyhow::Result<usize> {
+    let records = committer.two_phase_redo_records().await?;
+    let decision_log = committer.two_phase_decision_log();
+    let mut resolved = 0usize;
+    for entry in records.values() {
+        if entry.partition_id() != local_partition || !entry.prepare_timed_out(timeout) {
+            continue;
+        }
+        let txn_id = entry.transaction_id();
+        let decision = match decision_log.get_decision(&txn_id).await? {
+            Some(decision) => decision,
+            None => {
+                let participants = entry
+                    .participants()
+                    .into_iter()
+                    .map(|partition| partition.0)
+                    .collect();
+                let rollback = TwoPhaseDecision::RolledBack {
+                    reason: format!(
+                        "2PC prepare timed out after {:?} without a durable coordinator decision",
+                        timeout,
+                    ),
+                    participants,
+                };
+                if decision_log
+                    .write_decision_if_absent(&txn_id, &rollback)
+                    .await?
+                {
+                    tracing::warn!(
+                        "2PC Watcher: wrote timeout rollback decision for abandoned txn={}",
+                        txn_id,
+                    );
+                    rollback
+                } else {
+                    decision_log.get_decision(&txn_id).await?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "2PC Watcher: decision for txn={} appeared during timeout rollback \
+                             race but could not be read",
+                            txn_id,
+                        )
+                    })?
+                }
+            },
+        };
+        resolve_decision_for_local_partition(committer, local_partition, txn_id, decision).await;
+        resolved += 1;
+    }
+    Ok(resolved)
+}
 
 /// Start the transaction watcher as a background task.
 /// Periodically scans NATS KV for unresolved 2PC transactions.
@@ -105,53 +220,18 @@ pub fn start<RT: Runtime>(
                     },
                 };
 
-                match decision {
-                    TwoPhaseDecision::Committed { participants, .. } => {
-                        if !participants.contains(&local_partition.0) {
-                            continue;
-                        }
-                        // Transaction was committed but the coordinator may have
-                        // crashed before sending CommitPrepared to all participants.
-                        // Try to commit locally — if already committed, this is a no-op.
-                        match committer.commit_prepared(txn_id.clone()).await {
-                            Ok(ts) => {
-                                tracing::info!(
-                                    "2PC Watcher: resolved committed txn={} at ts={}",
-                                    txn_id,
-                                    u64::from(ts),
-                                );
-                            },
-                            Err(e) => {
-                                // "unknown transaction" means it was already committed.
-                                if e.to_string().contains("unknown transaction") {
-                                    tracing::debug!(
-                                        "2PC Watcher: committed txn={} already resolved locally",
-                                        txn_id,
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        "2PC Watcher: CommitPrepared for {txn_id} not ready: {e:#}"
-                                    );
-                                }
-                            },
-                        }
-                    },
-                    TwoPhaseDecision::RolledBack { participants, .. } => {
-                        if !participants.contains(&local_partition.0) {
-                            continue;
-                        }
-                        // Transaction was rolled back but cleanup may be incomplete.
-                        match committer.rollback_prepared(txn_id.clone()).await {
-                            Ok(()) | Err(_) => {
-                                tracing::debug!(
-                                    "2PC Watcher: rolled back txn={} locally or it was already \
-                                     gone",
-                                    txn_id,
-                                );
-                            },
-                        }
-                    },
-                }
+                resolve_decision_for_local_partition(&committer, local_partition, txn_id, decision)
+                    .await;
+            }
+
+            if let Err(err) = rollback_expired_local_prepares(
+                &committer,
+                local_partition,
+                Duration::from_secs(PREPARE_TIMEOUT_SECS),
+            )
+            .await
+            {
+                tracing::debug!("2PC Watcher: failed to resolve expired prepares: {err:#}");
             }
         }
     });

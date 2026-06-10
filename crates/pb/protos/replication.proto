@@ -143,6 +143,11 @@ message TwoPcPrepareRequest {
   // Participants reject mismatched versions so stale ownership maps cannot
   // prepare writes on the wrong partition during rebalancing.
   uint64 placement_version = 5;
+
+  // Full participant set for this 2PC attempt. Participants persist this in
+  // their redo record so a watcher can write an authoritative rollback
+  // decision if the coordinator disappears after prepare ACK.
+  repeated uint32 participants = 6;
 }
 
 message TwoPcPrepareResponse {

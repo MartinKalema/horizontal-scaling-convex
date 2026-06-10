@@ -17,7 +17,11 @@
 
 use std::{
     collections::BTreeMap,
-    time::Duration,
+    time::{
+        Duration,
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 use anyhow::Context;
@@ -113,7 +117,7 @@ impl std::fmt::Display for TwoPhaseTransactionId {
 /// State of a 2PC transaction stored in NATS KV.
 /// This is the commit decision record — the point of no return.
 /// Follows Vitess's Metadata Manager (MM) pattern.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TwoPhaseDecision {
     /// All participants prepared successfully. Commit.
     Committed {
@@ -143,6 +147,10 @@ pub struct TwoPhaseRedoEntry {
     pub transaction_id: String,
     pub prepare_ts: u64,
     pub partition_id: u32,
+    #[serde(default)]
+    pub participants: Vec<u32>,
+    #[serde(default)]
+    pub prepared_at_unix_millis: Option<u64>,
     pub write_source: Option<String>,
     pub participant_transaction_hex: String,
 }
@@ -155,6 +163,24 @@ impl TwoPhaseRedoEntry {
         transaction: ParticipantTransaction,
         write_source: &WriteSource,
     ) -> anyhow::Result<Self> {
+        Self::new_with_participants(
+            transaction_id,
+            prepare_ts,
+            partition_id,
+            &[partition_id],
+            transaction,
+            write_source,
+        )
+    }
+
+    pub fn new_with_participants(
+        transaction_id: &TwoPhaseTransactionId,
+        prepare_ts: Timestamp,
+        partition_id: PartitionId,
+        participants: &[PartitionId],
+        transaction: ParticipantTransaction,
+        write_source: &WriteSource,
+    ) -> anyhow::Result<Self> {
         let proto = TwoPcParticipantTransactionProto::try_from(transaction)?;
         let mut bytes = Vec::new();
         proto
@@ -164,6 +190,8 @@ impl TwoPhaseRedoEntry {
             transaction_id: transaction_id.0.clone(),
             prepare_ts: u64::from(prepare_ts),
             partition_id: partition_id.0,
+            participants: participants.iter().map(|partition| partition.0).collect(),
+            prepared_at_unix_millis: Some(now_unix_millis()),
             write_source: write_source.as_str().map(str::to_string),
             participant_transaction_hex: hex::encode(bytes),
         })
@@ -181,6 +209,24 @@ impl TwoPhaseRedoEntry {
         PartitionId(self.partition_id)
     }
 
+    pub fn participants(&self) -> Vec<PartitionId> {
+        if self.participants.is_empty() {
+            vec![self.partition_id()]
+        } else {
+            self.participants.iter().copied().map(PartitionId).collect()
+        }
+    }
+
+    pub fn prepare_age(&self) -> Option<Duration> {
+        let prepared_at = self.prepared_at_unix_millis?;
+        let now = now_unix_millis();
+        Some(Duration::from_millis(now.saturating_sub(prepared_at)))
+    }
+
+    pub fn prepare_timed_out(&self, timeout: Duration) -> bool {
+        self.prepare_age().is_some_and(|age| age >= timeout)
+    }
+
     pub fn write_source(&self) -> WriteSource {
         WriteSource::from(self.write_source.clone())
     }
@@ -192,6 +238,15 @@ impl TwoPhaseRedoEntry {
             .context("2PC: Failed to parse participant transaction redo")?;
         ParticipantTransaction::try_from(proto)
     }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -230,6 +285,27 @@ pub mod testing {
             Ok(())
         }
 
+        async fn write_decision_if_absent(
+            &self,
+            transaction_id: &TwoPhaseTransactionId,
+            decision: &TwoPhaseDecision,
+        ) -> anyhow::Result<bool> {
+            let mut decisions = self.decisions.lock();
+            if decisions.contains_key(&transaction_id.0) {
+                Ok(false)
+            } else {
+                decisions.insert(transaction_id.0.clone(), decision.clone());
+                Ok(true)
+            }
+        }
+
+        async fn get_decision(
+            &self,
+            transaction_id: &TwoPhaseTransactionId,
+        ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+            Ok(self.decisions.lock().get(&transaction_id.0).cloned())
+        }
+
         async fn delete_decision(
             &self,
             transaction_id: &TwoPhaseTransactionId,
@@ -264,6 +340,22 @@ pub trait TwoPhaseDecisionLog: Send + Sync + 'static {
         decision: &TwoPhaseDecision,
     ) -> anyhow::Result<()>;
 
+    async fn write_decision_if_absent(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        decision: &TwoPhaseDecision,
+    ) -> anyhow::Result<bool> {
+        self.write_decision(transaction_id, decision).await?;
+        Ok(true)
+    }
+
+    async fn get_decision(
+        &self,
+        _transaction_id: &TwoPhaseTransactionId,
+    ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+        Ok(None)
+    }
+
     async fn delete_decision(&self, transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()>;
 }
 
@@ -277,6 +369,14 @@ impl TwoPhaseDecisionLog for NoopTwoPhaseDecisionLog {
         _decision: &TwoPhaseDecision,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn write_decision_if_absent(
+        &self,
+        _transaction_id: &TwoPhaseTransactionId,
+        _decision: &TwoPhaseDecision,
+    ) -> anyhow::Result<bool> {
+        Ok(true)
     }
 
     async fn delete_decision(&self, _transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()> {
@@ -323,6 +423,40 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
             .await
             .with_context(|| format!("2PC: Failed to write decision for {transaction_id}"))?;
         Ok(())
+    }
+
+    async fn write_decision_if_absent(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        decision: &TwoPhaseDecision,
+    ) -> anyhow::Result<bool> {
+        let payload = serde_json::to_vec(decision)
+            .with_context(|| format!("2PC: Failed to serialize decision for {transaction_id}"))?;
+        match self
+            .kv
+            .create(two_phase_decision_key(transaction_id), payload.into())
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn get_decision(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+    ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+        let Some(entry) = self
+            .kv
+            .entry(two_phase_decision_key(transaction_id))
+            .await
+            .with_context(|| format!("2PC: Failed to read decision for {transaction_id}"))?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&entry.value)
+            .with_context(|| format!("2PC: Failed to parse decision for {transaction_id}"))
+            .map(Some)
     }
 
     async fn delete_decision(&self, transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()> {
@@ -835,6 +969,7 @@ impl TwoPhaseCommitGrpcClient {
         write_source: WriteSource,
         prepare_ts: Timestamp,
         placement_version: crate::partition::PlacementVersion,
+        participants: &[PartitionId],
     ) -> anyhow::Result<PrepareResult> {
         let request = TwoPcPrepareRequest {
             transaction_id: transaction_id.0.clone(),
@@ -842,6 +977,7 @@ impl TwoPhaseCommitGrpcClient {
             write_source: write_source.as_str().unwrap_or_default().to_string(),
             prepare_ts: u64::from(prepare_ts),
             placement_version: u64::from(placement_version),
+            participants: participants.iter().map(|partition| partition.0).collect(),
         };
         let response = self
             .client

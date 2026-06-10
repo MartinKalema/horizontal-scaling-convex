@@ -970,6 +970,7 @@ impl<RT: Runtime> Committer<RT> {
                             transaction,
                             write_source,
                             prepare_ts,
+                            participants,
                             result,
                         }) => {
                             let r = self.handle_prepare_remote(
@@ -977,6 +978,7 @@ impl<RT: Runtime> Committer<RT> {
                                 transaction,
                                 write_source,
                                 prepare_ts,
+                                participants,
                             )
                             .await;
                             let _ = result.send(r);
@@ -3221,6 +3223,7 @@ impl<RT: Runtime> Committer<RT> {
         transaction: crate::two_phase::ParticipantTransaction,
         write_source: WriteSource,
         prepare_ts: Timestamp,
+        participants: Vec<crate::partition::PartitionId>,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
         tracing::info!(
             "2PC Remote Prepare: txn={}, {} writes, prepare_ts={}",
@@ -3229,10 +3232,11 @@ impl<RT: Runtime> Committer<RT> {
             u64::from(prepare_ts),
         );
 
-        let redo = crate::two_phase::TwoPhaseRedoEntry::new(
+        let redo = crate::two_phase::TwoPhaseRedoEntry::new_with_participants(
             &transaction_id,
             prepare_ts,
             self.local_partition_for_two_phase(),
+            &participants,
             transaction.clone(),
             &write_source,
         )?;
@@ -4039,6 +4043,19 @@ impl CommitterClient {
         self.two_phase_decision_log.clone()
     }
 
+    pub(crate) async fn two_phase_redo_records(
+        &self,
+    ) -> anyhow::Result<BTreeMap<String, crate::two_phase::TwoPhaseRedoEntry>> {
+        let Some(value) = self
+            .persistence_reader
+            .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+            .await?
+        else {
+            return Ok(BTreeMap::new());
+        };
+        serde_json::from_value(value).context("2PC: Failed to parse durable redo records")
+    }
+
     async fn wait_for_remote_read_frontiers(
         &self,
         begin_ts: Timestamp,
@@ -4270,6 +4287,7 @@ impl CommitterClient {
         transaction: crate::two_phase::ParticipantTransaction,
         write_source: WriteSource,
         prepare_ts: Timestamp,
+        participants: Vec<crate::partition::PartitionId>,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
         self.wait_for_remote_read_frontiers(
             *transaction.begin_timestamp,
@@ -4283,6 +4301,7 @@ impl CommitterClient {
             transaction,
             write_source,
             prepare_ts,
+            participants,
             result: tx,
         };
         self.sender.try_send(message).map_err(|e| match e {
@@ -4490,6 +4509,7 @@ enum CommitterMessage {
         transaction: crate::two_phase::ParticipantTransaction,
         write_source: WriteSource,
         prepare_ts: Timestamp,
+        participants: Vec<crate::partition::PartitionId>,
         result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
     },
     AllocateCommitTs {
