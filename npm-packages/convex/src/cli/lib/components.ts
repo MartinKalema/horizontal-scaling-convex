@@ -19,7 +19,7 @@ import {
   reportPushCompleted,
   startPush,
   waitForSchema,
-} from "./deploy2.js";
+} from "./deployProtocol.js";
 import { version } from "../version.js";
 import { ensureHasConvexDependency, functionsDir } from "./utils/utils.js";
 import {

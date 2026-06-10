@@ -900,18 +900,15 @@ export function diffConfig(
   return { diffString: diff };
 }
 
-/** Handle an error from
- * legacy push path:
- * - /api/push_config
- * modern push paths:
- * - /api/deploy2/evaluate_push
- * - /api/deploy2/start_push
- * - /api/deploy2/finish_push
+/** Handle an error from deploy push paths:
+ * - /api/deploy/evaluate_push
+ * - /api/deploy/start_push
+ * - /api/deploy/finish_push
  *
  * finish_push errors are different from start_push errors and in theory could
  * be handled differently, but starting over works for all of them.
  */
-export async function handlePushConfigError(
+export async function handleDeployError(
   ctx: Context,
   error: unknown,
   defaultMessage: string,

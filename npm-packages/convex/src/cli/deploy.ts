@@ -20,7 +20,7 @@ import { usageStateWarning } from "./lib/usage.js";
 import { getTeamAndProjectFromPreviewAdminKey } from "./lib/deployment.js";
 import { runPush } from "./lib/components.js";
 import { promptYesNo } from "./lib/utils/prompts.js";
-import { deployToDeployment, runCommand } from "./lib/deploy2.js";
+import { deployToDeployment, runCommand } from "./lib/deployProtocol.js";
 import {
   DeploymentSelection,
   getDeploymentSelection,

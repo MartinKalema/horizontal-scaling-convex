@@ -46,7 +46,7 @@ const mockConvexClient = mockConvexReactClient()
   }))
   .registerQueryFake(udfs.components.list, () => [])
   .registerQueryFake(udfs.getVersion.default, () => "1.18.0")
-  .registerQueryFake(udfs.deploymentEvents.lastPushEvent, () => null)
+  .registerQueryFake(udfs.deploymentEvents.lastDeployEvent, () => null)
   .registerQueryFake(
     udfs.convexCloudUrl.default,
     () => mockDeployment.deploymentUrl,

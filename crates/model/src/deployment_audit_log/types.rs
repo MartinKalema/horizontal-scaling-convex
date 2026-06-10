@@ -158,10 +158,10 @@ pub enum DeploymentAuditLogEvent {
     DeleteCanonicalUrl {
         request_destination: RequestDestination,
     },
-    PushConfig {
+    Deploy {
         config_diff: ConfigDiff,
     },
-    PushConfigWithComponents {
+    DeployWithComponents {
         diffs: PushComponentDiffs,
     },
     BuildIndexes {
@@ -242,10 +242,8 @@ impl DeploymentAuditLogEvent {
             },
             DeploymentAuditLogEvent::UpdateCanonicalUrl { .. } => "update_canonical_url",
             DeploymentAuditLogEvent::DeleteCanonicalUrl { .. } => "delete_canonical_url",
-            DeploymentAuditLogEvent::PushConfig { .. } => "push_config",
-            DeploymentAuditLogEvent::PushConfigWithComponents { .. } => {
-                "push_config_with_components"
-            },
+            DeploymentAuditLogEvent::Deploy { .. } => "deploy",
+            DeploymentAuditLogEvent::DeployWithComponents { .. } => "deploy_with_components",
             DeploymentAuditLogEvent::BuildIndexes { .. } => "build_indexes",
             DeploymentAuditLogEvent::ChangeDeploymentState { .. } => "change_deployment_state",
             DeploymentAuditLogEvent::SnapshotImport { .. } => "snapshot_import",
@@ -280,10 +278,10 @@ impl DeploymentAuditLogEvent {
             } => {
                 obj!("request_destination" => request_destination.to_string())
             },
-            DeploymentAuditLogEvent::PushConfig { config_diff } => {
+            DeploymentAuditLogEvent::Deploy { config_diff } => {
                 DocumentObject::try_from(config_diff)
             },
-            DeploymentAuditLogEvent::PushConfigWithComponents { diffs } => diffs.try_into(),
+            DeploymentAuditLogEvent::DeployWithComponents { diffs } => diffs.try_into(),
             DeploymentAuditLogEvent::BuildIndexes {
                 added_indexes,
                 removed_indexes,
@@ -456,11 +454,13 @@ impl TryFrom<DocumentObject> for DeploymentAuditLogEvent {
             "delete_canonical_url" => DeploymentAuditLogEvent::DeleteCanonicalUrl {
                 request_destination: remove_string(&mut fields, "request_destination")?.parse()?,
             },
-            "push_config" => DeploymentAuditLogEvent::PushConfig {
+            "deploy" | "push_config" => DeploymentAuditLogEvent::Deploy {
                 config_diff: DocumentObject::try_from(fields)?.try_into()?,
             },
-            "push_config_with_components" => DeploymentAuditLogEvent::PushConfigWithComponents {
-                diffs: DocumentObject::try_from(fields)?.try_into()?,
+            "deploy_with_components" | "push_config_with_components" => {
+                DeploymentAuditLogEvent::DeployWithComponents {
+                    diffs: DocumentObject::try_from(fields)?.try_into()?,
+                }
             },
             "build_indexes" => {
                 let added_indexes = remove_vec(&mut fields, "added_indexes")?

@@ -150,12 +150,12 @@ export const ResumingDeployment: Story = {
   },
 };
 
-export const PushConfig: Story = {
+export const Deploy: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: { added: [], removed: [] },
         server_version: null,
@@ -169,12 +169,12 @@ export const PushConfig: Story = {
   },
 };
 
-export const PushConfigWithVersionChange: Story = {
+export const DeployWithVersionChange: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: { added: [], removed: [] },
         server_version: { previous_version: "0.5.0", next_version: "0.60" },
@@ -188,12 +188,12 @@ export const PushConfigWithVersionChange: Story = {
   },
 };
 
-export const PushConfigWithAuthChange: Story = {
+export const DeployWithAuthChange: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: { added: ["auth1", "auth2"], removed: ["auth3", "auth4"] },
         server_version: null,
@@ -207,12 +207,12 @@ export const PushConfigWithAuthChange: Story = {
   },
 };
 
-export const PushConfigWithChange: Story = {
+export const DeployWithChange: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: { added: [], removed: [] },
         server_version: null,
@@ -355,12 +355,12 @@ export const PushConfigWithChange: Story = {
   },
 };
 
-export const PushConfigWithAddition: Story = {
+export const DeployWithAddition: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: { added: [], removed: [] },
         server_version: null,
@@ -446,12 +446,12 @@ export const PushConfigWithAddition: Story = {
   },
 };
 
-export const PushConfigWithDeletion: Story = {
+export const DeployWithDeletion: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: { added: [], removed: [] },
         server_version: null,
@@ -527,12 +527,12 @@ export const PushConfigWithDeletion: Story = {
   },
 };
 
-export const PushConfigWithEnforcementChange: Story = {
+export const DeployWithEnforcementChange: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: { added: [], removed: [] },
         server_version: null,
@@ -589,12 +589,12 @@ export const PushConfigWithEnforcementChange: Story = {
   },
 };
 
-export const PushConfigWithLargeDiff: Story = {
+export const DeployWithLargeDiff: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: {
           added: [],
@@ -1212,12 +1212,12 @@ export const PushConfigWithLargeDiff: Story = {
   },
 };
 
-export const PushConfigWithCron: Story = {
+export const DeployWithCron: Story = {
   args: {
     event: {
       _id: "" as Id<"_deployment_audit_log">,
       _creationTime: Date.parse("12/19/2022, 10:00:00 AM"),
-      action: "push_config",
+      action: "deploy",
       metadata: {
         auth: { added: [], removed: [] },
         server_version: null,

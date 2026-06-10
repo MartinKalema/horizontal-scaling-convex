@@ -157,7 +157,7 @@ impl RouteAuthorityRule {
 
 const ANY_NODE_STATIC_SCHEMA: &str = "static schema or deploy-introspection route";
 const EXPLICIT_DEPLOY_FORWARDING: &str =
-    "deploy2 handlers forward to the metadata owner and Raft leader before mutating state";
+    "deploy protocol handlers forward to the metadata owner and Raft leader before mutating state";
 const COORDINATOR_GLOBAL_STATE: &str =
     "route touches deployment-global state and must run on partition 0 / Raft leader";
 
@@ -175,20 +175,15 @@ pub(crate) const LOCAL_BACKEND_API_ROUTE_AUTHORITIES: &[RouteAuthorityRule] = &[
         ANY_NODE_STATIC_SCHEMA,
     ),
     RouteAuthorityRule::exact(
-        "deploy config read",
-        "/get_config",
-        RouteAuthorityClass::AnyNodeSafe,
-        "CLI reads the target node before deploy2 push so each node can materialize local modules",
-    ),
-    RouteAuthorityRule::exact(
         "deploy config hash read",
         "/get_config_hashes",
         RouteAuthorityClass::AnyNodeSafe,
-        "CLI reads the target node before deploy2 push so each node can materialize local modules",
+        "CLI reads the target node before the deploy protocol push so each node can materialize \
+         local modules",
     ),
     RouteAuthorityRule::prefix(
-        "deploy2 metadata operation",
-        "/deploy2/",
+        "deploy protocol metadata operation",
+        "/deploy/",
         RouteAuthorityClass::ExplicitForwarding,
         EXPLICIT_DEPLOY_FORWARDING,
     ),
@@ -229,26 +224,8 @@ pub(crate) const LOCAL_BACKEND_API_ROUTE_AUTHORITIES: &[RouteAuthorityRule] = &[
         COORDINATOR_GLOBAL_STATE,
     ),
     RouteAuthorityRule::exact(
-        "deploy config push",
-        "/push_config",
-        RouteAuthorityClass::CoordinatorOwner,
-        COORDINATOR_GLOBAL_STATE,
-    ),
-    RouteAuthorityRule::exact(
-        "schema prepare",
-        "/prepare_schema",
-        RouteAuthorityClass::CoordinatorOwner,
-        COORDINATOR_GLOBAL_STATE,
-    ),
-    RouteAuthorityRule::exact(
         "dashboard test function runner",
         "/run_test_function",
-        RouteAuthorityClass::CoordinatorOwner,
-        COORDINATOR_GLOBAL_STATE,
-    ),
-    RouteAuthorityRule::prefix(
-        "schema state read",
-        "/schema_state/",
         RouteAuthorityClass::CoordinatorOwner,
         COORDINATOR_GLOBAL_STATE,
     ),
@@ -506,12 +483,12 @@ mod tests {
     #[test]
     fn test_normalizes_nested_api_prefix() {
         assert_eq!(
-            normalize_local_backend_api_path("/api/push_config"),
-            "/push_config"
+            normalize_local_backend_api_path("/api/deploy/start_push"),
+            "/deploy/start_push"
         );
         assert_eq!(
-            normalize_local_backend_api_path("/push_config"),
-            "/push_config"
+            normalize_local_backend_api_path("/deploy/start_push"),
+            "/deploy/start_push"
         );
         assert_eq!(normalize_local_backend_api_path("/apiary"), "/apiary");
     }
@@ -523,12 +500,8 @@ mod tests {
             Some(RouteAuthorityClass::AnyNodeSafe)
         );
         assert_eq!(
-            class_for("/api/deploy2/start_push"),
+            class_for("/api/deploy/start_push"),
             Some(RouteAuthorityClass::ExplicitForwarding)
-        );
-        assert_eq!(
-            class_for("/api/push_config"),
-            Some(RouteAuthorityClass::CoordinatorOwner)
         );
         assert_eq!(
             class_for("/api/actions/mutation"),

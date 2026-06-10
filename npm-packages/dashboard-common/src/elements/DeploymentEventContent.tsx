@@ -48,13 +48,15 @@ export function DeploymentEventContent({
   switch (event.action) {
     case "build_indexes":
       // There are old audit log events for building indexes that
-      // are redundant with the schema diff in push config events.
+      // are redundant with the schema diff in deploy events.
       return null;
 
+    case "deploy":
     case "push_config":
-      body = <PushContent event={event} />;
+      body = <DeployContent event={event} />;
       break;
 
+    case "deploy_with_components":
     case "push_config_with_components":
       body = (
         <>
@@ -63,7 +65,7 @@ export function DeploymentEventContent({
               const auth =
                 component_path === null ? event.metadata.auth_diff : undefined;
               return (
-                <PushContentForComponents
+                <DeployContentForComponents
                   key={component_path}
                   diff={component_diff}
                   componentName={component_path}
@@ -179,9 +181,11 @@ export function ActionText({ event }: { event: DeploymentAuditLogEvent }) {
     case "build_indexes":
       return <span>updated indexes</span>;
 
+    case "deploy":
     case "push_config":
       return <span>deployed functions</span>;
 
+    case "deploy_with_components":
     case "push_config_with_components":
       return <span>deployed functions</span>;
 
@@ -379,10 +383,10 @@ function AuthElement({ diff }: { diff: Infer<typeof authDiff> }) {
   );
 }
 
-function PushContent({
+function DeployContent({
   event,
 }: {
-  event: DeploymentAuditLogEvent & { action: "push_config" };
+  event: DeploymentAuditLogEvent & { action: "deploy" | "push_config" };
 }) {
   const { auth, crons, server_version, schema } = event.metadata;
   const authElement = AuthElement({ diff: auth });
@@ -407,7 +411,7 @@ function PushContent({
   );
 }
 
-function PushContentForComponents({
+function DeployContentForComponents({
   diff,
   auth,
   componentName,

@@ -843,7 +843,7 @@ pub static APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: LazyLock<usize> =
     LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_NODE_ACTIONS", 64));
 
 /// The maximum number of concurrent package uploads during
-/// `/api/deploy2/start_push` + `/api/deploy2/evaluate_push`.
+/// `/api/deploy/start_push` + `/api/deploy/evaluate_push`.
 pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
     LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_UPLOADS", 4));
 
@@ -1346,7 +1346,7 @@ pub static TABLE_SUMMARY_AGE_JITTER_SECONDS: LazyLock<f32> =
 pub static HTTP_SERVER_TIMEOUT_DURATION: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("HTTP_SERVER_TIMEOUT_SECONDS", 300)));
 
-/// The limit on the request size to /push_config.
+/// The limit on the request size to deploy push endpoints.
 // Schema and code bundle pushes must be less than this.
 pub static MAX_PUSH_BYTES: LazyLock<usize> =
     LazyLock::new(|| env_config("MAX_PUSH_BYTES", 200_000_000));
@@ -1390,7 +1390,7 @@ pub static REQUEST_TRACE_SAMPLE_CONFIG: LazyLock<SamplingConfig> = LazyLock::new
         "REQUEST_TRACE_SAMPLE_CONFIG",
         prod_override(
             SamplingConfig::default(),
-            r#"{"defaultFraction":0.00001,"routeOverrides":[{"routeRegexp":"/api/push_config","fraction":0.1}, {"routeRegexp":"conductor/load-instance","fraction":0.01}, {"routeRegexp":"usage_tracking_worker/send_usage","fraction":0.01}]}"#
+            r#"{"defaultFraction":0.00001,"routeOverrides":[{"routeRegexp":"/api/deploy/(start_push|evaluate_push|finish_push)","fraction":0.1}, {"routeRegexp":"conductor/load-instance","fraction":0.01}, {"routeRegexp":"usage_tracking_worker/send_usage","fraction":0.01}]}"#
                 .parse()
                 .unwrap(),
         ),

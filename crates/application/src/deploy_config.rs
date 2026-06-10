@@ -157,7 +157,7 @@ pub struct PushMetrics {
     pub occ_stats: OccRetryStats,
 }
 
-struct EvaluatedPushContents {
+struct EvaluatedDeployContents {
     app: CheckedComponent,
     auth_info: Vec<AuthInfo>,
     component_definition_packages: BTreeMap<ComponentDefinitionPath, SourcePackage>,
@@ -170,7 +170,7 @@ struct EvaluatedPushContents {
 impl<RT: Runtime> Application<RT> {
     #[fastrace::trace]
     pub async fn start_push(&self, config: &ProjectConfig) -> anyhow::Result<StartPushResult> {
-        let EvaluatedPushContents {
+        let EvaluatedDeployContents {
             app,
             auth_info,
             component_definition_packages,
@@ -218,7 +218,7 @@ impl<RT: Runtime> Application<RT> {
     async fn evaluate_push_contents(
         &self,
         config: &ProjectConfig,
-    ) -> anyhow::Result<EvaluatedPushContents> {
+    ) -> anyhow::Result<EvaluatedDeployContents> {
         let unix_timestamp = self.runtime.unix_timestamp();
         let (external_deps_id, component_definition_packages, app_functions) =
             self.upload_packages(config).await?;
@@ -297,7 +297,7 @@ impl<RT: Runtime> Application<RT> {
         let ctx = TypecheckContext::new(&evaluated_components, &initializer_evaluator);
         let app = ctx.instantiate_root().await?;
 
-        Ok(EvaluatedPushContents {
+        Ok(EvaluatedDeployContents {
             app,
             auth_info,
             component_definition_packages,
@@ -516,7 +516,7 @@ impl<RT: Runtime> Application<RT> {
         &self,
         config: &ProjectConfig,
     ) -> anyhow::Result<EvaluatePushResponse> {
-        let EvaluatedPushContents {
+        let EvaluatedDeployContents {
             app,
             evaluated_components,
             ..
@@ -719,7 +719,7 @@ impl<RT: Runtime> Application<RT> {
                             component_diffs: component_diffs.clone(),
                         };
                         let audit_log_events =
-                            vec![DeploymentAuditLogEvent::PushConfigWithComponents { diffs }];
+                            vec![DeploymentAuditLogEvent::DeployWithComponents { diffs }];
                         let diff = FinishPushDiff {
                             auth_diff,
                             definition_diffs,
@@ -753,7 +753,7 @@ impl<RT: Runtime> Application<RT> {
     }
 
     /// N.B.: does not check auth
-    pub async fn push_config_no_components(
+    pub async fn deploy_config_no_components(
         &self,
         identity: Identity,
         config_file: ConfigFile,

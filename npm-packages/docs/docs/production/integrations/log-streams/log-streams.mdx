@@ -470,17 +470,17 @@ Schema:
 - `topic`: `audit_log`
 - `timestamp`: Unix epoch timestamp in milliseconds
 - `audit_log_action`: string, e.g. `"create_environment_variable"`,
-  `"push_config"`, `"change_deployment_state"`
+  `"deploy"`, `"change_deployment_state"`
 - `audit_log_metadata`: string, stringified JSON holding metadata about the
   event. The exact format of this event may change.
 
-Example `push_config` audit log:
+Example `deploy` audit log:
 
 ```json
 {
   "topic": "audit_log",
   "timestamp": 1714421999886,
-  "audit_log_action": "push_config",
+  "audit_log_action": "deploy",
   "audit_log_metadata": "{\"auth\":{\"added\":[],\"removed\":[]},\"crons\":{\"added\":[],\"deleted\":[],\"updated\":[]},..."
 }
 ```

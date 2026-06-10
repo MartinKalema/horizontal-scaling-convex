@@ -127,11 +127,11 @@ Schema:
 
 - `_topic = "_audit_log"`
 - `_timestamp` = Unix epoch timestamp in milliseconds
-- `action = "create_environment_variable" | "update_environment_variable" | "delete_environment_variable" | "replace_environment_variable" | "push_config" | "build_indexes" | "change_deployment_state"`
+- `action = "create_environment_variable" | "update_environment_variable" | "delete_environment_variable" | "replace_environment_variable" | "deploy" | "push_config" | "build_indexes" | "change_deployment_state"`
 - `actionMetadata` = object whose fields depends on the value of the `action`
   field.
 
-Example `push_config` audit log:
+Example legacy `push_config` audit log:
 
 ```json
 {

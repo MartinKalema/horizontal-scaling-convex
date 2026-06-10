@@ -129,8 +129,8 @@ export const schemaDiffType = v.optional(
   ),
 );
 
-export const pushConfig = v.object({
-  action: v.literal("push_config"),
+export const deploy = v.object({
+  action: v.union(v.literal("deploy"), v.literal("push_config")),
   member_id: v.int64(),
   metadata: v.object({
     auth: authDiff,
@@ -157,8 +157,11 @@ export const componentDiff = v.object({
   schemaDiff: schemaDiffType,
 });
 
-export const pushConfigWithComponents = v.object({
-  action: v.literal("push_config_with_components"),
+export const deployWithComponents = v.object({
+  action: v.union(
+    v.literal("deploy_with_components"),
+    v.literal("push_config_with_components"),
+  ),
   member_id: v.int64(),
   metadata: v.object({
     auth_diff: v.optional(authDiff),
@@ -225,8 +228,8 @@ const deploymentAuditLogTable = defineTable(
     updateCanonicalUrl,
     deleteCanonicalUrl,
     buildIndexes,
-    pushConfig,
-    pushConfigWithComponents,
+    deploy,
+    deployWithComponents,
     changeDeploymentState,
     clearTables,
     snapshotImport,

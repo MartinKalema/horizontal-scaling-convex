@@ -93,7 +93,6 @@ pub mod config;
 pub mod custom_headers;
 pub mod dashboard;
 pub mod deploy_config;
-pub mod deploy_config2;
 pub mod deployment_info;
 pub mod deployment_state;
 pub mod environment_variables;
@@ -124,7 +123,7 @@ pub mod two_phase_service;
 pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 
 #[derive(Clone)]
-pub struct LocalAppState {
+pub struct BackendAppState {
     // Origin for the server (e.g. http://127.0.0.1:3210, https://demo.convex.cloud)
     pub origin: ConvexOrigin,
     // Origin for the corresponding convex.site (where we serve HTTP) (e.g. http://127.0.0.1:8001, https://crazy-giraffe-123.convex.site)
@@ -147,7 +146,7 @@ pub struct LocalAppState {
         Option<tokio::sync::mpsc::UnboundedSender<database::raft_node::RaftMessage>>,
 }
 
-impl LocalAppState {
+impl BackendAppState {
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.application.shutdown().await?;
 
@@ -155,7 +154,7 @@ impl LocalAppState {
     }
 }
 
-// Contains state needed to serve most http routes. Similar to LocalAppState,
+// Contains state needed to serve most http routes. Similar to BackendAppState,
 // but uses ApplicationApi instead of Application, which allows it to be used
 // in both Backend and Usher.
 #[derive(Clone)]
@@ -183,8 +182,8 @@ pub struct DeployRouterState {
     pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
 }
 
-impl From<&LocalAppState> for DeployRouterState {
-    fn from(st: &LocalAppState) -> Self {
+impl From<&BackendAppState> for DeployRouterState {
+    fn from(st: &BackendAppState) -> Self {
         Self {
             instance_name: st.instance_name.clone(),
             instance_secret: st.instance_secret,
@@ -210,8 +209,8 @@ pub struct AdminRouterState {
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
 }
 
-impl From<&LocalAppState> for AdminRouterState {
-    fn from(st: &LocalAppState) -> Self {
+impl From<&BackendAppState> for AdminRouterState {
+    fn from(st: &BackendAppState) -> Self {
         Self {
             origin: st.origin.clone(),
             site_origin: st.site_origin.clone(),
@@ -225,8 +224,8 @@ impl From<&LocalAppState> for AdminRouterState {
     }
 }
 
-impl axum::extract::FromRef<LocalAppState> for AdminRouterState {
-    fn from_ref(st: &LocalAppState) -> Self {
+impl axum::extract::FromRef<BackendAppState> for AdminRouterState {
+    fn from_ref(st: &BackendAppState) -> Self {
         Self::from(st)
     }
 }
@@ -239,8 +238,8 @@ pub struct ActionCallbackRouterState {
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
 }
 
-impl From<&LocalAppState> for ActionCallbackRouterState {
-    fn from(st: &LocalAppState) -> Self {
+impl From<&BackendAppState> for ActionCallbackRouterState {
+    fn from(st: &BackendAppState) -> Self {
         Self {
             application: st.application.clone(),
             replica_mode: st.replica_mode,
@@ -258,8 +257,8 @@ pub struct ImportExportRouterState {
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
 }
 
-impl From<&LocalAppState> for ImportExportRouterState {
-    fn from(st: &LocalAppState) -> Self {
+impl From<&BackendAppState> for ImportExportRouterState {
+    fn from(st: &BackendAppState) -> Self {
         Self {
             application: st.application.clone(),
             replica_mode: st.replica_mode,
@@ -278,7 +277,7 @@ pub async fn make_app(
     persistence: Arc<dyn Persistence>,
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
-) -> anyhow::Result<LocalAppState> {
+) -> anyhow::Result<BackendAppState> {
     let key_broker = config.key_broker()?;
     let persistence_was_fresh = persistence.is_fresh();
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
@@ -868,7 +867,7 @@ pub async fn make_app(
                     peer_addresses.insert(id, normalized_grpc_addr.clone());
                     peer_grpc_urls.insert(id, normalized_grpc_addr);
                     if let Ok(origin) =
-                        crate::deploy_config2::http_origin_from_peer_addr(addr.trim())
+                        crate::deploy_config::http_origin_from_peer_addr(addr.trim())
                     {
                         peer_http_origins.insert(id, origin);
                     }
@@ -1000,7 +999,7 @@ pub async fn make_app(
         );
     }
 
-    let app_state = LocalAppState {
+    let app_state = BackendAppState {
         origin,
         site_origin: config.convex_site_url()?,
         instance_name,
