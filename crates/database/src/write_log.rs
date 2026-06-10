@@ -741,6 +741,16 @@ impl PendingWrites {
         }
     }
 
+    pub fn remove(
+        &mut self,
+        mut handle: PendingWriteHandle,
+    ) -> Option<(Timestamp, OrderedDocumentWrites, WriteSource, Snapshot)> {
+        let expected_ts = handle.0.take()?;
+        self.by_ts
+            .remove(&expected_ts)
+            .map(|(writes, write_source, snapshot)| (expected_ts, writes, write_source, snapshot))
+    }
+
     pub fn min_ts(&self) -> Option<Timestamp> {
         self.by_ts.first_key_value().map(|(ts, _)| *ts)
     }

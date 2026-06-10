@@ -902,6 +902,130 @@ async fn test_local_only_prepare_does_not_wait_for_remote_frontier(
 }
 
 #[convex_macro::test_runtime]
+async fn test_local_commit_retries_while_prepare_is_unresolved(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "prepared"))
+        .await?;
+    let final_tx = tx.finalize()?;
+    let txn_id = TwoPhaseTransactionId::new();
+    node.committer_for_test()
+        .prepare(
+            txn_id.clone(),
+            final_tx,
+            WriteSource::new("prepared_blocks_local_commit_test"),
+        )
+        .await?;
+
+    let err = insert_doc(
+        &node,
+        "messages",
+        assert_obj!("text" => "retry-after-prepare"),
+    )
+    .await
+    .expect_err("local commit should retry while a prepared transaction is unresolved");
+    assert!(
+        format!("{err:#}").contains("unresolved 2PC prepared transaction"),
+        "unexpected error: {err:#}",
+    );
+
+    node.committer_for_test().rollback_prepared(txn_id).await?;
+
+    insert_doc(&node, "messages", assert_obj!("text" => "after-rollback")).await?;
+
+    let messages = run_query(
+        node,
+        TableNamespace::root_component(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        messages.len(),
+        1,
+        "rolled-back prepared write should not become visible, and the committer should accept \
+         new writes after rollback",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_prepare_retries_while_local_commit_is_pending(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+
+    let hold_guard = pause.hold(AFTER_PENDING_WRITE_SNAPSHOT);
+    let node_for_commit = node.clone();
+    let local_commit = async move {
+        insert_doc(
+            &node_for_commit,
+            "messages",
+            assert_obj!("text" => "pending-local"),
+        )
+        .await
+    };
+
+    let node_for_prepare = node.clone();
+    let prepare_while_pending = async move {
+        let pause_guard = hold_guard.wait_for_blocked().await;
+
+        let mut tx = node_for_prepare.begin(Identity::system()).await?;
+        TestFacingModel::new(&mut tx)
+            .insert(&"messages".parse()?, assert_obj!("text" => "prepared"))
+            .await?;
+        let final_tx = tx.finalize()?;
+        let err = node_for_prepare
+            .committer_for_test()
+            .prepare(
+                TwoPhaseTransactionId::new(),
+                final_tx,
+                WriteSource::new("prepare_waits_for_pending_commit_test"),
+            )
+            .await
+            .expect_err("prepare should retry while an older local commit is pending");
+        assert!(
+            format!("{err:#}").contains("blocked by an unresolved pending write"),
+            "unexpected error: {err:#}",
+        );
+
+        if let Some(guard) = pause_guard {
+            guard.unpause();
+        }
+        anyhow::Ok(())
+    };
+
+    futures::try_join!(local_commit, prepare_while_pending)?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"messages".parse()?,
+            assert_obj!("text" => "prepared-after-publish"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let txn_id = TwoPhaseTransactionId::new();
+    node.committer_for_test()
+        .prepare(
+            txn_id.clone(),
+            final_tx,
+            WriteSource::new("prepare_after_pending_commit_test"),
+        )
+        .await?;
+    node.committer_for_test().rollback_prepared(txn_id).await?;
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_local_commit_waits_for_remote_frontier(rt: TestRuntime) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
     let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;

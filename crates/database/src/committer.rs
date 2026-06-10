@@ -1438,6 +1438,18 @@ impl<RT: Runtime> Committer<RT> {
                 prepare_ts: existing.commit_ts,
             });
         }
+        if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+            let metadata = ErrorMetadata::system_occ(
+                Some(u64::from(begin_ts)),
+                write_source.as_str().map(|source| source.to_string()),
+            );
+            anyhow::bail!(anyhow::anyhow!(metadata).context(format!(
+                "2PC Prepare for txn={} blocked by an unresolved pending write at ts={}; retry \
+                 after the pending write publishes",
+                transaction_id,
+                u64::from(min_pending_ts),
+            )));
+        }
 
         let commit_ts = if let Some(commit_ts) = explicit_commit_ts {
             anyhow::ensure!(
@@ -1536,6 +1548,17 @@ impl<RT: Runtime> Committer<RT> {
         write_source: WriteSource,
     ) -> anyhow::Result<ValidatedCommit> {
         self.ensure_leader_for_writes()?;
+        if !self.prepared_transactions.is_empty() {
+            let metadata = ErrorMetadata::system_occ(
+                Some(u64::from(*transaction.begin_timestamp)),
+                write_source.as_str().map(|source| source.to_string()),
+            );
+            anyhow::bail!(anyhow::anyhow!(metadata).context(format!(
+                "Commit blocked by {} unresolved 2PC prepared transaction(s); retry after the \
+                 prepared transaction commits or rolls back",
+                self.prepared_transactions.len(),
+            )));
+        }
 
         // Partition ownership check: verify that all authoritative writes for
         // this operation target tables owned by this node. Deploy metadata
@@ -2846,9 +2869,18 @@ impl<RT: Runtime> Committer<RT> {
             u64::from(prepared.commit_ts),
         );
 
-        // Remove from PendingWrites so it no longer blocks conflicting
-        // transactions. We pop it and discard.
-        self.pending_writes.pop_first(prepared.pending_write);
+        // Remove this exact prepared intent from PendingWrites so it no longer
+        // blocks conflicting transactions. Do not pop the FIFO head here: an
+        // older local commit may be pending ahead of this prepared transaction.
+        self.pending_writes
+            .remove(prepared.pending_write)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "2PC RollbackPrepared: pending write for txn={} at ts={} was missing",
+                    transaction_id,
+                    u64::from(prepared.commit_ts),
+                )
+            })?;
 
         Ok(())
     }
