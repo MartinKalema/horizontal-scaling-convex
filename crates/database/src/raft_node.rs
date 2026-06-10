@@ -14,7 +14,10 @@
 //!   - [raft-rs five_mem_node example](https://github.com/tikv/raft-rs/blob/master/examples/five_mem_node/main.rs)
 
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeSet,
+        HashMap,
+    },
     sync::Arc,
     time::{
         Duration,
@@ -69,7 +72,13 @@ pub struct RaftProposal {
     /// Serialized mutation data.
     pub data: Vec<u8>,
     /// Channel to notify the client when the proposal is committed.
-    pub result_tx: tokio::sync::oneshot::Sender<bool>,
+    pub result_tx: tokio::sync::oneshot::Sender<RaftProposalResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftProposalResult {
+    Committed { index: u64 },
+    Rejected,
 }
 
 /// Messages that can be sent to the Raft node.
@@ -78,6 +87,12 @@ pub enum RaftMessage {
     Raft(Message),
     /// A client proposal to be committed.
     Propose(RaftProposal),
+    /// Mark a live local proposal as durably applied to the Convex state
+    /// machine after the committer has installed it locally.
+    MarkApplied {
+        index: u64,
+        result_tx: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
     /// Shutdown the Raft node.
     Shutdown,
 }
@@ -115,7 +130,7 @@ pub struct RaftNode {
     /// Storage backend.
     pub(crate) storage: ConvexRaftStorage,
     /// Pending proposals waiting for commit (index → callback).
-    pending_proposals: HashMap<u64, tokio::sync::oneshot::Sender<bool>>,
+    pending_proposals: HashMap<u64, tokio::sync::oneshot::Sender<RaftProposalResult>>,
     /// Channel for receiving messages.
     mailbox: mpsc::UnboundedReceiver<RaftMessage>,
     /// Channels for sending Raft messages to other nodes.
@@ -127,6 +142,11 @@ pub struct RaftNode {
     is_leader_flag: bool,
     /// Leadership change callbacks.
     leadership_callbacks: LeadershipCallbacks,
+    /// Highest Raft log index durably applied to the local Convex state
+    /// machine.
+    durable_applied_index: u64,
+    /// Applied entries above `durable_applied_index` waiting for earlier gaps.
+    applied_indexes_pending_persistence: BTreeSet<u64>,
 }
 
 impl RaftNode {
@@ -152,13 +172,7 @@ impl RaftNode {
             snapshot_provider,
         )?;
 
-        // On restart, pick up where we left off (applied index from
-        // the persisted hard state's commit). This prevents raft-rs
-        // from re-applying already-committed entries.
-        let initial_state = storage
-            .initial_state()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let applied = initial_state.hard_state.get_commit();
+        let applied = storage.applied_index()?;
 
         let raft_config = Config {
             id: config.node_id,
@@ -184,7 +198,81 @@ impl RaftNode {
             config,
             is_leader_flag: false,
             leadership_callbacks: LeadershipCallbacks::default(),
+            durable_applied_index: applied,
+            applied_indexes_pending_persistence: BTreeSet::new(),
         })
+    }
+
+    fn record_applied_index(&mut self, index: u64) -> anyhow::Result<()> {
+        if index <= self.durable_applied_index {
+            return Ok(());
+        }
+        self.applied_indexes_pending_persistence.insert(index);
+
+        let mut next_applied = self.durable_applied_index;
+        while self
+            .applied_indexes_pending_persistence
+            .remove(&(next_applied + 1))
+        {
+            next_applied += 1;
+        }
+        if next_applied > self.durable_applied_index {
+            self.storage.set_applied_index(next_applied)?;
+            self.durable_applied_index = next_applied;
+        }
+        Ok(())
+    }
+
+    fn record_snapshot_applied_index(&mut self, index: u64) -> anyhow::Result<()> {
+        if index > self.durable_applied_index {
+            self.storage.set_applied_index(index)?;
+            self.durable_applied_index = index;
+        }
+        self.applied_indexes_pending_persistence
+            .retain(|pending_index| *pending_index > index);
+        Ok(())
+    }
+
+    fn process_committed_entry(
+        &mut self,
+        entry: Entry,
+        on_committed: &mut impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let index = entry.index;
+        if entry.data.is_empty() {
+            self.record_applied_index(index)?;
+            return Ok(None);
+        }
+
+        match entry.get_entry_type() {
+            EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
+                // Configuration change — apply to Raft membership.
+                let cc = ConfChange::default();
+                if let Ok(cs) = self.raw_node.apply_conf_change(&cc) {
+                    if let Err(e) = self.storage.set_conf_state(cs) {
+                        tracing::error!("Failed to persist conf state: {e}");
+                        return Err(e);
+                    }
+                }
+                self.record_applied_index(index)?;
+                Ok(None)
+            },
+            EntryType::EntryNormal => {
+                if let Some(tx) = self.pending_proposals.remove(&index) {
+                    if tx.send(RaftProposalResult::Committed { index }).is_ok() {
+                        return Ok(None);
+                    }
+                    tracing::warn!(
+                        "Local Raft proposal at index {index} was committed but waiter dropped; \
+                         applying through the Raft state-machine callback"
+                    );
+                }
+
+                on_committed(&entry.data)?;
+                self.record_applied_index(index)?;
+                Ok(Some(entry.data.to_vec()))
+            },
+        }
     }
 
     /// Run the Raft loop. This is the main event loop following TiKV's pattern:
@@ -211,14 +299,18 @@ impl RaftNode {
                             let index = self.raw_node.raft.raft_log.last_index() + 1;
                             if let Err(e) = self.raw_node.propose(vec![], proposal.data) {
                                 tracing::warn!("Raft propose error: {e}");
-                                let _ = proposal.result_tx.send(false);
+                                let _ = proposal.result_tx.send(RaftProposalResult::Rejected);
                             } else {
                                 self.pending_proposals.insert(index, proposal.result_tx);
                             }
                         } else {
                             // Not leader — reject.
-                            let _ = proposal.result_tx.send(false);
+                            let _ = proposal.result_tx.send(RaftProposalResult::Rejected);
                         }
+                    },
+                    Ok(RaftMessage::MarkApplied { index, result_tx }) => {
+                        let result = self.record_applied_index(index);
+                        let _ = result_tx.send(result);
                     },
                     Ok(RaftMessage::Shutdown) => {
                         tracing::info!("Raft node {} shutting down", self.config.node_id);
@@ -308,7 +400,7 @@ impl RaftNode {
                         self.is_leader_flag = false;
                         // Reject all pending proposals — we're no longer leader.
                         for (_, tx) in self.pending_proposals.drain() {
-                            let _ = tx.send(false);
+                            let _ = tx.send(RaftProposalResult::Rejected);
                         }
                         (self.leadership_callbacks.on_lost_leadership)();
                     }
@@ -359,17 +451,23 @@ impl RaftNode {
                     }
                 }
 
-                // 2. Persist and apply any incoming snapshot before appending entries.
+                // 2. Apply and persist any incoming snapshot before appending entries.
                 if !ready.snapshot().is_empty() {
                     let snapshot_timer = metrics::raft_snapshot_apply_timer();
                     let snapshot_bytes = ready.snapshot().get_data().len();
                     metrics::log_raft_snapshot_apply_bytes(snapshot_bytes);
-                    if let Err(e) = self.storage.apply_snapshot(ready.snapshot()) {
+                    if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
+                        tracing::error!("Failed to apply snapshot to state machine: {e}");
+                        drop(snapshot_timer);
+                        return Err(e);
+                    } else if let Err(e) = self.storage.apply_snapshot(ready.snapshot()) {
                         tracing::error!("Failed to persist snapshot: {e}");
                         drop(snapshot_timer);
                         return Err(e);
-                    } else if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
-                        tracing::error!("Failed to apply snapshot to state machine: {e}");
+                    } else if let Err(e) =
+                        self.record_snapshot_applied_index(ready.snapshot().get_metadata().index)
+                    {
+                        tracing::error!("Failed to persist snapshot applied index: {e}");
                         drop(snapshot_timer);
                         return Err(e);
                     } else {
@@ -410,36 +508,9 @@ impl RaftNode {
 
                 // 6. Apply committed entries to state machine.
                 for entry in ready.take_committed_entries() {
-                    if entry.data.is_empty() {
-                        // Raft internal entry (leader election, etc.)
-                        continue;
-                    }
-
-                    match entry.get_entry_type() {
-                        EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
-                            // Configuration change — apply to Raft membership.
-                            let cc = ConfChange::default();
-                            if let Ok(cs) = self.raw_node.apply_conf_change(&cc) {
-                                if let Err(e) = self.storage.set_conf_state(cs) {
-                                    tracing::error!("Failed to persist conf state: {e}");
-                                    return Err(e);
-                                }
-                            }
-                        },
-                        EntryType::EntryNormal => {
-                            // Normal entry — apply to state machine.
-                            if let Err(e) = on_committed(&entry.data) {
-                                tracing::error!("Failed to apply committed entry: {e}");
-                                return Err(e);
-                            }
-
-                            // Notify the proposer if this was our proposal.
-                            if self.raw_node.raft.state == StateRole::Leader {
-                                if let Some(tx) = self.pending_proposals.remove(&entry.index) {
-                                    let _ = tx.send(true);
-                                }
-                            }
-                        },
+                    if let Err(e) = self.process_committed_entry(entry, &mut on_committed) {
+                        tracing::error!("Failed to apply committed entry: {e}");
+                        return Err(e);
                     }
                 }
 
@@ -466,11 +537,9 @@ impl RaftNode {
 
                 // Apply remaining committed entries.
                 for entry in light_rd.take_committed_entries() {
-                    if !entry.data.is_empty() && entry.get_entry_type() == EntryType::EntryNormal {
-                        if let Err(e) = on_committed(&entry.data) {
-                            tracing::error!("Failed to apply light committed entry: {e}");
-                            return Err(e);
-                        }
+                    if let Err(e) = self.process_committed_entry(entry, &mut on_committed) {
+                        tracing::error!("Failed to apply light committed entry: {e}");
+                        return Err(e);
                     }
                 }
 
@@ -537,6 +606,7 @@ impl RaftNode {
 
         if !ready.snapshot().is_empty() {
             self.storage.apply_snapshot(ready.snapshot())?;
+            self.record_snapshot_applied_index(ready.snapshot().get_metadata().index)?;
         }
         if let Some(hs) = ready.hs() {
             self.storage
@@ -545,16 +615,14 @@ impl RaftNode {
             self.storage.append_entries(ready.entries())?;
         }
         for entry in ready.take_committed_entries() {
-            if !entry.data.is_empty() {
-                on_committed(&entry.data)?;
-                committed.push(entry.data.to_vec());
+            if let Some(data) = self.process_committed_entry(entry, &mut on_committed)? {
+                committed.push(data);
             }
         }
         let mut light_rd = self.raw_node.advance(ready);
         for entry in light_rd.take_committed_entries() {
-            if !entry.data.is_empty() {
-                on_committed(&entry.data)?;
-                committed.push(entry.data.to_vec());
+            if let Some(data) = self.process_committed_entry(entry, &mut on_committed)? {
+                committed.push(data);
             }
         }
         self.raw_node.advance_apply();
@@ -728,6 +796,49 @@ mod tests {
             node.raw_node.raft.raft_log.applied, applied_before,
             "failed state-machine apply must not advance the Raft applied index",
         );
+    }
+
+    #[tokio::test]
+    async fn test_restart_replays_committed_but_unapplied_entry() {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+        let engine = test_engine();
+
+        {
+            let storage =
+                ConvexRaftStorage::new(PartitionId(0), engine.clone(), 1, vec![1], None).unwrap();
+            let mut entry = Entry::default();
+            entry.set_index(1);
+            entry.set_term(1);
+            entry.set_data(b"committed but unapplied".to_vec().into());
+
+            let mut hs = HardState::default();
+            hs.set_term(1);
+            hs.set_commit(1);
+            storage.append_entries_and_hardstate(&[entry], &hs).unwrap();
+            assert_eq!(storage.applied_index().unwrap(), 0);
+        }
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
+        assert_eq!(
+            node.raw_node.raft.raft_log.applied, 0,
+            "restart must initialize applied from durable applied index, not HardState.commit",
+        );
+
+        let committed = node.process_ready_test();
+        assert!(
+            committed
+                .iter()
+                .any(|data| data == b"committed but unapplied"),
+            "committed-but-unapplied entry should replay after restart: {committed:?}",
+        );
+        assert_eq!(node.storage.applied_index().unwrap(), 1);
     }
 
     #[tokio::test]

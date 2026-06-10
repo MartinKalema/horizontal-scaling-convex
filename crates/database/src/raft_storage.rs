@@ -11,6 +11,7 @@
 //!   - Log entries via `add_entries` (raft-engine tracks first/last index)
 //!   - HardState via `put_message` (term, vote, commit)
 //!   - ConfState via `put_message` (voter/learner membership)
+//!   - Applied index via a small raw KV value (state-machine apply progress)
 //!
 //! Reference: [TiKV raft-engine](https://github.com/tikv/raft-engine)
 //! Reference: [PingCAP Blog](https://www.pingcap.com/blog/raft-engine-a-log-structured-embedded-storage-engine-for-multi-raft-logs-in-tikv/)
@@ -39,6 +40,8 @@ use crate::partition::PartitionId;
 const HARD_STATE_KEY: &[u8] = b"hard_state";
 /// Key for storing ConfState in raft-engine's KV space.
 const CONF_STATE_KEY: &[u8] = b"conf_state";
+/// Key for storing the highest Raft log index durably applied to Convex state.
+const APPLIED_INDEX_KEY: &[u8] = b"applied_index";
 /// Key for storing the latest installed/generated snapshot in raft-engine's KV
 /// space.
 const SNAPSHOT_KEY: &[u8] = b"snapshot";
@@ -233,6 +236,44 @@ impl ConvexRaftStorage {
         self.engine
             .write(&mut batch, true)
             .context("Failed to write entries+HardState to raft-engine")?;
+        Ok(())
+    }
+
+    /// Highest Raft log index durably applied to the Convex state machine.
+    ///
+    /// This intentionally differs from `HardState.commit`: commit means a
+    /// quorum accepted the log entry; applied means this local replica
+    /// installed it.
+    pub fn applied_index(&self) -> anyhow::Result<u64> {
+        if let Some(raw) = self.engine.get(self.region_id(), APPLIED_INDEX_KEY) {
+            let bytes: [u8; 8] = raw
+                .as_slice()
+                .try_into()
+                .with_context(|| format!("Invalid Raft applied index value: {raw:?}"))?;
+            return Ok(u64::from_be_bytes(bytes));
+        }
+        // Backward compatibility for snapshots created before the applied-index
+        // key existed: an installed snapshot implies the state machine is applied
+        // through the snapshot metadata index.
+        Ok(self
+            .snapshot_metadata()?
+            .map(|metadata| metadata.index)
+            .unwrap_or(0))
+    }
+
+    pub fn set_applied_index(&self, index: u64) -> anyhow::Result<()> {
+        self.check_fail_next_write_for_test()?;
+        let mut batch = LogBatch::default();
+        batch
+            .put(
+                self.region_id(),
+                APPLIED_INDEX_KEY.to_vec(),
+                index.to_be_bytes().to_vec(),
+            )
+            .context("Failed to add applied index to LogBatch")?;
+        self.engine
+            .write(&mut batch, true)
+            .context("Failed to write applied index to raft-engine")?;
         Ok(())
     }
 
@@ -431,12 +472,11 @@ impl Storage for ConvexRaftStorage {
             ));
         };
 
-        let hard_state = self.hard_state().map_err(|e| {
+        let snapshot_index = self.applied_index().map_err(|e| {
             raft::Error::Store(StorageError::Other(Box::new(std::io::Error::other(
                 e.to_string(),
             ))))
         })?;
-        let snapshot_index = hard_state.commit;
         if snapshot_index == 0 {
             return Err(raft::Error::Store(
                 StorageError::SnapshotTemporarilyUnavailable,
@@ -513,6 +553,16 @@ mod tests {
         assert_eq!(retrieved.get_term(), 5);
         assert_eq!(retrieved.get_vote(), 2);
         assert_eq!(retrieved.get_commit(), 10);
+    }
+
+    #[test]
+    fn test_applied_index_persistence() {
+        let engine = test_engine();
+        let storage = ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1], None).unwrap();
+
+        assert_eq!(storage.applied_index().unwrap(), 0);
+        storage.set_applied_index(7).unwrap();
+        assert_eq!(storage.applied_index().unwrap(), 7);
     }
 
     #[test]
@@ -598,6 +648,11 @@ mod tests {
             hs.set_commit(5);
             storage.set_hardstate(&hs).unwrap();
 
+            assert!(
+                storage.snapshot(5, 2).is_err(),
+                "snapshot must not use commit index before applied index is persisted",
+            );
+            storage.set_applied_index(5).unwrap();
             let snapshot = storage.snapshot(5, 2).unwrap();
             assert_eq!(snapshot.get_metadata().index, 5);
             assert_eq!(snapshot.get_metadata().term, 2);

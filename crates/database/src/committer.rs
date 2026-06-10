@@ -152,6 +152,7 @@ use crate::{
         table_summary_finish_bootstrap_timer,
         user_documents_size_subgauge,
     },
+    raft_node::RaftProposalResult,
     reads::ReadSet,
     search_index_bootstrap::{
         stream_revision_pairs_for_indexes,
@@ -205,6 +206,7 @@ enum PersistenceWrite {
         parent_trace: EncodedSpan,
         commit_id: usize,
         delta: CommitDelta,
+        raft_applied_index: Option<u64>,
     },
     RejectedBeforePersistence {
         pending_write: PendingWriteHandle,
@@ -360,11 +362,12 @@ fn checkpoint_index_entries(
     index_entries
 }
 
-type RaftCommitWaiter = Option<oneshot::Receiver<bool>>;
+type RaftCommitWaiter = Option<oneshot::Receiver<RaftProposalResult>>;
 
 struct PublishedCommit {
     commit_ts: Timestamp,
     delta: CommitDelta,
+    raft_applied_index: Option<u64>,
 }
 
 pub struct Committer<RT: Runtime> {
@@ -625,6 +628,7 @@ impl<RT: Runtime> Committer<RT> {
                             result,
                             parent_trace,
                             delta,
+                            raft_applied_index,
                             ..
                         } => {
                             let parent_span = initialize_root_from_parent("Committer::publish_commit", parent_trace);
@@ -646,6 +650,29 @@ impl<RT: Runtime> Committer<RT> {
                                 },
                             };
                             drop(_guard);
+                            if let Some(raft_applied_index) = raft_applied_index {
+                                let Some(raft_state) = self.raft_state.as_ref() else {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "mark Raft applied index",
+                                        anyhow::anyhow!(
+                                            "commit returned Raft applied index {} without Raft state",
+                                            raft_applied_index,
+                                        ),
+                                    );
+                                };
+                                if let Err(err) =
+                                    raft_state.mark_applied(raft_applied_index).await
+                                {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "mark Raft applied index",
+                                        err,
+                                    );
+                                }
+                            }
                             if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta,
@@ -942,6 +969,29 @@ impl<RT: Runtime> Committer<RT> {
                                 },
                             };
                             let commit_ts = published_commit.commit_ts;
+                            if let Some(raft_applied_index) = published_commit.raft_applied_index {
+                                let Some(raft_state) = self.raft_state.as_ref() else {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "mark Raft applied index for prepared write",
+                                        anyhow::anyhow!(
+                                            "prepared commit returned Raft applied index {} without Raft state",
+                                            raft_applied_index,
+                                        ),
+                                    );
+                                };
+                                if let Err(err) =
+                                    raft_state.mark_applied(raft_applied_index).await
+                                {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "mark Raft applied index for prepared write",
+                                        err,
+                                    );
+                                }
+                            }
                             if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta,
@@ -1792,13 +1842,13 @@ impl<RT: Runtime> Committer<RT> {
     async fn wait_for_raft_commit(
         raft_commit_waiter: RaftCommitWaiter,
         commit_ts: Timestamp,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<u64>> {
         let Some(raft_commit_waiter) = raft_commit_waiter else {
-            return Ok(());
+            return Ok(None);
         };
         match raft_commit_waiter.await {
-            Ok(true) => Ok(()),
-            Ok(false) => anyhow::bail!(
+            Ok(RaftProposalResult::Committed { index }) => Ok(Some(index)),
+            Ok(RaftProposalResult::Rejected) => anyhow::bail!(
                 "Raft rejected commit at ts={} before quorum commit",
                 u64::from(commit_ts),
             ),
@@ -2026,7 +2076,11 @@ impl<RT: Runtime> Committer<RT> {
         drop(snapshot_manager);
 
         apply_timer.finish();
-        Ok(PublishedCommit { commit_ts, delta })
+        Ok(PublishedCommit {
+            commit_ts,
+            delta,
+            raft_applied_index: None,
+        })
     }
 
     fn install_snapshot(
@@ -2995,7 +3049,7 @@ impl<RT: Runtime> Committer<RT> {
             source_partition,
         );
         let raft_commit_waiter = self.propose_commit_to_raft(&delta)?;
-        block_in_place(|| {
+        let raft_applied_index = block_in_place(|| {
             let wait_future = Self::wait_for_raft_commit(raft_commit_waiter, commit_ts);
             let rt = tokio::runtime::Handle::current();
             if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
@@ -3046,7 +3100,15 @@ impl<RT: Runtime> Committer<RT> {
         );
 
         // Publish commit — makes writes visible to reads.
-        self.publish_commit_from_updates(commit_ts, ordered_updates, write_source, snapshot, delta)
+        let mut published_commit = self.publish_commit_from_updates(
+            commit_ts,
+            ordered_updates,
+            write_source,
+            snapshot,
+            delta,
+        )?;
+        published_commit.raft_applied_index = raft_applied_index;
+        Ok(published_commit)
     }
 
     /// Rollback a previously prepared transaction: remove from PendingWrites.
@@ -3218,16 +3280,19 @@ impl<RT: Runtime> Committer<RT> {
         let rt = self.runtime.clone();
         Some(
             async move {
-                if let Err(err) = Self::wait_for_raft_commit(raft_commit_waiter, commit_ts).await {
-                    return Ok(PersistenceWrite::RejectedBeforePersistence {
-                        pending_write,
-                        commit_timer,
-                        result,
-                        commit_id,
-                        err,
-                    });
-                }
-
+                let raft_applied_index =
+                    match Self::wait_for_raft_commit(raft_commit_waiter, commit_ts).await {
+                        Ok(index) => index,
+                        Err(err) => {
+                            return Ok(PersistenceWrite::RejectedBeforePersistence {
+                                pending_write,
+                                commit_timer,
+                                result,
+                                commit_id,
+                                err,
+                            });
+                        },
+                    };
                 let mut backoff = Backoff::new(
                     INITIAL_PERSISTENCE_WRITES_BACKOFF,
                     MAX_PERSISTENCE_WRITES_BACKOFF,
@@ -3265,6 +3330,7 @@ impl<RT: Runtime> Committer<RT> {
                             parent_trace: parent_trace_copy,
                             commit_id,
                             delta,
+                            raft_applied_index,
                         });
                     }
                 }
@@ -4081,19 +4147,23 @@ mod tests {
         is_retryable_system_generated_id_conflict,
         Committer,
     };
+    use crate::raft_node::RaftProposalResult;
 
     #[tokio::test]
     async fn raft_commit_waiter_accepts_committed_proposal() -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        tx.send(true).unwrap();
+        tx.send(RaftProposalResult::Committed { index: 7 }).unwrap();
 
-        Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1)).await
+        let applied_index =
+            Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1)).await?;
+        assert_eq!(applied_index, Some(7));
+        Ok(())
     }
 
     #[tokio::test]
     async fn raft_commit_waiter_rejects_failed_proposal() {
         let (tx, rx) = oneshot::channel();
-        tx.send(false).unwrap();
+        tx.send(RaftProposalResult::Rejected).unwrap();
 
         let err = Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1))
             .await
@@ -4103,7 +4173,10 @@ mod tests {
 
     #[tokio::test]
     async fn raft_commit_waiter_allows_non_raft_commit() -> anyhow::Result<()> {
-        Committer::<TestRuntime>::wait_for_raft_commit(None, Timestamp::must(1)).await
+        let applied_index =
+            Committer::<TestRuntime>::wait_for_raft_commit(None, Timestamp::must(1)).await?;
+        assert_eq!(applied_index, None);
+        Ok(())
     }
 
     #[test]
