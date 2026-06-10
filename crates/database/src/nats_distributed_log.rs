@@ -53,6 +53,14 @@ const SUBJECT_BASE: &str = "convex.commits";
 const SYSTEM_TABLE_SUBJECT: &str = "convex.commits.system";
 const FRONTIER_HEARTBEAT_SUBJECT: &str = "convex.commits.frontier_heartbeat";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetentionGap {
+    expected_stream_sequence: u64,
+    first_retained_sequence: u64,
+    ack_floor_stream_sequence: u64,
+    delivered_stream_sequence: u64,
+}
+
 /// Configuration for connecting to NATS.
 #[derive(Clone, Debug)]
 pub struct NatsConfig {
@@ -77,6 +85,33 @@ pub struct NatsDistributedLog {
 }
 
 impl NatsDistributedLog {
+    fn retention_gap(
+        stream_messages: u64,
+        first_retained_sequence: u64,
+        ack_floor_stream_sequence: u64,
+        delivered_stream_sequence: u64,
+        from_ts: Timestamp,
+    ) -> Option<RetentionGap> {
+        if stream_messages == 0 || first_retained_sequence == 0 {
+            return None;
+        }
+        let expected_stream_sequence = if ack_floor_stream_sequence > 0 {
+            ack_floor_stream_sequence.saturating_add(1)
+        } else if delivered_stream_sequence > 0 || u64::from(from_ts) == 0 {
+            1
+        } else {
+            // A checkpointed consumer without durable sequence state cannot
+            // prove continuity from JetStream sequence numbers alone.
+            return None;
+        };
+        (expected_stream_sequence < first_retained_sequence).then_some(RetentionGap {
+            expected_stream_sequence,
+            first_retained_sequence,
+            ack_floor_stream_sequence,
+            delivered_stream_sequence,
+        })
+    }
+
     fn partition_subject(partition: PartitionId) -> String {
         format!("{SUBJECT_BASE}.{}", partition.0)
     }
@@ -124,13 +159,39 @@ impl NatsDistributedLog {
             .await
             .context("Failed to get NATS consumer info")?
             .clone();
+        let from_ts_u64 = u64::from(from_ts);
+        let mut stream = self.stream.clone();
+        let stream_info = stream
+            .info()
+            .await
+            .context("Failed to get NATS stream info for retention-gap check")?
+            .clone();
+        if let Some(gap) = Self::retention_gap(
+            stream_info.state.messages,
+            stream_info.state.first_sequence,
+            consumer_info.ack_floor.stream_sequence,
+            consumer_info.delivered.stream_sequence,
+            from_ts,
+        ) {
+            metrics::log_replication_transport_retention_gap();
+            anyhow::bail!(
+                "NATS replication stream retention gap for consumer '{}': next required stream \
+                 sequence {} is older than first retained sequence {} (ack_floor={}, \
+                 delivered={}, from_ts={}). Rebootstrap from checkpoint before serving.",
+                consumer_name,
+                gap.expected_stream_sequence,
+                gap.first_retained_sequence,
+                gap.ack_floor_stream_sequence,
+                gap.delivered_stream_sequence,
+                from_ts_u64,
+            );
+        }
         metrics::log_replication_transport_pending_messages(consumer_info.num_pending);
         metrics::log_replication_transport_stream_sequence(consumer_info.delivered.stream_sequence);
         metrics::log_replication_transport_consumer_sequence(
             consumer_info.delivered.consumer_sequence,
         );
 
-        let from_ts_u64 = u64::from(from_ts);
         let messages = consumer
             .messages()
             .await
@@ -643,6 +704,61 @@ mod tests {
         let mut no_source = heartbeat.clone();
         no_source.source_partition = None;
         assert!(!NatsDistributedLog::is_frontier_heartbeat_delta(&no_source));
+        Ok(())
+    }
+
+    #[test]
+    fn retention_gap_detects_ack_floor_behind_first_retained() -> anyhow::Result<()> {
+        assert_eq!(
+            NatsDistributedLog::retention_gap(10, 100, 98, 98, Timestamp::try_from(0u64)?,),
+            Some(super::RetentionGap {
+                expected_stream_sequence: 99,
+                first_retained_sequence: 100,
+                ack_floor_stream_sequence: 98,
+                delivered_stream_sequence: 98,
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_gap_detects_fresh_from_beginning_after_retention() -> anyhow::Result<()> {
+        assert_eq!(
+            NatsDistributedLog::retention_gap(10, 2, 0, 0, Timestamp::try_from(0u64)?),
+            Some(super::RetentionGap {
+                expected_stream_sequence: 1,
+                first_retained_sequence: 2,
+                ack_floor_stream_sequence: 0,
+                delivered_stream_sequence: 0,
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_gap_allows_contiguous_resume() -> anyhow::Result<()> {
+        assert_eq!(
+            NatsDistributedLog::retention_gap(10, 99, 98, 98, Timestamp::try_from(0u64)?,),
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_gap_allows_empty_stream() -> anyhow::Result<()> {
+        assert_eq!(
+            NatsDistributedLog::retention_gap(0, 0, 0, 0, Timestamp::try_from(0u64)?),
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_gap_allows_checkpointed_consumer_without_sequence() -> anyhow::Result<()> {
+        assert_eq!(
+            NatsDistributedLog::retention_gap(10, 100, 0, 0, Timestamp::try_from(42u64)?),
+            None,
+        );
         Ok(())
     }
 }

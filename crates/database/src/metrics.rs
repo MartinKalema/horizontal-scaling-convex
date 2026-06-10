@@ -546,6 +546,14 @@ pub fn log_replication_transport_consumer_sequence(sequence: u64) {
     );
 }
 
+register_convex_counter!(
+    DATABASE_REPLICATION_TRANSPORT_RETENTION_GAPS_TOTAL,
+    "Number of replication consumers stopped because JetStream retention removed required deltas"
+);
+pub fn log_replication_transport_retention_gap() {
+    log_counter(&DATABASE_REPLICATION_TRANSPORT_RETENTION_GAPS_TOTAL, 1);
+}
+
 register_convex_histogram!(
     DOCUMENTS_SIZE_BYTES,
     "Total size of documents in user tables in bytes"
