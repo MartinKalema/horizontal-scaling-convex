@@ -557,6 +557,7 @@ pub fn router(st: BackendAppState) -> Router {
                 st.node_addresses.clone(),
                 st.raft_state.clone(),
                 st.raft_peer_grpc_urls.clone(),
+                st.cluster_grpc_auth.clone(),
             ),
         ),
         database: st.application.database().clone(),
@@ -566,6 +567,7 @@ pub fn router(st: BackendAppState) -> Router {
         node_addresses: st.node_addresses.clone(),
         raft_state: st.raft_state.clone(),
         raft_peer_grpc_urls: st.raft_peer_grpc_urls.clone(),
+        cluster_grpc_auth: st.cluster_grpc_auth.clone(),
         replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
     };
 

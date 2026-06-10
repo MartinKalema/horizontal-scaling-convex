@@ -40,6 +40,7 @@ What is implemented today:
 - NATS JetStream commit-delta replication;
 - idempotent replica delta apply and retention-gap detection;
 - bounded remote-read frontier waits;
+- shared-secret authentication for internal cluster gRPC calls;
 - route authority checks that fail closed for unsafe clustered routes;
 - write-owner mutation routing so clients do not have to hand-route simple writes;
 - selective-delivery groundwork for reducing replication fanout;
@@ -47,7 +48,6 @@ What is implemented today:
 
 Important work still remains:
 
-- authenticate internal cluster gRPC traffic;
 - make Raft the single visible apply point for partition commits;
 - replicate full intra-partition state needed for failover;
 - harden 2PC prepare durability, rollback, and decision retention;
@@ -228,6 +228,7 @@ npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 | `NUM_PARTITIONS` | Number of table partitions | `2` |
 | `NATS_URL` | NATS JetStream connection | `nats://nats:4222` |
 | `NODE_ADDRESSES` | Partition owner gRPC addresses for forwarding and 2PC | `0=node-a:50051,1=node-b:50051` |
+| `INSTANCE_SECRET` / `SHARED_INSTANCE_SECRET_PATH` | Shared deployment secret; also derives the internal cluster gRPC auth token | `$(cat /run/secrets/convex_instance_secret)` |
 | `INSTANCE_NAME` | Unique node identifier | `convex-node-a` |
 | `REPLICATION_MODE` | Node role for primary/replica mode | `primary` |
 | `REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL_MS` | Idle heartbeat interval for remote-read frontier progress | `1000` |

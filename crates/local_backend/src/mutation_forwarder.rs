@@ -18,6 +18,7 @@ use application::{
     RedactedQueryReturn,
 };
 use common::{
+    grpc::ClusterGrpcAuth,
     http::RequestDestination,
     types::FunctionCaller,
     version::ClientVersion,
@@ -55,15 +56,31 @@ use value::JsonPackedValue;
 pub struct MutationForwarderService {
     api: Arc<dyn ApplicationApi>,
     instance_name: String,
+    cluster_auth: Option<ClusterGrpcAuth>,
 }
 
 impl MutationForwarderService {
-    pub fn new(api: Arc<dyn ApplicationApi>, instance_name: String) -> Self {
-        Self { api, instance_name }
+    pub fn new(
+        api: Arc<dyn ApplicationApi>,
+        instance_name: String,
+        cluster_auth: Option<ClusterGrpcAuth>,
+    ) -> Self {
+        Self {
+            api,
+            instance_name,
+            cluster_auth,
+        }
     }
 
     pub fn into_server(self) -> TonicMutationForwarderServer<Self> {
         TonicMutationForwarderServer::new(self)
+    }
+
+    fn authenticate<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if let Some(auth) = &self.cluster_auth {
+            auth.authenticate(request)?;
+        }
+        Ok(())
     }
 }
 
@@ -73,6 +90,7 @@ impl MutationForwarder for MutationForwarderService {
         &self,
         request: Request<ForwardMutationRequest>,
     ) -> Result<Response<ForwardMutationResponse>, Status> {
+        self.authenticate(&request)?;
         let req = request.into_inner();
 
         let identity = req
@@ -153,6 +171,7 @@ impl MutationForwarder for MutationForwarderService {
         &self,
         request: Request<ForwardQueryRequest>,
     ) -> Result<Response<ForwardQueryResponse>, Status> {
+        self.authenticate(&request)?;
         let req = request.into_inner();
 
         let identity = req
@@ -244,11 +263,26 @@ impl MutationForwarder for MutationForwarderService {
 /// gRPC client for forwarding mutations from Replica to Primary.
 pub struct MutationForwarderGrpcClient {
     client: TonicMutationForwarderClient<Channel>,
+    cluster_auth: Option<ClusterGrpcAuth>,
 }
 
 impl MutationForwarderGrpcClient {
     /// Connect to the Primary's gRPC mutation forwarding service.
     pub async fn connect(primary_url: &str) -> anyhow::Result<Self> {
+        Self::connect_inner(primary_url, None).await
+    }
+
+    pub async fn connect_with_auth(
+        primary_url: &str,
+        cluster_auth: ClusterGrpcAuth,
+    ) -> anyhow::Result<Self> {
+        Self::connect_inner(primary_url, Some(cluster_auth)).await
+    }
+
+    async fn connect_inner(
+        primary_url: &str,
+        cluster_auth: Option<ClusterGrpcAuth>,
+    ) -> anyhow::Result<Self> {
         let normalized_url = if primary_url.contains("://") {
             primary_url.to_string()
         } else {
@@ -258,7 +292,17 @@ impl MutationForwarderGrpcClient {
             .await
             .with_context(|| format!("Failed to connect to Primary at {normalized_url}"))?;
         tracing::info!("Connected to Primary mutation forwarder at {normalized_url}");
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            cluster_auth,
+        })
+    }
+
+    fn request<T>(&self, message: T) -> Request<T> {
+        match &self.cluster_auth {
+            Some(auth) => auth.request(message),
+            None => Request::new(message),
+        }
     }
 
     /// Forward a mutation to the Primary and return the result.
@@ -281,7 +325,7 @@ impl MutationForwarderGrpcClient {
         let response = self
             .client
             .clone()
-            .forward_mutation(Request::new(request))
+            .forward_mutation(self.request(request))
             .await
             .context("gRPC mutation forwarding failed")?;
         Ok(response.into_inner())
@@ -308,7 +352,7 @@ impl MutationForwarderGrpcClient {
         let response = self
             .client
             .clone()
-            .forward_query(Request::new(request))
+            .forward_query(self.request(request))
             .await
             .context("gRPC query forwarding failed")?;
         let response = response.into_inner();

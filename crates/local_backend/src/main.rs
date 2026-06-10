@@ -140,17 +140,23 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
         let grpc_addr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
         let api: std::sync::Arc<dyn application::api::ApplicationApi> =
             std::sync::Arc::new(st.application.clone());
-        let forwarder = MutationForwarderService::new(api, st.instance_name.clone());
+        let cluster_grpc_auth = st.cluster_grpc_auth.clone();
+        let forwarder =
+            MutationForwarderService::new(api, st.instance_name.clone(), cluster_grpc_auth.clone());
         let two_pc = two_phase_service::TwoPhaseCommitGrpcService::new(
             st.application.database().committer_client(),
             st.raft_state.clone(),
             st.raft_peer_grpc_urls.clone(),
             st.placement_metadata_store.clone(),
+            cluster_grpc_auth.clone(),
         );
 
         // Add Raft transport server if Raft is enabled.
         let raft_transport = st.raft_mailbox_tx.as_ref().map(|mailbox_tx| {
-            database::raft_transport::RaftTransportServer::new(mailbox_tx.clone())
+            database::raft_transport::RaftTransportServer::new(
+                mailbox_tx.clone(),
+                cluster_grpc_auth.clone(),
+            )
         });
 
         let mut grpc_shutdown_rx = shutdown_rx.clone();

@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use common::{
     bootstrap_model::index::database_index::IndexedFields,
     document::DocumentUpdateWithPrevTs,
+    grpc::ClusterGrpcAuth,
     interval::IntervalSet,
     query::FilterValue,
     types::{
@@ -787,10 +788,25 @@ fn text_query_term_to_proto(value: TextQueryTerm) -> searchlight::TextQueryTerm 
 /// gRPC client for reaching remote partitions' 2PC service.
 pub struct TwoPhaseCommitGrpcClient {
     client: TonicTwoPcClient<Channel>,
+    cluster_auth: Option<ClusterGrpcAuth>,
 }
 
 impl TwoPhaseCommitGrpcClient {
     pub async fn connect(addr: &str) -> anyhow::Result<Self> {
+        Self::connect_inner(addr, None).await
+    }
+
+    pub async fn connect_with_auth(
+        addr: &str,
+        cluster_auth: ClusterGrpcAuth,
+    ) -> anyhow::Result<Self> {
+        Self::connect_inner(addr, Some(cluster_auth)).await
+    }
+
+    async fn connect_inner(
+        addr: &str,
+        cluster_auth: Option<ClusterGrpcAuth>,
+    ) -> anyhow::Result<Self> {
         let normalized_addr = if addr.contains("://") {
             addr.to_string()
         } else {
@@ -799,7 +815,17 @@ impl TwoPhaseCommitGrpcClient {
         let client = TonicTwoPcClient::connect(normalized_addr.clone())
             .await
             .with_context(|| format!("Failed to connect to 2PC service at {normalized_addr}"))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            cluster_auth,
+        })
+    }
+
+    fn request<T>(&self, message: T) -> Request<T> {
+        match &self.cluster_auth {
+            Some(auth) => auth.request(message),
+            None => Request::new(message),
+        }
     }
 
     pub async fn prepare(
@@ -820,7 +846,7 @@ impl TwoPhaseCommitGrpcClient {
         let response = self
             .client
             .clone()
-            .prepare(Request::new(request))
+            .prepare(self.request(request))
             .await
             .context("gRPC Prepare failed")?;
         let TwoPcPrepareResponse { prepare_ts } = response.into_inner();
@@ -839,7 +865,7 @@ impl TwoPhaseCommitGrpcClient {
         let response = self
             .client
             .clone()
-            .commit_prepared(Request::new(request))
+            .commit_prepared(self.request(request))
             .await
             .context("gRPC CommitPrepared failed")?;
         Ok(response.into_inner().commit_ts)
@@ -854,7 +880,7 @@ impl TwoPhaseCommitGrpcClient {
         };
         self.client
             .clone()
-            .rollback_prepared(Request::new(request))
+            .rollback_prepared(self.request(request))
             .await
             .context("gRPC RollbackPrepared failed")?;
         Ok(())

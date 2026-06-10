@@ -233,6 +233,7 @@ async fn create_node_with_persistence_and_table_number_allocator(
         partition_map,
         node_addresses,
         two_phase_decision_log,
+        None,
         timestamp_oracle,
         table_number_allocator,
         None,

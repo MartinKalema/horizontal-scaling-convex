@@ -139,6 +139,7 @@ pub struct BackendAppState {
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
     pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
     pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+    pub cluster_grpc_auth: Option<common::grpc::ClusterGrpcAuth>,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
     pub placement_metadata_store: Option<Arc<dyn database::partition::PlacementMetadataStore>>,
     /// Raft partition mailbox for receiving Raft messages from peers.
@@ -168,6 +169,7 @@ pub struct RouterState {
     pub node_addresses: Option<database::two_phase::NodeAddresses>,
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
     pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+    pub cluster_grpc_auth: Option<common::grpc::ClusterGrpcAuth>,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
 }
 
@@ -357,10 +359,18 @@ pub async fn make_app(
             Arc::new(database::two_phase::NoopTwoPhaseDecisionLog)
         };
 
+    let instance_secret = config.secret()?;
+    let cluster_grpc_auth =
+        common::grpc::ClusterGrpcAuth::from_shared_secret(instance_secret.as_bytes())?;
+
     let replica_mutation_forwarder = if config.replication_mode == "replica" {
         match config.primary_grpc_url.as_deref() {
             Some(primary_grpc_url) => Some(Arc::new(
-                mutation_forwarder::MutationForwarderGrpcClient::connect(primary_grpc_url).await?,
+                mutation_forwarder::MutationForwarderGrpcClient::connect_with_auth(
+                    primary_grpc_url,
+                    cluster_grpc_auth.clone(),
+                )
+                .await?,
             )),
             None => None,
         }
@@ -406,6 +416,7 @@ pub async fn make_app(
             .as_deref()
             .map(database::two_phase::NodeAddresses::from_config),
         two_phase_decision_log,
+        Some(cluster_grpc_auth.clone()),
         timestamp_oracle,
         table_number_allocator,
         None, // raft_state: set after Raft node starts, not during Database::load
@@ -592,7 +603,6 @@ pub async fn make_app(
 
     let origin = config.convex_origin_url()?;
     let instance_name = config.name();
-    let instance_secret = config.secret()?;
     let partition_id = config.partition_id.map(database::partition::PartitionId);
     let node_addresses = config
         .node_addresses
@@ -944,8 +954,11 @@ pub async fn make_app(
         let raft_engine = ConvexRaftStorage::open_engine(raft_engine_path)?;
 
         // Create transport channels for peer communication.
-        let (peer_senders, transport_clients) =
-            raft_transport::create_transport(&peer_addresses, raft_node_id);
+        let (peer_senders, transport_clients) = raft_transport::create_transport(
+            &peer_addresses,
+            raft_node_id,
+            Some(cluster_grpc_auth.clone()),
+        );
 
         let snapshot_provider = {
             let database = database.clone();
@@ -1075,6 +1088,7 @@ pub async fn make_app(
         replica_mutation_forwarder,
         placement_metadata_store,
         raft_mailbox_tx,
+        cluster_grpc_auth: Some(cluster_grpc_auth),
     };
 
     Ok(app_state)

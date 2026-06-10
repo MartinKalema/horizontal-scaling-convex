@@ -18,6 +18,8 @@
 use std::collections::HashMap;
 
 use anyhow::Context;
+use common::grpc::ClusterGrpcAuth;
+use pb::replication::RaftMessageBatch;
 use raft::prelude::Message;
 use tokio::sync::mpsc;
 
@@ -47,13 +49,26 @@ pub struct RaftTransportClient {
     address: String,
     /// Receiver for outgoing messages to this peer.
     outgoing_rx: mpsc::UnboundedReceiver<Message>,
+    cluster_auth: Option<ClusterGrpcAuth>,
 }
 
 impl RaftTransportClient {
-    pub fn new(address: String, outgoing_rx: mpsc::UnboundedReceiver<Message>) -> Self {
+    pub fn new(
+        address: String,
+        outgoing_rx: mpsc::UnboundedReceiver<Message>,
+        cluster_auth: Option<ClusterGrpcAuth>,
+    ) -> Self {
         Self {
             address,
             outgoing_rx,
+            cluster_auth,
+        }
+    }
+
+    fn request(&self, batch: RaftMessageBatch) -> tonic::Request<RaftMessageBatch> {
+        match &self.cluster_auth {
+            Some(auth) => auth.request(batch),
+            None => tonic::Request::new(batch),
         }
     }
 
@@ -115,7 +130,7 @@ impl RaftTransportClient {
                 batch.push(encode_raft_message(&msg));
             }
 
-            let request = tonic::Request::new(RaftMessageBatch { messages: batch });
+            let request = self.request(RaftMessageBatch { messages: batch });
 
             if let Err(e) = client.send_messages(request).await {
                 tracing::warn!(
@@ -149,11 +164,18 @@ impl RaftTransportClient {
 pub struct RaftTransportServer {
     /// Mailbox to forward received messages to the local Raft node.
     mailbox_tx: mpsc::UnboundedSender<RaftMessage>,
+    cluster_auth: Option<ClusterGrpcAuth>,
 }
 
 impl RaftTransportServer {
-    pub fn new(mailbox_tx: mpsc::UnboundedSender<RaftMessage>) -> Self {
-        Self { mailbox_tx }
+    pub fn new(
+        mailbox_tx: mpsc::UnboundedSender<RaftMessage>,
+        cluster_auth: Option<ClusterGrpcAuth>,
+    ) -> Self {
+        Self {
+            mailbox_tx,
+            cluster_auth,
+        }
     }
 
     pub fn into_service(
@@ -169,6 +191,9 @@ impl pb::replication::raft_transport_service_server::RaftTransportService for Ra
         &self,
         request: tonic::Request<pb::replication::RaftMessageBatch>,
     ) -> Result<tonic::Response<pb::replication::RaftMessageResponse>, tonic::Status> {
+        if let Some(auth) = &self.cluster_auth {
+            auth.authenticate(&request)?;
+        }
         let batch = request.into_inner();
 
         for data in batch.messages {
@@ -200,6 +225,7 @@ impl pb::replication::raft_transport_service_server::RaftTransportService for Ra
 pub fn create_transport(
     peer_addresses: &HashMap<u64, String>,
     local_node_id: u64,
+    cluster_auth: Option<ClusterGrpcAuth>,
 ) -> (
     HashMap<u64, mpsc::UnboundedSender<Message>>,
     Vec<RaftTransportClient>,
@@ -213,7 +239,11 @@ pub fn create_transport(
         }
         let (tx, rx) = mpsc::unbounded_channel();
         peer_senders.insert(peer_id, tx);
-        clients.push(RaftTransportClient::new(address.clone(), rx));
+        clients.push(RaftTransportClient::new(
+            address.clone(),
+            rx,
+            cluster_auth.clone(),
+        ));
     }
 
     (peer_senders, clients)
@@ -250,7 +280,7 @@ mod tests {
         addresses.insert(2, "http://node-b:50051".to_string());
         addresses.insert(3, "http://node-c:50051".to_string());
 
-        let (senders, clients) = create_transport(&addresses, 1);
+        let (senders, clients) = create_transport(&addresses, 1, None);
 
         // Should have senders for nodes 2 and 3, but not 1 (self).
         assert_eq!(senders.len(), 2);
@@ -258,5 +288,25 @@ mod tests {
         assert!(senders.contains_key(&3));
         assert!(!senders.contains_key(&1));
         assert_eq!(clients.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_raft_transport_rejects_missing_cluster_auth() -> anyhow::Result<()> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let auth = ClusterGrpcAuth::for_test("raft-secret")?;
+        let server = RaftTransportServer::new(tx, Some(auth));
+        let err =
+            pb::replication::raft_transport_service_server::RaftTransportService::send_messages(
+                &server,
+                tonic::Request::new(pb::replication::RaftMessageBatch {
+                    messages: vec![encode_raft_message(&Message::default())],
+                }),
+            )
+            .await
+            .expect_err("unauthenticated Raft messages must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(rx.try_recv().is_err());
+        Ok(())
     }
 }

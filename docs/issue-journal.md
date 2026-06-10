@@ -560,6 +560,28 @@ own for distributed changes.
   - `cargo test -p database test_cross_partition_commit_uses_remote_prepare_over_grpc -- --nocapture`
   - `cargo check -p database`
 
+### 2026-06 — Authenticated internal cluster gRPC traffic
+
+- **Status:** complete
+- **Related issue:** `#164`
+- **What this fixes:** internal forwarding, 2PC, and Raft gRPC services
+  previously trusted any caller that could reach the internal port. Forwarded
+  user identities were decoded with unchecked helpers, so the network boundary
+  itself was doing too much security work.
+- **Behavior:** cluster gRPC clients now attach a metadata token derived from
+  the shared deployment instance secret. Mutation/query forwarding, 2PC
+  participant RPCs, and Raft transport servers reject missing or mismatched
+  tokens with `Unauthenticated`.
+- **Operational note:** this is peer authentication for the cluster control
+  plane. The gRPC port should still be private to cluster members, and all
+  nodes in one deployment must share the same instance secret.
+- **Validation:**
+  - `cargo check -p local_backend --tests`
+  - `cargo test -p common test_authenticate_requires_matching_token -- --nocapture`
+  - `cargo test -p database test_raft_transport_rejects_missing_cluster_auth -- --nocapture`
+  - `cargo test -p local_backend test_internal_grpc_services_reject_missing_cluster_auth -- --nocapture`
+  - `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

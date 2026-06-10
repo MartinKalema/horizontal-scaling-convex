@@ -50,6 +50,7 @@ async fn load_test_primary(
         None,
         Arc::new(crate::two_phase::NoopTwoPhaseDecisionLog),
         None,
+        None,
         Arc::new(crate::LocalTableNumberAllocator),
         None,
     )
