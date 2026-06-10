@@ -137,7 +137,9 @@ async fn test_config_large_modules(rt: TestRuntime) -> anyhow::Result<()> {
         .map(|i| {
             ModuleConfig {
                 path: format!("mod_{i}.js").parse().unwrap(),
-                source: ModuleSource::new(&("// some js".to_owned() + &"a".repeat(1 << 21))), // 2MB
+                source: ModuleSource::new(
+                    &("// some js".to_owned() + "a".repeat(1 << 21).as_str()),
+                ), // 2MB
                 source_map: None,
                 environment: ModuleEnvironment::Isolate,
             }

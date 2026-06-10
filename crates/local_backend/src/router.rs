@@ -9,13 +9,16 @@ use axum::{
     extract::{
         DefaultBodyLimit,
         FromRef,
+        State,
     },
+    response::IntoResponse,
     routing::{
         delete,
         get,
         post,
         put,
     },
+    Json,
     Router,
 };
 use common::{
@@ -25,6 +28,7 @@ use common::{
             FromMtState,
             MtState,
         },
+        HttpResponseError,
     },
     knobs::{
         AIRBYTE_STREAMING_IMPORT_REQUEST_SIZE_LIMIT,
@@ -38,6 +42,7 @@ use http::{
     StatusCode,
 };
 use metrics::SERVER_VERSION_STR;
+use serde::Serialize;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{
@@ -78,11 +83,9 @@ use crate::{
         run_test_function,
     },
     deploy_config::{
-        get_config,
+        self,
         get_config_hashes,
-        push_config,
     },
-    deploy_config2,
     environment_variables::{
         list_environment_variables,
         platform_router,
@@ -116,13 +119,10 @@ use crate::{
         vector_search,
     },
     public_api::public_api_router,
+    route_authority::ensure_local_backend_api_authority,
     scheduling::{
         cancel_all_jobs,
         cancel_job,
-    },
-    schema::{
-        prepare_schema,
-        schema_state,
     },
     snapshot_export::{
         cancel_export,
@@ -164,9 +164,110 @@ use crate::{
         replace_tables,
     },
     subs::sync,
-    LocalAppState,
+    ActionCallbackRouterState,
+    AdminRouterState,
+    BackendAppState,
+    DeployRouterState,
+    ImportExportRouterState,
     RouterState,
 };
+
+const BUILD_GIT_SHA: &str = env!("VERGEN_GIT_SHA");
+const BUILD_GIT_COMMIT_TIMESTAMP: &str = env!("VERGEN_GIT_COMMIT_TIMESTAMP");
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildInfo {
+    server_version: String,
+    git_sha: &'static str,
+    git_commit_timestamp: &'static str,
+}
+
+async fn deploy_api_authority_middleware(
+    State(st): State<DeployRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    ensure_local_backend_api_authority(&st, req.uri().path())?;
+    Ok(next.run(req).await)
+}
+
+async fn admin_api_authority_middleware(
+    State(st): State<AdminRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    ensure_local_backend_api_authority(&st, req.uri().path())?;
+    Ok(next.run(req).await)
+}
+
+async fn log_sink_api_authority_middleware(
+    State(st): State<AdminRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/logs{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
+
+async fn platform_api_authority_middleware(
+    State(st): State<AdminRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/v1{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
+
+async fn action_callback_api_authority_middleware(
+    State(st): State<ActionCallbackRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/actions{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
+
+async fn import_export_api_authority_middleware(
+    State(st): State<ImportExportRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    ensure_local_backend_api_authority(&st, req.uri().path())?;
+    Ok(next.run(req).await)
+}
+
+async fn sync_api_authority_middleware(
+    State(st): State<RouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    ensure_local_backend_api_authority(&st, "/sync")?;
+    Ok(next.run(req).await)
+}
+
+async fn snapshot_export_api_authority_middleware(
+    State(st): State<ImportExportRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/export{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
+
+async fn streaming_import_api_authority_middleware(
+    State(st): State<ImportExportRouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let nested_path = format!("/streaming_import{}", req.uri().path());
+    ensure_local_backend_api_authority(&st, &nested_path)?;
+    Ok(next.run(req).await)
+}
 
 // Security addon for documenting authentication methods
 #[derive(Debug)]
@@ -279,7 +380,7 @@ struct PublicApiDoc;
 )]
 struct DashboardApiDoc;
 
-pub fn router(st: LocalAppState) -> Router {
+pub fn router(st: BackendAppState) -> Router {
     let browser_routes = Router::new()
         // Called by the browser (and optionally authenticated by a cookie or `Authorization`
         // header). Passes version in the URL because websockets can't do it in header.
@@ -288,7 +389,7 @@ pub fn router(st: LocalAppState) -> Router {
     // routes are added by common_dashboard_routes below
     let (_, common_dashboard_openapi_spec) =
         OpenApiRouter::with_openapi(DashboardApiDoc::openapi())
-            .merge(common_dashboard_api_router())
+            .merge(common_dashboard_api_router::<AdminRouterState>())
             .split_for_parts();
     let (local_only_dashboard_routes, local_only_openapi_spec) =
         OpenApiRouter::with_openapi(DashboardApiDoc::openapi())
@@ -298,7 +399,8 @@ pub fn router(st: LocalAppState) -> Router {
     let mut dashboard_openapi_spec = common_dashboard_openapi_spec;
     dashboard_openapi_spec.merge(local_only_openapi_spec);
     let dashboard_openapi_json = dashboard_openapi_spec.to_pretty_json().unwrap();
-    let dashboard_routes = common_dashboard_routes()
+    let admin_state = AdminRouterState::from(&st);
+    let dashboard_routes = common_dashboard_routes::<AdminRouterState>()
         .merge(local_only_dashboard_routes)
         // Environment variable routes
         .route("/update_environment_variables", post(update_environment_variables))
@@ -311,25 +413,25 @@ pub fn router(st: LocalAppState) -> Router {
         .route("/dashboard_openapi.json", axum::routing::get({
             move || async { dashboard_openapi_json }
         }))
-        .layer(ServiceBuilder::new());
+        .layer(ServiceBuilder::new())
+        .layer(axum::middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin_api_authority_middleware,
+        ))
+        .with_state(admin_state.clone());
 
-    let cli_routes = Router::new()
-        .route("/push_config", post(push_config))
-        .route("/prepare_schema", post(prepare_schema))
-        .route("/deploy2/start_push", post(deploy_config2::start_push))
-        .route(
-            "/deploy2/evaluate_push",
-            post(deploy_config2::evaluate_push),
-        )
+    let deploy_push_routes = Router::new()
+        .route("/deploy/start_push", post(deploy_config::start_push))
+        .route("/deploy/evaluate_push", post(deploy_config::evaluate_push))
         .route("/run_test_function", post(run_test_function))
         .route(
-            "/deploy2/wait_for_schema",
-            post(deploy_config2::wait_for_schema),
+            "/deploy/wait_for_schema",
+            post(deploy_config::wait_for_schema),
         )
-        .route("/deploy2/finish_push", post(deploy_config2::finish_push))
+        .route("/deploy/finish_push", post(deploy_config::finish_push))
         .route(
-            "/deploy2/report_push_completed",
-            post(deploy_config2::report_push_completed_handler),
+            "/deploy/report_push_completed",
+            post(deploy_config::report_push_completed_handler),
         )
         .layer(
             ServiceBuilder::new()
@@ -338,44 +440,106 @@ pub fn router(st: LocalAppState) -> Router {
                 }))
                 .layer(RequestDecompressionLayer::new())
                 .layer(DefaultBodyLimit::max(*MAX_PUSH_BYTES)),
-        )
-        .route("/get_config", post(get_config))
+        );
+    let deploy_state = DeployRouterState::from(&st);
+    let deploy_routes = Router::new()
+        .merge(deploy_push_routes)
         .route("/get_config_hashes", post(get_config_hashes))
-        .route("/schema_state/{schema_id}", get(schema_state))
+        .layer(cli_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            deploy_state.clone(),
+            deploy_api_authority_middleware,
+        ))
+        .with_state(deploy_state);
+
+    let observability_routes = Router::new()
         .route("/stream_udf_execution", get(stream_udf_execution))
         .route("/stream_function_logs", get(stream_function_logs))
-        .merge(import_routes())
-        .layer(cli_cors());
+        .layer(cli_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin_api_authority_middleware,
+        ))
+        .with_state(admin_state.clone());
 
+    let log_sink_routes = log_sink_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            admin_state.clone(),
+            log_sink_api_authority_middleware,
+        ))
+        .with_state(admin_state.clone());
+
+    let import_export_state = ImportExportRouterState::from(&st);
+    let snapshot_import_routes = import_routes()
+        .layer(cli_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            import_export_state.clone(),
+            import_export_api_authority_middleware,
+        ))
+        .with_state(import_export_state.clone());
+    let streaming_export_routes = streaming_export_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            import_export_state.clone(),
+            import_export_api_authority_middleware,
+        ))
+        .with_state(import_export_state.clone());
     let snapshot_export_routes = Router::new()
         .route("/request/zip", post(request_zip_export))
         .route("/zip/{id}", get(get_zip_export))
         .route("/set_expiration/{snapshot_id}", post(set_export_expiration))
-        .route("/cancel/{snapshot_id}", post(cancel_export));
+        .route("/cancel/{snapshot_id}", post(cancel_export))
+        .layer(axum::middleware::from_fn_with_state(
+            import_export_state.clone(),
+            snapshot_export_api_authority_middleware,
+        ))
+        .with_state(import_export_state.clone());
+    let streaming_import_routes = streaming_import_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            import_export_state.clone(),
+            streaming_import_api_authority_middleware,
+        ))
+        .with_state(import_export_state.clone());
+
+    let action_callback_state = ActionCallbackRouterState::from(&st);
+    let action_callback_routes = action_callback_routes(action_callback_state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            action_callback_state.clone(),
+            action_callback_api_authority_middleware,
+        ))
+        .with_state(action_callback_state);
 
     let (platform_routes, platform_openapi) =
         OpenApiRouter::with_openapi(PlatformApiDoc::openapi())
-            .merge(platform_router())
-            .merge(crate::deployment_info::platform_router())
-            .merge(crate::canonical_urls::platform_router())
-            .merge(crate::log_sinks::platform_router())
-            .merge(crate::deployment_state::platform_router())
+            .merge(platform_router::<AdminRouterState>())
+            .merge(crate::deployment_info::platform_router::<AdminRouterState>())
+            .merge(crate::canonical_urls::platform_router::<AdminRouterState>())
+            .merge(crate::log_sinks::platform_router::<AdminRouterState>())
+            .merge(crate::deployment_state::platform_router::<AdminRouterState>())
             .split_for_parts();
     let platform_openapi_spec = platform_openapi.to_pretty_json().unwrap();
-    let platform_routes = Router::new().merge(platform_routes).route(
-        "/openapi.json",
-        axum::routing::get(move || async { platform_openapi_spec }),
-    );
+    let platform_routes = Router::new()
+        .merge(platform_routes)
+        .route(
+            "/openapi.json",
+            axum::routing::get(move || async { platform_openapi_spec }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            admin_state.clone(),
+            platform_api_authority_middleware,
+        ))
+        .with_state(admin_state);
 
     let api_routes = Router::new()
-        .merge(cli_routes)
-        .merge(dashboard_routes)
-        .merge(streaming_export_routes())
-        .nest("/actions", action_callback_routes(st.clone()))
+        .merge(observability_routes)
+        .nest("/logs", log_sink_routes)
+        .merge(snapshot_import_routes)
+        .merge(streaming_export_routes)
         .nest("/export", snapshot_export_routes)
-        .nest("/logs", log_sink_routes())
-        .nest("/streaming_import", streaming_import_routes())
-        .nest("/v1", platform_routes);
+        .nest("/streaming_import", streaming_import_routes)
+        .nest("/actions", action_callback_routes)
+        .merge(dashboard_routes)
+        .nest("/v1", platform_routes)
+        .merge(deploy_routes);
 
     // Endpoints migrated to use the RouterState trait instead of application.
     let (public_routes, public_openapi) = OpenApiRouter::with_openapi(PublicApiDoc::openapi())
@@ -383,10 +547,39 @@ pub fn router(st: LocalAppState) -> Router {
         .split_for_parts();
     let public_openapi_spec = public_openapi.to_pretty_json().unwrap();
 
-    let migrated_api_routes = Router::new()
+    let router_state = RouterState {
+        api: Arc::new(
+            crate::query_forwarding_api::SelectiveQueryForwardingApi::new(
+                Arc::new(st.application.clone()),
+                st.application.database().clone(),
+                st.replica_mode,
+                st.partition_id,
+                st.node_addresses.clone(),
+                st.raft_state.clone(),
+                st.raft_peer_grpc_urls.clone(),
+            ),
+        ),
+        database: st.application.database().clone(),
+        runtime: st.application.runtime(),
+        replica_mode: st.replica_mode,
+        partition_id: st.partition_id,
+        node_addresses: st.node_addresses.clone(),
+        raft_state: st.raft_state.clone(),
+        raft_peer_grpc_urls: st.raft_peer_grpc_urls.clone(),
+        replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
+    };
+
+    let sync_routes = Router::new()
         .merge(browser_routes)
-        .merge(public_routes)
         .route("/sync", get(sync))
+        .layer(axum::middleware::from_fn_with_state(
+            router_state.clone(),
+            sync_api_authority_middleware,
+        ));
+
+    let migrated_api_routes = Router::new()
+        .merge(sync_routes)
+        .merge(public_routes)
         .route(
             "/public_openapi.json",
             axum::routing::get({
@@ -402,12 +595,7 @@ pub fn router(st: LocalAppState) -> Router {
         // Notably, any layers added here won't apply to common routes
         // added inside `serve_http`
         .nest("/http/", http_action_routes())
-        .with_state(RouterState {
-            api: Arc::new(st.application.clone()),
-            runtime: st.application.runtime(),
-            replica_mode: st.replica_mode,
-            replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
-        });
+        .with_state(router_state);
 
     let version = SERVER_VERSION_STR.to_string();
 
@@ -439,11 +627,9 @@ pub fn storage_api_routes() -> Router<RouterState> {
 // IMPORTANT NOTE: Those routes are proxied by Usher. Any changes to the router,
 // such as adding or removing a route, or changing limits, also need to be
 // applied to `crates_private/usher/src/proxy.rs`.
-pub fn action_callback_routes<S>(state: S) -> Router<S>
-where
-    LocalAppState: FromMtState<S>,
-    S: Send + Sync + Clone + 'static,
-{
+pub fn action_callback_routes(
+    state: ActionCallbackRouterState,
+) -> Router<ActionCallbackRouterState> {
     Router::new()
         .route("/query", post(internal_query_post))
         .route("/mutation", post(internal_mutation_post))
@@ -459,14 +645,13 @@ where
         .route("/storage_delete", post(storage_delete))
         // All routes above this line get the increased limit
         .layer(DefaultBodyLimit::max(*MAX_BACKEND_RPC_REQUEST_SIZE))
-        .layer(axum::middleware::from_fn_with_state(state, action_callbacks_middleware::<S>))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            action_callbacks_middleware,
+        ))
 }
 
-pub fn import_routes<S>() -> Router<S>
-where
-    LocalAppState: FromMtState<S>,
-    S: Clone + Send + Sync + 'static,
-{
+pub fn import_routes() -> Router<ImportExportRouterState> {
     Router::new()
         .route("/import", post(import))
         .route("/import/start_upload", post(import_start_upload))
@@ -485,7 +670,7 @@ pub fn http_action_routes() -> Router<RouterState> {
 
 pub fn app_metrics_routes<S>() -> Router<S>
 where
-    LocalAppState: FromMtState<S>,
+    AdminRouterState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
@@ -508,7 +693,7 @@ where
 // Routes with the same handlers for the local backend + closed source backend
 pub fn common_dashboard_routes<S>() -> Router<S>
 where
-    LocalAppState: FromMtState<S>,
+    AdminRouterState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     let (dashboard_routes_from_openapi, _dashboard_openapi_spec) =
@@ -523,15 +708,34 @@ where
 
 pub fn health_check_routes<S>(version: String) -> Router<S>
 where
-    LocalAppState: FromMtState<S>,
+    BackendAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
+    let instance_version = version.clone();
+    let build_info = BuildInfo {
+        server_version: version,
+        git_sha: BUILD_GIT_SHA,
+        git_commit_timestamp: BUILD_GIT_COMMIT_TIMESTAMP,
+    };
     Router::new()
         .route(
             "/instance_name",
-            get(|MtState(st): MtState<LocalAppState>| async move { st.instance_name.clone() }),
+            get(|MtState(st): MtState<BackendAppState>| async move { st.instance_name.clone() }),
         )
-        .route("/instance_version", get(|| async move { version }))
+        .route(
+            "/instance_version",
+            get(move || {
+                let instance_version = instance_version.clone();
+                async move { instance_version }
+            }),
+        )
+        .route(
+            "/build_info",
+            get(move || {
+                let build_info = build_info.clone();
+                async move { Json(build_info) }
+            }),
+        )
         .route(
             "/",
             get(|| async { "This Convex deployment is running. See https://docs.convex.dev/." }),
@@ -548,11 +752,7 @@ where
 // IMPORTANT NOTE: Those routes are proxied by Usher. Any changes to the router,
 // such as adding or removing a route, or changing limits, also need to be
 // applied to `crates_private/usher/src/proxy.rs`.
-pub fn streaming_import_routes<S>() -> Router<S>
-where
-    LocalAppState: FromMtState<S>,
-    S: Clone + Send + Sync + 'static,
-{
+pub fn streaming_import_routes() -> Router<ImportExportRouterState> {
     Router::new()
         .route(
             "/import_airbyte_records",
@@ -576,11 +776,7 @@ where
 // IMPORTANT NOTE: Those routes are proxied by Usher. Any changes to the router,
 // such as adding or removing a route, or changing limits, also need to be
 // applied to `crates_private/usher/src/proxy.rs`.
-pub fn streaming_export_routes<S>() -> Router<S>
-where
-    LocalAppState: FromMtState<S>,
-    S: Clone + Send + Sync + 'static,
-{
+pub fn streaming_export_routes() -> Router<ImportExportRouterState> {
     Router::new()
         .route("/document_deltas", get(document_deltas_get))
         .route("/document_deltas", post(document_deltas_post))
@@ -600,7 +796,7 @@ where
 // applied to `crates_private/usher/src/proxy.rs`.
 pub fn log_sink_routes<S>() -> Router<S>
 where
-    LocalAppState: FromMtState<S>,
+    AdminRouterState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
@@ -633,15 +829,37 @@ pub fn cors() -> CorsLayer {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        time::Duration,
+    };
 
     use anyhow::Context;
     use axum::body::Body;
     use axum_extra::headers::authorization::Credentials;
-    use http::Request;
+    use common::{
+        components::ComponentId,
+        http::{
+            ConvexHttpService,
+            NoopRouteMapper,
+        },
+    };
+    use database::partition::PartitionId;
+    use http::{
+        Request,
+        StatusCode,
+    };
+    use http_body_util::BodyExt;
+    use metrics::SERVER_VERSION_STR;
     use runtime::prod::ProdRuntime;
+    use serde_json::json;
+    use tower::ServiceExt;
 
-    use crate::test_helpers::setup_backend_for_test;
+    use crate::{
+        router::router,
+        test_helpers::setup_backend_for_test,
+        MAX_CONCURRENT_REQUESTS,
+    };
 
     const DASHBOARD_SPEC_FILE: &str =
         "../../npm-packages/dashboard/dashboard-deployment-openapi.json";
@@ -705,6 +923,470 @@ mod tests {
                  test_api_specs_match`"
             );
         }
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_legacy_deploy_routes_are_not_registered(rt: ProdRuntime) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let app = ConvexHttpService::new(
+            router(backend.st.clone()),
+            "legacy_deploy_routes_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for (method, path) in [
+            ("POST", "/api/get_config"),
+            ("POST", "/api/push_config"),
+            ("POST", "/api/prepare_schema"),
+            ("GET", "/api/schema_state/not-a-real-schema-id"),
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .method(method)
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))?;
+            let (parts, body) = app.router().clone().oneshot(req).await?.into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{path}: {body}");
+        }
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_deploy_config_hashes_allow_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+        let admin_key = admin_header
+            .to_str()?
+            .strip_prefix("Convex ")
+            .context("admin auth header must use the Convex scheme")?
+            .to_string();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "deploy_config_hashes_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/get_config_hashes")
+            .method("POST")
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "adminKey": admin_key,
+            }))?))?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_dashboard_static_schema_allows_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "dashboard_schema_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/dashboard_openapi.json")
+            .method("GET")
+            .header("Host", "localhost")
+            .body(Body::empty())?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_dashboard_admin_route_rejects_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "dashboard_admin_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/list_environment_variables")
+            .method("GET")
+            .header("Host", "localhost")
+            .header("Authorization", admin_header)
+            .body(Body::empty())?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("ServiceUnavailable"), "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_platform_static_schema_allows_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "platform_schema_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/v1/openapi.json")
+            .method("GET")
+            .header("Host", "localhost")
+            .body(Body::empty())?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_platform_admin_route_rejects_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "platform_admin_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/v1/deployment_info")
+            .method("GET")
+            .header("Host", "localhost")
+            .header("Authorization", admin_header)
+            .body(Body::empty())?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("ServiceUnavailable"), "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_action_callbacks_reject_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let callback_token = backend
+            .st
+            .application
+            .key_broker()
+            .issue_action_token(ComponentId::test_user());
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "action_callback_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for path in [
+            "/api/actions/mutation",
+            "/api/actions/schedule_job",
+            "/api/actions/storage_delete",
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .method("POST")
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .header("Convex-Action-Callback-Token", callback_token.clone())
+                .body(Body::from("{}"))?;
+            let (parts, body) = partitioned_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                parts.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {body}"
+            );
+            assert!(body.contains("ServiceUnavailable"), "{path}: {body}");
+        }
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_import_export_routes_reject_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "import_export_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for (method, path, body) in [
+            ("POST", "/api/import/start_upload", ""),
+            ("POST", "/api/export/request/zip", ""),
+            ("GET", "/api/streaming_import/get_schema", ""),
+            ("GET", "/api/document_deltas?cursor=0", ""),
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .method(method)
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .header("Authorization", admin_header.clone())
+                .body(Body::from(body))?;
+            let (parts, body) = partitioned_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                parts.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {body}"
+            );
+            assert!(body.contains("ServiceUnavailable"), "{path}: {body}");
+        }
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_log_observability_routes_reject_non_authority_partition(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "log_observability_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for (method, path, body) in [
+            ("POST", "/api/logs/datadog_sink", "{}"),
+            ("POST", "/api/v1/create_log_stream", "{}"),
+            ("GET", "/api/stream_udf_execution?cursor=0", ""),
+            ("GET", "/api/stream_function_logs?cursor=0", ""),
+            (
+                "GET",
+                "/api/app_metrics/function_concurrency?window=%7B%7D",
+                "",
+            ),
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .method(method)
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .header("Authorization", admin_header.clone())
+                .body(Body::from(body))?;
+            let (parts, body) = partitioned_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                parts.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {body}"
+            );
+            assert!(body.contains("ServiceUnavailable"), "{path}: {body}");
+        }
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_deploy_routes_use_explicit_forwarding_authority(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        let admin_header = backend.admin_auth_header.0.encode();
+        let admin_key = admin_header
+            .to_str()?
+            .strip_prefix("Convex ")
+            .context("admin auth header must use the Convex scheme")?
+            .to_string();
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "deploy_authority_exemption_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let req = Request::builder()
+            .uri("/api/deploy/report_push_completed")
+            .method("POST")
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "adminKey": admin_key,
+                "spans": [],
+            }))?))?;
+        let (parts, body) = partitioned_app
+            .router()
+            .clone()
+            .oneshot(req)
+            .await?
+            .into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_sync_routes_reject_non_authority_partition_before_websocket_upgrade(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "sync_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for path in ["/api/sync", "/api/1.0.0/sync"] {
+            let req = Request::builder()
+                .uri(path)
+                .method("GET")
+                .header("Host", "localhost")
+                .body(Body::empty())?;
+            let (parts, body) = partitioned_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(body.contains("ServiceUnavailable"), "{body}");
+        }
+
         Ok(())
     }
 }

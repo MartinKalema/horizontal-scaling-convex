@@ -31,12 +31,12 @@ use futures::FutureExt;
 use serde_json::Value as JsonValue;
 
 use crate::{
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
+    AdminRouterState,
 };
 
 pub async fn stream_udf_execution(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(query_args): Query<StreamUdfExecutionQueryArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -79,7 +79,7 @@ pub async fn stream_udf_execution(
 // If (session_id, client_request_counter) is provided, the results will be
 // filtered to events from the root execution of the corresponding request.
 pub async fn stream_function_logs(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Query(query_args): Query<StreamFunctionLogs>,

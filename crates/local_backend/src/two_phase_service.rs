@@ -7,9 +7,20 @@
 //! The coordinator uses the database-layer gRPC client to reach remote
 //! partitions.
 
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
+
 use database::{
+    partition::{
+        PlacementMetadataStore,
+        PlacementVersion,
+    },
+    raft_partition::RaftPartitionState,
     two_phase::{
         ParticipantTransaction,
+        TwoPhaseCommitGrpcClient,
         TwoPhaseTransactionId,
     },
     CommitterClient,
@@ -37,15 +48,103 @@ use tonic::{
 /// forwards them to the local CommitterClient.
 pub struct TwoPhaseCommitGrpcService {
     committer: CommitterClient,
+    raft_state: Option<RaftPartitionState>,
+    raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+    placement_metadata_store: Option<Arc<dyn PlacementMetadataStore>>,
 }
 
 impl TwoPhaseCommitGrpcService {
-    pub fn new(committer: CommitterClient) -> Self {
-        Self { committer }
+    pub fn new(
+        committer: CommitterClient,
+        raft_state: Option<RaftPartitionState>,
+        raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+        placement_metadata_store: Option<Arc<dyn PlacementMetadataStore>>,
+    ) -> Self {
+        Self {
+            committer,
+            raft_state,
+            raft_peer_grpc_urls,
+            placement_metadata_store,
+        }
     }
 
     pub fn into_server(self) -> TonicTwoPcServer<Self> {
         TonicTwoPcServer::new(self)
+    }
+
+    async fn leader_client(&self) -> Result<Option<TwoPhaseCommitGrpcClient>, Status> {
+        let Some(raft_state) = self.raft_state.as_ref() else {
+            return Ok(None);
+        };
+        if raft_state.is_leader() {
+            return Ok(None);
+        }
+        let leader_id = raft_state.leader_id();
+        if leader_id == 0 {
+            return Err(Status::unavailable(
+                "No elected Raft leader for this partition yet",
+            ));
+        }
+        let leader_addr = self
+            .raft_peer_grpc_urls
+            .as_ref()
+            .and_then(|urls| urls.get(&leader_id))
+            .cloned()
+            .ok_or_else(|| {
+                Status::unavailable(format!(
+                    "Missing RAFT_PEERS entry for Raft leader node {leader_id}"
+                ))
+            })?;
+        let client = TwoPhaseCommitGrpcClient::connect(&leader_addr)
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!(
+                    "Failed to connect to Raft leader {} at {}: {e:#}",
+                    leader_id, leader_addr
+                ))
+            })?;
+        Ok(Some(client))
+    }
+
+    async fn refresh_placement_metadata(&self) -> Result<(), Status> {
+        let Some(store) = self.placement_metadata_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(metadata) = store.load().await.map_err(|e| {
+            Status::unavailable(format!(
+                "Failed to refresh placement metadata before Prepare retry: {e:#}"
+            ))
+        })?
+        else {
+            return Ok(());
+        };
+        self.committer
+            .refresh_placement_metadata(metadata)
+            .map_err(|e| {
+                Status::failed_precondition(format!(
+                    "Refreshed placement metadata but local state is still invalid: {e:#}"
+                ))
+            })
+    }
+
+    async fn ensure_placement_version(
+        &self,
+        placement_version: PlacementVersion,
+    ) -> Result<(), Status> {
+        match self.committer.ensure_placement_version(placement_version) {
+            Ok(()) => Ok(()),
+            Err(original_err) => {
+                self.refresh_placement_metadata().await?;
+                self.committer
+                    .ensure_placement_version(placement_version)
+                    .map_err(|e| {
+                        Status::failed_precondition(format!(
+                            "Prepare rejected after placement metadata refresh: {e:#}. Original \
+                             rejection: {original_err:#}"
+                        ))
+                    })
+            },
+        }
     }
 }
 
@@ -66,6 +165,24 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             .prepare_ts
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
+        let placement_version = PlacementVersion::from(req.placement_version);
+        self.ensure_placement_version(placement_version).await?;
+
+        if let Some(client) = self.leader_client().await? {
+            let result = client
+                .prepare(
+                    &txn_id,
+                    transaction,
+                    req.write_source.into(),
+                    prepare_ts,
+                    placement_version,
+                )
+                .await
+                .map_err(|e| Status::internal(format!("Leader Prepare failed: {e:#}")))?;
+            return Ok(Response::new(TwoPcPrepareResponse {
+                prepare_ts: u64::from(result.prepare_ts),
+            }));
+        }
 
         let result = self
             .committer
@@ -85,6 +202,14 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
         let req = request.into_inner();
         let txn_id = TwoPhaseTransactionId(req.transaction_id.clone());
 
+        if let Some(client) = self.leader_client().await? {
+            let commit_ts = client
+                .commit_prepared(&txn_id)
+                .await
+                .map_err(|e| Status::internal(format!("Leader CommitPrepared failed: {e:#}")))?;
+            return Ok(Response::new(TwoPcCommitResponse { commit_ts }));
+        }
+
         let ts = self
             .committer
             .commit_prepared(txn_id)
@@ -102,6 +227,14 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
     ) -> Result<Response<TwoPcRollbackResponse>, Status> {
         let req = request.into_inner();
         let txn_id = TwoPhaseTransactionId(req.transaction_id.clone());
+
+        if let Some(client) = self.leader_client().await? {
+            client
+                .rollback_prepared(&txn_id)
+                .await
+                .map_err(|e| Status::internal(format!("Leader RollbackPrepared failed: {e:#}")))?;
+            return Ok(Response::new(TwoPcRollbackResponse {}));
+        }
 
         self.committer
             .rollback_prepared(txn_id)

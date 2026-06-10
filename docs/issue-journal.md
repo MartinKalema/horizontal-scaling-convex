@@ -65,7 +65,7 @@ own for distributed changes.
   cross-partition commit, and rollback on participant failure; `cargo check`
   for `local_backend`.
 
-### 2026-04 — Forwarded `deploy2` requests failed auth on the metadata owner
+### 2026-04 — Forwarded deploy protocol requests failed auth on the metadata owner
 
 - **Status:** fixed
 - **Symptom:** deploys sent to a non-owner node failed once that node forwarded
@@ -129,7 +129,7 @@ own for distributed changes.
   of shutting the node down. A targeted regression test covers the exact
   failing-oracle path.
 - **Validation:**
-  - `cargo test -p database test_idle_replication_frontier_heartbeat_tso_failure_is_nonfatal`
+  - `cargo test -p database test_idle_remote_read_frontier_heartbeat_tso_failure_is_nonfatal`
   - fresh image build and push:
     `ghcr.io/martinkalema/convex-horizontal-scaling:backend-heartbeat-nonfatal-c2410ab-20260424-101611-dirty`
   - pushed digest:
@@ -269,9 +269,302 @@ own for distributed changes.
     on the scraped node, so those names will appear after the next real
     snapshot-apply event on that node
 
+### 2026-04 — Same-partition followers still depend on NATS for application/deploy convergence
+
+- **Status:** open
+- **Related issue:** `#74`
+- **Symptom:** the first safe-looking `#74` attempt added partition-filtered
+  JetStream subscriptions and stopped partitioned nodes from consuming their
+  own partition's NATS subject, on the assumption that same-partition followers
+  already had everything they needed from Raft. The full clean-cluster
+  validation split cleanly:
+  - `77/77` write-scaling tests still passed
+  - the `10`-test Raft failover suite broke immediately
+  - followers in the same partition no longer agreed with the leader after a
+    single write, and they could not take over correctly after the leader was
+    killed
+- **Root Cause:** our current follower state convergence path still relies on
+  same-partition `CommitDelta` delivery over NATS. Removing the local-partition
+  JetStream feed did not just reduce cross-partition fanout; it also stopped
+  same-partition followers from converging application-visible deployment/data
+  state well enough to serve queries and become healthy write leaders during
+  failover. In other words, this codebase is not yet at the point where Raft
+  alone makes a follower query-ready for its partition.
+- **Fix:** roll back the runtime behavior change so partitioned nodes continue
+  consuming all partition subjects for now, keep the filtered-subscribe support
+  in the distributed-log abstraction/NATS transport as dormant groundwork, and
+  treat `#74` as blocked on a precursor: make same-partition followers fully
+  self-sufficient from their own Raft/apply path before we try to trim local
+  partition NATS traffic.
+- **Validation:**
+  - focused cargo pass after rollback:
+    `cargo test -p local_backend test_fresh_replica_bootstraps_from_checkpoint -- --nocapture`
+  - attempted optimization image on a clean cluster:
+    - `77/77` write-scaling tests passed
+    - Raft failover suite failed at follower agreement and post-leader-kill
+      writes
+  - rebuilt rollback image and reran the full clean-cluster harness:
+    `self-hosted/docker/test.sh`
+    Result: all `77` write-scaling tests passed and all `10` Raft failover
+    tests passed
+
+### 2026-05 — Test 29 exposed that replication frontier was not a strong-read fence
+
+- **Status:** fixed
+- **Related issue:** `#74`
+- **Symptom:** Write Scaling Test 29 (`Max Batch Size 200 docs`) failed in a
+  very specific way on the clean cluster:
+  - forwarded `messages:batchWrite(count=200)` returned success via Node A
+  - the immediate local `messages:countBatch(prefix)` on that same node
+    returned `0`
+  - cross-node reads could already see all `200`
+  - the local follower converged to `200` about a second later
+- **Root Cause:** we were treating the per-partition `replication_frontier`
+  like a strong local read fence. That frontier was allowed to advance on
+  idle/empty replication heartbeats, so a same-partition follower could decide
+  "I am fresh enough" before the actual batch write had become query-visible on
+  that node. This is exactly the distinction that TiKV makes between
+  leader-side progress (`resolved-ts`) and follower-safe local read progress
+  (`safe-ts`): observed replication progress is not automatically a safe local
+  strong-read timestamp.
+- **Fix:** split the signal in the snapshot manager:
+  - keep `replication_frontier` for observed/stale-read-style progress and
+    observability
+  - add a separate per-partition `replication_write_frontier` that advances
+    only when a real replicated write is published into the local snapshot/write
+    state
+  - make forwarded follower mutations wait on this write frontier instead of
+    the heartbeat-advancing frontier before returning success to the caller
+- **Validation:**
+  - targeted regression:
+    `cargo test -p database test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts -- --nocapture`
+  - focused forwarding proof:
+    `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
+  - fresh image rebuild, clean profile-scoped reset
+    `docker compose --profile cluster down -v --remove-orphans`, cluster
+    restart via `docker compose --profile cluster up -d`, and full harness
+    rerun:
+    `self-hosted/docker/test.sh`
+    Result: all `77` write-scaling tests passed and all `10` Raft failover
+    tests passed, including Test 29
+
+### 2026-05 — Same-partition followers became self-sufficient from Raft/apply
+
+- **Status:** fixed
+- **Related issue:** `#74`
+- **Symptom:** the first partition-filtering attempt had shown that removing a
+  partition's own NATS subject broke failover, which looked like proof that
+  same-partition followers still needed local-partition `CommitDelta` traffic.
+- **Root Cause:** the follower gap was not inherent to the design; it was in
+  our Raft apply path. We were skipping committed Raft entries based on whether
+  the node was *currently* leader instead of whether the entry had originally
+  been proposed locally. After leader changes, a node could become leader and
+  incorrectly skip committed entries that originated on the old leader. NATS
+  happened to mask that bug by delivering the same-partition delta through a
+  second path.
+- **Fix:** make Raft apply origin-aware and then trim NATS fanout:
+  - tag intra-partition Raft-published deltas with the proposing
+    `source_raft_node_id`
+  - apply every committed Raft delta locally unless this exact node already
+    proposed and applied it itself
+  - once same-partition followers were converging correctly from Raft/apply,
+    switch partitioned `ReplicaDeltaConsumer` subscriptions to only the *other*
+    partitions' NATS subjects via `subscribe_filtered(...)`
+- **Why this matches the big databases:** mature systems treat the ordered
+  replicated log as the authoritative path for same-replica convergence, and
+  then layer changefeeds/streaming on top of that. They do not depend on a
+  secondary change stream to make Raft followers query-ready:
+  - etcd/raft requires `Ready` batches to be handled and applied in order
+  - TiKV's apply worker is explicitly responsible for committed Raft entries
+  - CockroachDB followers catch up by replaying the Raft log or loading a
+    snapshot and then replaying later actions
+  - YugabyteDB followers apply committed log entries to their state machine
+- **Validation:**
+  - focused forwarding proof:
+    `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
+  - fresh image rebuild from the filtered-subscribe branch state
+  - clean profile-scoped reset:
+    `docker compose --profile cluster down -v --remove-orphans`
+  - cluster restart:
+    `docker compose --profile cluster up -d`
+  - full clean-cluster harness rerun:
+    `self-hosted/docker/test.sh`
+    Result: all `77` write-scaling tests passed and all `10` Raft failover
+    tests passed with partitioned nodes no longer consuming their own
+    partition's NATS subject
+
+### 2026-05 — Started explicit selective-delivery interest tracking
+
+- **Status:** in progress
+- **Related issue:** `#96`
+- **Why this first:** before we can safely narrow cross-partition delivery, the
+  system needs an explicit notion of what data a node is actually interested
+  in. Today, the subscription/read path still gets its "read anywhere" behavior
+  from a broad remote snapshot, so skipping remote deltas without a real
+  interest model would silently change semantics.
+- **What this slice adds:**
+  - a database-side `DeltaInterestTracker` that aggregates live subscription
+    interests as a node-local set of table names
+  - `Database::subscribe(...)` now resolves a subscription token's read-set
+    into concrete non-system table names before registering the subscription
+  - `SubscriptionsClient` / `SubscriptionManager` now keep those per-subscription
+    table interests and maintain reference counts as subscriptions start and end
+  - a new `database_selective_delivery_interested_tables_info` metric and a
+    `CommitDelta::touched_table_names()` helper for the next transport-side step
+- **What this does not do yet:** it does **not** change runtime fanout or stop
+  delivering any remote deltas. This is the seam the later NATS/changefeed
+  routing work will use.
+- **Validation:**
+  - `cargo check -p local_backend`
+  - `cargo test -p database delta_interest::tests::interest_tracker_ref_counts_tables -- --nocapture`
+  - `cargo test -p database commit_delta::tests::touched_table_names_collects_unique_tables -- --nocapture`
+  - `cargo test -p database subscription::tests::test_log_rewind_invalidates_subscriptions_and_reanchors_manager -- --nocapture`
+
+### 2026-05 — Added selective-delivery shadow control plane
+
+- **Status:** in progress
+- **Related issue:** `#96`
+- **What this slice adds:**
+  - nodes now publish their live table-interest set into a dedicated NATS KV
+    bucket (`convex_delta_interest`) with freshness timestamps
+  - producers can now compute which nodes are interested in a delta's touched
+    tables and shadow-publish those deltas to node-specific subjects
+    (`convex.commits.node.<node>`) in addition to the existing broad partition
+    subject
+  - this gives us a real selective-delivery control plane and transport shape
+    without yet changing the current broad read-anywhere data path
+- **Why this is still shadow mode:** broad remote replication is still required
+  for one-shot cross-partition queries. Live subscriptions tell us what a node
+  is interested in over time, but ad hoc query execution still does not expose
+  the full table set *before* execution. Until the request path can catch up or
+  reroute those cold-table reads safely, switching consumers away from the broad
+  path would change semantics.
+- **Validation:**
+  - `cargo check -p local_backend`
+  - `cargo test -p database selective_delivery::tests::interested_nodes_match_tables_and_skip_stale_entries -- --nocapture`
+  - `cargo test -p database selective_delivery::tests::node_subject_names_are_stable -- --nocapture`
+
+### 2026-05 — Added recent-query interest leases for stateless reads
+
+- **Status:** in progress
+- **Related issue:** `#96`
+- **Why this slice matters:** sync queries already warm table interest after
+  their first execution because they immediately subscribe on the returned
+  token. Plain HTTP queries do not; they learn their table set only after
+  execution and then discard it. That made the control plane under-report real
+  read traffic from stateless query paths.
+- **What this slice adds:**
+  - `DeltaInterestTracker` now supports short-lived recent-interest leases in
+    addition to long-lived subscription ref-counts
+  - the selective-delivery interest publisher prunes expired recent-interest
+    leases before publishing to NATS KV
+  - latest-timestamp public HTTP queries now feed their returned token back
+    into the tracker for a short TTL, so repeated ad hoc reads can warm table
+    interest over time
+- **What this still does not solve:** this improves the signal for selective
+  routing, but it still does not make the *first* cold-table query safe under a
+  fully selective delivery regime. We still need either cold-table catch-up or
+  request rerouting before the active cutover.
+- **Validation:**
+  - `cargo test -p local_backend test_http_query_records_recent_delta_interest -- --nocapture`
+
+### 2026-05 — Added query-forwarder infrastructure for cold-read reroute
+
+- **Status:** in progress
+- **Related issue:** `#96`
+- **What this slice adds:**
+  - the existing gRPC `MutationForwarder` service now also supports forwarding
+    public queries to an authoritative peer
+  - forwarded query responses include the non-system table names touched by the
+    returned token/read-set, so the caller can warm selective-delivery interest
+    from a routed read instead of losing that information
+- **Why this matters:** the remaining `#96` blocker is the first cold-table
+  stateless query. This forwarder gives us the transport primitive for a safe
+  reroute path without forcing us to hard-code the wrong policy prematurely.
+- **What this still does not do:** the public HTTP query handlers do not yet
+  automatically reroute cold reads. We still need to decide the active policy:
+  query reroute target, fallback behavior, and when to prefer reroute versus
+  local execution.
+- **Validation:**
+  - `cargo test -p local_backend test_query_forwarder_returns_touched_tables -- --nocapture`
+  - `cargo check -p local_backend`
+
+### 2026-05 — Completed leader-aware latest-query routing for selective delivery
+
+- **Status:** complete
+- **Related issue:** `#96`
+- **What closed the loop:**
+  - system-table deltas now continue to fan out on a dedicated global NATS
+    subject so deploy/metadata state is never accidentally gated by table
+    interest
+  - latest public queries from non-authority partitions still reroute to the
+    partition-0 authority
+  - latest public queries from partition-0 followers now also reroute to the
+    current Raft leader instead of trying to serve an unsafe local latest read
+- **Why this was necessary:** once user-table deltas became selective, a
+  partition-0 follower could no longer safely answer every latest query from
+  its local snapshot. The remaining full-harness failures were exactly that
+  shape: writes forwarded to the leader succeeded, but immediate reads on a
+  partition-0 follower could still observe stale local state. Leader-aware
+  latest-query forwarding closes that gap without re-broadcasting the old broad
+  replication stream.
+- **Focused validation:**
+  - `cargo check -p local_backend`
+  - `cargo test -p local_backend test_selective_query_forwarding_api_routes_partitioned_queries -- --nocapture`
+  - `cargo test -p local_backend test_selective_query_forwarding_api_routes_authority_partition_follower_queries -- --nocapture`
+  - `cargo test -p local_backend test_http_mutation_local_partitioned_write_does_not_wait_for_replication_frontier -- --nocapture`
+  - `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
+  - `cargo test -p database selective_delivery::tests -- --nocapture`
+  - `cargo test -p database test_remote_single_partition_commit_rejects_before_waiting_for_remote_frontier -- --nocapture`
+- **End-to-end validation:**
+  - rebuilt backend image from branch state
+  - `docker compose --profile cluster down -v --remove-orphans`
+  - `docker compose --profile cluster up -d --pull never`
+  - `bash self-hosted/docker/test.sh`
+  - result: `ALL 77 TESTS PASSED`, `ALL 10 TESTS PASSED`, `ALL SUITES PASSED`
+
+### 2026-06 — Added NATS retention-gap detection for replica consumers
+
+- **Status:** complete
+- **Related issue:** `#162`
+- **What this fixes:** a durable JetStream consumer could previously resume from
+  the earliest retained message even if finite stream retention had already
+  deleted messages the node still needed. That is a silent-divergence failure
+  mode, so the consumer now compares its durable sequence floor with the
+  stream's first retained sequence before applying any deltas.
+- **Behavior:** if the next required stream sequence is older than
+  `first_seq`, subscription fails closed with an operator-facing rebootstrap
+  error and increments a retention-gap metric instead of applying a truncated
+  history.
+- **Validation:**
+  - `cargo test -p database nats_distributed_log::tests -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
+### 2026-06 — Routed remote single-partition mutations through the owner
+
+- **Status:** complete
+- **Related issue:** `#163`
+- **What this fixes:** a mutation received by a healthy non-owner partition
+  could execute user code locally and then fail at commit time with "route this
+  mutation to the correct partition owner." That leaked partition topology to
+  clients.
+- **Behavior:** once a finalized transaction is classified as targeting a
+  single remote owner, the committer now uses the existing participant gRPC path
+  as a one-participant 2PC route. Local-owner writes still use the fast path,
+  cross-partition writes still use 2PC, and clusters without `NODE_ADDRESSES`
+  still fail closed instead of guessing.
+- **Validation:**
+  - `cargo test -p database test_partition_enforcement -- --nocapture`
+  - `cargo test -p database test_remote_single_partition_write_routes_to_owner_over_grpc -- --nocapture`
+  - `cargo test -p database test_cross_partition_commit_uses_remote_prepare_over_grpc -- --nocapture`
+  - `cargo check -p database`
+
 ## Open Issues
 
-None currently tracked in this journal after the latest clean-cluster run.
+- `#74` is no longer blocked on follower self-sufficiency. The current
+  remaining question is how far we want to push selective fanout beyond
+  excluding same-partition NATS traffic.
 
 ## Notes
 

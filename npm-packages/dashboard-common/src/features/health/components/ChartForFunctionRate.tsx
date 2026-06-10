@@ -114,7 +114,12 @@ export function ChartForFunctionRate({
   const [startDate] = useState(new Date(Date.now() - 3600 * 1000));
   const chartRef = useRef<HTMLDivElement>(null);
   const auditLogs = useDeploymentAuditLogs(startDate.getTime(), {
-    actions: ["push_config", "push_config_with_components"],
+    actions: [
+      "deploy",
+      "deploy_with_components",
+      "push_config",
+      "push_config_with_components",
+    ],
   });
   const deploysByMinute = auditLogs?.map(
     (log) => {

@@ -10,7 +10,7 @@ import { formatIndex } from "./indexes.js";
 import { promptYesNo } from "./utils/prompts.js";
 import { Span } from "./tracing.js";
 import { StartPushRequest } from "./deployApi/startPush.js";
-import { evaluatePush } from "./deploy2.js";
+import { evaluatePush } from "./deployProtocol.js";
 import { DeveloperIndexConfig, IndexDiff } from "./deployApi/finishPush.js";
 import { runSystemQuery } from "./run.js";
 

@@ -146,14 +146,14 @@ export function DeploymentSummary({
   regions?: Array<{ name: string; displayName: string }>;
 }) {
   const { TeamMemberLink } = useContext(DeploymentInfoContext);
-  const lastPushEvent = useQuery(udfs.deploymentEvents.lastPushEvent, {});
+  const lastDeployEvent = useQuery(udfs.deploymentEvents.lastDeployEvent, {});
 
-  // Resolve the team member who last deployed from the push event
+  // Resolve the team member who last deployed from the deploy event.
   const deployer = teamMembers?.find(
-    (tm) => lastPushEvent && tm.id === Number(lastPushEvent.member_id),
+    (tm) => lastDeployEvent && tm.id === Number(lastDeployEvent.member_id),
   );
-  const deployerId = lastPushEvent
-    ? Number(lastPushEvent.member_id) || undefined
+  const deployerId = lastDeployEvent
+    ? Number(lastDeployEvent.member_id) || undefined
     : undefined;
   const deployerName = deployer?.name || deployer?.email || undefined;
 
@@ -175,7 +175,7 @@ export function DeploymentSummary({
 
   // Check if we're still loading critical data
   const isLoading =
-    lastPushEvent === undefined ||
+    lastDeployEvent === undefined ||
     serverVersion === undefined ||
     (deployment.kind === "cloud" &&
       (convexCloudUrl === undefined ||
@@ -298,7 +298,7 @@ export function DeploymentSummary({
             </div>
 
             {/* Convex Version */}
-            {lastPushEvent && (
+            {lastDeployEvent && (
               <div className="flex items-center gap-2">
                 <Tooltip tip="Convex package version">
                   <CubeIcon
@@ -349,7 +349,7 @@ export function DeploymentSummary({
                   aria-label="Last deployment"
                 />
               </Tooltip>
-              {!lastPushEvent ? (
+              {!lastDeployEvent ? (
                 <span className="text-sm text-content-secondary">
                   Never deployed
                 </span>
@@ -357,7 +357,7 @@ export function DeploymentSummary({
                 <div className="flex flex-wrap items-center gap-1 text-sm text-content-primary">
                   <span>Last deployed</span>
                   <TimestampDistance
-                    date={new Date(lastPushEvent._creationTime)}
+                    date={new Date(lastDeployEvent._creationTime)}
                     className="text-sm text-content-primary"
                   />
                   {deployerId !== undefined && deployerName && (

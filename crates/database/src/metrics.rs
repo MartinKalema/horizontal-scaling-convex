@@ -1,3 +1,7 @@
+use ::search::metrics::{
+    SearchType,
+    SEARCH_TYPE_LABEL,
+};
 use common::{
     identity::IDENTITY_LABEL,
     runtime::Runtime,
@@ -26,10 +30,6 @@ use metrics::{
 use prometheus::{
     VMHistogram,
     VMHistogramVec,
-};
-use ::search::metrics::{
-    SearchType,
-    SEARCH_TYPE_LABEL,
 };
 
 use crate::{
@@ -244,6 +244,70 @@ pub fn log_replication_frontier_ts(source_partition: PartitionId, ts: Timestamp)
 }
 
 register_convex_gauge!(
+    DATABASE_REPLICATION_WRITE_FRONTIER_TS_INFO,
+    "Latest source-partition write timestamp that is safe for local strong reads on this node",
+    &SOURCE_PARTITION_LABELS
+);
+pub fn log_replication_write_frontier_ts(source_partition: PartitionId, ts: Timestamp) {
+    log_gauge_with_labels(
+        &DATABASE_REPLICATION_WRITE_FRONTIER_TS_INFO,
+        u64::from(ts) as f64,
+        vec![source_partition_label(source_partition)],
+    );
+}
+
+register_convex_histogram!(
+    DATABASE_REMOTE_READ_FRONTIER_WAIT_SECONDS,
+    "Time spent waiting for remote read frontiers before a read/commit can proceed",
+    &OUTCOME_LABELS
+);
+pub fn log_remote_read_frontier_wait_seconds(outcome: &'static str, seconds: f64) {
+    log_distribution_with_labels(
+        &DATABASE_REMOTE_READ_FRONTIER_WAIT_SECONDS,
+        seconds,
+        vec![outcome_label(outcome)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_REMOTE_READ_FRONTIER_WAIT_TIMEOUTS_TOTAL,
+    "Number of remote replication frontier waits that timed out"
+);
+pub fn log_remote_read_frontier_wait_timeout() {
+    log_counter(&DATABASE_REMOTE_READ_FRONTIER_WAIT_TIMEOUTS_TOTAL, 1);
+}
+
+register_convex_gauge!(
+    DATABASE_SELECTIVE_DELIVERY_INTERESTED_TABLES_INFO,
+    "Number of unique tables currently tracked as selectively interesting on this node"
+);
+pub fn log_selective_delivery_interested_tables(num_tables: usize) {
+    log_gauge(
+        &DATABASE_SELECTIVE_DELIVERY_INTERESTED_TABLES_INFO,
+        num_tables as f64,
+    );
+}
+
+register_convex_counter!(
+    DATABASE_SELECTIVE_DELIVERY_TARGETED_DELIVERIES_TOTAL,
+    "Total number of targeted selective-delivery shadow publishes sent to node-specific subjects"
+);
+pub fn log_selective_delivery_targeted_deliveries(num_deliveries: usize) {
+    log_counter(
+        &DATABASE_SELECTIVE_DELIVERY_TARGETED_DELIVERIES_TOTAL,
+        num_deliveries as u64,
+    );
+}
+
+register_convex_counter!(
+    DATABASE_SELECTIVE_DELIVERY_SHADOW_RECEIVES_TOTAL,
+    "Total number of node-targeted selective-delivery shadow deltas consumed"
+);
+pub fn log_selective_delivery_shadow_receive() {
+    log_counter(&DATABASE_SELECTIVE_DELIVERY_SHADOW_RECEIVES_TOTAL, 1);
+}
+
+register_convex_gauge!(
     DATABASE_LATEST_REPEATABLE_TS_INFO,
     "Latest repeatable timestamp currently visible on this node"
 );
@@ -403,7 +467,10 @@ register_convex_histogram!(
     "Number of participants involved in a 2PC transaction"
 );
 pub fn log_two_phase_participants(num_participants: usize) {
-    log_distribution(&DATABASE_TWO_PHASE_PARTICIPANTS_TOTAL, num_participants as f64);
+    log_distribution(
+        &DATABASE_TWO_PHASE_PARTICIPANTS_TOTAL,
+        num_participants as f64,
+    );
 }
 
 register_convex_histogram!(
@@ -411,7 +478,10 @@ register_convex_histogram!(
     "Number of prepare timestamp allocation attempts for a 2PC transaction"
 );
 pub fn log_two_phase_prepare_attempts(num_attempts: usize) {
-    log_distribution(&DATABASE_TWO_PHASE_PREPARE_ATTEMPTS_TOTAL, num_attempts as f64);
+    log_distribution(
+        &DATABASE_TWO_PHASE_PREPARE_ATTEMPTS_TOTAL,
+        num_attempts as f64,
+    );
 }
 
 register_convex_histogram!(
@@ -474,6 +544,14 @@ pub fn log_replication_transport_consumer_sequence(sequence: u64) {
         &DATABASE_REPLICATION_TRANSPORT_CONSUMER_SEQUENCE_INFO,
         sequence as f64,
     );
+}
+
+register_convex_counter!(
+    DATABASE_REPLICATION_TRANSPORT_RETENTION_GAPS_TOTAL,
+    "Number of replication consumers stopped because JetStream retention removed required deltas"
+);
+pub fn log_replication_transport_retention_gap() {
+    log_counter(&DATABASE_REPLICATION_TRANSPORT_RETENTION_GAPS_TOTAL, 1);
 }
 
 register_convex_histogram!(

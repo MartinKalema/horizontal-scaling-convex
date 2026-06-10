@@ -5705,6 +5705,7 @@ dependencies = [
  "futures",
  "futures-async-stream",
  "governor",
+ "headers",
  "http 1.3.1",
  "http-body-util",
  "http_client",

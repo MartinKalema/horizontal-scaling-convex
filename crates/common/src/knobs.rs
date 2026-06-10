@@ -375,19 +375,29 @@ pub static MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY: LazyLock<Duration> = LazyLoc
     ))
 });
 
-/// How often an idle partition leader should publish a lightweight
-/// replication-frontier heartbeat to other partitions.
+/// How often an idle partition leader should publish a lightweight remote-read
+/// frontier heartbeat to other partitions.
 ///
 /// This is separate from `MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY` because
 /// cross-partition OCC needs a much fresher "safe frontier" than follower
 /// persistence readers do. The heartbeat is the distributed equivalent of
 /// CockroachDB's closed timestamp side transport: even if a partition is idle,
 /// peers still learn that reads below this timestamp are safe.
-pub static REPLICATION_FRONTIER_HEARTBEAT_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_millis(env_config(
-        "REPLICATION_FRONTIER_HEARTBEAT_INTERVAL_MS",
-        200,
-    ))
+pub static REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    let millis = std::env::var("REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        // Deprecated fallback for existing local/demo configs.
+        .unwrap_or_else(|| env_config("REPLICATION_FRONTIER_HEARTBEAT_INTERVAL_MS", 200));
+    Duration::from_millis(millis)
+});
+
+/// Maximum time to wait for a remote partition's read frontier before
+/// failing the request. This should be comfortably above the heartbeat interval
+/// so normal idle frontier progress succeeds, but bounded so missing transport
+/// progress does not hang user operations forever.
+pub static REMOTE_READ_FRONTIER_WAIT_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_millis(env_config("REMOTE_READ_FRONTIER_WAIT_TIMEOUT_MS", 5000))
 });
 
 /// This is the max duration between a Commit and bumping max_repeatable_ts.
@@ -843,7 +853,7 @@ pub static APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: LazyLock<usize> =
     LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_NODE_ACTIONS", 64));
 
 /// The maximum number of concurrent package uploads during
-/// `/api/deploy2/start_push` + `/api/deploy2/evaluate_push`.
+/// `/api/deploy/start_push` + `/api/deploy/evaluate_push`.
 pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
     LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_UPLOADS", 4));
 
@@ -1346,7 +1356,7 @@ pub static TABLE_SUMMARY_AGE_JITTER_SECONDS: LazyLock<f32> =
 pub static HTTP_SERVER_TIMEOUT_DURATION: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("HTTP_SERVER_TIMEOUT_SECONDS", 300)));
 
-/// The limit on the request size to /push_config.
+/// The limit on the request size to deploy push endpoints.
 // Schema and code bundle pushes must be less than this.
 pub static MAX_PUSH_BYTES: LazyLock<usize> =
     LazyLock::new(|| env_config("MAX_PUSH_BYTES", 200_000_000));
@@ -1390,7 +1400,7 @@ pub static REQUEST_TRACE_SAMPLE_CONFIG: LazyLock<SamplingConfig> = LazyLock::new
         "REQUEST_TRACE_SAMPLE_CONFIG",
         prod_override(
             SamplingConfig::default(),
-            r#"{"defaultFraction":0.00001,"routeOverrides":[{"routeRegexp":"/api/push_config","fraction":0.1}, {"routeRegexp":"conductor/load-instance","fraction":0.01}, {"routeRegexp":"usage_tracking_worker/send_usage","fraction":0.01}]}"#
+            r#"{"defaultFraction":0.00001,"routeOverrides":[{"routeRegexp":"/api/deploy/(start_push|evaluate_push|finish_push)","fraction":0.1}, {"routeRegexp":"conductor/load-instance","fraction":0.01}, {"routeRegexp":"usage_tracking_worker/send_usage","fraction":0.01}]}"#
                 .parse()
                 .unwrap(),
         ),

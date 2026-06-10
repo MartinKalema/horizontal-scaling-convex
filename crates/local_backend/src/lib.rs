@@ -6,6 +6,7 @@
 
 use std::{
     self,
+    collections::BTreeMap,
     sync::Arc,
     time::Duration,
 };
@@ -92,7 +93,6 @@ pub mod config;
 pub mod custom_headers;
 pub mod dashboard;
 pub mod deploy_config;
-pub mod deploy_config2;
 pub mod deployment_info;
 pub mod deployment_state;
 pub mod environment_variables;
@@ -105,6 +105,8 @@ pub mod node_action_callbacks;
 pub mod parse;
 pub mod proxy;
 pub mod public_api;
+pub mod query_forwarding_api;
+pub mod route_authority;
 pub mod router;
 pub mod scheduling;
 pub mod schema;
@@ -121,7 +123,7 @@ pub mod two_phase_service;
 pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 
 #[derive(Clone)]
-pub struct LocalAppState {
+pub struct BackendAppState {
     // Origin for the server (e.g. http://127.0.0.1:3210, https://demo.convex.cloud)
     pub origin: ConvexOrigin,
     // Origin for the corresponding convex.site (where we serve HTTP) (e.g. http://127.0.0.1:8001, https://crazy-giraffe-123.convex.site)
@@ -134,14 +136,18 @@ pub struct LocalAppState {
     pub replica_mode: bool,
     pub partition_id: Option<database::partition::PartitionId>,
     pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+    pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
+    pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
+    pub placement_metadata_store: Option<Arc<dyn database::partition::PlacementMetadataStore>>,
     /// Raft partition mailbox for receiving Raft messages from peers.
     /// None if Raft is not enabled.
     pub raft_mailbox_tx:
         Option<tokio::sync::mpsc::UnboundedSender<database::raft_node::RaftMessage>>,
 }
 
-impl LocalAppState {
+impl BackendAppState {
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.application.shutdown().await?;
 
@@ -149,19 +155,137 @@ impl LocalAppState {
     }
 }
 
-// Contains state needed to serve most http routes. Similar to LocalAppState,
+// Contains state needed to serve most http routes. Similar to BackendAppState,
 // but uses ApplicationApi instead of Application, which allows it to be used
 // in both Backend and Usher.
 #[derive(Clone)]
 pub struct RouterState {
     pub api: Arc<dyn ApplicationApi>,
+    pub database: database::Database<ProdRuntime>,
     pub runtime: ProdRuntime,
     pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+    pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
+}
+
+#[derive(Clone)]
+pub struct DeployRouterState {
+    pub instance_name: String,
+    pub instance_secret: InstanceSecret,
+    pub application: Application<ProdRuntime>,
+    pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+    pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
+}
+
+impl From<&BackendAppState> for DeployRouterState {
+    fn from(st: &BackendAppState) -> Self {
+        Self {
+            instance_name: st.instance_name.clone(),
+            instance_secret: st.instance_secret,
+            application: st.application.clone(),
+            replica_mode: st.replica_mode,
+            partition_id: st.partition_id,
+            node_addresses: st.node_addresses.clone(),
+            raft_state: st.raft_state.clone(),
+            raft_peer_http_origins: st.raft_peer_http_origins.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AdminRouterState {
+    pub origin: ConvexOrigin,
+    pub site_origin: ConvexSite,
+    pub instance_name: String,
+    pub application: Application<ProdRuntime>,
+    pub zombify_rx: async_broadcast::Receiver<()>,
+    pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+}
+
+impl From<&BackendAppState> for AdminRouterState {
+    fn from(st: &BackendAppState) -> Self {
+        Self {
+            origin: st.origin.clone(),
+            site_origin: st.site_origin.clone(),
+            instance_name: st.instance_name.clone(),
+            application: st.application.clone(),
+            zombify_rx: st.zombify_rx.clone(),
+            replica_mode: st.replica_mode,
+            partition_id: st.partition_id,
+            raft_state: st.raft_state.clone(),
+        }
+    }
+}
+
+impl axum::extract::FromRef<BackendAppState> for AdminRouterState {
+    fn from_ref(st: &BackendAppState) -> Self {
+        Self::from(st)
+    }
+}
+
+#[derive(Clone)]
+pub struct ActionCallbackRouterState {
+    pub application: Application<ProdRuntime>,
+    pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+}
+
+impl From<&BackendAppState> for ActionCallbackRouterState {
+    fn from(st: &BackendAppState) -> Self {
+        Self {
+            application: st.application.clone(),
+            replica_mode: st.replica_mode,
+            partition_id: st.partition_id,
+            raft_state: st.raft_state.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ImportExportRouterState {
+    pub application: Application<ProdRuntime>,
+    pub replica_mode: bool,
+    pub partition_id: Option<database::partition::PartitionId>,
+    pub raft_state: Option<database::raft_partition::RaftPartitionState>,
+}
+
+impl From<&BackendAppState> for ImportExportRouterState {
+    fn from(st: &BackendAppState) -> Self {
+        Self {
+            application: st.application.clone(),
+            replica_mode: st.replica_mode,
+            partition_id: st.partition_id,
+            raft_state: st.raft_state.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
 pub struct EmptyResponse {}
+
+fn replica_delta_consumer_start_ts(
+    local_snapshot_ts: common::types::Timestamp,
+    partition_id: Option<u32>,
+) -> common::types::Timestamp {
+    if partition_id.is_some() {
+        // Partitioned nodes compare remote origin timestamps against this value
+        // inside the NATS consumer. Until we have per-source durable replay
+        // checkpoints, replay every remote partition delta instead of using a
+        // local snapshot timestamp as a cross-node lower bound.
+        common::types::Timestamp::MIN
+    } else {
+        local_snapshot_ts
+    }
+}
 
 pub async fn make_app(
     runtime: ProdRuntime,
@@ -169,7 +293,7 @@ pub async fn make_app(
     persistence: Arc<dyn Persistence>,
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
-) -> anyhow::Result<LocalAppState> {
+) -> anyhow::Result<BackendAppState> {
     let key_broker = config.key_broker()?;
     let persistence_was_fresh = persistence.is_fresh();
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
@@ -211,6 +335,28 @@ pub async fn make_app(
         None
     };
 
+    let table_number_allocator: Arc<dyn database::TableNumberAllocator> =
+        if config.partition_id.is_some() {
+            if let Some(nats_url) = &config.nats_url {
+                Arc::new(database::NatsTableNumberAllocator::connect(nats_url).await?)
+            } else {
+                Arc::new(database::LocalTableNumberAllocator)
+            }
+        } else {
+            Arc::new(database::LocalTableNumberAllocator)
+        };
+
+    let two_phase_decision_log: Arc<dyn database::two_phase::TwoPhaseDecisionLog> =
+        if config.partition_id.is_some() {
+            if let Some(nats_url) = &config.nats_url {
+                Arc::new(database::two_phase::NatsTwoPhaseDecisionLog::connect(nats_url).await?)
+            } else {
+                Arc::new(database::two_phase::NoopTwoPhaseDecisionLog)
+            }
+        } else {
+            Arc::new(database::two_phase::NoopTwoPhaseDecisionLog)
+        };
+
     let replica_mutation_forwarder = if config.replication_mode == "replica" {
         match config.primary_grpc_url.as_deref() {
             Some(primary_grpc_url) => Some(Arc::new(
@@ -221,6 +367,19 @@ pub async fn make_app(
     } else {
         None
     };
+    let static_placement_metadata = config.partition_id.map(|_| {
+        let partition_map_str = config.partition_map.as_deref().unwrap_or("");
+        let num_partitions = config.num_partitions.unwrap_or(1);
+        database::partition::PlacementMetadata::from_static_config(
+            database::partition::StaticPlacementConfig {
+                table_assignments: partition_map_str,
+                num_partitions,
+                placement_version: database::partition::PlacementVersion::new(
+                    config.partition_map_version.unwrap_or_default(),
+                ),
+            },
+        )
+    });
 
     let database = Database::load(
         persistence.clone(),
@@ -237,22 +396,37 @@ pub async fn make_app(
         distributed_log.clone(),
         config.replication_mode == "replica",
         config.partition_id.map(|id| {
-            let partition_map_str = config.partition_map.as_deref().unwrap_or("");
-            let num_partitions = config.num_partitions.unwrap_or(1);
-            database::partition::PartitionMap::from_config(
-                partition_map_str,
-                database::partition::PartitionId(id),
-                num_partitions,
-            )
+            static_placement_metadata
+                .as_ref()
+                .expect("partitioned startup should have placement metadata")
+                .into_partition_map(database::partition::PartitionId(id))
         }),
         config
             .node_addresses
             .as_deref()
             .map(database::two_phase::NodeAddresses::from_config),
+        two_phase_decision_log,
         timestamp_oracle,
+        table_number_allocator,
         None, // raft_state: set after Raft node starts, not during Database::load
     )
     .await?;
+
+    let placement_metadata_store: Option<Arc<dyn database::partition::PlacementMetadataStore>> =
+        if let (Some(bootstrap_metadata), Some(nats_url)) = (
+            static_placement_metadata.clone(),
+            config.nats_url.as_deref(),
+        ) {
+            let store: Arc<dyn database::partition::PlacementMetadataStore> =
+                Arc::new(database::partition::NatsPlacementMetadataStore::connect(nats_url).await?);
+            let authoritative_metadata = store.ensure_initialized(bootstrap_metadata).await?;
+            database
+                .committer_client()
+                .refresh_placement_metadata(authoritative_metadata)?;
+            Some(store)
+        } else {
+            None
+        };
 
     if config.replication_mode == "replica" && persistence_was_fresh {
         let checkpoint_path = config.checkpoint_storage_path.as_ref().ok_or_else(|| {
@@ -424,6 +598,9 @@ pub async fn make_app(
         .node_addresses
         .as_deref()
         .map(database::two_phase::NodeAddresses::from_config);
+    let mut raft_state_for_app = None;
+    let mut raft_peer_http_origins = None;
+    let mut raft_peer_grpc_urls = None;
 
     if !config.disable_beacon {
         let beacon_future = beacon::start_beacon(
@@ -437,10 +614,127 @@ pub async fn make_app(
         runtime.spawn_background("beacon_worker", beacon_future);
     }
 
+    if let Some(nats_url) = &config.nats_url {
+        let nats_url = nats_url.clone();
+        let registry_node_name = config.name();
+        let delta_interest_tracker = database.delta_interest_tracker();
+        let mut interest_rx = delta_interest_tracker.watch();
+        runtime.spawn_background("selective_delivery_interest_publisher", async move {
+            let registry = match database::selective_delivery::SelectiveDeliveryRegistry::connect(
+                &nats_url,
+                registry_node_name.clone(),
+            )
+            .await
+            {
+                Ok(registry) => registry,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to start selective-delivery interest publisher for {}: {e:#}",
+                        registry_node_name,
+                    );
+                    return;
+                },
+            };
+
+            loop {
+                delta_interest_tracker.prune_expired();
+                let interest_snapshot = interest_rx.borrow().clone();
+                if let Err(e) = registry.publish_local_interest(&interest_snapshot).await {
+                    tracing::warn!(
+                        "Failed to publish selective-delivery interest for {}: {e:#}",
+                        registry_node_name,
+                    );
+                }
+                tokio::select! {
+                    changed = interest_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
+                }
+            }
+        });
+    }
+
+    if config.partition_id == Some(0) {
+        if let Some(nats_url) = &config.nats_url {
+            let nats_url = nats_url.clone();
+            let shadow_node_name = config.name();
+            let shadow_from_ts = *database.now_ts_for_reads();
+            runtime.spawn_background("selective_delivery_shadow_consumer", async move {
+                let consumer = match database::nats_distributed_log::NatsDistributedLog::connect(
+                    database::nats_distributed_log::NatsConfig {
+                        url: nats_url,
+                        consumer_name: Some(format!("{shadow_node_name}-selective-shadow")),
+                        partition_id: None,
+                    },
+                )
+                .await
+                {
+                    Ok(consumer) => consumer,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to start selective-delivery shadow consumer for {}: {e:#}",
+                            shadow_node_name,
+                        );
+                        return;
+                    },
+                };
+
+                match consumer
+                    .subscribe_node_targeted(shadow_from_ts, &shadow_node_name)
+                    .await
+                {
+                    Ok(mut stream) => {
+                        tracing::info!(
+                            "Selective-delivery shadow consumer subscribed for {}",
+                            shadow_node_name
+                        );
+                        while let Some(result) = futures::StreamExt::next(&mut stream).await {
+                            match result {
+                                Ok(message) => {
+                                    let (delta, ack) = message.into_parts();
+                                    database::log_selective_delivery_shadow_receive();
+                                    tracing::debug!(
+                                        "Selective-delivery shadow delta observed for {} at ts={}",
+                                        shadow_node_name,
+                                        u64::from(delta.ts),
+                                    );
+                                    if let Err(e) = ack.ack().await {
+                                        tracing::warn!(
+                                            "Selective-delivery shadow consumer failed to ack for \
+                                             {} at ts={}: {e:#}",
+                                            shadow_node_name,
+                                            u64::from(delta.ts),
+                                        );
+                                        break;
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Selective-delivery shadow consumer error for {}: {e:#}",
+                                        shadow_node_name,
+                                    );
+                                    break;
+                                },
+                            }
+                        }
+                    },
+                    Err(e) => tracing::warn!(
+                        "Failed to subscribe selective-delivery shadow consumer for {}: {e:#}",
+                        shadow_node_name,
+                    ),
+                }
+            });
+        }
+    }
+
     // Start the ReplicaDeltaConsumer to tail NATS and apply deltas from other
     // nodes. Runs on:
     //   - Replicas (REPLICATION_MODE=replica): consumes Primary's deltas
-    //   - Partitioned writers (PARTITION_ID set): consumes other partitions' deltas
+    //   - Partitioned writers (PARTITION_ID set): consumes only other partitions'
+    //     deltas, leaving same-partition convergence to Raft
     // Creates a fresh NATS connection dedicated to the consumer.
     let needs_delta_consumer =
         config.replication_mode == "replica" || config.partition_id.is_some();
@@ -448,66 +742,128 @@ pub async fn make_app(
         if let Some(nats_url) = &config.nats_url {
             let nats_url = nats_url.clone();
             let committer = database.committer_client();
+            let use_selective_node_targeting = config
+                .partition_id
+                .is_some_and(|local_partition| local_partition != 0);
+            let remote_partitions = config.partition_id.map(|local_partition| {
+                if let Some(num_partitions) = config.num_partitions {
+                    (0..num_partitions)
+                        .map(database::partition::PartitionId)
+                        .filter(|partition| partition.0 != local_partition)
+                        .collect::<Vec<_>>()
+                } else {
+                    config
+                        .node_addresses
+                        .as_deref()
+                        .map(database::two_phase::NodeAddresses::from_config)
+                        .map(|addresses| {
+                            addresses
+                                .partitions()
+                                .into_iter()
+                                .filter(|partition| partition.0 != local_partition)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                }
+            });
             // In partitioned mode, start consuming from the beginning of the
-            // stream. Each node has its own database with independent timestamps,
-            // so we can't use the local database timestamp as a lower bound.
-            // The self-delta skip (source_node filter) prevents double-applying.
-            // In replica mode, start from the locally visible snapshot, which
-            // may have just been bootstrapped from the latest checkpoint.
-            let from_ts = if config.partition_id.is_some() {
-                common::types::Timestamp::MIN
-            } else {
-                *database.now_ts_for_reads()
-            };
+            // stream. Each node has its own database with independent local
+            // apply timestamps, so local snapshot timestamps are not safe lower
+            // bounds for remote origin deltas. We explicitly restrict
+            // partitioned nodes to other partitions' subjects so same-partition
+            // convergence comes from Raft apply. In replica mode, start from the
+            // locally visible snapshot, which may have just been bootstrapped
+            // from the latest checkpoint.
+            let from_ts =
+                replica_delta_consumer_start_ts(*database.now_ts_for_reads(), config.partition_id);
             let consumer_name = config.name();
+            let consumer_runtime = runtime.clone();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
-                let consumer_nats =
-                    match database::nats_distributed_log::NatsDistributedLog::connect(
-                        database::nats_distributed_log::NatsConfig {
-                            url: nats_url,
-                            consumer_name: Some(consumer_name),
-                            partition_id: None,
+                let mut backoff = Duration::from_millis(250);
+                loop {
+                    tracing::info!(
+                        use_selective_node_targeting,
+                        ?remote_partitions,
+                        "ReplicaDeltaConsumer subscribing to NATS..."
+                    );
+                    let subscribe_result = if use_selective_node_targeting {
+                        match database::nats_distributed_log::NatsDistributedLog::connect(
+                            database::nats_distributed_log::NatsConfig {
+                                url: nats_url.clone(),
+                                consumer_name: Some(format!("{consumer_name}-selective")),
+                                partition_id: None,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(consumer) => {
+                                consumer
+                                    .subscribe_selective_node(from_ts.into(), &consumer_name)
+                                    .await
+                            },
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        match database::nats_distributed_log::NatsDistributedLog::connect(
+                            database::nats_distributed_log::NatsConfig {
+                                url: nats_url.clone(),
+                                consumer_name: Some(consumer_name.clone()),
+                                partition_id: None,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(consumer) => {
+                                let consumer_nats_dyn: Arc<
+                                    dyn database::commit_delta::DistributedLog,
+                                > = Arc::new(consumer);
+                                consumer_nats_dyn
+                                    .subscribe_filtered(from_ts.into(), remote_partitions.clone())
+                                    .await
+                            },
+                            Err(e) => Err(e),
+                        }
+                    };
+                    match subscribe_result {
+                        Ok(stream) => {
+                            tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
+                            let result = database::replica::consume_replication_stream(
+                                stream,
+                                committer.clone(),
+                                |ts, n| {
+                                    if use_selective_node_targeting {
+                                        database::log_selective_delivery_shadow_receive();
+                                    }
+                                    tracing::info!(
+                                        "Applied replica delta: ts={}, {} updates",
+                                        u64::from(ts),
+                                        n
+                                    );
+                                },
+                            )
+                            .await;
+                            if let Err(e) = result {
+                                tracing::error!(
+                                    "ReplicaDeltaConsumer stream failed; restarting after {:?}: \
+                                     {e:#}",
+                                    backoff,
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "ReplicaDeltaConsumer stream ended; restarting after {:?}",
+                                    backoff,
+                                );
+                            }
                         },
-                    )
-                    .await
-                    {
-                        Ok(n) => Arc::new(n),
                         Err(e) => {
                             tracing::error!(
-                                "Failed to connect NATS for ReplicaDeltaConsumer: {e:#}"
+                                "Failed to subscribe to NATS; retrying after {:?}: {e:#}",
+                                backoff,
                             );
-                            return;
                         },
-                    };
-                let consumer_nats_dyn: Arc<dyn database::commit_delta::DistributedLog> =
-                    consumer_nats;
-                tracing::info!("ReplicaDeltaConsumer subscribing to NATS...");
-                match consumer_nats_dyn.subscribe(from_ts.into()).await {
-                    Ok(mut stream) => {
-                        tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
-                        while let Some(result) = futures::StreamExt::next(&mut stream).await {
-                            match result {
-                                Ok(delta) => {
-                                    let ts = delta.ts;
-                                    let n = delta.document_updates.len();
-                                    match committer.apply_replica_delta(delta).await {
-                                        Ok(_) => tracing::info!(
-                                            "Applied replica delta: ts={}, {} updates",
-                                            u64::from(ts),
-                                            n
-                                        ),
-                                        Err(e) => tracing::error!(
-                                            "Failed to apply delta at ts={}: {e:#}",
-                                            u64::from(ts)
-                                        ),
-                                    }
-                                },
-                                Err(e) => tracing::error!("Error reading NATS delta: {e:#}"),
-                            }
-                        }
-                        tracing::warn!("ReplicaDeltaConsumer stream ended");
-                    },
-                    Err(e) => tracing::error!("Failed to subscribe to NATS: {e:#}"),
+                    }
+                    consumer_runtime.wait(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
             });
             tracing::info!("Started ReplicaDeltaConsumer for replication");
@@ -515,12 +871,13 @@ pub async fn make_app(
     }
 
     // Start the 2PC Transaction Watcher for crash recovery.
-    if config.partition_id.is_some() {
+    if let Some(partition_id) = config.partition_id {
         if let Some(nats_url) = &config.nats_url {
             database::two_phase_watcher::start(
                 runtime.clone(),
                 database.committer_client(),
                 nats_url.clone(),
+                database::partition::PartitionId(partition_id),
             );
             tracing::info!("Started 2PC Transaction Watcher");
         }
@@ -547,12 +904,25 @@ pub async fn make_app(
 
         // Parse peer addresses: "1=host:port,2=host:port,3=host:port"
         let mut peer_addresses = std::collections::HashMap::new();
+        let mut peer_http_origins = BTreeMap::new();
+        let mut peer_grpc_urls = BTreeMap::new();
         let mut peer_ids = Vec::new();
         for pair in raft_peers_str.split(',') {
             let pair = pair.trim();
             if let Some((id_str, addr)) = pair.split_once('=') {
                 if let Ok(id) = id_str.trim().parse::<u64>() {
-                    peer_addresses.insert(id, addr.trim().to_string());
+                    let normalized_grpc_addr = if addr.contains("://") {
+                        addr.trim().to_string()
+                    } else {
+                        format!("http://{}", addr.trim())
+                    };
+                    peer_addresses.insert(id, normalized_grpc_addr.clone());
+                    peer_grpc_urls.insert(id, normalized_grpc_addr);
+                    if let Ok(origin) =
+                        crate::deploy_config::http_origin_from_peer_addr(addr.trim())
+                    {
+                        peer_http_origins.insert(id, origin);
+                    }
                     peer_ids.push(id);
                 }
             }
@@ -593,6 +963,9 @@ pub async fn make_app(
             Some(snapshot_provider),
         )?;
         let raft_state = manager.state();
+        raft_state_for_app = Some(raft_state.clone());
+        raft_peer_http_origins = Some(peer_http_origins);
+        raft_peer_grpc_urls = Some(peer_grpc_urls);
         let mb_tx = manager.mailbox_tx();
         raft_mailbox_tx = Some(mb_tx);
 
@@ -605,53 +978,71 @@ pub async fn make_app(
             let committer = database.committer_client();
             let raft_state_for_apply = raft_state.clone();
             runtime.spawn_background("raft_node", async move {
-                node.run(
-                    |data| {
-                        // Deserialize the CommitDelta from the Raft entry.
-                        let envelope: database::nats_distributed_log::DeltaEnvelope =
-                            serde_json::from_slice(data).map_err(|e| {
-                                anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
-                            })?;
-                        let delta = envelope.to_delta()?;
+                if let Err(e) = node
+                    .run(
+                        |data| {
+                            // Deserialize the CommitDelta from the Raft entry.
+                            let envelope: database::nats_distributed_log::DeltaEnvelope =
+                                serde_json::from_slice(data).map_err(|e| {
+                                    anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
+                                })?;
+                            let proposed_locally =
+                                envelope.source_raft_node_id() == Some(raft_node_id);
+                            let delta = envelope.to_delta()?;
 
-                        // Leader already applied locally — skip.
-                        // Followers apply via the Committer (same path as NATS).
-                        if !raft_state_for_apply.is_leader() {
-                            tracing::info!(
-                                "Raft follower applying committed delta: ts={}",
-                                u64::from(delta.ts),
-                            );
-                            // apply_replica_delta is async — use block_in_place
-                            // since we're in the Raft loop's sync callback.
+                            // Skip only the entries this node already committed
+                            // locally before proposing them through Raft. Every
+                            // other committed entry must be applied here, even if
+                            // this node later became leader.
+                            if !proposed_locally {
+                                tracing::info!(
+                                    "Applying committed Raft delta locally: ts={}, leader_now={}",
+                                    u64::from(delta.ts),
+                                    raft_state_for_apply.is_leader(),
+                                );
+                                // apply_replica_delta is async — use block_in_place
+                                // since we're in the Raft loop's sync callback.
+                                let committer = committer.clone();
+                                common::runtime::block_in_place(|| {
+                                    let rt = tokio::runtime::Handle::current();
+                                    rt.block_on(async {
+                                        if let Err(e) = committer.apply_replica_delta(delta).await {
+                                            tracing::error!("Raft follower apply failed: {e:#}");
+                                        }
+                                    })
+                                });
+                            }
+
+                            Ok(())
+                        },
+                        |snapshot_bytes| {
+                            let checkpoint =
+                                database::snapshot_checkpointer::checkpoint_from_bytes(
+                                    snapshot_bytes,
+                                )?;
                             let committer = committer.clone();
                             common::runtime::block_in_place(|| {
                                 let rt = tokio::runtime::Handle::current();
                                 rt.block_on(async {
-                                    if let Err(e) = committer.apply_replica_delta(delta).await {
-                                        tracing::error!("Raft follower apply failed: {e:#}");
-                                    }
+                                    committer.install_snapshot(checkpoint).await?;
+                                    Ok::<_, anyhow::Error>(())
                                 })
-                            });
-                        }
-
-                        Ok(())
-                    },
-                    |snapshot_bytes| {
-                        let checkpoint =
-                            database::snapshot_checkpointer::checkpoint_from_bytes(snapshot_bytes)?;
-                        let committer = committer.clone();
-                        common::runtime::block_in_place(|| {
-                            let rt = tokio::runtime::Handle::current();
-                            rt.block_on(async {
-                                committer.install_snapshot(checkpoint).await?;
-                                Ok::<_, anyhow::Error>(())
                             })
-                        })
-                    },
-                )
-                .await;
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!("Raft node stopped after fatal error: {e:#}");
+                    panic!("Raft node stopped after fatal error: {e:#}");
+                }
             });
         }
+
+        // Defer leader enforcement until after local database/application
+        // bootstrap is complete, then attach the live Raft state to the
+        // Committer so normal writes propose through Raft and followers reject
+        // non-leader writes.
+        database.attach_raft_state(raft_state.clone()).await?;
 
         // Start transport clients for each peer.
         for client in transport_clients {
@@ -668,7 +1059,7 @@ pub async fn make_app(
         );
     }
 
-    let app_state = LocalAppState {
+    let app_state = BackendAppState {
         origin,
         site_origin: config.convex_site_url()?,
         instance_name,
@@ -678,7 +1069,11 @@ pub async fn make_app(
         replica_mode: config.replication_mode == "replica",
         partition_id,
         node_addresses,
+        raft_state: raft_state_for_app,
+        raft_peer_http_origins,
+        raft_peer_grpc_urls,
         replica_mutation_forwarder,
+        placement_metadata_store,
         raft_mailbox_tx,
     };
 
@@ -717,6 +1112,7 @@ mod tests {
         query::Order,
         shutdown::ShutdownSignal,
         testing::TestPersistence,
+        types::Timestamp,
     };
     use futures::TryStreamExt;
     use keybroker::Identity;
@@ -733,6 +1129,26 @@ mod tests {
         config::LocalConfig,
         make_app,
     };
+
+    #[test]
+    fn partitioned_replica_consumers_do_not_start_from_local_snapshot_ts() -> anyhow::Result<()> {
+        let local_snapshot_ts = Timestamp::try_from(1_000_000u64)?;
+
+        assert_eq!(
+            super::replica_delta_consumer_start_ts(local_snapshot_ts, Some(0)),
+            Timestamp::MIN,
+        );
+        assert_eq!(
+            super::replica_delta_consumer_start_ts(local_snapshot_ts, Some(1)),
+            Timestamp::MIN,
+        );
+        assert_eq!(
+            super::replica_delta_consumer_start_ts(local_snapshot_ts, None),
+            local_snapshot_ts,
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn test_fresh_replica_bootstraps_from_checkpoint() -> anyhow::Result<()> {

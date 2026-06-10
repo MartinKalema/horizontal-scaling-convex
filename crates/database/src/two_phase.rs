@@ -15,9 +15,14 @@
 //!   - TiDB 1PC: https://pingcap.github.io/tidb-dev-guide/understand-tidb/1pc.html
 //!   - CockroachDB: https://www.cockroachlabs.com/blog/parallel-commits/
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::Duration,
+};
 
 use anyhow::Context;
+use async_nats::jetstream::kv::Store;
+use async_trait::async_trait;
 use common::{
     bootstrap_model::index::database_index::IndexedFields,
     document::DocumentUpdateWithPrevTs,
@@ -47,6 +52,7 @@ use pb::{
     },
     searchlight,
 };
+use prost::Message;
 use search::{
     query::{
         FuzzyDistance,
@@ -136,8 +142,101 @@ pub struct TwoPhaseRedoEntry {
     pub transaction_id: String,
     pub prepare_ts: u64,
     pub partition_id: u32,
-    pub num_document_writes: usize,
-    pub num_index_writes: usize,
+    pub write_source: Option<String>,
+    pub participant_transaction_hex: String,
+}
+
+impl TwoPhaseRedoEntry {
+    pub fn new(
+        transaction_id: &TwoPhaseTransactionId,
+        prepare_ts: Timestamp,
+        partition_id: PartitionId,
+        transaction: ParticipantTransaction,
+        write_source: &WriteSource,
+    ) -> anyhow::Result<Self> {
+        let proto = TwoPcParticipantTransactionProto::try_from(transaction)?;
+        let mut bytes = Vec::new();
+        proto
+            .encode(&mut bytes)
+            .context("2PC: Failed to encode participant transaction redo")?;
+        Ok(Self {
+            transaction_id: transaction_id.0.clone(),
+            prepare_ts: u64::from(prepare_ts),
+            partition_id: partition_id.0,
+            write_source: write_source.as_str().map(str::to_string),
+            participant_transaction_hex: hex::encode(bytes),
+        })
+    }
+
+    pub fn transaction_id(&self) -> TwoPhaseTransactionId {
+        TwoPhaseTransactionId(self.transaction_id.clone())
+    }
+
+    pub fn prepare_ts(&self) -> anyhow::Result<Timestamp> {
+        self.prepare_ts.try_into()
+    }
+
+    pub fn partition_id(&self) -> PartitionId {
+        PartitionId(self.partition_id)
+    }
+
+    pub fn write_source(&self) -> WriteSource {
+        WriteSource::from(self.write_source.clone())
+    }
+
+    pub fn participant_transaction(&self) -> anyhow::Result<ParticipantTransaction> {
+        let bytes = hex::decode(&self.participant_transaction_hex)
+            .context("2PC: Failed to decode participant transaction redo")?;
+        let proto = TwoPcParticipantTransactionProto::decode(bytes.as_slice())
+            .context("2PC: Failed to parse participant transaction redo")?;
+        ParticipantTransaction::try_from(proto)
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    pub struct InMemoryTwoPhaseDecisionLog {
+        decisions: Arc<Mutex<BTreeMap<String, TwoPhaseDecision>>>,
+    }
+
+    impl InMemoryTwoPhaseDecisionLog {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn decisions(&self) -> BTreeMap<String, TwoPhaseDecision> {
+            self.decisions.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TwoPhaseDecisionLog for InMemoryTwoPhaseDecisionLog {
+        async fn write_decision(
+            &self,
+            transaction_id: &TwoPhaseTransactionId,
+            decision: &TwoPhaseDecision,
+        ) -> anyhow::Result<()> {
+            self.decisions
+                .lock()
+                .insert(transaction_id.0.clone(), decision.clone());
+            Ok(())
+        }
+
+        async fn delete_decision(
+            &self,
+            transaction_id: &TwoPhaseTransactionId,
+        ) -> anyhow::Result<()> {
+            self.decisions.lock().remove(&transaction_id.0);
+            Ok(())
+        }
+    }
 }
 
 /// NATS KV key prefix for 2PC decision records.
@@ -146,8 +245,93 @@ pub const TWO_PHASE_KV_PREFIX: &str = "2pc_";
 /// NATS KV bucket for 2PC state.
 pub const TWO_PHASE_KV_BUCKET: &str = "convex_2pc";
 
+/// Retain resolved 2PC decision records long enough for watcher recovery.
+pub const TWO_PHASE_DECISION_TTL_SECS: u64 = 3600;
+
 /// Timeout for prepared transactions before the watcher rolls them back.
 pub const PREPARE_TIMEOUT_SECS: u64 = 30;
+
+pub fn two_phase_decision_key(transaction_id: &TwoPhaseTransactionId) -> String {
+    format!("{TWO_PHASE_KV_PREFIX}{}", transaction_id.0)
+}
+
+#[async_trait]
+pub trait TwoPhaseDecisionLog: Send + Sync + 'static {
+    async fn write_decision(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        decision: &TwoPhaseDecision,
+    ) -> anyhow::Result<()>;
+
+    async fn delete_decision(&self, transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()>;
+}
+
+pub struct NoopTwoPhaseDecisionLog;
+
+#[async_trait]
+impl TwoPhaseDecisionLog for NoopTwoPhaseDecisionLog {
+    async fn write_decision(
+        &self,
+        _transaction_id: &TwoPhaseTransactionId,
+        _decision: &TwoPhaseDecision,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_decision(&self, _transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct NatsTwoPhaseDecisionLog {
+    kv: Store,
+}
+
+impl NatsTwoPhaseDecisionLog {
+    pub async fn connect(nats_url: &str) -> anyhow::Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = async_nats::connect(nats_url)
+            .await
+            .with_context(|| format!("2PC: Failed to connect to NATS at {nats_url}"))?;
+        let jetstream = async_nats::jetstream::new(client);
+        let kv = jetstream
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: TWO_PHASE_KV_BUCKET.to_string(),
+                history: 1,
+                max_age: Duration::from_secs(TWO_PHASE_DECISION_TTL_SECS),
+                ..Default::default()
+            })
+            .await
+            .context("2PC: Failed to create decision KV bucket")?;
+        Ok(Self { kv })
+    }
+}
+
+#[async_trait]
+impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
+    async fn write_decision(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        decision: &TwoPhaseDecision,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_vec(decision)
+            .with_context(|| format!("2PC: Failed to serialize decision for {transaction_id}"))?;
+        self.kv
+            .put(two_phase_decision_key(transaction_id), payload.into())
+            .await
+            .with_context(|| format!("2PC: Failed to write decision for {transaction_id}"))?;
+        Ok(())
+    }
+
+    async fn delete_decision(&self, transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()> {
+        self.kv
+            .delete(two_phase_decision_key(transaction_id))
+            .await
+            .with_context(|| format!("2PC: Failed to delete decision for {transaction_id}"))?;
+        Ok(())
+    }
+}
 
 /// Partition-to-address mapping for gRPC communication.
 /// Each entry maps a partition ID to the gRPC address of its owner node.
@@ -277,6 +461,46 @@ impl ParticipantTransaction {
             begin_timestamp: transaction.begin_timestamp,
             tablet_metadata,
             reads,
+            writes: selected_writes,
+        })
+    }
+
+    pub fn from_entire_final_transaction(transaction: &FinalTransaction) -> anyhow::Result<Self> {
+        let selected_writes: Vec<_> = transaction.writes.coalesced_writes().cloned().collect();
+        let mut tablet_metadata = BTreeMap::new();
+        let mut record_tablet = |tablet_id: TabletId| -> anyhow::Result<()> {
+            if tablet_metadata.contains_key(&tablet_id) {
+                return Ok(());
+            }
+            let table_name = transaction.table_mapping.tablet_name(tablet_id)?;
+            let table_number = transaction.table_mapping.tablet_number(tablet_id)?;
+            let namespace = transaction.table_mapping.tablet_namespace(tablet_id)?;
+            tablet_metadata.insert(
+                tablet_id,
+                ParticipantTabletMetadata {
+                    tablet_id,
+                    namespace,
+                    table_number,
+                    table_name,
+                },
+            );
+            Ok(())
+        };
+
+        for (index_name, _) in transaction.reads.read_set().iter_indexed() {
+            record_tablet(*index_name.table())?;
+        }
+        for (index_name, _) in transaction.reads.read_set().iter_search() {
+            record_tablet(*index_name.table())?;
+        }
+        for write in &selected_writes {
+            record_tablet(write.id.tablet_id)?;
+        }
+
+        Ok(Self {
+            begin_timestamp: transaction.begin_timestamp,
+            tablet_metadata,
+            reads: transaction.reads.read_set().clone(),
             writes: selected_writes,
         })
     }
@@ -584,12 +808,14 @@ impl TwoPhaseCommitGrpcClient {
         transaction: ParticipantTransaction,
         write_source: WriteSource,
         prepare_ts: Timestamp,
+        placement_version: crate::partition::PlacementVersion,
     ) -> anyhow::Result<PrepareResult> {
         let request = TwoPcPrepareRequest {
             transaction_id: transaction_id.0.clone(),
             transaction: Some(transaction.try_into()?),
             write_source: write_source.as_str().unwrap_or_default().to_string(),
             prepare_ts: u64::from(prepare_ts),
+            placement_version: u64::from(placement_version),
         };
         let response = self
             .client

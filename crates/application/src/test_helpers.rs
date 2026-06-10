@@ -222,7 +222,9 @@ impl<RT: Runtime> ApplicationTestExt<RT> for Application<RT> {
             false,
             None,
             None,
+            Arc::new(database::two_phase::NoopTwoPhaseDecisionLog),
             None,
+            Arc::new(database::LocalTableNumberAllocator),
             None,
         )
         .await?;

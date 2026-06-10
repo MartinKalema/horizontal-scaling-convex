@@ -33,7 +33,7 @@ import { runPush } from "./components.js";
 import { suggestedEnvVarNames } from "./envvars.js";
 import { runSystemQuery } from "./run.js";
 import {
-  handlePushConfigError,
+  handleDeployError,
   readProjectConfig,
   getAuthKitConfig,
 } from "./config.js";
@@ -60,7 +60,7 @@ async function brotliCompress(ctx: Context, data: string): Promise<Buffer> {
   return result;
 }
 
-/** Push configuration2 to the given remote origin. */
+/** Deploy configuration to the given remote origin. */
 export async function startPush(
   ctx: Context,
   span: Span,
@@ -76,7 +76,7 @@ export async function startPush(
     span,
     request,
     options,
-    "/api/deploy2/start_push",
+    "/api/deploy/start_push",
   );
   return startPushResponse.parse(response);
 }
@@ -96,7 +96,7 @@ export async function evaluatePush(
     span,
     request,
     options,
-    "/api/deploy2/evaluate_push",
+    "/api/deploy/evaluate_push",
   );
   return evaluatePushResponse.parse(response);
 }
@@ -110,9 +110,9 @@ async function pushCode(
     deploymentName: string | null;
     deploymentType?: DeploymentType;
   },
-  endpoint: "/api/deploy2/start_push" | "/api/deploy2/evaluate_push",
+  endpoint: "/api/deploy/start_push" | "/api/deploy/evaluate_push",
 ): Promise<unknown> {
-  // Log a summary of the push request instead of the full object
+  // Log a summary of the deploy request instead of the full object.
   const unchangedModuleCount =
     request.appDefinition?.unchangedModuleHashes?.length ?? 0;
   const changedModuleCount = request.appDefinition?.changedModules?.length ?? 0;
@@ -124,7 +124,7 @@ async function pushCode(
     hasDependencies: request.nodeDependencies?.length > 0,
     dryRun: request.dryRun,
   };
-  logVerbose(`Push request summary: ${JSON.stringify(requestSummary)}`);
+  logVerbose(`Deploy request summary: ${JSON.stringify(requestSummary)}`);
   const onError = (err: any) => {
     if (err.toString() === "TypeError: fetch failed") {
       changeSpinner(`Fetch failed, is ${options.url} correct? Retrying...`);
@@ -147,10 +147,10 @@ async function pushCode(
     });
     return await response.json();
   } catch (error: unknown) {
-    return await handlePushConfigError(
+    return await handleDeployError(
       ctx,
       error,
-      "Error: Unable to start push to " + options.url,
+      "Error: Unable to start deploy to " + options.url,
       options.deploymentName,
       {
         adminKey: request.adminKey,
@@ -187,7 +187,7 @@ export async function waitForSchema(
   while (true) {
     let currentStatus: SchemaStatus;
     try {
-      const response = await fetch("/api/deploy2/wait_for_schema", {
+      const response = await fetch("/api/deploy/wait_for_schema", {
         body: JSON.stringify({
           adminKey: options.adminKey,
           schemaChange: startPush.schemaChange,
@@ -314,7 +314,7 @@ export async function finishPush(
     dryRun: options.dryRun,
   };
   try {
-    const response = await fetch("/api/deploy2/finish_push", {
+    const response = await fetch("/api/deploy/finish_push", {
       body: await brotliCompress(ctx, JSON.stringify(request)),
       method: "POST",
       headers: {
@@ -325,7 +325,7 @@ export async function finishPush(
     });
     return finishPushDiff.parse(await response.json());
   } catch (error: unknown) {
-    return await handlePushConfigError(
+    return await handleDeployError(
       ctx,
       error,
       "Error: Unable to finish push to " + options.url,
@@ -360,7 +360,7 @@ export async function reportPushCompleted(
     adminKey,
   });
   try {
-    const response = await fetch("/api/deploy2/report_push_completed", {
+    const response = await fetch("/api/deploy/report_push_completed", {
       body: JSON.stringify({
         adminKey,
         spans: reporter.spans,

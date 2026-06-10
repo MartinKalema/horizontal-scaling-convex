@@ -28,6 +28,7 @@ use crate::{
         NodeAddresses,
         ParticipantTransaction,
         TwoPhaseCommitGrpcClient,
+        TwoPhaseDecision,
         TwoPhaseTransactionId,
     },
     write_log::WriteSource,
@@ -40,8 +41,9 @@ pub enum TransactionClassification {
     /// All writes target a single partition — use the normal fast path (TiDB
     /// 1PC).
     SinglePartition,
-    /// All writes target a single remote partition. This should be rejected by
-    /// the receiving node instead of running 2PC locally.
+    /// All writes target a single remote partition. Route the finalized
+    /// transaction to that owner instead of exposing partition topology to the
+    /// client.
     RemoteSinglePartition { owner: PartitionId },
     /// Writes span multiple partitions — use 2PC.
     CrossPartition {
@@ -146,6 +148,7 @@ async fn prepare_participant(
                 participant_tx,
                 write_source.clone(),
                 prepare_ts,
+                partition_map.placement_version(),
             )
             .await?
     };
@@ -212,12 +215,34 @@ async fn commit_participant(
     }
 }
 
+async fn write_decision_record(
+    local_committer: &CommitterClient,
+    transaction_id: &TwoPhaseTransactionId,
+    decision: &TwoPhaseDecision,
+) -> anyhow::Result<()> {
+    local_committer
+        .two_phase_decision_log()
+        .write_decision(transaction_id, decision)
+        .await
+}
+
+async fn delete_decision_record(
+    local_committer: &CommitterClient,
+    transaction_id: &TwoPhaseTransactionId,
+) -> anyhow::Result<()> {
+    local_committer
+        .two_phase_decision_log()
+        .delete_decision(transaction_id)
+        .await
+}
+
 fn is_retryable_prepare_ts_error(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.to_string().contains("2PC Prepare assigned ts="))
 }
 
-/// Execute the 2PC protocol for a cross-partition transaction.
+/// Execute the 2PC protocol for a transaction that cannot commit on the local
+/// fast path.
 pub async fn coordinate_two_phase_commit(
     local_committer: &CommitterClient,
     transaction: FinalTransaction,
@@ -225,11 +250,18 @@ pub async fn coordinate_two_phase_commit(
     partition_map: &PartitionMap,
 ) -> anyhow::Result<Timestamp> {
     let timer = metrics::two_phase_coordinator_timer();
-    let TransactionClassification::CrossPartition { partitions: _ } =
-        classify_transaction(&transaction, partition_map, &write_source)
-    else {
-        anyhow::bail!("2PC coordinator called for a single-partition transaction");
-    };
+    match classify_transaction(&transaction, partition_map, &write_source) {
+        TransactionClassification::SinglePartition => {
+            anyhow::bail!("2PC coordinator called for a local single-partition transaction");
+        },
+        TransactionClassification::RemoteSinglePartition { owner } => {
+            tracing::info!(
+                "2PC Coordinator: routing single-partition transaction to remote owner {}",
+                owner,
+            );
+        },
+        TransactionClassification::CrossPartition { partitions: _ } => {},
+    }
 
     let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
     let txn_id = TwoPhaseTransactionId::new();
@@ -286,6 +318,22 @@ pub async fn coordinate_two_phase_commit(
                         participant,
                         txn_id,
                     );
+                    let retryable_prepare_ts_error =
+                        is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES;
+                    if !retryable_prepare_ts_error && !prepared_participants.is_empty() {
+                        let decision = TwoPhaseDecision::RolledBack {
+                            reason: err.to_string(),
+                            participants: prepared_participants.iter().map(|p| p.0).collect(),
+                        };
+                        write_decision_record(local_committer, &txn_id, &decision)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "2PC Coordinator: failed to write rollback decision for \
+                                     txn={txn_id}"
+                                )
+                            })?;
+                    }
                     for prepared in prepared_participants.iter().rev().copied() {
                         if let Err(rollback_err) = rollback_participant(
                             local_committer,
@@ -305,7 +353,7 @@ pub async fn coordinate_two_phase_commit(
                         }
                     }
 
-                    if is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES {
+                    if retryable_prepare_ts_error {
                         metrics::log_two_phase_prepare_retry();
                         tracing::info!(
                             "2PC Coordinator: retrying txn={} with a newer prepare timestamp \
@@ -329,6 +377,16 @@ pub async fn coordinate_two_phase_commit(
         if retry_prepare {
             continue;
         }
+
+        let decision = TwoPhaseDecision::Committed {
+            commit_ts: u64::from(prepare_ts),
+            participants: prepared_participants.iter().map(|p| p.0).collect(),
+        };
+        write_decision_record(local_committer, &txn_id, &decision)
+            .await
+            .with_context(|| {
+                format!("2PC Coordinator: failed to write commit decision for txn={txn_id}")
+            })?;
 
         let mut commit_results = Vec::new();
         for participant in &prepared_participants {
@@ -367,6 +425,12 @@ pub async fn coordinate_two_phase_commit(
         );
         metrics::log_two_phase_prepare_attempts(prepare_attempts);
         metrics::log_two_phase_decision("commit");
+        if let Err(err) = delete_decision_record(local_committer, &txn_id).await {
+            tracing::warn!(
+                "2PC Coordinator: committed txn={} but failed to delete durable decision: {err:#}",
+                txn_id,
+            );
+        }
         timer.finish();
         return Ok(prepare_ts);
     }

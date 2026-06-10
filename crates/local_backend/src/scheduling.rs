@@ -34,9 +34,9 @@ use value::TableNamespace;
 
 use crate::{
     admin::must_be_admin_with_write_access,
-    authentication::ExtractIdentity,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
     parse::parse_document_id,
-    LocalAppState,
+    AdminRouterState,
 };
 
 #[derive(Deserialize)]
@@ -58,7 +58,7 @@ pub struct CancelAllJobsRequest {
 
 #[debug_handler]
 pub async fn cancel_all_jobs(
-    State(st): State<LocalAppState>,
+    State(st): State<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(CancelAllJobsRequest {
         component_id,
@@ -117,7 +117,7 @@ pub struct CancelJobRequest {
 
 #[debug_handler]
 pub async fn cancel_job(
-    State(st): State<LocalAppState>,
+    State(st): State<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(cancel_job_request): Json<CancelJobRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -158,7 +158,7 @@ pub struct DeleteScheduledFunctionsTableRequest {
     responses((status = 200))
 )]
 pub async fn delete_scheduled_functions_table(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(DeleteScheduledFunctionsTableRequest { component_id }): Json<
         DeleteScheduledFunctionsTableRequest,

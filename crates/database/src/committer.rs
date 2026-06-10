@@ -50,7 +50,8 @@ use common::{
         COMMIT_TRACE_THRESHOLD,
         MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY,
         MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY,
-        REPLICATION_FRONTIER_HEARTBEAT_INTERVAL,
+        REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL,
+        REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
         TRANSACTION_WARN_READ_SET_INTERVALS,
     },
     persistence::{
@@ -156,6 +157,8 @@ use crate::{
         BootstrappedSearchIndexes,
     },
     snapshot_manager::{
+        partition_timestamp_map_from_json,
+        partition_timestamp_map_to_json,
         replication_frontiers_to_json,
         SnapshotManager,
         TableSummaries,
@@ -214,17 +217,20 @@ enum PersistenceWrite {
     /// and replicated — flow through one sequential log.
     ReplicaDelta {
         commit_ts: Timestamp,
+        remote_ts: Timestamp,
         snapshot: Snapshot,
         remapped_updates: Vec<common::document::DocumentUpdate>,
         write_source: WriteSource,
         write_bytes: u64,
         source_partition: Option<crate::partition::PartitionId>,
+        applied_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
-    ReplicationFrontierHeartbeat {
+    RemoteReadFrontierHeartbeat {
         commit_ts: Timestamp,
         source_partition: crate::partition::PartitionId,
+        applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -232,6 +238,7 @@ enum PersistenceWrite {
         snapshot_ts: Timestamp,
         snapshot: Snapshot,
         replication_frontiers: BTreeMap<crate::partition::PartitionId, Timestamp>,
+        applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -243,7 +250,7 @@ impl PersistenceWrite {
             Self::Commit { commit_id, .. } => *commit_id,
             Self::MaxRepeatableTimestamp { commit_id, .. } => *commit_id,
             Self::ReplicaDelta { commit_id, .. } => *commit_id,
-            Self::ReplicationFrontierHeartbeat { commit_id, .. } => *commit_id,
+            Self::RemoteReadFrontierHeartbeat { commit_id, .. } => *commit_id,
             Self::InstallSnapshot { commit_id, .. } => *commit_id,
         }
     }
@@ -344,6 +351,14 @@ fn checkpoint_index_entries(
     index_entries
 }
 
+type RaftCommitWaiter = Option<oneshot::Receiver<bool>>;
+
+struct PublishedCommit {
+    commit_ts: Timestamp,
+    raft_commit_waiter: RaftCommitWaiter,
+    delta: CommitDelta,
+}
+
 pub struct Committer<RT: Runtime> {
     // Internal staged commits for conflict checking.
     pending_writes: PendingWrites,
@@ -367,9 +382,10 @@ pub struct Committer<RT: Runtime> {
     // so Replica nodes can update their state.
     distributed_log: Arc<dyn DistributedLog>,
 
-    // Partition map for write routing. Determines which tables this node owns.
+    // Refreshable placement state for write routing. Determines which tables
+    // this node owns.
     // None means single-partition mode (owns everything).
-    partition_map: Option<crate::partition::PartitionMap>,
+    placement_state: Option<crate::partition::PlacementState>,
 
     // Global timestamp oracle for multi-node deployments (TiDB PD pattern).
     // When set, next_commit_ts() draws from the TSO instead of the local clock,
@@ -393,6 +409,12 @@ pub struct Committer<RT: Runtime> {
     // When set, the Committer rejects writes if this node is not the Raft leader.
     // None means no Raft (existing behavior — always accept writes).
     raft_state: Option<crate::raft_partition::RaftPartitionState>,
+
+    // Durable idempotency frontier for replicated transport messages.
+    // Unlike `SnapshotManager::replication_frontiers`, this map is keyed by
+    // the origin partition's commit timestamp, not this node's local apply
+    // timestamp.
+    applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -433,6 +455,13 @@ impl<RT: Runtime> Committer<RT> {
         self.queued_snapshots.push_back((commit_id, ts, snapshot));
     }
 
+    fn local_partition_for_two_phase(&self) -> crate::partition::PartitionId {
+        self.placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.local_partition())
+            .unwrap_or(crate::partition::PartitionId(0))
+    }
+
     fn dequeue_snapshot(&mut self, commit_id: usize) {
         let (queued_commit_id, ..) = self
             .queued_snapshots
@@ -455,14 +484,18 @@ impl<RT: Runtime> Committer<RT> {
         distributed_log: Arc<dyn DistributedLog>,
         partition_map: Option<crate::partition::PartitionMap>,
         node_addresses: Option<crate::two_phase::NodeAddresses>,
+        two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
+        applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
         let conflict_checker = PendingWrites::new();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
         let snapshot_reader = snapshot_manager.reader();
-        let client_partition_map = partition_map.clone();
+        let placement_state =
+            partition_map.map(crate::partition::PlacementState::from_partition_map);
+        let client_placement_state = placement_state.clone();
         let committer = Self {
             pending_writes: conflict_checker,
             log,
@@ -475,11 +508,12 @@ impl<RT: Runtime> Committer<RT> {
             virtual_system_mapping,
             user_documents_size_gauge: user_documents_size_subgauge(),
             distributed_log,
-            partition_map,
+            placement_state,
             timestamp_oracle,
             prepared_transactions: std::collections::HashMap::new(),
             queued_snapshots: VecDeque::new(),
             raft_state,
+            applied_delta_watermarks,
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -496,15 +530,18 @@ impl<RT: Runtime> Committer<RT> {
             persistence_reader,
             retention_validator,
             snapshot_reader,
-            partition_map: client_partition_map,
+            placement_state: client_placement_state,
             node_addresses,
+            two_phase_decision_log,
         }
     }
 
     async fn go(mut self, mut rx: mpsc::Receiver<CommitterMessage>) -> anyhow::Result<()> {
+        self.recover_two_phase_redo_records().await?;
+
         let mut last_bumped_repeatable_ts = self.runtime.monotonic_now();
-        let mut last_replication_frontier_heartbeat = self.runtime.monotonic_now();
-        let mut last_replication_frontier_heartbeat_ts = Timestamp::MIN;
+        let mut last_remote_read_frontier_heartbeat = self.runtime.monotonic_now();
+        let mut last_remote_read_frontier_heartbeat_ts = Timestamp::MIN;
         // Assume there were commits just before the backend restarted, so first do a
         // quick bump.
         // None means a bump is ongoing. Avoid parallel bumps in case they
@@ -531,15 +568,15 @@ impl<RT: Runtime> Committer<RT> {
             } else {
                 Either::Right(std::future::pending())
             };
-            let frontier_heartbeat_fut = if self
-                .partition_map
+            let remote_read_frontier_heartbeat_fut = if self
+                .placement_state
                 .as_ref()
-                .is_some_and(|partition_map| partition_map.num_partitions() > 1)
+                .is_some_and(|placement_state| placement_state.num_partitions() > 1)
             {
                 Either::Left(
                     self.runtime.wait(
-                        REPLICATION_FRONTIER_HEARTBEAT_INTERVAL
-                            .saturating_sub(last_replication_frontier_heartbeat.elapsed()),
+                        REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL
+                            .saturating_sub(last_remote_read_frontier_heartbeat.elapsed()),
                     ),
                 )
             } else {
@@ -559,11 +596,11 @@ impl<RT: Runtime> Committer<RT> {
                     commit_id += 1;
                     last_bumped_repeatable_ts = self.runtime.monotonic_now();
                 }
-                _ = frontier_heartbeat_fut.fuse() => {
-                    self.maybe_publish_idle_replication_frontier_heartbeat(
-                        &mut last_replication_frontier_heartbeat_ts,
+                _ = remote_read_frontier_heartbeat_fut.fuse() => {
+                    self.maybe_publish_idle_remote_read_frontier_heartbeat(
+                        &mut last_remote_read_frontier_heartbeat_ts,
                     );
-                    last_replication_frontier_heartbeat = self.runtime.monotonic_now();
+                    last_remote_read_frontier_heartbeat = self.runtime.monotonic_now();
                 }
                 result = self.persistence_writes.select_next_some() => {
                     let pending_commit = result.context("Write failed. Unsure if transaction committed to disk.")?;
@@ -584,9 +621,46 @@ impl<RT: Runtime> Committer<RT> {
                             let _guard = publish_commit_span.set_local_parent();
                             let commit_ts = pending_write.must_commit_ts();
                             self.dequeue_snapshot(pending_commit_id);
-                            self.publish_commit(
+                            let published_commit = match self.publish_commit(
                                 pending_write, write_bytes, document_writes, index_writes,
-                            );
+                            ) {
+                                Ok(published_commit) => published_commit,
+                                Err(err) => {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "publish committed write",
+                                        err,
+                                    );
+                                },
+                            };
+                            drop(_guard);
+                            if let Err(err) = Self::wait_for_raft_commit(
+                                published_commit.raft_commit_waiter,
+                                published_commit.commit_ts,
+                            )
+                            .await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "replicate committed write through Raft",
+                                    err,
+                                );
+                            }
+                            if let Err(err) = Self::publish_commit_delta(
+                                self.distributed_log.clone(),
+                                published_commit.delta,
+                            )
+                            .await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "publish committed write to replication log",
+                                    err,
+                                );
+                            }
                             let _ = result.send(Ok(commit_ts));
 
                             // When we next get free cycles and there is no ongoing bump,
@@ -614,11 +688,13 @@ impl<RT: Runtime> Committer<RT> {
                         },
                         PersistenceWrite::ReplicaDelta {
                             commit_ts,
+                            remote_ts,
                             snapshot,
                             remapped_updates,
                             write_source,
                             write_bytes,
                             source_partition,
+                            applied_delta_watermarks,
                             result,
                             ..
                         } => {
@@ -632,19 +708,37 @@ impl<RT: Runtime> Committer<RT> {
                             if !writes.is_empty() {
                                 self.log.append(commit_ts, writes, write_source);
                             }
+                            if let Some(frontiers) = applied_delta_watermarks {
+                                self.persistence
+                                    .write_persistence_global(
+                                        PersistenceGlobalKey::AppliedDeltaWatermarks,
+                                        partition_timestamp_map_to_json(&frontiers),
+                                    )
+                                    .await?;
+                            }
                             let mut sm = self.snapshot_manager.write();
                             sm.push(commit_ts, snapshot, write_bytes);
                             if let Some(source_partition) = source_partition {
                                 sm.update_replication_frontier(source_partition, commit_ts)?;
+                                sm.update_replication_write_frontier(source_partition, commit_ts)?;
+                                self.applied_delta_watermarks
+                                    .insert(source_partition, remote_ts);
                             }
                             let _ = result.send(Ok(commit_ts));
                         },
-                        PersistenceWrite::ReplicationFrontierHeartbeat {
+                        PersistenceWrite::RemoteReadFrontierHeartbeat {
                             commit_ts,
                             source_partition,
+                            applied_delta_watermarks,
                             result,
                             ..
                         } => {
+                            self.persistence
+                                .write_persistence_global(
+                                    PersistenceGlobalKey::AppliedDeltaWatermarks,
+                                    partition_timestamp_map_to_json(&applied_delta_watermarks),
+                                )
+                                .await?;
                             self.publish_replication_frontier_progress(
                                 commit_ts,
                                 source_partition,
@@ -655,6 +749,7 @@ impl<RT: Runtime> Committer<RT> {
                             snapshot_ts,
                             snapshot,
                             replication_frontiers,
+                            applied_delta_watermarks,
                             result,
                             ..
                         } => {
@@ -663,6 +758,7 @@ impl<RT: Runtime> Committer<RT> {
                             self.queued_snapshots.clear();
                             self.log.reset(snapshot_ts);
                             self.last_assigned_ts = snapshot_ts;
+                            self.applied_delta_watermarks = applied_delta_watermarks;
                             self.snapshot_manager.write().replace(
                                 snapshot_ts,
                                 snapshot,
@@ -730,6 +826,16 @@ impl<RT: Runtime> Committer<RT> {
                                 commit_id += 1;
                             }
                         },
+                        Some(CommitterMessage::SetRaftState { raft_state, result }) => {
+                            tracing::info!(
+                                "Committer attached to Raft partition {} (leader={}, leader_id={})",
+                                raft_state.partition_id(),
+                                raft_state.is_leader(),
+                                raft_state.leader_id(),
+                            );
+                            self.raft_state = Some(raft_state);
+                            let _ = result.send(());
+                        },
                         Some(CommitterMessage::InstallSnapshot { checkpoint, result }) => {
                             self.install_snapshot(checkpoint, result, commit_id)?;
                             commit_id += 1;
@@ -741,9 +847,9 @@ impl<RT: Runtime> Committer<RT> {
                             commit_id += 1;
                         },
                         #[cfg(any(test, feature = "testing"))]
-                        Some(CommitterMessage::TickIdleReplicationFrontierHeartbeat { result }) => {
-                            self.maybe_publish_idle_replication_frontier_heartbeat(
-                                &mut last_replication_frontier_heartbeat_ts,
+                        Some(CommitterMessage::TickIdleRemoteReadFrontierHeartbeat { result }) => {
+                            self.maybe_publish_idle_remote_read_frontier_heartbeat(
+                                &mut last_remote_read_frontier_heartbeat_ts,
                             );
                             let _ = result.send(());
                         },
@@ -775,7 +881,9 @@ impl<RT: Runtime> Committer<RT> {
                             write_source,
                             result,
                         }) => {
-                            let r = self.handle_prepare(transaction_id, transaction, write_source);
+                            let r = self
+                                .handle_prepare(transaction_id, transaction, write_source)
+                                .await;
                             let _ = result.send(r);
                         },
                         Some(CommitterMessage::PrepareRemote {
@@ -790,7 +898,8 @@ impl<RT: Runtime> Committer<RT> {
                                 transaction,
                                 write_source,
                                 prepare_ts,
-                            );
+                            )
+                            .await;
                             let _ = result.send(r);
                         },
                         Some(CommitterMessage::AllocateCommitTs { result }) => {
@@ -803,14 +912,74 @@ impl<RT: Runtime> Committer<RT> {
                             transaction_id,
                             result,
                         }) => {
-                            let r = self.handle_commit_prepared(transaction_id);
-                            let _ = result.send(r);
+                            let redo_transaction_id = transaction_id.clone();
+                            let published_commit = match self.handle_commit_prepared(transaction_id)
+                            {
+                                Ok(published_commit) => published_commit,
+                                Err(err) => {
+                                    let _ = result.send(Err(err));
+                                    continue;
+                                },
+                            };
+                            let commit_ts = published_commit.commit_ts;
+                            if let Err(err) = Self::wait_for_raft_commit(
+                                published_commit.raft_commit_waiter,
+                                commit_ts,
+                            )
+                            .await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "replicate prepared write through Raft",
+                                    err,
+                                );
+                            }
+                            if let Err(err) = Self::publish_commit_delta(
+                                self.distributed_log.clone(),
+                                published_commit.delta,
+                            )
+                            .await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "publish prepared write to replication log",
+                                    err,
+                                );
+                            }
+                            if let Err(err) = Self::delete_two_phase_redo(
+                                self.persistence.clone(),
+                                &redo_transaction_id,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "2PC CommitPrepared: committed txn={} but failed to delete \
+                                     redo: {err:#}",
+                                    redo_transaction_id,
+                                );
+                            }
+                            let _ = result.send(Ok(commit_ts));
                         },
                         Some(CommitterMessage::RollbackPrepared {
                             transaction_id,
                             result,
                         }) => {
-                            let r = self.handle_rollback_prepared(transaction_id);
+                            let r = self.handle_rollback_prepared(transaction_id.clone());
+                            if r.is_ok()
+                                && let Err(err) = Self::delete_two_phase_redo(
+                                    self.persistence.clone(),
+                                    &transaction_id,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "2PC RollbackPrepared: rolled back txn={} but failed to \
+                                     delete redo: {err:#}",
+                                    transaction_id,
+                                );
+                            }
                             let _ = result.send(r);
                         },
                     }
@@ -1084,7 +1253,7 @@ impl<RT: Runtime> Committer<RT> {
         }
         drop(snapshot_manager);
         if advanced {
-            self.publish_replication_frontier_heartbeat(new_max_repeatable);
+            self.publish_remote_read_frontier_heartbeat(new_max_repeatable);
         }
         Ok(())
     }
@@ -1104,36 +1273,37 @@ impl<RT: Runtime> Committer<RT> {
         Ok(())
     }
 
-    fn maybe_publish_idle_replication_frontier_heartbeat(
+    fn maybe_publish_idle_remote_read_frontier_heartbeat(
         &mut self,
-        last_replication_frontier_heartbeat_ts: &mut Timestamp,
+        last_remote_read_frontier_heartbeat_ts: &mut Timestamp,
     ) {
-        match self.idle_replication_frontier_heartbeat_ts() {
+        match self.idle_remote_read_frontier_heartbeat_ts() {
             Ok(Some(frontier_ts)) => {
-                if frontier_ts > *last_replication_frontier_heartbeat_ts {
-                    self.publish_replication_frontier_heartbeat(frontier_ts);
-                    *last_replication_frontier_heartbeat_ts = frontier_ts;
+                if frontier_ts > *last_remote_read_frontier_heartbeat_ts {
+                    self.publish_remote_read_frontier_heartbeat(frontier_ts);
+                    *last_remote_read_frontier_heartbeat_ts = frontier_ts;
                 }
             },
             Ok(None) => {},
             Err(e) => {
                 let local_partition = self
-                    .partition_map
+                    .placement_state
                     .as_ref()
-                    .map(|partition_map| partition_map.local_partition());
+                    .map(|placement_state| placement_state.local_partition());
                 tracing::warn!(
                     ?local_partition,
                     error = %format!("{e:#}"),
-                    "Skipping idle replication frontier heartbeat"
+                    "Skipping idle remote read frontier heartbeat"
                 );
             },
         }
     }
 
-    fn publish_replication_frontier_heartbeat(&self, frontier_ts: Timestamp) {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+    fn publish_remote_read_frontier_heartbeat(&self, frontier_ts: Timestamp) {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return;
         };
+        let partition_map = placement_state.partition_map();
         if partition_map.num_partitions() <= 1 {
             return;
         }
@@ -1150,26 +1320,27 @@ impl<RT: Runtime> Committer<RT> {
             document_writes: Arc::new(Vec::new()),
             document_updates: Vec::new(),
             index_writes: Arc::new(Vec::new()),
-            write_source: WriteSource::new("replication_frontier_heartbeat"),
+            write_source: WriteSource::new("remote_read_frontier_heartbeat"),
             write_bytes: 0,
             tablet_id_to_table_name: BTreeMap::new(),
             source_partition: Some(partition_map.local_partition()),
         };
         let distributed_log = self.distributed_log.clone();
-        tokio_spawn("publish_replication_frontier_heartbeat", async move {
+        tokio_spawn("publish_remote_read_frontier_heartbeat", async move {
             if let Err(e) = distributed_log.publish(delta).await {
                 tracing::error!(
-                    "Failed to publish replication frontier heartbeat at ts={}: {e:#}",
+                    "Failed to publish remote read frontier heartbeat at ts={}: {e:#}",
                     u64::from(frontier_ts),
                 );
             }
         });
     }
 
-    fn idle_replication_frontier_heartbeat_ts(&mut self) -> anyhow::Result<Option<Timestamp>> {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+    fn idle_remote_read_frontier_heartbeat_ts(&mut self) -> anyhow::Result<Option<Timestamp>> {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(None);
         };
+        let partition_map = placement_state.partition_map();
         if partition_map.num_partitions() <= 1 {
             return Ok(None);
         }
@@ -1206,9 +1377,10 @@ impl<RT: Runtime> Committer<RT> {
         table_mapping: &TableMapping,
         write_source: &WriteSource,
     ) -> anyhow::Result<()> {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(());
         };
+        let partition_map = placement_state.partition_map();
 
         for write in writes {
             let tablet_id = write.id.tablet_id;
@@ -1217,7 +1389,7 @@ impl<RT: Runtime> Committer<RT> {
                 .with_context(|| format!("Missing table mapping for prepared write {tablet_id}"))?;
             if let Some(partition) = crate::partition::routed_partition_for_table(
                 &table_name,
-                partition_map,
+                &partition_map,
                 write_source,
             ) && partition != partition_map.local_partition()
             {
@@ -1240,9 +1412,10 @@ impl<RT: Runtime> Committer<RT> {
         table_mapping: &TableMapping,
         write_source: &WriteSource,
     ) -> anyhow::Result<()> {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(());
         };
+        let partition_map = placement_state.partition_map();
 
         let stale = {
             let snapshot_manager = self.snapshot_manager.read();
@@ -1251,7 +1424,7 @@ impl<RT: Runtime> Committer<RT> {
                 begin_ts,
                 reads,
                 table_mapping,
-                partition_map,
+                &partition_map,
                 write_source,
             )
         };
@@ -1300,6 +1473,18 @@ impl<RT: Runtime> Committer<RT> {
             return Ok(crate::two_phase::PrepareResult {
                 prepare_ts: existing.commit_ts,
             });
+        }
+        if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+            let metadata = ErrorMetadata::system_occ(
+                Some(u64::from(begin_ts)),
+                write_source.as_str().map(|source| source.to_string()),
+            );
+            anyhow::bail!(anyhow::anyhow!(metadata).context(format!(
+                "2PC Prepare for txn={} blocked by an unresolved pending write at ts={}; retry \
+                 after the pending write publishes",
+                transaction_id,
+                u64::from(min_pending_ts),
+            )));
         }
 
         let commit_ts = if let Some(commit_ts) = explicit_commit_ts {
@@ -1399,17 +1584,29 @@ impl<RT: Runtime> Committer<RT> {
         write_source: WriteSource,
     ) -> anyhow::Result<ValidatedCommit> {
         self.ensure_leader_for_writes()?;
+        if !self.prepared_transactions.is_empty() {
+            let metadata = ErrorMetadata::system_occ(
+                Some(u64::from(*transaction.begin_timestamp)),
+                write_source.as_str().map(|source| source.to_string()),
+            );
+            anyhow::bail!(anyhow::anyhow!(metadata).context(format!(
+                "Commit blocked by {} unresolved 2PC prepared transaction(s); retry after the \
+                 prepared transaction commits or rolls back",
+                self.prepared_transactions.len(),
+            )));
+        }
 
         // Partition ownership check: verify that all authoritative writes for
         // this operation target tables owned by this node. Deploy metadata
         // operations route system tables to the metadata owner on partition 0.
-        if let Some(ref partition_map) = self.partition_map {
+        if let Some(placement_state) = self.placement_state.as_ref() {
+            let partition_map = placement_state.partition_map();
             for write in transaction.writes.coalesced_writes() {
                 let tablet_id = write.id.tablet_id;
                 if let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) {
                     if let Some(partition) = crate::partition::routed_partition_for_table(
                         &table_name,
-                        partition_map,
+                        &partition_map,
                         &write_source,
                     ) && partition != partition_map.local_partition()
                     {
@@ -1567,6 +1764,95 @@ impl<RT: Runtime> Committer<RT> {
         Ok(())
     }
 
+    async fn wait_for_raft_commit(
+        raft_commit_waiter: RaftCommitWaiter,
+        commit_ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        let Some(raft_commit_waiter) = raft_commit_waiter else {
+            return Ok(());
+        };
+        match raft_commit_waiter.await {
+            Ok(true) => Ok(()),
+            Ok(false) => anyhow::bail!(
+                "Raft rejected commit at ts={} before quorum commit",
+                u64::from(commit_ts),
+            ),
+            Err(_) => anyhow::bail!(
+                "Raft proposal result channel closed before commit at ts={} reached quorum",
+                u64::from(commit_ts),
+            ),
+        }
+    }
+
+    fn fail_committed_write(
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        commit_ts: Timestamp,
+        operation: &'static str,
+        err: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let message = format!(
+            "Failed to {operation} after local persistence commit at ts={}: {err:#}",
+            u64::from(commit_ts),
+        );
+        let _ = result.send(Err(anyhow::anyhow!(message.clone())));
+        anyhow::bail!(message)
+    }
+
+    async fn publish_commit_delta(
+        distributed_log: Arc<dyn DistributedLog>,
+        delta: CommitDelta,
+    ) -> anyhow::Result<()> {
+        let delta_ts = delta.ts;
+        distributed_log.publish(delta).await.with_context(|| {
+            format!(
+                "Failed to publish commit delta at ts={}",
+                u64::from(delta_ts)
+            )
+        })
+    }
+
+    fn propose_commit_to_raft(&self, delta: &CommitDelta) -> anyhow::Result<RaftCommitWaiter> {
+        let Some(ref raft) = self.raft_state else {
+            return Ok(None);
+        };
+        if !raft.is_leader() {
+            anyhow::bail!(
+                "Raft leadership lost before proposing commit at ts={} for partition {}",
+                u64::from(delta.ts),
+                raft.partition_id(),
+            );
+        }
+        let envelope =
+            crate::nats_distributed_log::DeltaEnvelope::from_delta(delta, "", Some(raft.node_id()))
+                .with_context(|| {
+                    format!(
+                        "Failed to wrap commit delta at ts={} for Raft proposal",
+                        u64::from(delta.ts),
+                    )
+                })?;
+        let data = serde_json::to_vec(&envelope).with_context(|| {
+            format!(
+                "Failed to serialize commit delta at ts={} for Raft proposal",
+                u64::from(delta.ts),
+            )
+        })?;
+        let (tx, rx) = oneshot::channel();
+        raft.send(crate::raft_node::RaftMessage::Propose(
+            crate::raft_node::RaftProposal {
+                data,
+                result_tx: tx,
+            },
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to propose commit at ts={} to Raft partition {}",
+                u64::from(delta.ts),
+                raft.partition_id(),
+            )
+        })?;
+        Ok(Some(rx))
+    }
+
     /// After writing the new rows to persistence, mark the commit as complete
     /// and allow the updated rows to be read by other transactions.
     #[fastrace::trace]
@@ -1576,7 +1862,7 @@ impl<RT: Runtime> Committer<RT> {
         write_bytes: u64,
         document_writes: Arc<Vec<DocumentLogEntry>>,
         index_writes: Arc<Vec<PersistenceIndexEntry>>,
-    ) {
+    ) -> anyhow::Result<PublishedCommit> {
         let apply_timer = metrics::commit_apply_timer();
         let commit_ts = pending_write.must_commit_ts();
 
@@ -1642,6 +1928,7 @@ impl<RT: Runtime> Committer<RT> {
         // Publish the new version of our database metadata and the index.
         let mut snapshot_manager = self.snapshot_manager.write();
         snapshot_manager.push(commit_ts, new_snapshot, write_bytes);
+        drop(snapshot_manager);
         let mut tablet_id_to_table_name = std::collections::BTreeMap::new();
         for update in &document_updates {
             let tablet_id = update.id.tablet_id;
@@ -1662,46 +1949,18 @@ impl<RT: Runtime> Committer<RT> {
             write_bytes,
             tablet_id_to_table_name,
             source_partition: self
-                .partition_map
+                .placement_state
                 .as_ref()
-                .map(|partition_map| partition_map.local_partition()),
+                .map(|placement_state| placement_state.local_partition()),
         };
 
-        // Propose delta to Raft for intra-partition replication (if Raft enabled).
-        // TiKV pattern: leader proposes pre-computed writes to Raft after local commit.
-        // Followers receive the committed entry and apply via apply_replica_delta.
-        if let Some(ref raft) = self.raft_state {
-            if raft.is_leader() {
-                let envelope = crate::nats_distributed_log::DeltaEnvelope::from_delta(
-                    &delta,
-                    &format!("raft-leader"),
-                );
-                if let Ok(envelope) = envelope {
-                    if let Ok(data) = serde_json::to_vec(&envelope) {
-                        let (tx, _rx) = tokio::sync::oneshot::channel();
-                        let _ = raft.send(crate::raft_node::RaftMessage::Propose(
-                            crate::raft_node::RaftProposal {
-                                data,
-                                result_tx: tx,
-                            },
-                        ));
-                    }
-                }
-            }
-        }
-
-        let distributed_log = self.distributed_log.clone();
-        let delta_ts = commit_ts;
-        tokio_spawn("publish_commit_delta", async move {
-            if let Err(e) = distributed_log.publish(delta).await {
-                tracing::error!(
-                    "Failed to publish commit delta at ts={}: {e:#}",
-                    u64::from(delta_ts)
-                );
-            }
-        });
-
+        let raft_commit_waiter = self.propose_commit_to_raft(&delta)?;
         apply_timer.finish();
+        Ok(PublishedCommit {
+            commit_ts,
+            raft_commit_waiter,
+            delta,
+        })
     }
 
     fn install_snapshot(
@@ -1713,7 +1972,10 @@ impl<RT: Runtime> Committer<RT> {
         let persistence = self.persistence.clone();
         let runtime = self.runtime.clone();
         let virtual_system_mapping = self.virtual_system_mapping.clone();
-        let partition_map = self.partition_map.clone();
+        let partition_map = self
+            .placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.partition_map());
         let persistence_version = persistence.reader().version();
 
         self.persistence_writes.push_back(
@@ -1793,13 +2055,19 @@ impl<RT: Runtime> Committer<RT> {
                         .write(&[], chunk, ConflictStrategy::Overwrite)
                         .await?;
                 }
-                for key in PersistenceGlobalKey::all_keys() {
+                for key in PersistenceGlobalKey::checkpoint_keys() {
                     if let Some(value) = checkpoint.globals.get(&String::from(key)) {
                         persistence
                             .write_persistence_global(key, value.clone())
                             .await?;
                     }
                 }
+                persistence
+                    .write_persistence_global(
+                        PersistenceGlobalKey::TwoPhaseRedoRecords,
+                        serde_json::json!({}),
+                    )
+                    .await?;
 
                 let replication_frontiers = checkpoint
                     .globals
@@ -1820,11 +2088,20 @@ impl<RT: Runtime> Committer<RT> {
                             })
                             .unwrap_or_default()
                     });
+                let applied_delta_watermarks = checkpoint
+                    .globals
+                    .get(&String::from(PersistenceGlobalKey::AppliedDeltaWatermarks))
+                    .map(|value| {
+                        partition_timestamp_map_from_json(value.clone(), "applied delta watermarks")
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
 
                 Ok(PersistenceWrite::InstallSnapshot {
                     snapshot_ts: checkpoint_ts,
                     snapshot: db_snapshot.snapshot,
                     replication_frontiers,
+                    applied_delta_watermarks,
                     result,
                     commit_id,
                 })
@@ -1871,6 +2148,20 @@ impl<RT: Runtime> Committer<RT> {
         // prepare. We therefore use the remote commit timestamp as a floor and
         // only bump above it when local monotonicity requires it.
         let remote_ts = delta.ts;
+        if let Some(source_partition) = delta.source_partition
+            && self
+                .applied_delta_watermarks
+                .get(&source_partition)
+                .is_some_and(|frontier| *frontier >= remote_ts)
+        {
+            tracing::info!(
+                "Skipping duplicate replica delta: source_partition={}, remote_ts={}",
+                source_partition.0,
+                u64::from(remote_ts),
+            );
+            let _ = result.send(Ok(remote_ts));
+            return Ok(());
+        }
         let latest_ts = self.snapshot_manager.read().latest_ts();
         let commit_ts = cmp::max(
             remote_ts,
@@ -2044,6 +2335,13 @@ impl<RT: Runtime> Committer<RT> {
                 }
                 frontiers
             };
+            let updated_applied_delta_watermarks = {
+                let mut frontiers = self.applied_delta_watermarks.clone();
+                frontiers.insert(source_partition, remote_ts);
+                frontiers
+            };
+            self.applied_delta_watermarks
+                .insert(source_partition, remote_ts);
             let persistence = self.persistence.clone();
             self.persistence_writes.push_back(
                 async move {
@@ -2053,9 +2351,10 @@ impl<RT: Runtime> Committer<RT> {
                             replication_frontiers_to_json(&updated_replication_frontiers),
                         )
                         .await?;
-                    Ok(PersistenceWrite::ReplicationFrontierHeartbeat {
+                    Ok(PersistenceWrite::RemoteReadFrontierHeartbeat {
                         commit_ts,
                         source_partition,
+                        applied_delta_watermarks: updated_applied_delta_watermarks,
                         result,
                         commit_id,
                     })
@@ -2077,29 +2376,16 @@ impl<RT: Runtime> Committer<RT> {
 
         // Phase 1: Apply _tables updates (creates new tables).
         //
-        // Each node assigns table numbers independently (like CockroachDB's
-        // non-transactional descriptor ID allocator or TiDB's PD global ID).
-        // When replicating a _tables entry from another node, the remote
-        // table number may collide with a different local table. We reassign
-        // the table number to a locally-unique value, preserving only the
-        // table name and TabletId (derived from document_id) for remapping.
+        // Clustered deployments allocate user table numbers from a global
+        // allocator, so public document IDs embedded in document values are
+        // portable across nodes. Replica apply must therefore preserve the
+        // source TableMetadata.number exactly. If a local table with the same
+        // name already exists with a different number, fail loudly instead of
+        // silently rewriting IDs into a different table-number namespace.
         if !tables_updates.is_empty() {
-            use value::{
-                DocumentObject,
-                TableNumber,
-            };
+            use value::DocumentObject;
 
             let remap = build_remap(&snapshot, &delta.tablet_id_to_table_name);
-            let mapping = snapshot.table_registry.table_mapping();
-
-            // Find the next available user table number by scanning local tables.
-            // User table numbers start above NUM_RESERVED_SYSTEM_TABLE_NUMBERS (10000).
-            let max_local_number: u32 = mapping
-                .iter()
-                .map(|(_, _, num, _)| u32::from(num))
-                .max()
-                .unwrap_or(10000);
-            let mut next_number = max_local_number + 1;
 
             for update in &tables_updates {
                 let primary_tablet = update.id.tablet_id;
@@ -2135,40 +2421,43 @@ impl<RT: Runtime> Committer<RT> {
                 let metadata: TableMetadata = new_doc.value().0.clone().try_into()?;
 
                 // If the table already exists locally by name, skip this update.
-                // Each node may have independently created the same table.
+                // Each node may have independently created the same table, but
+                // the table number must now be globally stable.
                 if snapshot
                     .table_registry
                     .table_exists(metadata.namespace, &metadata.name)
                 {
-                    tracing::debug!(
-                        "Skipping _tables update for '{}': already exists locally",
+                    let existing = snapshot
+                        .table_registry
+                        .table_mapping()
+                        .namespace(metadata.namespace)
+                        .id(&metadata.name)?;
+                    anyhow::ensure!(
+                        existing.table_number == metadata.number,
+                        "Replicated table '{}' has table number {} but local table uses {}",
                         metadata.name,
+                        u32::from(metadata.number),
+                        u32::from(existing.table_number),
+                    );
+                    tracing::debug!(
+                        "Skipping _tables update for '{}': already exists locally with stable \
+                         table number {}",
+                        metadata.name,
+                        u32::from(metadata.number),
                     );
                     continue;
                 }
 
-                // Reassign the table number to avoid collisions with local tables.
-                // This is the same pattern as CockroachDB's descriptor ID allocator:
-                // each node picks the next available number locally.
-                let local_number = TableNumber::try_from(next_number)?;
-                next_number += 1;
-                let local_metadata = TableMetadata::new_with_state(
-                    metadata.namespace,
-                    metadata.name.clone(),
-                    local_number,
-                    metadata.state,
-                );
-                let local_value: DocumentObject = local_metadata.try_into()?;
+                let local_value: DocumentObject = metadata.clone().try_into()?;
 
                 tracing::info!(
-                    "Creating replicated table '{}' with local number {} (remote was {})",
+                    "Creating replicated table '{}' with stable table number {}",
                     metadata.name,
-                    u32::from(local_number),
                     u32::from(metadata.number),
                 );
 
                 // Build a new ResolvedDocument with the remapped tablet ID and
-                // the locally-assigned table number.
+                // the globally-stable table number from the source metadata.
                 let remapped_id = ResolvedDocumentId {
                     tablet_id: local_tablet,
                     document_id: update.id.document_id,
@@ -2198,12 +2487,15 @@ impl<RT: Runtime> Committer<RT> {
                 Some(t) => *t,
                 None => {
                     let table_name = delta.tablet_id_to_table_name.get(&primary_tablet);
-                    tracing::debug!(
-                        "Skipping update for unmapped table {:?} (TabletId {:?})",
+                    let err = anyhow::anyhow!(
+                        "Cannot apply replica delta at ts={} because table {:?} (TabletId {:?}) \
+                         is not mapped locally; retry after table metadata is available",
+                        u64::from(remote_ts),
                         table_name,
                         primary_tablet,
                     );
-                    continue;
+                    let _ = result.send(Err(err));
+                    return Ok(());
                 },
             };
             let remapped = DocumentUpdate {
@@ -2265,6 +2557,15 @@ impl<RT: Runtime> Committer<RT> {
             }
             frontiers
         });
+        let updated_applied_delta_watermarks = delta.source_partition.map(|source_partition| {
+            let mut frontiers = self.applied_delta_watermarks.clone();
+            frontiers.insert(source_partition, remote_ts);
+            frontiers
+        });
+        if let Some(source_partition) = delta.source_partition {
+            self.applied_delta_watermarks
+                .insert(source_partition, remote_ts);
+        }
 
         let persistence = self.persistence.clone();
         self.enqueue_snapshot(commit_id, commit_ts, snapshot.clone());
@@ -2273,6 +2574,7 @@ impl<RT: Runtime> Committer<RT> {
             let doc_writes = document_writes.clone();
             let idx_writes = index_writes.clone();
             let replication_frontiers = updated_replication_frontiers.clone();
+            let applied_delta_watermarks = updated_applied_delta_watermarks.clone();
             let source_partition = delta.source_partition;
             async move {
                 // Write to persistence (so function runner can load modules).
@@ -2299,11 +2601,13 @@ impl<RT: Runtime> Committer<RT> {
 
                 Ok(PersistenceWrite::ReplicaDelta {
                     commit_ts,
+                    remote_ts,
                     snapshot,
                     remapped_updates: all_remapped_updates,
                     write_source: delta.write_source,
                     write_bytes: delta.write_bytes,
                     source_partition,
+                    applied_delta_watermarks,
                     result,
                     commit_id,
                 })
@@ -2325,46 +2629,97 @@ impl<RT: Runtime> Committer<RT> {
 
     // ========== 2PC Handlers (Vitess prepare/commit/rollback pattern) ==========
 
-    /// Prepare phase: validate OCC, assign timestamp, stage writes.
-    /// Does NOT publish — the transaction is held in prepared_transactions
-    /// until CommitPrepared or RollbackPrepared arrives.
-    fn handle_prepare(
-        &mut self,
-        transaction_id: crate::two_phase::TwoPhaseTransactionId,
-        transaction: FinalTransaction,
-        write_source: WriteSource,
-    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        tracing::info!(
-            "2PC Prepare: txn={}, {} writes",
-            transaction_id,
-            transaction.writes.coalesced_writes().count(),
-        );
-
-        self.stage_prepared_transaction(
-            transaction_id,
-            *transaction.begin_timestamp,
-            transaction.reads.read_set(),
-            transaction.writes.coalesced_writes().cloned().collect(),
-            &transaction.table_mapping,
-            write_source,
-            None,
-        )
+    async fn load_two_phase_redo_records(
+        persistence: Arc<dyn Persistence>,
+    ) -> anyhow::Result<BTreeMap<String, crate::two_phase::TwoPhaseRedoEntry>> {
+        let Some(value) = persistence
+            .reader()
+            .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+            .await?
+        else {
+            return Ok(BTreeMap::new());
+        };
+        serde_json::from_value(value).context("2PC: Failed to parse durable redo records")
     }
 
-    fn handle_prepare_remote(
+    async fn write_two_phase_redo_records(
+        persistence: Arc<dyn Persistence>,
+        records: &BTreeMap<String, crate::two_phase::TwoPhaseRedoEntry>,
+    ) -> anyhow::Result<()> {
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::TwoPhaseRedoRecords,
+                serde_json::to_value(records).context("2PC: Failed to serialize redo records")?,
+            )
+            .await
+            .context("2PC: Failed to persist redo records")
+    }
+
+    async fn persist_two_phase_redo(
+        persistence: Arc<dyn Persistence>,
+        entry: crate::two_phase::TwoPhaseRedoEntry,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_two_phase_redo_records(persistence.clone()).await?;
+        records.insert(entry.transaction_id.clone(), entry);
+        Self::write_two_phase_redo_records(persistence, &records).await
+    }
+
+    async fn delete_two_phase_redo(
+        persistence: Arc<dyn Persistence>,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_two_phase_redo_records(persistence.clone()).await?;
+        if records.remove(&transaction_id.0).is_some() {
+            Self::write_two_phase_redo_records(persistence, &records).await?;
+        }
+        Ok(())
+    }
+
+    async fn redo_entry_is_already_committed(
+        persistence_reader: Arc<dyn PersistenceReader>,
+        retention_validator: Arc<dyn RetentionValidator>,
+        entry: &crate::two_phase::TwoPhaseRedoEntry,
+        transaction: &crate::two_phase::ParticipantTransaction,
+        prepare_ts: Timestamp,
+    ) -> anyhow::Result<bool> {
+        if transaction.writes.is_empty() {
+            return Ok(false);
+        }
+        let expected: BTreeSet<_> = transaction
+            .writes
+            .iter()
+            .map(|write| InternalDocumentId::new(write.id.tablet_id, write.id.internal_id()))
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut stream = persistence_reader.load_documents(
+            TimestampRange::at(prepare_ts),
+            Order::Asc,
+            1024,
+            retention_validator,
+        );
+        while let Some(doc) = stream.try_next().await? {
+            if expected.contains(&doc.id) {
+                seen.insert(doc.id);
+            }
+        }
+        let already_committed = seen.len() == expected.len();
+        if already_committed {
+            tracing::info!(
+                "2PC Recovery: redo txn={} is already committed at ts={}, deleting redo",
+                entry.transaction_id,
+                u64::from(prepare_ts),
+            );
+        }
+        Ok(already_committed)
+    }
+
+    fn stage_participant_prepared_transaction(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
         transaction: crate::two_phase::ParticipantTransaction,
         write_source: WriteSource,
         prepare_ts: Timestamp,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        tracing::info!(
-            "2PC Remote Prepare: txn={}, {} writes, prepare_ts={}",
-            transaction_id,
-            transaction.writes.len(),
-            u64::from(prepare_ts),
-        );
-
         let mut table_mapping = self
             .snapshot_manager
             .read()
@@ -2383,12 +2738,157 @@ impl<RT: Runtime> Committer<RT> {
         )
     }
 
+    async fn recover_two_phase_redo_records(&mut self) -> anyhow::Result<()> {
+        let records = Self::load_two_phase_redo_records(self.persistence.clone()).await?;
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "2PC Recovery: rebuilding {} prepared transaction(s) from durable redo",
+            records.len(),
+        );
+        for entry in records.values() {
+            let transaction_id = entry.transaction_id();
+            let prepare_ts = entry.prepare_ts()?;
+            let transaction = entry.participant_transaction().with_context(|| {
+                format!(
+                    "2PC Recovery: failed to decode participant transaction for txn={}",
+                    transaction_id
+                )
+            })?;
+            if entry.partition_id() != self.local_partition_for_two_phase() {
+                tracing::warn!(
+                    "2PC Recovery: ignoring redo txn={} for partition {}, local partition is {}",
+                    transaction_id,
+                    entry.partition_id().0,
+                    self.local_partition_for_two_phase().0,
+                );
+                continue;
+            }
+            if Self::redo_entry_is_already_committed(
+                self.persistence.reader(),
+                self.retention_validator.clone(),
+                entry,
+                &transaction,
+                prepare_ts,
+            )
+            .await?
+            {
+                Self::delete_two_phase_redo(self.persistence.clone(), &transaction_id).await?;
+                continue;
+            }
+
+            self.stage_participant_prepared_transaction(
+                transaction_id.clone(),
+                transaction,
+                entry.write_source(),
+                prepare_ts,
+            )
+            .with_context(|| {
+                format!("2PC Recovery: failed to stage prepared txn={transaction_id}")
+            })?;
+            tracing::info!(
+                "2PC Recovery: restored prepared txn={} at ts={}",
+                transaction_id,
+                u64::from(prepare_ts),
+            );
+        }
+        Ok(())
+    }
+
+    /// Prepare phase: validate OCC, assign timestamp, stage writes.
+    /// Does NOT publish — the transaction is held in prepared_transactions
+    /// until CommitPrepared or RollbackPrepared arrives.
+    async fn handle_prepare(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: FinalTransaction,
+        write_source: WriteSource,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        tracing::info!(
+            "2PC Prepare: txn={}, {} writes",
+            transaction_id,
+            transaction.writes.coalesced_writes().count(),
+        );
+
+        let participant_transaction =
+            crate::two_phase::ParticipantTransaction::from_entire_final_transaction(&transaction)?;
+        let result = self.stage_prepared_transaction(
+            transaction_id.clone(),
+            *transaction.begin_timestamp,
+            transaction.reads.read_set(),
+            transaction.writes.coalesced_writes().cloned().collect(),
+            &transaction.table_mapping,
+            write_source.clone(),
+            None,
+        )?;
+        let redo = crate::two_phase::TwoPhaseRedoEntry::new(
+            &transaction_id,
+            result.prepare_ts,
+            self.local_partition_for_two_phase(),
+            participant_transaction,
+            &write_source,
+        )?;
+        if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo).await {
+            if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                tracing::error!(
+                    "2PC Prepare: failed to rollback in-memory txn={} after redo write failure: \
+                     {rollback_err:#}",
+                    transaction_id,
+                );
+            }
+            return Err(err);
+        }
+        Ok(result)
+    }
+
+    async fn handle_prepare_remote(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        prepare_ts: Timestamp,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        tracing::info!(
+            "2PC Remote Prepare: txn={}, {} writes, prepare_ts={}",
+            transaction_id,
+            transaction.writes.len(),
+            u64::from(prepare_ts),
+        );
+
+        let redo = crate::two_phase::TwoPhaseRedoEntry::new(
+            &transaction_id,
+            prepare_ts,
+            self.local_partition_for_two_phase(),
+            transaction.clone(),
+            &write_source,
+        )?;
+        let result = self.stage_participant_prepared_transaction(
+            transaction_id.clone(),
+            transaction,
+            write_source,
+            prepare_ts,
+        )?;
+        if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo).await {
+            if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                tracing::error!(
+                    "2PC Prepare: failed to rollback in-memory txn={} after redo write failure: \
+                     {rollback_err:#}",
+                    transaction_id,
+                );
+            }
+            return Err(err);
+        }
+        Ok(result)
+    }
+
     /// Commit a previously prepared transaction: write to persistence,
     /// publish to snapshot manager and write log, publish delta to NATS.
     fn handle_commit_prepared(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
-    ) -> anyhow::Result<Timestamp> {
+    ) -> anyhow::Result<PublishedCommit> {
         let prepared = self
             .prepared_transactions
             .remove(&transaction_id)
@@ -2427,9 +2927,7 @@ impl<RT: Runtime> Committer<RT> {
             prepared.write_bytes,
             prepared.document_writes,
             prepared.index_writes,
-        );
-
-        Ok(prepared.commit_ts)
+        )
     }
 
     /// Rollback a previously prepared transaction: remove from PendingWrites.
@@ -2453,9 +2951,18 @@ impl<RT: Runtime> Committer<RT> {
             u64::from(prepared.commit_ts),
         );
 
-        // Remove from PendingWrites so it no longer blocks conflicting
-        // transactions. We pop it and discard.
-        self.pending_writes.pop_first(prepared.pending_write);
+        // Remove this exact prepared intent from PendingWrites so it no longer
+        // blocks conflicting transactions. Do not pop the FIFO head here: an
+        // older local commit may be pending ahead of this prepared transaction.
+        self.pending_writes
+            .remove(prepared.pending_write)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "2PC RollbackPrepared: pending write for txn={} at ts={} was missing",
+                    transaction_id,
+                    u64::from(prepared.commit_ts),
+                )
+            })?;
 
         Ok(())
     }
@@ -2711,6 +3218,7 @@ impl<RT: Runtime> Committer<RT> {
 
     fn next_commit_ts(&mut self) -> anyhow::Result<Timestamp> {
         let _timer = next_commit_ts_seconds();
+        let local_floor = self.local_commit_floor()?;
 
         // When a global TSO is configured (TiDB PD pattern), draw timestamps
         // from it instead of the local clock. This ensures globally unique,
@@ -2722,40 +3230,34 @@ impl<RT: Runtime> Committer<RT> {
             let ts = block_in_place(|| {
                 let rt = tokio::runtime::Handle::current();
                 if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                    futures::executor::block_on(tso.next_ts())
+                    futures::executor::block_on(tso.next_ts_at_or_after(local_floor))
                 } else {
-                    rt.block_on(tso.next_ts())
+                    rt.block_on(tso.next_ts_at_or_after(local_floor))
                 }
             })?;
-            // Still enforce local monotonicity against snapshot and last_assigned.
-            let log_floor = self.log.max_ts().succ()?;
-            let latest_ts = self.snapshot_manager.read().latest_ts();
-            let max = cmp::max(
+            anyhow::ensure!(
+                ts >= local_floor,
+                "TSO returned ts={} below requested local floor {}",
                 ts,
-                cmp::max(
-                    log_floor,
-                    cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
-                ),
+                local_floor,
             );
-            self.last_assigned_ts = max;
-            return Ok(max);
+            self.last_assigned_ts = ts;
+            return Ok(ts);
         }
 
         // Single-node mode: existing behavior (local clock + monotonic counter).
-        let log_floor = self.log.max_ts().succ()?;
-        let latest_ts = self.snapshot_manager.read().latest_ts();
-        let max = cmp::max(
-            log_floor,
-            cmp::max(
-                latest_ts.succ()?,
-                cmp::max(
-                    self.runtime.generate_timestamp()?,
-                    self.last_assigned_ts.succ()?,
-                ),
-            ),
-        );
+        let max = cmp::max(local_floor, self.runtime.generate_timestamp()?);
         self.last_assigned_ts = max;
         Ok(max)
+    }
+
+    fn local_commit_floor(&self) -> anyhow::Result<Timestamp> {
+        let log_floor = self.log.max_ts().succ()?;
+        let latest_ts = self.snapshot_manager.read().latest_ts();
+        Ok(cmp::max(
+            log_floor,
+            cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
+        ))
     }
 
     fn next_max_repeatable_ts(&mut self) -> anyhow::Result<Timestamp> {
@@ -2789,8 +3291,9 @@ pub struct CommitterClient {
     persistence_reader: Arc<dyn PersistenceReader>,
     retention_validator: Arc<dyn RetentionValidator>,
     snapshot_reader: Reader<SnapshotManager>,
-    partition_map: Option<crate::partition::PartitionMap>,
+    placement_state: Option<crate::partition::PlacementState>,
     node_addresses: Option<crate::two_phase::NodeAddresses>,
+    two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
 }
 
 impl CommitterClient {
@@ -2826,6 +3329,23 @@ impl CommitterClient {
         rx.await.map_err(|_| metrics::shutdown_error())?
     }
 
+    pub async fn set_raft_state(
+        &self,
+        raft_state: crate::raft_partition::RaftPartitionState,
+    ) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::SetRaftState {
+            raft_state,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?;
+        Ok(())
+    }
+
     pub async fn finish_table_summary_bootstrap(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::FinishTableSummaryBootstrap { result: tx };
@@ -2838,9 +3358,9 @@ impl CommitterClient {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub async fn tick_idle_replication_frontier_heartbeat_for_test(&self) -> anyhow::Result<()> {
+    pub async fn tick_idle_remote_read_frontier_heartbeat_for_test(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::TickIdleReplicationFrontierHeartbeat { result: tx };
+        let message = CommitterMessage::TickIdleRemoteReadFrontierHeartbeat { result: tx };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -2872,22 +3392,57 @@ impl CommitterClient {
         self.node_addresses.as_ref()
     }
 
+    pub fn placement_version(&self) -> crate::partition::PlacementVersion {
+        self.placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.placement_version())
+            .unwrap_or(crate::partition::PlacementVersion::STATIC)
+    }
+
+    pub fn refresh_placement_metadata(
+        &self,
+        metadata: crate::partition::PlacementMetadata,
+    ) -> anyhow::Result<()> {
+        let Some(placement_state) = self.placement_state.as_ref() else {
+            anyhow::bail!("Cannot refresh placement metadata in single-partition mode");
+        };
+        placement_state.refresh(metadata)
+    }
+
+    pub fn ensure_placement_version(
+        &self,
+        requested: crate::partition::PlacementVersion,
+    ) -> anyhow::Result<()> {
+        let local = self.placement_version();
+        anyhow::ensure!(
+            local == requested,
+            "Placement version mismatch: request used {requested}, local node is on {local}. \
+             Refresh placement metadata before retrying the write."
+        );
+        Ok(())
+    }
+
+    pub(crate) fn two_phase_decision_log(&self) -> Arc<dyn crate::two_phase::TwoPhaseDecisionLog> {
+        self.two_phase_decision_log.clone()
+    }
+
     async fn wait_for_remote_read_frontiers(
         &self,
         begin_ts: Timestamp,
         reads: &ReadSet,
         write_source: &WriteSource,
     ) -> anyhow::Result<()> {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(());
         };
+        let partition_map = placement_state.partition_map();
 
         let required = {
             let snapshot_reader = self.snapshot_reader.lock();
             remote_read_partitions(
                 reads,
                 snapshot_reader.latest_snapshot().table_mapping(),
-                partition_map,
+                &partition_map,
                 write_source,
             )
         };
@@ -2919,8 +3474,33 @@ impl CommitterClient {
             begin_ts,
             required,
         );
-        join_all(waits).await;
-        Ok(())
+        let started = tokio::time::Instant::now();
+        let wait_all = join_all(waits);
+        let timeout = tokio::time::sleep(*REMOTE_READ_FRONTIER_WAIT_TIMEOUT);
+        futures::pin_mut!(wait_all, timeout);
+        select_biased! {
+            _ = wait_all.fuse() => {
+                metrics::log_remote_read_frontier_wait_seconds(
+                    "success",
+                    started.elapsed().as_secs_f64(),
+                );
+                Ok(())
+            },
+            _ = timeout.fuse() => {
+                metrics::log_remote_read_frontier_wait_seconds(
+                    "timeout",
+                    started.elapsed().as_secs_f64(),
+                );
+                metrics::log_remote_read_frontier_wait_timeout();
+                anyhow::bail!(
+                    "Timed out after {:?} waiting for remote read frontiers to reach begin_ts={} \
+                     on partitions {:?}",
+                    *REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
+                    begin_ts,
+                    required,
+                )
+            },
+        }
     }
 
     pub fn commit<RT: Runtime>(
@@ -2942,6 +3522,18 @@ impl CommitterClient {
 
         // Finish reading everything from persistence.
         let transaction = transaction.finalize()?;
+        let partition_map = self
+            .placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.partition_map());
+        let transaction_classification = partition_map.as_ref().map(|partition_map| {
+            crate::two_phase_coordinator::classify_transaction(
+                &transaction,
+                partition_map,
+                &write_source,
+            )
+        });
+
         self.wait_for_remote_read_frontiers(
             *transaction.begin_timestamp,
             transaction.reads.read_set(),
@@ -2957,22 +3549,27 @@ impl CommitterClient {
 
         // Classify: single-partition (fast path) vs cross-partition (2PC).
         // TiDB 1PC optimization: skip 2PC when all writes target one partition.
-        if let Some(ref partition_map) = self.partition_map {
-            match crate::two_phase_coordinator::classify_transaction(
-                &transaction,
-                partition_map,
-                &write_source,
-            ) {
+        if let Some(ref partition_map) = partition_map {
+            match transaction_classification
+                .expect("partitioned commit should always classify the finalized transaction")
+            {
                 crate::two_phase_coordinator::TransactionClassification::SinglePartition => {},
                 crate::two_phase_coordinator::TransactionClassification::RemoteSinglePartition {
                     owner,
                 } => {
-                    anyhow::bail!(
-                        "Write rejected: this transaction targets only {}, not this node ({}). \
-                         Route this mutation to the correct partition owner.",
+                    tracing::info!(
+                        "Remote single-partition transaction targets {}; routing from local {} \
+                         through the 2PC owner path",
                         owner,
                         partition_map.local_partition(),
                     );
+                    return crate::two_phase_coordinator::coordinate_two_phase_commit(
+                        self,
+                        transaction,
+                        write_source,
+                        partition_map,
+                    )
+                    .await;
                 },
                 crate::two_phase_coordinator::TransactionClassification::CrossPartition {
                     ..
@@ -3238,6 +3835,10 @@ enum CommitterMessage {
         delta: CommitDelta,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
+    SetRaftState {
+        raft_state: crate::raft_partition::RaftPartitionState,
+        result: oneshot::Sender<()>,
+    },
     InstallSnapshot {
         checkpoint: CheckpointData,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
@@ -3245,7 +3846,7 @@ enum CommitterMessage {
     #[cfg(any(test, feature = "testing"))]
     BumpMaxRepeatableTs { result: oneshot::Sender<Timestamp> },
     #[cfg(any(test, feature = "testing"))]
-    TickIdleReplicationFrontierHeartbeat { result: oneshot::Sender<()> },
+    TickIdleRemoteReadFrontierHeartbeat { result: oneshot::Sender<()> },
     LoadIndexesIntoMemory {
         tables: BTreeSet<TableName>,
         result: oneshot::Sender<anyhow::Result<()>>,
@@ -3302,9 +3903,39 @@ fn is_retryable_system_generated_id_conflict(
 mod tests {
     use std::str::FromStr;
 
+    use runtime::testing::TestRuntime;
+    use sync_types::Timestamp;
+    use tokio::sync::oneshot;
     use value::TableName;
 
-    use super::is_retryable_system_generated_id_conflict;
+    use super::{
+        is_retryable_system_generated_id_conflict,
+        Committer,
+    };
+
+    #[tokio::test]
+    async fn raft_commit_waiter_accepts_committed_proposal() -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        tx.send(true).unwrap();
+
+        Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1)).await
+    }
+
+    #[tokio::test]
+    async fn raft_commit_waiter_rejects_failed_proposal() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(false).unwrap();
+
+        let err = Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Raft rejected commit"));
+    }
+
+    #[tokio::test]
+    async fn raft_commit_waiter_allows_non_raft_commit() -> anyhow::Result<()> {
+        Committer::<TestRuntime>::wait_for_raft_commit(None, Timestamp::must(1)).await
+    }
 
     #[test]
     fn retryable_system_generated_id_conflict_matches_udf_config_table() {

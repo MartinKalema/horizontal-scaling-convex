@@ -6,7 +6,10 @@
 //! whatever transport carries deltas between nodes.
 
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     sync::Arc,
 };
 
@@ -73,6 +76,54 @@ pub struct CommitDelta {
     pub source_partition: Option<PartitionId>,
 }
 
+#[async_trait]
+pub trait ReplicationAck: Send + 'static {
+    async fn ack(self: Box<Self>) -> anyhow::Result<()>;
+
+    async fn nak(self: Box<Self>) -> anyhow::Result<()>;
+
+    async fn term(self: Box<Self>) -> anyhow::Result<()>;
+}
+
+pub struct ReplicationMessage {
+    pub delta: CommitDelta,
+    ack: Box<dyn ReplicationAck>,
+}
+
+impl ReplicationMessage {
+    pub fn new(delta: CommitDelta, ack: Box<dyn ReplicationAck>) -> Self {
+        Self { delta, ack }
+    }
+
+    pub fn noop_ack(delta: CommitDelta) -> Self {
+        Self {
+            delta,
+            ack: Box::new(NoopReplicationAck),
+        }
+    }
+
+    pub fn into_parts(self) -> (CommitDelta, Box<dyn ReplicationAck>) {
+        (self.delta, self.ack)
+    }
+}
+
+pub struct NoopReplicationAck;
+
+#[async_trait]
+impl ReplicationAck for NoopReplicationAck {
+    async fn ack(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn nak(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn term(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 /// Abstraction over the transport that carries [`CommitDelta`]s between
 /// the Primary node and Replica nodes.
 ///
@@ -91,7 +142,20 @@ pub trait DistributedLog: Send + Sync + 'static {
     async fn subscribe(
         &self,
         from_ts: Timestamp,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>>;
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>>;
+
+    /// Subscribe to deltas starting after `from_ts`, optionally restricting
+    /// delivery to specific source partitions.
+    ///
+    /// Implementations that do not support filtering can fall back to
+    /// [`subscribe`] and perform any filtering client-side.
+    async fn subscribe_filtered(
+        &self,
+        from_ts: Timestamp,
+        _source_partitions: Option<Vec<PartitionId>>,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+        self.subscribe(from_ts).await
+    }
 }
 
 /// No-op implementation for single-node deployments. `publish` does nothing,
@@ -107,8 +171,14 @@ impl DistributedLog for NoopDistributedLog {
     async fn subscribe(
         &self,
         _from_ts: Timestamp,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
         Ok(Box::pin(futures::stream::pending()))
+    }
+}
+
+impl CommitDelta {
+    pub fn touched_table_names(&self) -> BTreeSet<TableName> {
+        self.tablet_id_to_table_name.values().cloned().collect()
     }
 }
 
@@ -129,6 +199,7 @@ pub mod testing {
     use super::{
         CommitDelta,
         DistributedLog,
+        ReplicationMessage,
     };
 
     /// In-memory [`DistributedLog`] for testing. Stores deltas in a Vec and
@@ -164,7 +235,7 @@ pub mod testing {
         async fn subscribe(
             &self,
             from_ts: Timestamp,
-        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CommitDelta>>> {
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
             let existing: Vec<CommitDelta> = self
                 .deltas
                 .lock()
@@ -176,14 +247,61 @@ pub mod testing {
             let receiver = self.sender.subscribe();
             let broadcast_stream =
                 BroadcastStream::new(receiver).filter_map(move |result| match result {
-                    Ok(delta) if delta.ts > from_ts => Some(Ok(delta)),
+                    Ok(delta) if delta.ts > from_ts => {
+                        Some(Ok(ReplicationMessage::noop_ack(delta)))
+                    },
                     Ok(_) => None,
                     Err(e) => Some(Err(anyhow::anyhow!("broadcast lag: {e}"))),
                 });
 
-            let existing_stream = futures::stream::iter(existing.into_iter().map(Ok));
+            let existing_stream = futures::stream::iter(
+                existing
+                    .into_iter()
+                    .map(ReplicationMessage::noop_ack)
+                    .map(Ok),
+            );
             let combined = existing_stream.chain(broadcast_stream);
             Ok(Box::pin(combined))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::Arc,
+    };
+
+    use common::types::Timestamp;
+    use value::TableName;
+
+    use crate::{
+        commit_delta::CommitDelta,
+        write_log::WriteSource,
+    };
+
+    #[test]
+    fn touched_table_names_collects_unique_tables() {
+        let messages: TableName = "messages".parse().unwrap();
+        let tasks: TableName = "tasks".parse().unwrap();
+        let mut tablet_id_to_table_name = BTreeMap::new();
+        tablet_id_to_table_name.insert(value::TabletId::MIN, messages.clone());
+        tablet_id_to_table_name.insert(value::TabletId::MAX, tasks.clone());
+        let delta = CommitDelta {
+            ts: Timestamp::MIN,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_name,
+            source_partition: None,
+        };
+
+        assert_eq!(
+            delta.touched_table_names(),
+            [messages, tasks].into_iter().collect()
+        );
     }
 }

@@ -84,6 +84,8 @@ pub struct ConvexRaftStorage {
     conf_state: ConfState,
     /// Hook for generating state-machine snapshots on demand.
     snapshot_provider: Option<Arc<dyn RaftSnapshotProvider>>,
+    #[cfg(test)]
+    fail_next_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConvexRaftStorage {
@@ -147,7 +149,31 @@ impl ConvexRaftStorage {
             engine,
             conf_state,
             snapshot_provider,
+            #[cfg(test)]
+            fail_next_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_write_for_test(&self) {
+        self.fail_next_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn check_fail_next_write_for_test(&self) -> anyhow::Result<()> {
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected raft-engine write failure");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn check_fail_next_write_for_test(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Region ID for raft-engine (partition_id as u64).
@@ -161,6 +187,7 @@ impl ConvexRaftStorage {
         if entries.is_empty() {
             return Ok(());
         }
+        self.check_fail_next_write_for_test()?;
         let mut batch = LogBatch::default();
         batch
             .add_entries::<RaftMessageExt>(self.region_id(), entries)
@@ -174,6 +201,7 @@ impl ConvexRaftStorage {
     /// Persist hard state (term, vote, commit index).
     /// Called during Ready processing alongside entry append.
     pub fn set_hardstate(&self, hs: &HardState) -> anyhow::Result<()> {
+        self.check_fail_next_write_for_test()?;
         let mut batch = LogBatch::default();
         batch
             .put_message(self.region_id(), HARD_STATE_KEY.to_vec(), hs)
@@ -192,6 +220,7 @@ impl ConvexRaftStorage {
         entries: &[Entry],
         hs: &HardState,
     ) -> anyhow::Result<()> {
+        self.check_fail_next_write_for_test()?;
         let mut batch = LogBatch::default();
         if !entries.is_empty() {
             batch
@@ -209,6 +238,7 @@ impl ConvexRaftStorage {
 
     /// Set the conf state (voter/learner membership).
     pub fn set_conf_state(&mut self, cs: ConfState) -> anyhow::Result<()> {
+        self.check_fail_next_write_for_test()?;
         let mut batch = LogBatch::default();
         batch
             .put_message(self.region_id(), CONF_STATE_KEY.to_vec(), &cs)
@@ -227,6 +257,7 @@ impl ConvexRaftStorage {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: &Snapshot) -> anyhow::Result<()> {
+        self.check_fail_next_write_for_test()?;
         let metadata = snapshot.get_metadata();
         let mut batch = LogBatch::default();
         batch.add_command(self.region_id(), raft_engine::Command::Clean);

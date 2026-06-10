@@ -25,8 +25,18 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    sync::{
+        Arc,
+        RwLock,
+    },
 };
 
+use anyhow::Context;
+use async_trait::async_trait;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use value::TableName;
 
 use crate::write_log::WriteSource;
@@ -48,6 +58,396 @@ impl fmt::Display for PartitionId {
     }
 }
 
+/// Monotonically identifies the placement metadata version used for routing.
+///
+/// Version 0 is the static, startup-configured map. Dynamic placement updates
+/// must bump this value whenever ownership changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlacementVersion(pub u64);
+
+impl PlacementVersion {
+    pub const STATIC: Self = Self(0);
+
+    pub fn new(version: u64) -> Self {
+        Self(version)
+    }
+}
+
+impl From<PlacementVersion> for u64 {
+    fn from(version: PlacementVersion) -> Self {
+        version.0
+    }
+}
+
+impl From<u64> for PlacementVersion {
+    fn from(version: u64) -> Self {
+        Self(version)
+    }
+}
+
+impl fmt::Display for PlacementVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "placement-version-{}", self.0)
+    }
+}
+
+/// Where a placement map was loaded from.
+///
+/// The static config source preserves today's env-var path. The replicated
+/// source is the #130 target: placement metadata owned by the cluster rather
+/// than by each process's startup environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementMetadataSource {
+    StaticConfig,
+    Replicated,
+}
+
+/// Logical object owned by a partition.
+///
+/// We only route whole tables today. Keeping the target explicit prevents the
+/// control-plane model from baking in table-only ownership when #130 evolves
+/// toward range or key-prefix placement.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlacementTarget {
+    Table(TableName),
+}
+
+/// One ownership rule in the placement metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementRule {
+    pub target: PlacementTarget,
+    pub owner: PartitionId,
+}
+
+/// Static placement inputs from process config.
+pub struct StaticPlacementConfig<'a> {
+    pub table_assignments: &'a str,
+    pub num_partitions: u32,
+    pub placement_version: PlacementVersion,
+}
+
+/// Versioned placement metadata used to build runtime routing state.
+///
+/// This is the seam between the future replicated control-plane record and the
+/// existing `PartitionMap` used by commit, routing, and 2PC paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementMetadata {
+    source: PlacementMetadataSource,
+    version: PlacementVersion,
+    num_partitions: u32,
+    rules: BTreeMap<PlacementTarget, PartitionId>,
+}
+
+impl PlacementMetadata {
+    pub fn from_static_config(config: StaticPlacementConfig<'_>) -> Self {
+        let mut rules = BTreeMap::new();
+        if !config.table_assignments.is_empty() {
+            for pair in config.table_assignments.split(',') {
+                let pair = pair.trim();
+                if let Some((table, partition)) = pair.split_once('=') {
+                    let table = table.trim();
+                    let partition = partition.trim();
+                    if let (Ok(table_name), Ok(partition_id)) =
+                        (table.parse::<TableName>(), partition.parse::<u32>())
+                    {
+                        rules.insert(
+                            PlacementTarget::Table(table_name),
+                            PartitionId(partition_id),
+                        );
+                    }
+                }
+            }
+        }
+        Self {
+            source: PlacementMetadataSource::StaticConfig,
+            version: config.placement_version,
+            num_partitions: config.num_partitions,
+            rules,
+        }
+    }
+
+    pub fn from_partition_map(
+        partition_map: &PartitionMap,
+        source: PlacementMetadataSource,
+    ) -> Self {
+        Self {
+            source,
+            version: partition_map.placement_version(),
+            num_partitions: partition_map.num_partitions(),
+            rules: partition_map
+                .assignments()
+                .iter()
+                .map(|(table, owner)| (PlacementTarget::Table(table.clone()), *owner))
+                .collect(),
+        }
+    }
+
+    pub fn from_table_assignments(
+        source: PlacementMetadataSource,
+        version: PlacementVersion,
+        num_partitions: u32,
+        assignments: BTreeMap<TableName, PartitionId>,
+    ) -> Self {
+        Self {
+            source,
+            version,
+            num_partitions,
+            rules: assignments
+                .into_iter()
+                .map(|(table, owner)| (PlacementTarget::Table(table), owner))
+                .collect(),
+        }
+    }
+
+    pub fn source(&self) -> PlacementMetadataSource {
+        self.source
+    }
+
+    pub fn version(&self) -> PlacementVersion {
+        self.version
+    }
+
+    pub fn num_partitions(&self) -> u32 {
+        self.num_partitions
+    }
+
+    pub fn rules(&self) -> Vec<PlacementRule> {
+        self.rules
+            .iter()
+            .map(|(target, owner)| PlacementRule {
+                target: target.clone(),
+                owner: *owner,
+            })
+            .collect()
+    }
+
+    pub fn table_assignments(&self) -> BTreeMap<TableName, PartitionId> {
+        self.rules
+            .iter()
+            .filter_map(|(target, owner)| match target {
+                PlacementTarget::Table(table) => Some((table.clone(), *owner)),
+            })
+            .collect()
+    }
+
+    pub fn into_partition_map(&self, local_partition: PartitionId) -> PartitionMap {
+        PartitionMap {
+            assignments: self.table_assignments(),
+            local_partition,
+            num_partitions: self.num_partitions,
+            placement_version: self.version,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedPlacementMetadata {
+    version: u64,
+    num_partitions: u32,
+    table_assignments: BTreeMap<String, u32>,
+}
+
+impl From<&PlacementMetadata> for SerializedPlacementMetadata {
+    fn from(metadata: &PlacementMetadata) -> Self {
+        Self {
+            version: u64::from(metadata.version()),
+            num_partitions: metadata.num_partitions(),
+            table_assignments: metadata
+                .table_assignments()
+                .into_iter()
+                .map(|(table, partition)| (table.to_string(), partition.0))
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<SerializedPlacementMetadata> for PlacementMetadata {
+    type Error = anyhow::Error;
+
+    fn try_from(serialized: SerializedPlacementMetadata) -> anyhow::Result<Self> {
+        let assignments = serialized
+            .table_assignments
+            .into_iter()
+            .map(|(table, partition)| Ok((table.parse::<TableName>()?, PartitionId(partition))))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(PlacementMetadata::from_table_assignments(
+            PlacementMetadataSource::Replicated,
+            PlacementVersion::new(serialized.version),
+            serialized.num_partitions,
+            assignments,
+        ))
+    }
+}
+
+const PLACEMENT_KV_BUCKET: &str = "convex_placement";
+const PLACEMENT_CURRENT_KEY: &str = "current";
+
+#[async_trait]
+pub trait PlacementMetadataStore: Send + Sync + 'static {
+    async fn load(&self) -> anyhow::Result<Option<PlacementMetadata>>;
+    async fn ensure_initialized(
+        &self,
+        bootstrap_metadata: PlacementMetadata,
+    ) -> anyhow::Result<PlacementMetadata>;
+}
+
+pub struct NatsPlacementMetadataStore {
+    kv: async_nats::jetstream::kv::Store,
+}
+
+impl NatsPlacementMetadataStore {
+    pub async fn connect(nats_url: &str) -> anyhow::Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = async_nats::connect(nats_url).await.with_context(|| {
+            format!("Placement metadata: failed to connect to NATS at {nats_url}")
+        })?;
+        let jetstream = async_nats::jetstream::new(client);
+        let kv = jetstream
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: PLACEMENT_KV_BUCKET.to_string(),
+                history: 8,
+                ..Default::default()
+            })
+            .await
+            .context("Placement metadata: failed to create KV bucket")?;
+        Ok(Self { kv })
+    }
+
+    fn encode(metadata: &PlacementMetadata) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(&SerializedPlacementMetadata::from(metadata))
+            .context("Placement metadata: failed to serialize metadata")
+    }
+
+    fn decode(bytes: &[u8]) -> anyhow::Result<PlacementMetadata> {
+        let serialized: SerializedPlacementMetadata = serde_json::from_slice(bytes)
+            .context("Placement metadata: failed to parse metadata")?;
+        serialized.try_into()
+    }
+}
+
+#[async_trait]
+impl PlacementMetadataStore for NatsPlacementMetadataStore {
+    async fn load(&self) -> anyhow::Result<Option<PlacementMetadata>> {
+        let Some(entry) = self
+            .kv
+            .entry(PLACEMENT_CURRENT_KEY)
+            .await
+            .context("Placement metadata: failed to read current metadata")?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self::decode(&entry.value)?))
+    }
+
+    async fn ensure_initialized(
+        &self,
+        bootstrap_metadata: PlacementMetadata,
+    ) -> anyhow::Result<PlacementMetadata> {
+        if let Some(metadata) = self.load().await? {
+            return Ok(metadata);
+        }
+
+        let payload = Self::encode(&bootstrap_metadata)?;
+        match self.kv.create(PLACEMENT_CURRENT_KEY, payload.into()).await {
+            Ok(_) => self
+                .load()
+                .await?
+                .context("Placement metadata: current metadata missing after initialize"),
+            Err(_) => self
+                .load()
+                .await?
+                .context("Placement metadata: current metadata missing after initialize race"),
+        }
+    }
+}
+
+/// Refreshable placement state shared by routing components.
+///
+/// Callers take a `PartitionMap` snapshot before classifying or coordinating a
+/// transaction. That keeps a single transaction internally consistent even if a
+/// newer placement version is installed concurrently.
+#[derive(Clone, Debug)]
+pub struct PlacementState {
+    local_partition: PartitionId,
+    metadata: Arc<RwLock<PlacementMetadata>>,
+}
+
+impl PlacementState {
+    pub fn new(local_partition: PartitionId, metadata: PlacementMetadata) -> anyhow::Result<Self> {
+        Self::validate_local_partition(local_partition, metadata.num_partitions())?;
+        Ok(Self {
+            local_partition,
+            metadata: Arc::new(RwLock::new(metadata)),
+        })
+    }
+
+    pub fn from_partition_map(partition_map: PartitionMap) -> Self {
+        let metadata = PlacementMetadata::from_partition_map(
+            &partition_map,
+            PlacementMetadataSource::StaticConfig,
+        );
+        Self {
+            local_partition: partition_map.local_partition(),
+            metadata: Arc::new(RwLock::new(metadata)),
+        }
+    }
+
+    pub fn partition_map(&self) -> PartitionMap {
+        self.metadata
+            .read()
+            .expect("placement metadata lock poisoned")
+            .into_partition_map(self.local_partition)
+    }
+
+    pub fn refresh(&self, metadata: PlacementMetadata) -> anyhow::Result<()> {
+        Self::validate_local_partition(self.local_partition, metadata.num_partitions())?;
+        let mut current = self
+            .metadata
+            .write()
+            .expect("placement metadata lock poisoned");
+        anyhow::ensure!(
+            metadata.version() >= current.version(),
+            "Refusing to refresh placement metadata from {} down to {}",
+            current.version(),
+            metadata.version(),
+        );
+        *current = metadata;
+        Ok(())
+    }
+
+    pub fn placement_version(&self) -> PlacementVersion {
+        self.metadata
+            .read()
+            .expect("placement metadata lock poisoned")
+            .version()
+    }
+
+    pub fn local_partition(&self) -> PartitionId {
+        self.local_partition
+    }
+
+    pub fn num_partitions(&self) -> u32 {
+        self.metadata
+            .read()
+            .expect("placement metadata lock poisoned")
+            .num_partitions()
+    }
+
+    fn validate_local_partition(
+        local_partition: PartitionId,
+        num_partitions: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            local_partition.0 < num_partitions,
+            "Local partition {} is outside placement metadata with {} partitions",
+            local_partition,
+            num_partitions,
+        );
+        Ok(())
+    }
+}
+
 /// Maps table names to partitions.
 ///
 /// System tables (starting with `_`) are always on partition 0.
@@ -61,6 +461,8 @@ pub struct PartitionMap {
     local_partition: PartitionId,
     /// Total number of partitions in the cluster.
     num_partitions: u32,
+    /// Version of the placement metadata used to build this map.
+    placement_version: PlacementVersion,
 }
 
 impl PartitionMap {
@@ -71,26 +473,27 @@ impl PartitionMap {
     /// Tables not listed default to partition 0.
     /// System tables (starting with `_`) are always partition 0 regardless.
     pub fn from_config(config: &str, local_partition: PartitionId, num_partitions: u32) -> Self {
-        let mut assignments = BTreeMap::new();
-        if !config.is_empty() {
-            for pair in config.split(',') {
-                let pair = pair.trim();
-                if let Some((table, partition)) = pair.split_once('=') {
-                    let table = table.trim();
-                    let partition = partition.trim();
-                    if let (Ok(table_name), Ok(partition_id)) =
-                        (table.parse::<TableName>(), partition.parse::<u32>())
-                    {
-                        assignments.insert(table_name, PartitionId(partition_id));
-                    }
-                }
-            }
-        }
-        Self {
-            assignments,
+        Self::from_config_with_version(
+            config,
             local_partition,
             num_partitions,
-        }
+            PlacementVersion::STATIC,
+        )
+    }
+
+    /// Create a partition map from a config string and placement version.
+    pub fn from_config_with_version(
+        config: &str,
+        local_partition: PartitionId,
+        num_partitions: u32,
+        placement_version: PlacementVersion,
+    ) -> Self {
+        PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: config,
+            num_partitions,
+            placement_version,
+        })
+        .into_partition_map(local_partition)
     }
 
     /// Create a single-partition map (all tables on partition 0).
@@ -100,6 +503,7 @@ impl PartitionMap {
             assignments: BTreeMap::new(),
             local_partition: PartitionId::DEFAULT,
             num_partitions: 1,
+            placement_version: PlacementVersion::STATIC,
         }
     }
 
@@ -141,6 +545,11 @@ impl PartitionMap {
     /// Get the total number of partitions.
     pub fn num_partitions(&self) -> u32 {
         self.num_partitions
+    }
+
+    /// Get the placement metadata version.
+    pub fn placement_version(&self) -> PlacementVersion {
+        self.placement_version
     }
 
     /// Get all partition IDs in the cluster.
@@ -265,6 +674,155 @@ mod tests {
         let map = PartitionMap::from_config("a=1,b=2", PartitionId(0), 3);
         let all = map.all_partitions();
         assert_eq!(all, vec![PartitionId(0), PartitionId(1), PartitionId(2)]);
+    }
+
+    #[test]
+    fn test_placement_version_defaults_to_static() {
+        let map = PartitionMap::from_config("a=1", PartitionId(0), 2);
+        assert_eq!(map.placement_version(), PlacementVersion::STATIC);
+    }
+
+    #[test]
+    fn test_placement_version_from_config() {
+        let map = PartitionMap::from_config_with_version(
+            "a=1",
+            PartitionId(0),
+            2,
+            PlacementVersion::new(42),
+        );
+        assert_eq!(map.placement_version(), PlacementVersion::new(42));
+    }
+
+    #[test]
+    fn test_static_placement_metadata_builds_runtime_partition_map() {
+        let metadata = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=0,projects=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(7),
+        });
+
+        assert_eq!(metadata.source(), PlacementMetadataSource::StaticConfig);
+        assert_eq!(metadata.version(), PlacementVersion::new(7));
+        assert_eq!(metadata.num_partitions(), 2);
+        assert_eq!(
+            metadata
+                .table_assignments()
+                .get(&"projects".parse().unwrap()),
+            Some(&PartitionId(1)),
+        );
+
+        let map = metadata.into_partition_map(PartitionId(1));
+        assert_eq!(
+            map.partition_for_table(&"messages".parse().unwrap()),
+            PartitionId(0),
+        );
+        assert_eq!(
+            map.partition_for_table(&"projects".parse().unwrap()),
+            PartitionId(1),
+        );
+        assert!(map.is_local(&"projects".parse().unwrap()));
+        assert_eq!(map.placement_version(), PlacementVersion::new(7));
+    }
+
+    #[test]
+    fn test_static_placement_metadata_keeps_table_targets_explicit() {
+        let metadata = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=0,projects=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(3),
+        });
+        let rules = metadata.rules();
+
+        assert!(rules.contains(&PlacementRule {
+            target: PlacementTarget::Table("messages".parse().unwrap()),
+            owner: PartitionId(0),
+        }));
+        assert!(rules.contains(&PlacementRule {
+            target: PlacementTarget::Table("projects".parse().unwrap()),
+            owner: PartitionId(1),
+        }));
+    }
+
+    #[test]
+    fn test_placement_state_refreshes_to_newer_metadata() -> anyhow::Result<()> {
+        let state = PlacementState::new(
+            PartitionId(1),
+            PlacementMetadata::from_static_config(StaticPlacementConfig {
+                table_assignments: "messages=0,projects=1",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(1),
+            }),
+        )?;
+
+        state.refresh(PlacementMetadata::from_static_config(
+            StaticPlacementConfig {
+                table_assignments: "messages=1,projects=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(2),
+            },
+        ))?;
+
+        let map = state.partition_map();
+        assert_eq!(state.placement_version(), PlacementVersion::new(2));
+        assert_eq!(
+            map.partition_for_table(&"messages".parse().unwrap()),
+            PartitionId(1),
+        );
+        assert_eq!(
+            map.partition_for_table(&"projects".parse().unwrap()),
+            PartitionId(0),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_placement_state_rejects_version_downgrade() -> anyhow::Result<()> {
+        let state = PlacementState::new(
+            PartitionId(0),
+            PlacementMetadata::from_static_config(StaticPlacementConfig {
+                table_assignments: "messages=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(3),
+            }),
+        )?;
+
+        let err = state
+            .refresh(PlacementMetadata::from_static_config(
+                StaticPlacementConfig {
+                    table_assignments: "messages=1",
+                    num_partitions: 2,
+                    placement_version: PlacementVersion::new(2),
+                },
+            ))
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Refusing to refresh placement metadata"));
+        assert_eq!(state.placement_version(), PlacementVersion::new(3));
+        Ok(())
+    }
+
+    #[test]
+    fn test_placement_metadata_serialization_loads_as_replicated() -> anyhow::Result<()> {
+        let metadata = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=0,projects=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(9),
+        });
+
+        let bytes = NatsPlacementMetadataStore::encode(&metadata)?;
+        let decoded = NatsPlacementMetadataStore::decode(&bytes)?;
+
+        assert_eq!(decoded.source(), PlacementMetadataSource::Replicated);
+        assert_eq!(decoded.version(), PlacementVersion::new(9));
+        assert_eq!(
+            decoded
+                .table_assignments()
+                .get(&"projects".parse().unwrap()),
+            Some(&PartitionId(1)),
+        );
+        Ok(())
     }
 
     #[test]

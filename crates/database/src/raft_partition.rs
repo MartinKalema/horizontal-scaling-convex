@@ -72,6 +72,8 @@ pub struct RaftPartitionState {
     proposal_tx: mpsc::UnboundedSender<RaftMessage>,
     /// Partition ID.
     partition_id: PartitionId,
+    /// This node's ID within the Raft group.
+    node_id: u64,
 }
 
 impl RaftPartitionState {
@@ -90,11 +92,33 @@ impl RaftPartitionState {
         self.partition_id
     }
 
+    /// Get this node's ID within the Raft group.
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
     /// Send a Raft message to the node (proposals or forwarded Raft messages).
     pub fn send(&self, msg: RaftMessage) -> anyhow::Result<()> {
         self.proposal_tx.send(msg).map_err(|_| {
             anyhow::anyhow!("Raft node for partition {} not running", self.partition_id)
         })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_test(
+        is_leader: bool,
+        leader_id: u64,
+        partition_id: PartitionId,
+        node_id: u64,
+    ) -> Self {
+        let (proposal_tx, _proposal_rx) = mpsc::unbounded_channel();
+        Self {
+            is_leader: Arc::new(AtomicBool::new(is_leader)),
+            leader_id: Arc::new(AtomicU64::new(leader_id)),
+            proposal_tx,
+            partition_id,
+            node_id,
+        }
     }
 }
 
@@ -182,6 +206,7 @@ impl RaftPartitionManager {
             leader_id,
             proposal_tx: mailbox_tx.clone(),
             partition_id: config.partition_id,
+            node_id: config.node_id,
         };
         metrics::log_raft_is_leader(config.partition_id, false);
         metrics::log_raft_leader_id(config.partition_id, 0);

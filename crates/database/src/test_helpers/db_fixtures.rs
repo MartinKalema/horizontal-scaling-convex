@@ -101,7 +101,9 @@ impl<RT: Runtime> DbFixtures<RT> {
             false,
             None,
             None,
+            Arc::new(crate::two_phase::NoopTwoPhaseDecisionLog),
             None,
+            Arc::new(crate::LocalTableNumberAllocator),
             None,
         )
         .await?;

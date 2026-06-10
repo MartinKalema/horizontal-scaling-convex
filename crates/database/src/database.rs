@@ -195,6 +195,7 @@ use crate::{
     search_index_bootstrap::SearchIndexBootstrapWorker,
     snapshot_checkpointer::checkpoint_to_bytes,
     snapshot_manager::{
+        partition_timestamp_map_from_json,
         replication_frontiers_from_json,
         replication_frontiers_to_json,
         Snapshot,
@@ -215,6 +216,7 @@ use crate::{
         ErasedSystemIndex,
         SystemTable,
     },
+    table_number_allocator::TableNumberAllocator,
     table_registry::TableRegistry,
     table_summary::{
         self,
@@ -298,6 +300,7 @@ pub struct Database<RT: Runtime> {
     pub search_storage: Arc<OnceLock<Arc<dyn Storage>>>,
     shared_index_cache: Option<SharedIndexCache>,
     virtual_system_mapping: VirtualSystemMapping,
+    table_number_allocator: Arc<dyn TableNumberAllocator>,
     pub bootstrap_metadata: BootstrapMetadata,
     // Caches of snapshot TableMapping and by_id index ids, which are used repeatedly by
     // /api/list_snapshot.
@@ -987,7 +990,9 @@ impl<RT: Runtime> Database<RT> {
         replica_mode: bool,
         partition_map: Option<crate::partition::PartitionMap>,
         node_addresses: Option<crate::two_phase::NodeAddresses>,
+        two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
+        table_number_allocator: Arc<dyn TableNumberAllocator>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> anyhow::Result<Self> {
         let _load_database_timer = metrics::load_database_timer();
@@ -1048,6 +1053,13 @@ impl<RT: Runtime> Database<RT> {
                 })
                 .unwrap_or_default(),
         };
+        let applied_delta_watermarks = match reader
+            .get_persistence_global(PersistenceGlobalKey::AppliedDeltaWatermarks)
+            .await?
+        {
+            Some(value) => partition_timestamp_map_from_json(value, "applied delta watermarks")?,
+            None => BTreeMap::new(),
+        };
 
         let snapshot_manager = SnapshotManager::new(*ts, snapshot, replication_frontiers);
         let (snapshot_reader, snapshot_writer) = new_split_rw_lock(snapshot_manager);
@@ -1101,8 +1113,10 @@ impl<RT: Runtime> Database<RT> {
             committer_distributed_log,
             partition_map,
             node_addresses,
+            two_phase_decision_log,
             timestamp_oracle,
             raft_state,
+            applied_delta_watermarks,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
@@ -1125,6 +1139,7 @@ impl<RT: Runtime> Database<RT> {
             search_storage: Arc::new(OnceLock::new()),
             shared_index_cache,
             virtual_system_mapping,
+            table_number_allocator,
             bootstrap_metadata,
             table_mapping_snapshot_cache,
             by_id_indexes_snapshot_cache,
@@ -1165,6 +1180,16 @@ impl<RT: Runtime> Database<RT> {
         partition: crate::partition::PartitionId,
     ) -> Option<Timestamp> {
         self.snapshot_manager.lock().replication_frontier(partition)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replication_write_frontier_for_test(
+        &self,
+        partition: crate::partition::PartitionId,
+    ) -> Option<Timestamp> {
+        self.snapshot_manager
+            .lock()
+            .replication_write_frontier(partition)
     }
 
     #[cfg(test)]
@@ -1216,6 +1241,13 @@ impl<RT: Runtime> Database<RT> {
     /// the apply loop.
     pub fn committer_client(&self) -> CommitterClient {
         self.committer.clone()
+    }
+
+    pub async fn attach_raft_state(
+        &self,
+        raft_state: crate::raft_partition::RaftPartitionState,
+    ) -> anyhow::Result<()> {
+        self.committer.set_raft_state(raft_state).await
     }
 
     pub fn load_documents_in_table<'a>(
@@ -1669,6 +1701,30 @@ impl<RT: Runtime> Database<RT> {
         }
     }
 
+    pub async fn wait_for_replication_frontier(
+        &self,
+        partition: crate::partition::PartitionId,
+        write_ts: Timestamp,
+    ) {
+        let fut = self
+            .snapshot_manager
+            .lock()
+            .wait_for_replication_frontier(partition, write_ts);
+        fut.await;
+    }
+
+    pub async fn wait_for_replication_write_frontier(
+        &self,
+        partition: crate::partition::PartitionId,
+        write_ts: Timestamp,
+    ) {
+        let fut = self
+            .snapshot_manager
+            .lock()
+            .wait_for_replication_write_frontier(partition, write_ts);
+        fut.await;
+    }
+
     pub async fn begin_system(&self) -> anyhow::Result<Transaction<RT>> {
         self.begin(Identity::system()).await
     }
@@ -1910,7 +1966,7 @@ impl<RT: Runtime> Database<RT> {
             )),
         );
         let count_snapshot = Arc::new(snapshot.table_summaries);
-        let tx = Transaction::new(
+        let tx = Transaction::new_with_table_number_allocator(
             identity,
             id_generator,
             creation_time,
@@ -1923,6 +1979,7 @@ impl<RT: Runtime> Database<RT> {
             usage_tracker,
             self.retention_manager.clone(),
             self.virtual_system_mapping.clone(),
+            self.table_number_allocator.clone(),
         );
         Ok(tx)
     }
@@ -1977,7 +2034,7 @@ impl<RT: Runtime> Database<RT> {
             create_checkpoint(self.reader.as_ref(), ts, self.retention_validator()).await?;
 
         let mut globals = BTreeMap::new();
-        for key in PersistenceGlobalKey::all_keys() {
+        for key in PersistenceGlobalKey::checkpoint_keys() {
             if let Some(value) = self.reader.get_persistence_global(key).await? {
                 globals.insert(String::from(key), value);
             }
@@ -2063,18 +2120,74 @@ impl<RT: Runtime> Database<RT> {
     /// N.B. Only use this function for user subscriptions. System subscriptions
     /// should use `subscribe_and_wait_for_invalidation`.
     pub async fn subscribe(&self, token: Token) -> anyhow::Result<Subscription> {
-        self.subscriptions.subscribe(token, false)
+        let interested_tables = Arc::new(self.read_set_table_names(token.reads())?);
+        self.subscriptions
+            .subscribe(token, interested_tables, false)
     }
 
     pub async fn subscribe_and_wait_for_invalidation(
         &self,
         token: Token,
     ) -> anyhow::Result<Option<Timestamp>> {
-        let subscription = self.subscriptions.subscribe(token, true)?;
+        let interested_tables = Arc::new(self.read_set_table_names(token.reads())?);
+        let subscription = self
+            .subscriptions
+            .subscribe(token, interested_tables, true)?;
         let invalid_ts = subscription.wait_for_invalidation().await;
         let current_ts = self.now_ts_for_reads();
         metrics::log_subscription_invalidation_lag(invalid_ts, *current_ts);
         Ok(invalid_ts)
+    }
+
+    pub fn delta_interest_tracker(&self) -> crate::delta_interest::DeltaInterestTracker {
+        self.subscriptions.delta_interest_tracker()
+    }
+
+    pub fn token_table_names(&self, token: &Token) -> anyhow::Result<BTreeSet<TableName>> {
+        self.read_set_table_names(token.reads())
+    }
+
+    pub fn note_recent_delta_interest_for_token(
+        &self,
+        token: &Token,
+        ttl: Duration,
+    ) -> anyhow::Result<()> {
+        let interested_tables = self.token_table_names(token)?;
+        self.subscriptions
+            .delta_interest_tracker()
+            .refresh_recent_tables(&interested_tables, ttl);
+        Ok(())
+    }
+
+    fn read_set_table_names(&self, reads: &crate::ReadSet) -> anyhow::Result<BTreeSet<TableName>> {
+        let snapshot = self.latest_snapshot()?;
+        let table_mapping = snapshot.table_mapping();
+        let mut table_names = BTreeSet::new();
+
+        let mut record_table = |tablet_id| -> anyhow::Result<()> {
+            if !table_mapping.tablet_id_exists(tablet_id)
+                || table_mapping.is_system_tablet(tablet_id)
+            {
+                return Ok(());
+            }
+            let (_, _, table_name) =
+                table_mapping
+                    .get_table_metadata(tablet_id)
+                    .with_context(|| {
+                        format!("Missing table metadata for subscribed tablet {tablet_id}")
+                    })?;
+            table_names.insert(table_name.clone());
+            Ok(())
+        };
+
+        for (index_name, _) in reads.iter_indexed() {
+            record_table(*index_name.table())?;
+        }
+        for (index_name, _) in reads.iter_search() {
+            record_table(*index_name.table())?;
+        }
+
+        Ok(table_names)
     }
 
     fn streaming_export_table_filter(

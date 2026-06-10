@@ -67,9 +67,13 @@ use tokio::sync::{
     },
     watch,
 };
-use value::ResolvedDocumentId;
+use value::{
+    ResolvedDocumentId,
+    TableName,
+};
 
 use crate::{
+    delta_interest::DeltaInterestTracker,
     metrics::{
         self,
         log_subscriptions_invalidated,
@@ -93,13 +97,19 @@ struct SubscriptionKey {
 #[derive(Clone)]
 pub struct SubscriptionsClient {
     handles: Arc<Mutex<Vec<Box<dyn SpawnHandle>>>>,
+    delta_interest: DeltaInterestTracker,
     log: LogReader,
     senders: Vec<mpsc::Sender<SubscriptionRequest>>,
     next_manager: Arc<AtomicUsize>,
 }
 
 impl SubscriptionsClient {
-    pub fn subscribe(&self, token: Token, is_system: bool) -> anyhow::Result<Subscription> {
+    pub fn subscribe(
+        &self,
+        token: Token,
+        interested_tables: Arc<BTreeSet<TableName>>,
+        is_system: bool,
+    ) -> anyhow::Result<Subscription> {
         let token = match self.log.refresh_reads_until_max_ts(token)? {
             Ok(t) => t,
             Err(invalid_ts) => return Ok(Subscription::invalid(invalid_ts)),
@@ -107,6 +117,7 @@ impl SubscriptionsClient {
         let (subscription, sender) = Subscription::new(&token);
         let request = SubscriptionRequest {
             token,
+            interested_tables,
             sender,
             is_system,
         };
@@ -123,6 +134,10 @@ impl SubscriptionsClient {
             });
         }
         Ok(subscription)
+    }
+
+    pub fn delta_interest_tracker(&self) -> DeltaInterestTracker {
+        self.delta_interest.clone()
     }
 
     pub fn shutdown(&self) {
@@ -169,6 +184,7 @@ impl SubscriptionSender {
 
 struct SubscriptionRequest {
     token: Token,
+    interested_tables: Arc<BTreeSet<TableName>>,
     sender: SubscriptionSender,
     is_system: bool,
 }
@@ -218,6 +234,7 @@ impl SubscriptionsWorker {
         let num_managers = *NUM_SUBSCRIPTION_MANAGERS;
         let log_reader = log.reader();
         let initial_ts = log_reader.max_ts();
+        let delta_interest = DeltaInterestTracker::new();
 
         let retention_coordinator = RetentionCoordinator::new(num_managers, initial_ts, log);
 
@@ -230,8 +247,14 @@ impl SubscriptionsWorker {
 
             let manager_log = log_reader.clone();
             let coordinator = retention_coordinator.clone();
-            let mut manager =
-                SubscriptionManager::new(manager_id, manager_log, coordinator, initial_ts);
+            let manager_delta_interest = delta_interest.clone();
+            let mut manager = SubscriptionManager::new(
+                manager_id,
+                manager_log,
+                coordinator,
+                manager_delta_interest,
+                initial_ts,
+            );
             let handle = runtime.spawn("subscription_worker", async move {
                 manager.run_worker(rx).await
             });
@@ -241,6 +264,7 @@ impl SubscriptionsWorker {
 
         SubscriptionsClient {
             handles: Arc::new(Mutex::new(handles)),
+            delta_interest,
             log: log_reader,
             senders,
             next_manager: Arc::new(AtomicUsize::new(0)),
@@ -309,8 +333,13 @@ impl SubscriptionManager {
                 },
                 request = rx.recv().fuse() => {
                     match request {
-                        Some(SubscriptionRequest { token, sender,  is_system,}) => {
-                            match self.subscribe(token, sender, is_system) {
+                        Some(SubscriptionRequest {
+                            token,
+                            interested_tables,
+                            sender,
+                            is_system,
+                        }) => {
+                            match self.subscribe(token, interested_tables, sender, is_system) {
                                 Ok(_) => (),
                                 Err(mut e) => {
                                     report_error(&mut e).await;
@@ -352,6 +381,7 @@ pub struct SubscriptionManager {
     closed_subscriptions: FuturesUnordered<BoxFuture<'static, SubscriptionKey>>,
 
     log: LogReader,
+    delta_interest: DeltaInterestTracker,
 
     retention_coordinator: RetentionCoordinator,
 
@@ -364,6 +394,7 @@ pub struct SubscriptionManager {
 }
 
 struct Subscriber {
+    interested_tables: Arc<BTreeSet<TableName>>,
     reads: Arc<ReadSet>,
     sender: SubscriptionSender,
     seq: Sequence,
@@ -379,13 +410,20 @@ impl SubscriptionManager {
         let (log_owner, log_reader, _) = new_write_log(Timestamp::MIN);
         let initial_ts = log_reader.max_ts();
         let retention_coordinator = RetentionCoordinator::new(1, initial_ts, log_owner);
-        Self::new(0, log_reader, retention_coordinator, initial_ts)
+        Self::new(
+            0,
+            log_reader,
+            retention_coordinator,
+            DeltaInterestTracker::new(),
+            initial_ts,
+        )
     }
 
     fn new(
         manager_id: usize,
         log: LogReader,
         retention_coordinator: RetentionCoordinator,
+        delta_interest: DeltaInterestTracker,
         initial_ts: Timestamp,
     ) -> Self {
         Self {
@@ -395,6 +433,7 @@ impl SubscriptionManager {
             next_seq: 0,
             closed_subscriptions: FuturesUnordered::new(),
             log,
+            delta_interest,
             retention_coordinator,
             processed_ts: initial_ts,
         }
@@ -403,6 +442,7 @@ impl SubscriptionManager {
     pub fn subscribe(
         &mut self,
         mut token: Token,
+        interested_tables: Arc<BTreeSet<TableName>>,
         sender: SubscriptionSender,
         is_system: bool,
     ) -> anyhow::Result<SubscriberId> {
@@ -443,11 +483,13 @@ impl SubscriptionManager {
         self.next_seq += 1;
         let valid_tx = sender.valid_tx.clone();
         entry.insert(Subscriber {
+            interested_tables: interested_tables.clone(),
             reads: token.reads_owned(),
             sender,
             seq,
             is_system,
         });
+        self.delta_interest.add_tables(&interested_tables);
         self.closed_subscriptions.push(
             async move {
                 valid_tx.closed().await;
@@ -464,7 +506,7 @@ impl SubscriptionManager {
         token: Token,
     ) -> anyhow::Result<(Subscription, SubscriberId)> {
         let (subscription, sender) = Subscription::new(&token);
-        let id = self.subscribe(token, sender, false)?;
+        let id = self.subscribe(token, Arc::new(BTreeSet::new()), sender, false)?;
         Ok((subscription, id))
     }
 
@@ -651,6 +693,7 @@ impl SubscriptionManager {
         invalid_ts: Option<Timestamp>,
     ) {
         let entry = self.subscribers.remove(id);
+        self.delta_interest.remove_tables(&entry.interested_tables);
         self.subscriptions.remove(id, &entry.reads);
         // dropping `entry.sender` will invalidate the subscription
         entry.sender.drop_with_delay(delay, invalid_ts);
@@ -1336,8 +1379,13 @@ mod tests {
     async fn test_log_rewind_invalidates_subscriptions_and_reanchors_manager() {
         let (log_owner, log_reader, mut log_writer) = new_write_log(Timestamp::must(100));
         let coordinator = RetentionCoordinator::new(1, log_reader.max_ts(), log_owner);
-        let mut subscription_manager =
-            SubscriptionManager::new(0, log_reader, coordinator, Timestamp::must(100));
+        let mut subscription_manager = SubscriptionManager::new(
+            0,
+            log_reader,
+            coordinator,
+            crate::delta_interest::DeltaInterestTracker::new(),
+            Timestamp::must(100),
+        );
 
         let (subscription, _id) = subscription_manager
             .subscribe_for_testing(Token::empty(Timestamp::must(100)))
@@ -1413,7 +1461,13 @@ mod tests {
 
         let mut managers: Vec<_> = (0..num_managers)
             .map(|id| {
-                SubscriptionManager::new(id, log_reader.clone(), coordinator.clone(), initial_ts)
+                SubscriptionManager::new(
+                    id,
+                    log_reader.clone(),
+                    coordinator.clone(),
+                    crate::delta_interest::DeltaInterestTracker::new(),
+                    initial_ts,
+                )
             })
             .collect();
 

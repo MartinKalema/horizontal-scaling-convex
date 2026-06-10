@@ -53,13 +53,13 @@ use crate::{
     config::LocalConfig,
     make_app,
     router::router,
-    LocalAppState,
+    BackendAppState,
     MAX_CONCURRENT_REQUESTS,
 };
 
 pub struct TestLocalBackend {
     app: ConvexHttpService,
-    pub st: LocalAppState,
+    pub st: BackendAppState,
     pub admin_auth_header: Authorization<ConvexAdminAuthorization>,
 }
 

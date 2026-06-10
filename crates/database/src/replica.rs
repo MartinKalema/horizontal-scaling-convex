@@ -5,19 +5,125 @@
 //! serialized state machine update path (following the etcd/TiKV/Kafka
 //! pattern of one apply thread per node).
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use common::runtime::{
     Runtime,
     SpawnHandle,
 };
-use futures::StreamExt;
+use futures::{
+    stream::BoxStream,
+    StreamExt,
+};
 
 use crate::{
-    commit_delta::DistributedLog,
+    commit_delta::{
+        CommitDelta,
+        DistributedLog,
+        ReplicationMessage,
+    },
     committer::CommitterClient,
 };
+
+pub async fn apply_replication_message(
+    committer: &CommitterClient,
+    message: ReplicationMessage,
+) -> anyhow::Result<(common::types::Timestamp, usize)> {
+    let committer = committer.clone();
+    apply_replication_message_with(message, move |delta| async move {
+        committer.apply_replica_delta(delta).await
+    })
+    .await
+}
+
+pub async fn consume_replication_stream<F>(
+    stream: BoxStream<'static, anyhow::Result<ReplicationMessage>>,
+    committer: CommitterClient,
+    after_success: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(common::types::Timestamp, usize),
+{
+    consume_replication_stream_with(
+        stream,
+        move |message| {
+            let committer = committer.clone();
+            async move { apply_replication_message(&committer, message).await }
+        },
+        after_success,
+    )
+    .await
+}
+
+async fn consume_replication_stream_with<F, Fut, S>(
+    mut stream: BoxStream<'static, anyhow::Result<ReplicationMessage>>,
+    mut apply_message: F,
+    mut after_success: S,
+) -> anyhow::Result<()>
+where
+    F: FnMut(ReplicationMessage) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(common::types::Timestamp, usize)>>,
+    S: FnMut(common::types::Timestamp, usize),
+{
+    while let Some(result) = stream.next().await {
+        let message = result.context("Error reading from distributed log")?;
+        match apply_message(message).await {
+            Ok((applied_ts, num_updates)) => {
+                after_success(applied_ts, num_updates);
+            },
+            Err(e) => {
+                tracing::error!("Failed to apply replica delta; continuing consumer: {e:#}");
+            },
+        }
+    }
+
+    anyhow::bail!("ReplicaDeltaConsumer stream ended")
+}
+
+async fn apply_replication_message_with<F, Fut>(
+    message: ReplicationMessage,
+    apply: F,
+) -> anyhow::Result<(common::types::Timestamp, usize)>
+where
+    F: FnOnce(CommitDelta) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<common::types::Timestamp>>,
+{
+    let (delta, ack) = message.into_parts();
+    let ts = delta.ts;
+    let num_updates = delta.document_updates.len();
+
+    match apply(delta).await {
+        Ok(applied_ts) => {
+            ack.ack().await.with_context(|| {
+                format!(
+                    "Failed to ack applied replica delta at ts={}",
+                    u64::from(applied_ts),
+                )
+            })?;
+            Ok((applied_ts, num_updates))
+        },
+        Err(e) => {
+            tracing::error!(
+                "Failed to apply replica delta at ts={}: {e:#}",
+                u64::from(ts),
+            );
+            if let Err(ack_err) = ack.nak().await {
+                tracing::warn!(
+                    "Failed to NAK unapplied replica delta at ts={}: {ack_err:#}",
+                    u64::from(ts),
+                );
+            }
+            anyhow::bail!(
+                "Failed to apply replica delta at ts={}: {e:#}",
+                u64::from(ts)
+            );
+        },
+    }
+}
 
 /// Consumes [`CommitDelta`]s from a [`DistributedLog`] and feeds them
 /// through the Committer's apply loop via
@@ -37,15 +143,38 @@ impl ReplicaDeltaConsumer {
         committer: CommitterClient,
         from_ts: common::types::Timestamp,
     ) -> Self {
+        let runtime_for_task = runtime.clone();
         let handle = runtime.spawn("replica_delta_consumer", async move {
-            if let Err(e) = Self::run(distributed_log, committer, from_ts).await {
-                tracing::error!("ReplicaDeltaConsumer failed: {e:#}");
-            }
+            Self::run_supervised(runtime_for_task, distributed_log, committer, from_ts).await;
         });
         Self { _handle: handle }
     }
 
-    async fn run(
+    async fn run_supervised<RT: Runtime>(
+        runtime: RT,
+        distributed_log: Arc<dyn DistributedLog>,
+        committer: CommitterClient,
+        from_ts: common::types::Timestamp,
+    ) {
+        let mut backoff = Duration::from_millis(250);
+        loop {
+            match Self::run_once(distributed_log.clone(), committer.clone(), from_ts).await {
+                Ok(()) => {
+                    tracing::warn!("ReplicaDeltaConsumer exited cleanly; restarting");
+                },
+                Err(e) => {
+                    tracing::error!(
+                        "ReplicaDeltaConsumer failed; restarting after {:?}: {e:#}",
+                        backoff,
+                    );
+                },
+            }
+            runtime.wait(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    async fn run_once(
         distributed_log: Arc<dyn DistributedLog>,
         committer: CommitterClient,
         from_ts: common::types::Timestamp,
@@ -55,36 +184,206 @@ impl ReplicaDeltaConsumer {
             u64::from(from_ts)
         );
 
-        let mut stream = distributed_log
+        let stream = distributed_log
             .subscribe(from_ts)
             .await
             .context("Failed to subscribe to distributed log")?;
 
         tracing::info!("ReplicaDeltaConsumer subscribed, waiting for deltas...");
 
-        while let Some(result) = stream.next().await {
-            let delta = result.context("Error reading from distributed log")?;
-            let ts = delta.ts;
-            let num_updates = delta.document_updates.len();
+        consume_replication_stream(stream, committer, |applied_ts, num_updates| {
+            tracing::info!(
+                "Applied replica delta: ts={}, {} updates",
+                u64::from(applied_ts),
+                num_updates,
+            );
+        })
+        .await
+    }
+}
 
-            match committer.apply_replica_delta(delta).await {
-                Ok(applied_ts) => {
-                    tracing::info!(
-                        "Applied replica delta: ts={}, {} updates",
-                        u64::from(applied_ts),
-                        num_updates,
-                    );
-                },
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to apply replica delta at ts={}: {e:#}",
-                        u64::from(ts),
-                    );
-                },
-            }
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            atomic::{
+                AtomicUsize,
+                Ordering,
+            },
+            Arc,
+        },
+    };
+
+    use async_trait::async_trait;
+    use common::types::Timestamp;
+
+    use super::{
+        apply_replication_message_with,
+        consume_replication_stream_with,
+    };
+    use crate::{
+        commit_delta::{
+            CommitDelta,
+            ReplicationAck,
+            ReplicationMessage,
+        },
+        write_log::WriteSource,
+    };
+
+    #[derive(Default)]
+    struct AckCounts {
+        ack: AtomicUsize,
+        nak: AtomicUsize,
+        term: AtomicUsize,
+    }
+
+    struct RecordingAck {
+        counts: Arc<AckCounts>,
+    }
+
+    #[async_trait]
+    impl ReplicationAck for RecordingAck {
+        async fn ack(self: Box<Self>) -> anyhow::Result<()> {
+            self.counts.ack.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
-        tracing::warn!("ReplicaDeltaConsumer stream ended — no more deltas");
+        async fn nak(self: Box<Self>) -> anyhow::Result<()> {
+            self.counts.nak.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn term(self: Box<Self>) -> anyhow::Result<()> {
+            self.counts.term.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn test_message(ts: Timestamp, counts: Arc<AckCounts>) -> ReplicationMessage {
+        ReplicationMessage::new(
+            CommitDelta {
+                ts,
+                document_writes: Arc::new(Vec::new()),
+                document_updates: Vec::new(),
+                index_writes: Arc::new(Vec::new()),
+                write_source: WriteSource::unknown(),
+                write_bytes: 0,
+                tablet_id_to_table_name: BTreeMap::new(),
+                source_partition: None,
+            },
+            Box::new(RecordingAck { counts }),
+        )
+    }
+
+    #[tokio::test]
+    async fn apply_replication_message_acks_after_success() -> anyhow::Result<()> {
+        let counts = Arc::new(AckCounts::default());
+        let ts = Timestamp::try_from(42u64)?;
+        let (applied_ts, num_updates) =
+            apply_replication_message_with(test_message(ts, counts.clone()), |delta| async move {
+                Ok(delta.ts)
+            })
+            .await?;
+
+        assert_eq!(applied_ts, ts);
+        assert_eq!(num_updates, 0);
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.term.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_replication_message_naks_after_apply_failure() -> anyhow::Result<()> {
+        let counts = Arc::new(AckCounts::default());
+        let ts = Timestamp::try_from(42u64)?;
+        let err =
+            apply_replication_message_with(test_message(ts, counts.clone()), |_delta| async move {
+                anyhow::bail!("forced apply failure")
+            })
+            .await
+            .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Failed to apply replica delta"),
+            "{message}"
+        );
+        assert!(message.contains("forced apply failure"), "{message}");
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.term.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_failure_naks_then_redelivered_message_can_ack() -> anyhow::Result<()> {
+        let counts = Arc::new(AckCounts::default());
+        let ts = Timestamp::try_from(42u64)?;
+
+        let first_attempt =
+            apply_replication_message_with(test_message(ts, counts.clone()), |_delta| async move {
+                anyhow::bail!("transient apply failure")
+            })
+            .await;
+        assert!(first_attempt.is_err());
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+
+        let (applied_ts, _) =
+            apply_replication_message_with(test_message(ts, counts.clone()), |delta| async move {
+                Ok(delta.ts)
+            })
+            .await?;
+        assert_eq!(applied_ts, ts);
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.term.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_continues_after_apply_failure() -> anyhow::Result<()> {
+        let counts = Arc::new(AckCounts::default());
+        let first_ts = Timestamp::try_from(42u64)?;
+        let second_ts = Timestamp::try_from(43u64)?;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let successes_for_callback = successes.clone();
+        let stream = futures::stream::iter(vec![
+            Ok(test_message(first_ts, counts.clone())),
+            Ok(test_message(second_ts, counts.clone())),
+        ]);
+
+        let err = consume_replication_stream_with(
+            Box::pin(stream),
+            move |message| {
+                let attempts = attempts.clone();
+                async move {
+                    apply_replication_message_with(message, |delta| async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            anyhow::bail!("transient apply failure");
+                        }
+                        Ok(delta.ts)
+                    })
+                    .await
+                }
+            },
+            move |_ts, _num_updates| {
+                successes_for_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("finite test stream should report stream end");
+
+        assert!(
+            format!("{err:#}").contains("ReplicaDeltaConsumer stream ended"),
+            "unexpected error: {err:#}",
+        );
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+        assert_eq!(successes.load(Ordering::SeqCst), 1);
         Ok(())
     }
 }

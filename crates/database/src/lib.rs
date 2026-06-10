@@ -17,6 +17,7 @@ pub mod commit_delta;
 mod committer;
 mod database;
 mod database_index_workers;
+pub mod delta_interest;
 mod execution_size;
 mod metrics;
 pub mod nats_distributed_log;
@@ -35,6 +36,7 @@ pub mod replica;
 mod retention;
 mod search_index_bootstrap;
 mod search_index_workers;
+pub mod selective_delivery;
 pub mod snapshot_checkpointer;
 mod snapshot_manager;
 mod stack_traces;
@@ -42,6 +44,7 @@ pub mod streaming_export_selection;
 pub mod subscription;
 pub mod system_query;
 pub mod system_tables;
+mod table_number_allocator;
 mod table_registry;
 pub mod table_summary;
 mod table_usage;
@@ -88,6 +91,7 @@ pub use indexing::backend_in_memory_indexes::{
     DatabaseIndexSnapshotCache,
     TimestampedIndexCache,
 };
+pub use metrics::log_selective_delivery_shadow_receive;
 pub use patch::PatchValue;
 pub use preloaded::PreloadedIndexRange;
 pub use reads::{
@@ -97,6 +101,11 @@ pub use reads::{
     OVER_LIMIT_HELP,
 };
 pub use schema_registry::SchemaRegistry;
+pub use table_number_allocator::{
+    LocalTableNumberAllocator,
+    NatsTableNumberAllocator,
+    TableNumberAllocator,
+};
 pub use table_registry::TableRegistry;
 pub use token::{
     SerializedToken,

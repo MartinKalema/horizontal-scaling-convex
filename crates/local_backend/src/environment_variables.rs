@@ -34,8 +34,8 @@ use crate::{
         must_be_admin,
         must_be_admin_with_write_access,
     },
-    authentication::ExtractIdentity,
-    LocalAppState,
+    authentication::ExtractAdminIdentity as ExtractIdentity,
+    AdminRouterState,
 };
 
 #[derive(Deserialize, ToSchema)]
@@ -88,7 +88,7 @@ pub struct UpdateEnvVarsRequest {
     ),
 )]
 pub async fn update_environment_variables(
-    State(st): State<LocalAppState>,
+    State(st): State<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(UpdateEnvVarsRequest { changes }): Json<UpdateEnvVarsRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -139,7 +139,7 @@ pub struct ListEnvVarsResponse {
     ),
 )]
 pub async fn list_environment_variables(
-    MtState(st): MtState<LocalAppState>,
+    MtState(st): MtState<AdminRouterState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     must_be_admin(&identity)?;
@@ -165,7 +165,7 @@ fn validate_env_var(name: &String, value: &String) -> anyhow::Result<Environment
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    AdminRouterState: FromRef<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new().routes(utoipa_axum::routes!(

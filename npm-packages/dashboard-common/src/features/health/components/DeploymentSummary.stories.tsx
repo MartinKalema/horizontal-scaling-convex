@@ -7,11 +7,11 @@ import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import { mockDeploymentInfo } from "@common/lib/mockDeploymentInfo";
 import { DeploymentSummary } from "./DeploymentSummary";
 
-const mockLastPushEvent = {
+const mockLastDeployEvent = {
   _id: "123" as any,
   _creationTime: Date.now() - 1000 * 60 * 30, // 30 minutes ago
   member_id: BigInt(123),
-  action: "push_config" as const,
+  action: "deploy" as const,
   metadata: {} as any,
 } as any;
 
@@ -20,15 +20,15 @@ const mockConvexSiteUrl = "https://happy-animal-123.convex.site";
 
 const mockClient = mockConvexReactClient()
   .registerQueryFake(
-    udfs.deploymentEvents.lastPushEvent,
-    () => mockLastPushEvent,
+    udfs.deploymentEvents.lastDeployEvent,
+    () => mockLastDeployEvent,
   )
   .registerQueryFake(udfs.convexCloudUrl.default, () => mockConvexCloudUrl)
   .registerQueryFake(udfs.convexSiteUrl.default, () => mockConvexSiteUrl)
   .registerQueryFake(udfs.getVersion.default, () => "1.18.0");
 
 const mockClientNeverDeployed = mockConvexReactClient()
-  .registerQueryFake(udfs.deploymentEvents.lastPushEvent, () => null)
+  .registerQueryFake(udfs.deploymentEvents.lastDeployEvent, () => null)
   .registerQueryFake(udfs.convexCloudUrl.default, () => mockConvexCloudUrl)
   .registerQueryFake(udfs.convexSiteUrl.default, () => mockConvexSiteUrl)
   .registerQueryFake(udfs.getVersion.default, () => "1.18.0");
@@ -227,7 +227,7 @@ export const Loading: Story = {
     <ConvexProvider
       client={mockConvexReactClient()
         .registerQueryFake(
-          udfs.deploymentEvents.lastPushEvent,
+          udfs.deploymentEvents.lastDeployEvent,
           () => undefined as any,
         )
         .registerQueryFake(udfs.convexCloudUrl.default, () => undefined as any)
