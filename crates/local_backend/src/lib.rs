@@ -358,14 +358,16 @@ pub async fn make_app(
         config.partition_id.map(|id| {
             let partition_map_str = config.partition_map.as_deref().unwrap_or("");
             let num_partitions = config.num_partitions.unwrap_or(1);
-            database::partition::PartitionMap::from_config_with_version(
-                partition_map_str,
-                database::partition::PartitionId(id),
-                num_partitions,
-                database::partition::PlacementVersion::new(
-                    config.partition_map_version.unwrap_or_default(),
-                ),
+            database::partition::PlacementMetadata::from_static_config(
+                database::partition::StaticPlacementConfig {
+                    table_assignments: partition_map_str,
+                    num_partitions,
+                    placement_version: database::partition::PlacementVersion::new(
+                        config.partition_map_version.unwrap_or_default(),
+                    ),
+                },
             )
+            .into_partition_map(database::partition::PartitionId(id))
         }),
         config
             .node_addresses
