@@ -416,7 +416,21 @@ impl PartitionedPersistence {
 | **Subscription API** | `subscribe()` returns `Subscription` with invalidation notification. Identical API. |
 | **Persistence trait** | Same interface, just multiple instances. |
 | **Client SDK** | Clients still connect via WebSocket, still get real-time updates. Routing is transparent. |
-| **Developer-facing function model** | Queries, mutations, actions all work identically. Developers don't see partitions. |
+| **Developer-facing function model** | Queries, mutations, actions all work identically. Developers don't see partitions, leaders, placement versions, resolver shards, or routing epochs. |
+
+### No Topology Leaks
+
+The public API must continue to look like one logical Convex database. Internal
+systems may use partitions, Raft groups, ownership leases, placement versions,
+resolver shards, and selective delivery, but application code should not need
+to pass topology hints or avoid otherwise-valid transactions because records
+land on different partitions.
+
+Operator-visible topology is allowed and expected: metrics, placement tools,
+runbooks, and administrative dashboards should show where data lives and which
+node owns it. Developer-visible topology requirements are the line we should
+not cross. Performance guidance may say that related tables or ranges are
+faster when co-located, but correctness must remain a system responsibility.
 
 ---
 

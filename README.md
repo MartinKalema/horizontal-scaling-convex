@@ -2,7 +2,7 @@
 
 The first horizontal scaling implementation for the [Convex open-source backend](https://github.com/get-convex/convex-backend) — reads, writes, and automatic failover.
 
-Convex is a reactive database: real-time subscriptions, in-memory snapshots, OCC with automatic retry, TypeScript function execution. No distributed database — CockroachDB, TiDB, Vitess, YugabyteDB, or Spanner — has all of these. We made it scale horizontally without losing any of them.
+Convex is a reactive database: real-time subscriptions, in-memory snapshots, OCC with automatic retry, TypeScript function execution. No distributed database — CockroachDB, TiDB, Vitess, YugabyteDB, Spanner, or FoundationDB — has all of these together. This fork's goal is to scale those properties horizontally while keeping partitions, leaders, placement versions, and routing out of developer-facing APIs.
 
 ## The Problem
 
@@ -32,6 +32,9 @@ We took the best engineering from five distributed databases and combined them:
 The combination — real-time subscriptions + in-memory OCC + partitioned multi-writer + delta replication + 2PC — doesn't exist in any of those systems. CockroachDB doesn't have subscriptions. TiDB doesn't have in-memory snapshots. Vitess doesn't have OCC. We kept Convex's unique architecture and grafted distributed database patterns onto it.
 
 Full details: [docs/what-we-built.md](docs/what-we-built.md)
+
+Project-wide design goals, including the rule that topology must not leak into
+developer APIs: [docs/project-goals.md](docs/project-goals.md)
 
 Issue journal for regressions, fixes, and validation history:
 [docs/issue-journal.md](docs/issue-journal.md)
@@ -320,6 +323,7 @@ Full test details: [docs/write-scaling-tests.md](docs/write-scaling-tests.md)
 
 | Document | Contents |
 | --- | --- |
+| [Project Goals](docs/project-goals.md) | Preserve Convex semantics while preventing topology leaks into developer APIs |
 | [Production Deployment](docs/production-deployment.md) | Kubernetes (GKE, EKS), bare VMs (EC2), load balancing, persistent storage, peer discovery |
 | [Raft Integration](docs/raft-integration.md) | tikv/raft-rs integration design — Raft loop, storage, transport, state machine, leader lifecycle |
 | [What We Built](docs/what-we-built.md) | What we took from each distributed database and what's new |

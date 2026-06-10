@@ -48,6 +48,39 @@ impl fmt::Display for PartitionId {
     }
 }
 
+/// Monotonically identifies the placement metadata version used for routing.
+///
+/// Version 0 is the static, startup-configured map. Dynamic placement updates
+/// must bump this value whenever ownership changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlacementVersion(pub u64);
+
+impl PlacementVersion {
+    pub const STATIC: Self = Self(0);
+
+    pub fn new(version: u64) -> Self {
+        Self(version)
+    }
+}
+
+impl From<PlacementVersion> for u64 {
+    fn from(version: PlacementVersion) -> Self {
+        version.0
+    }
+}
+
+impl From<u64> for PlacementVersion {
+    fn from(version: u64) -> Self {
+        Self(version)
+    }
+}
+
+impl fmt::Display for PlacementVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "placement-version-{}", self.0)
+    }
+}
+
 /// Maps table names to partitions.
 ///
 /// System tables (starting with `_`) are always on partition 0.
@@ -61,6 +94,8 @@ pub struct PartitionMap {
     local_partition: PartitionId,
     /// Total number of partitions in the cluster.
     num_partitions: u32,
+    /// Version of the placement metadata used to build this map.
+    placement_version: PlacementVersion,
 }
 
 impl PartitionMap {
@@ -71,6 +106,21 @@ impl PartitionMap {
     /// Tables not listed default to partition 0.
     /// System tables (starting with `_`) are always partition 0 regardless.
     pub fn from_config(config: &str, local_partition: PartitionId, num_partitions: u32) -> Self {
+        Self::from_config_with_version(
+            config,
+            local_partition,
+            num_partitions,
+            PlacementVersion::STATIC,
+        )
+    }
+
+    /// Create a partition map from a config string and placement version.
+    pub fn from_config_with_version(
+        config: &str,
+        local_partition: PartitionId,
+        num_partitions: u32,
+        placement_version: PlacementVersion,
+    ) -> Self {
         let mut assignments = BTreeMap::new();
         if !config.is_empty() {
             for pair in config.split(',') {
@@ -90,6 +140,7 @@ impl PartitionMap {
             assignments,
             local_partition,
             num_partitions,
+            placement_version,
         }
     }
 
@@ -100,6 +151,7 @@ impl PartitionMap {
             assignments: BTreeMap::new(),
             local_partition: PartitionId::DEFAULT,
             num_partitions: 1,
+            placement_version: PlacementVersion::STATIC,
         }
     }
 
@@ -141,6 +193,11 @@ impl PartitionMap {
     /// Get the total number of partitions.
     pub fn num_partitions(&self) -> u32 {
         self.num_partitions
+    }
+
+    /// Get the placement metadata version.
+    pub fn placement_version(&self) -> PlacementVersion {
+        self.placement_version
     }
 
     /// Get all partition IDs in the cluster.
@@ -265,6 +322,23 @@ mod tests {
         let map = PartitionMap::from_config("a=1,b=2", PartitionId(0), 3);
         let all = map.all_partitions();
         assert_eq!(all, vec![PartitionId(0), PartitionId(1), PartitionId(2)]);
+    }
+
+    #[test]
+    fn test_placement_version_defaults_to_static() {
+        let map = PartitionMap::from_config("a=1", PartitionId(0), 2);
+        assert_eq!(map.placement_version(), PlacementVersion::STATIC);
+    }
+
+    #[test]
+    fn test_placement_version_from_config() {
+        let map = PartitionMap::from_config_with_version(
+            "a=1",
+            PartitionId(0),
+            2,
+            PlacementVersion::new(42),
+        );
+        assert_eq!(map.placement_version(), PlacementVersion::new(42));
     }
 
     #[test]

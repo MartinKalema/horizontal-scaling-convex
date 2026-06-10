@@ -808,12 +808,14 @@ impl TwoPhaseCommitGrpcClient {
         transaction: ParticipantTransaction,
         write_source: WriteSource,
         prepare_ts: Timestamp,
+        placement_version: crate::partition::PlacementVersion,
     ) -> anyhow::Result<PrepareResult> {
         let request = TwoPcPrepareRequest {
             transaction_id: transaction_id.0.clone(),
             transaction: Some(transaction.try_into()?),
             write_source: write_source.as_str().unwrap_or_default().to_string(),
             prepare_ts: u64::from(prepare_ts),
+            placement_version: u64::from(placement_version),
         };
         let response = self
             .client
