@@ -375,9 +375,10 @@ pub struct Committer<RT: Runtime> {
     // so Replica nodes can update their state.
     distributed_log: Arc<dyn DistributedLog>,
 
-    // Partition map for write routing. Determines which tables this node owns.
+    // Refreshable placement state for write routing. Determines which tables
+    // this node owns.
     // None means single-partition mode (owns everything).
-    partition_map: Option<crate::partition::PartitionMap>,
+    placement_state: Option<crate::partition::PlacementState>,
 
     // Global timestamp oracle for multi-node deployments (TiDB PD pattern).
     // When set, next_commit_ts() draws from the TSO instead of the local clock,
@@ -442,9 +443,9 @@ impl<RT: Runtime> Committer<RT> {
     }
 
     fn local_partition_for_two_phase(&self) -> crate::partition::PartitionId {
-        self.partition_map
+        self.placement_state
             .as_ref()
-            .map(|partition_map| partition_map.local_partition())
+            .map(|placement_state| placement_state.local_partition())
             .unwrap_or(crate::partition::PartitionId(0))
     }
 
@@ -478,7 +479,9 @@ impl<RT: Runtime> Committer<RT> {
         let conflict_checker = PendingWrites::new();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
         let snapshot_reader = snapshot_manager.reader();
-        let client_partition_map = partition_map.clone();
+        let placement_state =
+            partition_map.map(crate::partition::PlacementState::from_partition_map);
+        let client_placement_state = placement_state.clone();
         let committer = Self {
             pending_writes: conflict_checker,
             log,
@@ -491,7 +494,7 @@ impl<RT: Runtime> Committer<RT> {
             virtual_system_mapping,
             user_documents_size_gauge: user_documents_size_subgauge(),
             distributed_log,
-            partition_map,
+            placement_state,
             timestamp_oracle,
             prepared_transactions: std::collections::HashMap::new(),
             queued_snapshots: VecDeque::new(),
@@ -512,7 +515,7 @@ impl<RT: Runtime> Committer<RT> {
             persistence_reader,
             retention_validator,
             snapshot_reader,
-            partition_map: client_partition_map,
+            placement_state: client_placement_state,
             node_addresses,
             two_phase_decision_log,
         }
@@ -551,9 +554,9 @@ impl<RT: Runtime> Committer<RT> {
                 Either::Right(std::future::pending())
             };
             let frontier_heartbeat_fut = if self
-                .partition_map
+                .placement_state
                 .as_ref()
-                .is_some_and(|partition_map| partition_map.num_partitions() > 1)
+                .is_some_and(|placement_state| placement_state.num_partitions() > 1)
             {
                 Either::Left(
                     self.runtime.wait(
@@ -1248,9 +1251,9 @@ impl<RT: Runtime> Committer<RT> {
             Ok(None) => {},
             Err(e) => {
                 let local_partition = self
-                    .partition_map
+                    .placement_state
                     .as_ref()
-                    .map(|partition_map| partition_map.local_partition());
+                    .map(|placement_state| placement_state.local_partition());
                 tracing::warn!(
                     ?local_partition,
                     error = %format!("{e:#}"),
@@ -1261,9 +1264,10 @@ impl<RT: Runtime> Committer<RT> {
     }
 
     fn publish_replication_frontier_heartbeat(&self, frontier_ts: Timestamp) {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return;
         };
+        let partition_map = placement_state.partition_map();
         if partition_map.num_partitions() <= 1 {
             return;
         }
@@ -1297,9 +1301,10 @@ impl<RT: Runtime> Committer<RT> {
     }
 
     fn idle_replication_frontier_heartbeat_ts(&mut self) -> anyhow::Result<Option<Timestamp>> {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(None);
         };
+        let partition_map = placement_state.partition_map();
         if partition_map.num_partitions() <= 1 {
             return Ok(None);
         }
@@ -1336,9 +1341,10 @@ impl<RT: Runtime> Committer<RT> {
         table_mapping: &TableMapping,
         write_source: &WriteSource,
     ) -> anyhow::Result<()> {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(());
         };
+        let partition_map = placement_state.partition_map();
 
         for write in writes {
             let tablet_id = write.id.tablet_id;
@@ -1347,7 +1353,7 @@ impl<RT: Runtime> Committer<RT> {
                 .with_context(|| format!("Missing table mapping for prepared write {tablet_id}"))?;
             if let Some(partition) = crate::partition::routed_partition_for_table(
                 &table_name,
-                partition_map,
+                &partition_map,
                 write_source,
             ) && partition != partition_map.local_partition()
             {
@@ -1370,9 +1376,10 @@ impl<RT: Runtime> Committer<RT> {
         table_mapping: &TableMapping,
         write_source: &WriteSource,
     ) -> anyhow::Result<()> {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(());
         };
+        let partition_map = placement_state.partition_map();
 
         let stale = {
             let snapshot_manager = self.snapshot_manager.read();
@@ -1381,7 +1388,7 @@ impl<RT: Runtime> Committer<RT> {
                 begin_ts,
                 reads,
                 table_mapping,
-                partition_map,
+                &partition_map,
                 write_source,
             )
         };
@@ -1533,13 +1540,14 @@ impl<RT: Runtime> Committer<RT> {
         // Partition ownership check: verify that all authoritative writes for
         // this operation target tables owned by this node. Deploy metadata
         // operations route system tables to the metadata owner on partition 0.
-        if let Some(ref partition_map) = self.partition_map {
+        if let Some(placement_state) = self.placement_state.as_ref() {
+            let partition_map = placement_state.partition_map();
             for write in transaction.writes.coalesced_writes() {
                 let tablet_id = write.id.tablet_id;
                 if let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) {
                     if let Some(partition) = crate::partition::routed_partition_for_table(
                         &table_name,
-                        partition_map,
+                        &partition_map,
                         &write_source,
                     ) && partition != partition_map.local_partition()
                     {
@@ -1882,9 +1890,9 @@ impl<RT: Runtime> Committer<RT> {
             write_bytes,
             tablet_id_to_table_name,
             source_partition: self
-                .partition_map
+                .placement_state
                 .as_ref()
-                .map(|partition_map| partition_map.local_partition()),
+                .map(|placement_state| placement_state.local_partition()),
         };
 
         let raft_commit_waiter = self.propose_commit_to_raft(&delta)?;
@@ -1905,7 +1913,10 @@ impl<RT: Runtime> Committer<RT> {
         let persistence = self.persistence.clone();
         let runtime = self.runtime.clone();
         let virtual_system_mapping = self.virtual_system_mapping.clone();
-        let partition_map = self.partition_map.clone();
+        let partition_map = self
+            .placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.partition_map());
         let persistence_version = persistence.reader().version();
 
         self.persistence_writes.push_back(
@@ -3176,7 +3187,7 @@ pub struct CommitterClient {
     persistence_reader: Arc<dyn PersistenceReader>,
     retention_validator: Arc<dyn RetentionValidator>,
     snapshot_reader: Reader<SnapshotManager>,
-    partition_map: Option<crate::partition::PartitionMap>,
+    placement_state: Option<crate::partition::PlacementState>,
     node_addresses: Option<crate::two_phase::NodeAddresses>,
     two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
 }
@@ -3278,10 +3289,20 @@ impl CommitterClient {
     }
 
     pub fn placement_version(&self) -> crate::partition::PlacementVersion {
-        self.partition_map
+        self.placement_state
             .as_ref()
-            .map(|partition_map| partition_map.placement_version())
+            .map(|placement_state| placement_state.placement_version())
             .unwrap_or(crate::partition::PlacementVersion::STATIC)
+    }
+
+    pub fn refresh_placement_metadata(
+        &self,
+        metadata: crate::partition::PlacementMetadata,
+    ) -> anyhow::Result<()> {
+        let Some(placement_state) = self.placement_state.as_ref() else {
+            anyhow::bail!("Cannot refresh placement metadata in single-partition mode");
+        };
+        placement_state.refresh(metadata)
     }
 
     pub fn ensure_placement_version(
@@ -3307,16 +3328,17 @@ impl CommitterClient {
         reads: &ReadSet,
         write_source: &WriteSource,
     ) -> anyhow::Result<()> {
-        let Some(partition_map) = self.partition_map.as_ref() else {
+        let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(());
         };
+        let partition_map = placement_state.partition_map();
 
         let required = {
             let snapshot_reader = self.snapshot_reader.lock();
             remote_read_partitions(
                 reads,
                 snapshot_reader.latest_snapshot().table_mapping(),
-                partition_map,
+                &partition_map,
                 write_source,
             )
         };
@@ -3371,7 +3393,11 @@ impl CommitterClient {
 
         // Finish reading everything from persistence.
         let transaction = transaction.finalize()?;
-        let transaction_classification = self.partition_map.as_ref().map(|partition_map| {
+        let partition_map = self
+            .placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.partition_map());
+        let transaction_classification = partition_map.as_ref().map(|partition_map| {
             crate::two_phase_coordinator::classify_transaction(
                 &transaction,
                 partition_map,
@@ -3384,7 +3410,7 @@ impl CommitterClient {
             Some(crate::two_phase_coordinator::TransactionClassification::RemoteSinglePartition {
                 owner,
             }),
-        ) = (&self.partition_map, &transaction_classification)
+        ) = (&partition_map, &transaction_classification)
         {
             anyhow::bail!(
                 "Write rejected: this transaction targets only {}, not this node ({}). Route this \
@@ -3409,7 +3435,7 @@ impl CommitterClient {
 
         // Classify: single-partition (fast path) vs cross-partition (2PC).
         // TiDB 1PC optimization: skip 2PC when all writes target one partition.
-        if let Some(ref partition_map) = self.partition_map {
+        if let Some(ref partition_map) = partition_map {
             match transaction_classification
                 .expect("partitioned commit should always classify the finalized transaction")
             {

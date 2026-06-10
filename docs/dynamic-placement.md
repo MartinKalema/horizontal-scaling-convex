@@ -16,6 +16,10 @@ Placement ownership is now represented in two layers in
   are owned by which partitions.
 - `PartitionMap` is the runtime lookup object used by commit, routing, and 2PC
   paths.
+- `PlacementState` is the refreshable in-process holder shared by the committer
+  and commit client. Each transaction snapshots the current `PartitionMap`
+  before routing so a placement refresh cannot change ownership halfway through
+  one commit.
 
 The current metadata source is still static process config. Version `0` means
 the startup-configured map. Operators may now set `PARTITION_MAP_VERSION` and
@@ -47,8 +51,8 @@ preparing against the wrong owner.
 
 - Store placement metadata in a replicated system table instead of env vars.
 - Add an authority/lease model for who may publish a new placement version.
-- Make nodes refresh newer placement metadata without a full process restart
-  when they observe a stale-version rejection.
+- Plug `PlacementState` into that authoritative source so nodes refresh newer
+  placement metadata when they observe a stale-version rejection.
 - Add node membership metadata so new partitions can be added without editing
   every node config by hand.
 - Add an online movement workflow: freeze source writes for the moved range or
