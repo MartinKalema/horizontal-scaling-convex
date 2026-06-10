@@ -50,8 +50,8 @@ use common::{
         COMMIT_TRACE_THRESHOLD,
         MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY,
         MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY,
+        REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL,
         REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
-        REPLICATION_FRONTIER_HEARTBEAT_INTERVAL,
         TRANSACTION_WARN_READ_SET_INTERVALS,
     },
     persistence::{
@@ -227,7 +227,7 @@ enum PersistenceWrite {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
-    ReplicationFrontierHeartbeat {
+    RemoteReadFrontierHeartbeat {
         commit_ts: Timestamp,
         source_partition: crate::partition::PartitionId,
         applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
@@ -250,7 +250,7 @@ impl PersistenceWrite {
             Self::Commit { commit_id, .. } => *commit_id,
             Self::MaxRepeatableTimestamp { commit_id, .. } => *commit_id,
             Self::ReplicaDelta { commit_id, .. } => *commit_id,
-            Self::ReplicationFrontierHeartbeat { commit_id, .. } => *commit_id,
+            Self::RemoteReadFrontierHeartbeat { commit_id, .. } => *commit_id,
             Self::InstallSnapshot { commit_id, .. } => *commit_id,
         }
     }
@@ -540,8 +540,8 @@ impl<RT: Runtime> Committer<RT> {
         self.recover_two_phase_redo_records().await?;
 
         let mut last_bumped_repeatable_ts = self.runtime.monotonic_now();
-        let mut last_replication_frontier_heartbeat = self.runtime.monotonic_now();
-        let mut last_replication_frontier_heartbeat_ts = Timestamp::MIN;
+        let mut last_remote_read_frontier_heartbeat = self.runtime.monotonic_now();
+        let mut last_remote_read_frontier_heartbeat_ts = Timestamp::MIN;
         // Assume there were commits just before the backend restarted, so first do a
         // quick bump.
         // None means a bump is ongoing. Avoid parallel bumps in case they
@@ -568,15 +568,15 @@ impl<RT: Runtime> Committer<RT> {
             } else {
                 Either::Right(std::future::pending())
             };
-            let frontier_heartbeat_fut = if self
+            let remote_read_frontier_heartbeat_fut = if self
                 .placement_state
                 .as_ref()
                 .is_some_and(|placement_state| placement_state.num_partitions() > 1)
             {
                 Either::Left(
                     self.runtime.wait(
-                        REPLICATION_FRONTIER_HEARTBEAT_INTERVAL
-                            .saturating_sub(last_replication_frontier_heartbeat.elapsed()),
+                        REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL
+                            .saturating_sub(last_remote_read_frontier_heartbeat.elapsed()),
                     ),
                 )
             } else {
@@ -596,11 +596,11 @@ impl<RT: Runtime> Committer<RT> {
                     commit_id += 1;
                     last_bumped_repeatable_ts = self.runtime.monotonic_now();
                 }
-                _ = frontier_heartbeat_fut.fuse() => {
-                    self.maybe_publish_idle_replication_frontier_heartbeat(
-                        &mut last_replication_frontier_heartbeat_ts,
+                _ = remote_read_frontier_heartbeat_fut.fuse() => {
+                    self.maybe_publish_idle_remote_read_frontier_heartbeat(
+                        &mut last_remote_read_frontier_heartbeat_ts,
                     );
-                    last_replication_frontier_heartbeat = self.runtime.monotonic_now();
+                    last_remote_read_frontier_heartbeat = self.runtime.monotonic_now();
                 }
                 result = self.persistence_writes.select_next_some() => {
                     let pending_commit = result.context("Write failed. Unsure if transaction committed to disk.")?;
@@ -726,7 +726,7 @@ impl<RT: Runtime> Committer<RT> {
                             }
                             let _ = result.send(Ok(commit_ts));
                         },
-                        PersistenceWrite::ReplicationFrontierHeartbeat {
+                        PersistenceWrite::RemoteReadFrontierHeartbeat {
                             commit_ts,
                             source_partition,
                             applied_delta_watermarks,
@@ -847,9 +847,9 @@ impl<RT: Runtime> Committer<RT> {
                             commit_id += 1;
                         },
                         #[cfg(any(test, feature = "testing"))]
-                        Some(CommitterMessage::TickIdleReplicationFrontierHeartbeat { result }) => {
-                            self.maybe_publish_idle_replication_frontier_heartbeat(
-                                &mut last_replication_frontier_heartbeat_ts,
+                        Some(CommitterMessage::TickIdleRemoteReadFrontierHeartbeat { result }) => {
+                            self.maybe_publish_idle_remote_read_frontier_heartbeat(
+                                &mut last_remote_read_frontier_heartbeat_ts,
                             );
                             let _ = result.send(());
                         },
@@ -1253,7 +1253,7 @@ impl<RT: Runtime> Committer<RT> {
         }
         drop(snapshot_manager);
         if advanced {
-            self.publish_replication_frontier_heartbeat(new_max_repeatable);
+            self.publish_remote_read_frontier_heartbeat(new_max_repeatable);
         }
         Ok(())
     }
@@ -1273,15 +1273,15 @@ impl<RT: Runtime> Committer<RT> {
         Ok(())
     }
 
-    fn maybe_publish_idle_replication_frontier_heartbeat(
+    fn maybe_publish_idle_remote_read_frontier_heartbeat(
         &mut self,
-        last_replication_frontier_heartbeat_ts: &mut Timestamp,
+        last_remote_read_frontier_heartbeat_ts: &mut Timestamp,
     ) {
-        match self.idle_replication_frontier_heartbeat_ts() {
+        match self.idle_remote_read_frontier_heartbeat_ts() {
             Ok(Some(frontier_ts)) => {
-                if frontier_ts > *last_replication_frontier_heartbeat_ts {
-                    self.publish_replication_frontier_heartbeat(frontier_ts);
-                    *last_replication_frontier_heartbeat_ts = frontier_ts;
+                if frontier_ts > *last_remote_read_frontier_heartbeat_ts {
+                    self.publish_remote_read_frontier_heartbeat(frontier_ts);
+                    *last_remote_read_frontier_heartbeat_ts = frontier_ts;
                 }
             },
             Ok(None) => {},
@@ -1293,13 +1293,13 @@ impl<RT: Runtime> Committer<RT> {
                 tracing::warn!(
                     ?local_partition,
                     error = %format!("{e:#}"),
-                    "Skipping idle replication frontier heartbeat"
+                    "Skipping idle remote read frontier heartbeat"
                 );
             },
         }
     }
 
-    fn publish_replication_frontier_heartbeat(&self, frontier_ts: Timestamp) {
+    fn publish_remote_read_frontier_heartbeat(&self, frontier_ts: Timestamp) {
         let Some(placement_state) = self.placement_state.as_ref() else {
             return;
         };
@@ -1320,23 +1320,23 @@ impl<RT: Runtime> Committer<RT> {
             document_writes: Arc::new(Vec::new()),
             document_updates: Vec::new(),
             index_writes: Arc::new(Vec::new()),
-            write_source: WriteSource::new("replication_frontier_heartbeat"),
+            write_source: WriteSource::new("remote_read_frontier_heartbeat"),
             write_bytes: 0,
             tablet_id_to_table_name: BTreeMap::new(),
             source_partition: Some(partition_map.local_partition()),
         };
         let distributed_log = self.distributed_log.clone();
-        tokio_spawn("publish_replication_frontier_heartbeat", async move {
+        tokio_spawn("publish_remote_read_frontier_heartbeat", async move {
             if let Err(e) = distributed_log.publish(delta).await {
                 tracing::error!(
-                    "Failed to publish replication frontier heartbeat at ts={}: {e:#}",
+                    "Failed to publish remote read frontier heartbeat at ts={}: {e:#}",
                     u64::from(frontier_ts),
                 );
             }
         });
     }
 
-    fn idle_replication_frontier_heartbeat_ts(&mut self) -> anyhow::Result<Option<Timestamp>> {
+    fn idle_remote_read_frontier_heartbeat_ts(&mut self) -> anyhow::Result<Option<Timestamp>> {
         let Some(placement_state) = self.placement_state.as_ref() else {
             return Ok(None);
         };
@@ -2351,7 +2351,7 @@ impl<RT: Runtime> Committer<RT> {
                             replication_frontiers_to_json(&updated_replication_frontiers),
                         )
                         .await?;
-                    Ok(PersistenceWrite::ReplicationFrontierHeartbeat {
+                    Ok(PersistenceWrite::RemoteReadFrontierHeartbeat {
                         commit_ts,
                         source_partition,
                         applied_delta_watermarks: updated_applied_delta_watermarks,
@@ -3358,9 +3358,9 @@ impl CommitterClient {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub async fn tick_idle_replication_frontier_heartbeat_for_test(&self) -> anyhow::Result<()> {
+    pub async fn tick_idle_remote_read_frontier_heartbeat_for_test(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::TickIdleReplicationFrontierHeartbeat { result: tx };
+        let message = CommitterMessage::TickIdleRemoteReadFrontierHeartbeat { result: tx };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -3846,7 +3846,7 @@ enum CommitterMessage {
     #[cfg(any(test, feature = "testing"))]
     BumpMaxRepeatableTs { result: oneshot::Sender<Timestamp> },
     #[cfg(any(test, feature = "testing"))]
-    TickIdleReplicationFrontierHeartbeat { result: oneshot::Sender<()> },
+    TickIdleRemoteReadFrontierHeartbeat { result: oneshot::Sender<()> },
     LoadIndexesIntoMemory {
         tables: BTreeSet<TableName>,
         result: oneshot::Sender<anyhow::Result<()>>,

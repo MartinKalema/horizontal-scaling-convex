@@ -375,19 +375,21 @@ pub static MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY: LazyLock<Duration> = LazyLoc
     ))
 });
 
-/// How often an idle partition leader should publish a lightweight
-/// replication-frontier heartbeat to other partitions.
+/// How often an idle partition leader should publish a lightweight remote-read
+/// frontier heartbeat to other partitions.
 ///
 /// This is separate from `MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY` because
 /// cross-partition OCC needs a much fresher "safe frontier" than follower
 /// persistence readers do. The heartbeat is the distributed equivalent of
 /// CockroachDB's closed timestamp side transport: even if a partition is idle,
 /// peers still learn that reads below this timestamp are safe.
-pub static REPLICATION_FRONTIER_HEARTBEAT_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_millis(env_config(
-        "REPLICATION_FRONTIER_HEARTBEAT_INTERVAL_MS",
-        200,
-    ))
+pub static REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    let millis = std::env::var("REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        // Deprecated fallback for existing local/demo configs.
+        .unwrap_or_else(|| env_config("REPLICATION_FRONTIER_HEARTBEAT_INTERVAL_MS", 200));
+    Duration::from_millis(millis)
 });
 
 /// Maximum time to wait for a remote partition's read frontier before

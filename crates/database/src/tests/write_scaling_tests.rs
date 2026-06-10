@@ -953,7 +953,7 @@ async fn test_cross_partition_prepare_waits_for_remote_frontier(
             document_writes: Arc::new(Vec::new()),
             document_updates: Vec::new(),
             index_writes: Arc::new(Vec::new()),
-            write_source: WriteSource::new("replication_frontier_heartbeat_test"),
+            write_source: WriteSource::new("remote_read_frontier_heartbeat_test"),
             write_bytes: 0,
             tablet_id_to_table_name: Default::default(),
             source_partition: Some(PartitionId(1)),
@@ -1181,7 +1181,7 @@ async fn test_local_commit_waits_for_remote_frontier(rt: TestRuntime) -> anyhow:
             document_writes: Arc::new(Vec::new()),
             document_updates: Vec::new(),
             index_writes: Arc::new(Vec::new()),
-            write_source: WriteSource::new("replication_frontier_heartbeat_commit_test"),
+            write_source: WriteSource::new("remote_read_frontier_heartbeat_commit_test"),
             write_bytes: 0,
             tablet_id_to_table_name: Default::default(),
             source_partition: Some(PartitionId(1)),
@@ -1627,7 +1627,7 @@ async fn test_prepared_participant_recovers_from_redo_after_restart(
 }
 
 #[convex_macro::test_runtime]
-async fn test_replication_frontier_heartbeat_does_not_advance_snapshot_ts(
+async fn test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
@@ -2460,7 +2460,7 @@ fn test_tso_request_includes_local_replica_floor() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_idle_replication_frontier_heartbeat_tso_failure_is_nonfatal() -> anyhow::Result<()> {
+fn test_idle_remote_read_frontier_heartbeat_tso_failure_is_nonfatal() -> anyhow::Result<()> {
     let td = TestDriver::new_with_io();
     let rt = td.rt();
     td.run_until(async move {
@@ -2477,10 +2477,10 @@ fn test_idle_replication_frontier_heartbeat_tso_failure_is_nonfatal() -> anyhow:
 
         let committer = node.committer_for_test();
         committer
-            .tick_idle_replication_frontier_heartbeat_for_test()
+            .tick_idle_remote_read_frontier_heartbeat_for_test()
             .await?;
         committer
-            .tick_idle_replication_frontier_heartbeat_for_test()
+            .tick_idle_remote_read_frontier_heartbeat_for_test()
             .await?;
 
         Ok(())
