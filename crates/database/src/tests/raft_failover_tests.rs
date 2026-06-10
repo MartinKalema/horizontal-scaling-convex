@@ -94,6 +94,9 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
 
             if !ready.snapshot().is_empty() {
                 node.storage.apply_snapshot(ready.snapshot()).unwrap();
+                node.storage
+                    .set_applied_index(ready.snapshot().get_metadata().index)
+                    .unwrap();
             }
             node.storage.append_entries(ready.entries()).unwrap();
             if let Some(hs) = ready.hs() {
@@ -106,6 +109,7 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
                 {
                     committed.push(entry.data.to_vec());
                 }
+                node.storage.set_applied_index(entry.index).unwrap();
             }
 
             for msg in ready.take_persisted_messages() {
@@ -119,6 +123,7 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
                 {
                     committed.push(entry.data.to_vec());
                 }
+                node.storage.set_applied_index(entry.index).unwrap();
             }
             node.raw_node.advance_apply();
         }

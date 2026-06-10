@@ -647,6 +647,31 @@ own for distributed changes.
   - `cargo check -p database`
   - `cargo check -p local_backend`
 
+### 2026-06 — Persisted Raft state-machine applied index separately from commit index
+
+- **Status:** complete
+- **Related issue:** `#145`
+- **What this fixes:** Raft restart previously initialized `Config.applied`
+  from `HardState.commit`, treating quorum commit as if the local Convex state
+  machine had already installed every committed entry. A crash after commit
+  persistence but before state-machine apply could therefore skip a log entry
+  forever on restart.
+- **Behavior:** raft-engine now stores a separate durable applied index. Follower
+  and replayed entries persist that index only after successful state-machine
+  apply. Live local leader proposals report their committed log index back to
+  the commit future; after the committer publishes local visibility, it marks
+  that index applied through the Raft node. Raft snapshots are generated at the
+  durable applied index, not the commit index.
+- **Validation:**
+  - `cargo test -p database test_restart_replays_committed_but_unapplied_entry -- --nocapture`
+  - `cargo test -p database test_applied_index_persistence -- --nocapture`
+  - `cargo test -p database test_snapshot_persists_and_reloads -- --nocapture`
+  - `cargo test -p database raft_node::tests -- --nocapture`
+  - `cargo test -p database raft_commit_waiter -- --nocapture`
+  - `cargo test -p database raft_failover_tests -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

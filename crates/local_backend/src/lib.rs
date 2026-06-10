@@ -1004,29 +1004,24 @@ pub async fn make_app(
                                 envelope.source_raft_node_id() == Some(raft_node_id);
                             let delta = envelope.to_delta()?;
 
-                            // Skip only the entries this node proposed: the
-                            // local commit future is waiting for this Raft
-                            // decision and will publish after quorum. Every
-                            // other committed entry must be applied here, even
-                            // if this node later became leader.
-                            if !proposed_locally {
-                                tracing::info!(
-                                    "Applying committed Raft delta locally: ts={}, leader_now={}",
-                                    u64::from(delta.ts),
-                                    raft_state_for_apply.is_leader(),
-                                );
-                                // apply_replica_delta is async — use block_in_place
-                                // since we're in the Raft loop's sync callback.
-                                let committer = committer.clone();
-                                common::runtime::block_in_place(|| {
-                                    let rt = tokio::runtime::Handle::current();
-                                    rt.block_on(async {
-                                        committer.apply_replica_delta(delta).await.map_err(|e| {
-                                            anyhow::anyhow!("Raft follower apply failed: {e:#}")
-                                        })
+                            tracing::info!(
+                                "Applying committed Raft delta locally: ts={}, \
+                                 proposed_locally={}, leader_now={}",
+                                u64::from(delta.ts),
+                                proposed_locally,
+                                raft_state_for_apply.is_leader(),
+                            );
+                            // apply_replica_delta is async — use block_in_place
+                            // since we're in the Raft loop's sync callback.
+                            let committer = committer.clone();
+                            common::runtime::block_in_place(|| {
+                                let rt = tokio::runtime::Handle::current();
+                                rt.block_on(async {
+                                    committer.apply_replica_delta(delta).await.map_err(|e| {
+                                        anyhow::anyhow!("Raft state-machine apply failed: {e:#}")
                                     })
-                                })?;
-                            }
+                                })
+                            })?;
 
                             Ok(())
                         },

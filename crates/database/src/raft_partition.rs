@@ -104,6 +104,20 @@ impl RaftPartitionState {
         })
     }
 
+    /// Mark a locally proposed Raft entry as durably applied after the
+    /// Committer has installed it into Convex state.
+    pub async fn mark_applied(&self, index: u64) -> anyhow::Result<()> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.send(RaftMessage::MarkApplied { index, result_tx })?;
+        result_rx.await.map_err(|_| {
+            anyhow::anyhow!(
+                "Raft node for partition {} stopped before marking index {} applied",
+                self.partition_id,
+                index,
+            )
+        })?
+    }
+
     #[cfg(any(test, feature = "testing"))]
     pub fn new_for_test(
         is_leader: bool,
