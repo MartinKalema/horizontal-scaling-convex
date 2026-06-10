@@ -113,6 +113,7 @@ use crate::{
         TwoPhaseCommitGrpcClient,
         TwoPhaseDecision,
         TwoPhaseDecisionLog,
+        TwoPhaseRedoEntry,
         TwoPhaseTransactionId,
     },
     Database,
@@ -1691,6 +1692,185 @@ async fn test_prepared_participant_recovers_from_redo_after_restart(
         .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
         .await?;
     assert_eq!(redo, Some(serde_json::json!({})));
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_prepared_redo_apply_can_commit_after_failover(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "raft-prepared-redo"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("raft_prepared_redo_apply_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    let redo = TwoPhaseRedoEntry::new(
+        &txn_id,
+        prepare_ts,
+        PartitionId(1),
+        participant_tx,
+        &write_source,
+    )?;
+
+    node.committer_for_test()
+        .apply_raft_prepared_redo(redo)
+        .await?;
+    let committed_ts = node
+        .committer_for_test()
+        .commit_prepared(txn_id.clone())
+        .await?;
+    assert_eq!(committed_ts, prepare_ts);
+
+    let projects = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 1);
+
+    let redo = node
+        .committer_for_test()
+        .persistence_reader()
+        .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+        .await?;
+    assert_eq!(redo, Some(serde_json::json!({})));
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_commit_delta_cleans_prepared_redo_on_follower(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_number_allocator = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let follower = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator,
+    )
+    .await?;
+
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "seed-before-prepare"),
+    )
+    .await?;
+    let seed_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("seed insert should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(seed_delta)
+        .await?;
+
+    let mut tx = source.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "raft-commit-cleans-redo"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("raft_commit_delta_cleans_prepare_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = source.committer_for_test().allocate_commit_ts().await?;
+    let redo = TwoPhaseRedoEntry::new(
+        &txn_id,
+        prepare_ts,
+        PartitionId(1),
+        participant_tx.clone(),
+        &write_source,
+    )?;
+
+    follower
+        .committer_for_test()
+        .apply_raft_prepared_redo(redo)
+        .await?;
+    source
+        .committer_for_test()
+        .prepare_remote(txn_id.clone(), participant_tx, write_source, prepare_ts)
+        .await?;
+    source.committer_for_test().commit_prepared(txn_id).await?;
+
+    let delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("prepared commit should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(delta)
+        .await?;
+
+    let redo = follower
+        .committer_for_test()
+        .persistence_reader()
+        .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+        .await?;
+    assert_eq!(redo, Some(serde_json::json!({})));
+
+    insert_doc(
+        &follower,
+        "projects",
+        assert_obj!("name" => "after-raft-commit-cleanup"),
+    )
+    .await
+    .context("follower should accept local writes after Raft commit delta cleaned the prepare")?;
     Ok(())
 }
 

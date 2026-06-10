@@ -672,6 +672,27 @@ own for distributed changes.
   - `cargo check -p database`
   - `cargo check -p local_backend`
 
+### 2026-06 — Replicated 2PC prepare redo through Raft before prepare ACK
+
+- **Status:** complete
+- **Related issue:** `#155`
+- **What this fixes:** 2PC participants previously acknowledged prepare after
+  staging an in-memory intent and writing only their local redo record. If the
+  participant leader failed before the final decision, the new Raft leader
+  could lack the prepared transaction needed to commit or roll it back.
+- **Behavior:** prepare records are now serialized as typed Raft
+  state-machine entries. A participant ACKs prepare only after the redo record
+  is locally durable and the prepare entry has reached Raft quorum. Followers
+  apply the Raft prepare through the committer loop, persist the redo, and stage
+  the prepared intent so a promoted follower can resolve the transaction.
+  Same-partition Raft commit deltas clean up the prepared intent and redo on
+  followers after the final commit applies.
+- **Validation:**
+  - `cargo test -p database raft_state_machine -- --nocapture`
+  - `cargo test -p database test_raft_ -- --nocapture`
+  - `cargo test -p database prepare -- --nocapture`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

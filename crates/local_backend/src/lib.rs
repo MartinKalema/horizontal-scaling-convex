@@ -906,6 +906,7 @@ pub async fn make_app(
         use database::{
             raft_node::RaftNodeConfig,
             raft_partition::RaftPartitionManager,
+            raft_state_machine::RaftStateMachineEntry,
             raft_storage::ConvexRaftStorage,
             raft_transport,
         };
@@ -984,10 +985,11 @@ pub async fn make_app(
 
         // Start the Raft node in a background task.
         // TiKV Apply Worker pattern: committed Raft entries are applied
-        // to the state machine. On the leader, the commit future waits for
-        // this Raft decision before applying locally, so on_committed skips
-        // only entries this node proposed. Followers deserialize the
-        // CommitDelta and apply it via apply_replica_delta.
+        // to the state machine. On the proposer, the future waits for this
+        // Raft decision before applying locally, so on_committed skips live
+        // local proposals. Followers deserialize typed entries and install
+        // either commit deltas or 2PC prepare redo records through the
+        // Committer loop.
         if let Some(mut node) = manager.take_node() {
             let committer = database.committer_client();
             let raft_state_for_apply = raft_state.clone();
@@ -995,33 +997,57 @@ pub async fn make_app(
                 if let Err(e) = node
                     .run(
                         |data| {
-                            // Deserialize the CommitDelta from the Raft entry.
-                            let envelope: database::nats_distributed_log::DeltaEnvelope =
-                                serde_json::from_slice(data).map_err(|e| {
-                                    anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
-                                })?;
-                            let proposed_locally =
-                                envelope.source_raft_node_id() == Some(raft_node_id);
-                            let delta = envelope.to_delta()?;
+                            match RaftStateMachineEntry::from_bytes(data)? {
+                                RaftStateMachineEntry::CommitDelta { envelope } => {
+                                    let proposed_locally =
+                                        envelope.source_raft_node_id() == Some(raft_node_id);
+                                    let delta = envelope.to_delta()?;
 
-                            tracing::info!(
-                                "Applying committed Raft delta locally: ts={}, \
-                                 proposed_locally={}, leader_now={}",
-                                u64::from(delta.ts),
-                                proposed_locally,
-                                raft_state_for_apply.is_leader(),
-                            );
-                            // apply_replica_delta is async — use block_in_place
-                            // since we're in the Raft loop's sync callback.
-                            let committer = committer.clone();
-                            common::runtime::block_in_place(|| {
-                                let rt = tokio::runtime::Handle::current();
-                                rt.block_on(async {
-                                    committer.apply_replica_delta(delta).await.map_err(|e| {
-                                        anyhow::anyhow!("Raft state-machine apply failed: {e:#}")
-                                    })
-                                })
-                            })?;
+                                    tracing::info!(
+                                        "Applying committed Raft delta locally: ts={}, \
+                                         proposed_locally={}, leader_now={}",
+                                        u64::from(delta.ts),
+                                        proposed_locally,
+                                        raft_state_for_apply.is_leader(),
+                                    );
+                                    // apply_replica_delta is async — use block_in_place
+                                    // since we're in the Raft loop's sync callback.
+                                    let committer = committer.clone();
+                                    common::runtime::block_in_place(|| {
+                                        let rt = tokio::runtime::Handle::current();
+                                        rt.block_on(async {
+                                            committer.apply_replica_delta(delta).await.map_err(
+                                                |e| {
+                                                    anyhow::anyhow!(
+                                                        "Raft state-machine apply failed: {e:#}"
+                                                    )
+                                                },
+                                            )
+                                        })
+                                    })?;
+                                },
+                                RaftStateMachineEntry::TwoPhasePrepare { redo } => {
+                                    tracing::info!(
+                                        "Applying committed Raft 2PC prepare locally: txn={}, \
+                                         leader_now={}",
+                                        redo.transaction_id,
+                                        raft_state_for_apply.is_leader(),
+                                    );
+                                    let committer = committer.clone();
+                                    common::runtime::block_in_place(|| {
+                                        let rt = tokio::runtime::Handle::current();
+                                        rt.block_on(async {
+                                            committer.apply_raft_prepared_redo(redo).await.map_err(
+                                                |e| {
+                                                    anyhow::anyhow!(
+                                                        "Raft 2PC prepare apply failed: {e:#}"
+                                                    )
+                                                },
+                                            )
+                                        })
+                                    })?;
+                                },
+                            }
 
                             Ok(())
                         },
