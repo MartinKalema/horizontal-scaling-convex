@@ -44,6 +44,7 @@ pub mod streaming_export_selection;
 pub mod subscription;
 pub mod system_query;
 pub mod system_tables;
+mod table_number_allocator;
 mod table_registry;
 pub mod table_summary;
 mod table_usage;
@@ -100,6 +101,11 @@ pub use reads::{
     OVER_LIMIT_HELP,
 };
 pub use schema_registry::SchemaRegistry;
+pub use table_number_allocator::{
+    LocalTableNumberAllocator,
+    NatsTableNumberAllocator,
+    TableNumberAllocator,
+};
 pub use table_registry::TableRegistry;
 pub use token::{
     SerializedToken,

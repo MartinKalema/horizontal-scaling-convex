@@ -125,6 +125,10 @@ use crate::{
     reads::TransactionReadSet,
     schema_registry::SchemaRegistry,
     snapshot_manager::Snapshot,
+    table_number_allocator::{
+        LocalTableNumberAllocator,
+        TableNumberAllocator,
+    },
     table_summary::table_summary_bootstrapping_error,
     token::Token,
     transaction_id_generator::TransactionIdGenerator,
@@ -181,6 +185,7 @@ pub struct Transaction<RT: Runtime> {
 
     pub usage_tracker: FunctionUsageTracker,
     pub(crate) virtual_system_mapping: VirtualSystemMapping,
+    pub(crate) table_number_allocator: Arc<dyn TableNumberAllocator>,
 
     #[cfg(any(test, feature = "testing"))]
     index_size_override: Option<usize>,
@@ -223,6 +228,38 @@ impl<RT: Runtime> Transaction<RT> {
         retention_validator: Arc<dyn RetentionValidator>,
         virtual_system_mapping: VirtualSystemMapping,
     ) -> Self {
+        Self::new_with_table_number_allocator(
+            identity,
+            id_generator,
+            creation_time,
+            index,
+            metadata,
+            schema_registry,
+            component_registry,
+            count,
+            runtime,
+            usage_tracker,
+            retention_validator,
+            virtual_system_mapping,
+            Arc::new(LocalTableNumberAllocator),
+        )
+    }
+
+    pub fn new_with_table_number_allocator(
+        identity: Identity,
+        id_generator: TransactionIdGenerator,
+        creation_time: CreationTime,
+        index: TransactionIndex,
+        metadata: TableRegistry,
+        schema_registry: SchemaRegistry,
+        component_registry: ComponentRegistry,
+        count: Arc<dyn TableCountSnapshot>,
+        runtime: RT,
+        usage_tracker: FunctionUsageTracker,
+        retention_validator: Arc<dyn RetentionValidator>,
+        virtual_system_mapping: VirtualSystemMapping,
+        table_number_allocator: Arc<dyn TableNumberAllocator>,
+    ) -> Self {
         Self {
             identity,
             reads: TransactionReadSet::new(),
@@ -241,6 +278,7 @@ impl<RT: Runtime> Transaction<RT> {
             retention_validator,
             usage_tracker,
             virtual_system_mapping,
+            table_number_allocator,
             #[cfg(any(test, feature = "testing"))]
             index_size_override: None,
         }

@@ -320,6 +320,17 @@ pub async fn make_app(
         None
     };
 
+    let table_number_allocator: Arc<dyn database::TableNumberAllocator> =
+        if config.partition_id.is_some() {
+            if let Some(nats_url) = &config.nats_url {
+                Arc::new(database::NatsTableNumberAllocator::connect(nats_url).await?)
+            } else {
+                Arc::new(database::LocalTableNumberAllocator)
+            }
+        } else {
+            Arc::new(database::LocalTableNumberAllocator)
+        };
+
     let two_phase_decision_log: Arc<dyn database::two_phase::TwoPhaseDecisionLog> =
         if config.partition_id.is_some() {
             if let Some(nats_url) = &config.nats_url {
@@ -381,6 +392,7 @@ pub async fn make_app(
             .map(database::two_phase::NodeAddresses::from_config),
         two_phase_decision_log,
         timestamp_oracle,
+        table_number_allocator,
         None, // raft_state: set after Raft node starts, not during Database::load
     )
     .await?;
