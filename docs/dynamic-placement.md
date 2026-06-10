@@ -13,6 +13,11 @@ The table owner map is represented by `PartitionMap` in
 map. Operators may now set `PARTITION_MAP_VERSION` and must bump it whenever
 table ownership changes.
 
+Placement metadata is control-plane state, not an application API. Nodes,
+routers, and operators may reason about placement versions and ownership, but
+queries, mutations, actions, and subscriptions should continue to target one
+logical Convex database without shard or partition hints.
+
 Cross-partition 2PC `Prepare` requests carry the coordinator's placement
 version. The participant compares it with its local `PartitionMap` version and
 rejects mismatches before staging writes. This prevents a stale coordinator from
