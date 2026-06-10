@@ -81,6 +81,122 @@ impl fmt::Display for PlacementVersion {
     }
 }
 
+/// Where a placement map was loaded from.
+///
+/// The static config source preserves today's env-var path. The replicated
+/// source is the #130 target: placement metadata owned by the cluster rather
+/// than by each process's startup environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementMetadataSource {
+    StaticConfig,
+    Replicated,
+}
+
+/// Logical object owned by a partition.
+///
+/// We only route whole tables today. Keeping the target explicit prevents the
+/// control-plane model from baking in table-only ownership when #130 evolves
+/// toward range or key-prefix placement.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlacementTarget {
+    Table(TableName),
+}
+
+/// One ownership rule in the placement metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementRule {
+    pub target: PlacementTarget,
+    pub owner: PartitionId,
+}
+
+/// Static placement inputs from process config.
+pub struct StaticPlacementConfig<'a> {
+    pub table_assignments: &'a str,
+    pub num_partitions: u32,
+    pub placement_version: PlacementVersion,
+}
+
+/// Versioned placement metadata used to build runtime routing state.
+///
+/// This is the seam between the future replicated control-plane record and the
+/// existing `PartitionMap` used by commit, routing, and 2PC paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementMetadata {
+    source: PlacementMetadataSource,
+    version: PlacementVersion,
+    num_partitions: u32,
+    rules: BTreeMap<PlacementTarget, PartitionId>,
+}
+
+impl PlacementMetadata {
+    pub fn from_static_config(config: StaticPlacementConfig<'_>) -> Self {
+        let mut rules = BTreeMap::new();
+        if !config.table_assignments.is_empty() {
+            for pair in config.table_assignments.split(',') {
+                let pair = pair.trim();
+                if let Some((table, partition)) = pair.split_once('=') {
+                    let table = table.trim();
+                    let partition = partition.trim();
+                    if let (Ok(table_name), Ok(partition_id)) =
+                        (table.parse::<TableName>(), partition.parse::<u32>())
+                    {
+                        rules.insert(
+                            PlacementTarget::Table(table_name),
+                            PartitionId(partition_id),
+                        );
+                    }
+                }
+            }
+        }
+        Self {
+            source: PlacementMetadataSource::StaticConfig,
+            version: config.placement_version,
+            num_partitions: config.num_partitions,
+            rules,
+        }
+    }
+
+    pub fn source(&self) -> PlacementMetadataSource {
+        self.source
+    }
+
+    pub fn version(&self) -> PlacementVersion {
+        self.version
+    }
+
+    pub fn num_partitions(&self) -> u32 {
+        self.num_partitions
+    }
+
+    pub fn rules(&self) -> Vec<PlacementRule> {
+        self.rules
+            .iter()
+            .map(|(target, owner)| PlacementRule {
+                target: target.clone(),
+                owner: *owner,
+            })
+            .collect()
+    }
+
+    pub fn table_assignments(&self) -> BTreeMap<TableName, PartitionId> {
+        self.rules
+            .iter()
+            .filter_map(|(target, owner)| match target {
+                PlacementTarget::Table(table) => Some((table.clone(), *owner)),
+            })
+            .collect()
+    }
+
+    pub fn into_partition_map(&self, local_partition: PartitionId) -> PartitionMap {
+        PartitionMap {
+            assignments: self.table_assignments(),
+            local_partition,
+            num_partitions: self.num_partitions,
+            placement_version: self.version,
+        }
+    }
+}
+
 /// Maps table names to partitions.
 ///
 /// System tables (starting with `_`) are always on partition 0.
@@ -121,27 +237,12 @@ impl PartitionMap {
         num_partitions: u32,
         placement_version: PlacementVersion,
     ) -> Self {
-        let mut assignments = BTreeMap::new();
-        if !config.is_empty() {
-            for pair in config.split(',') {
-                let pair = pair.trim();
-                if let Some((table, partition)) = pair.split_once('=') {
-                    let table = table.trim();
-                    let partition = partition.trim();
-                    if let (Ok(table_name), Ok(partition_id)) =
-                        (table.parse::<TableName>(), partition.parse::<u32>())
-                    {
-                        assignments.insert(table_name, PartitionId(partition_id));
-                    }
-                }
-            }
-        }
-        Self {
-            assignments,
-            local_partition,
+        PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: config,
             num_partitions,
             placement_version,
-        }
+        })
+        .into_partition_map(local_partition)
     }
 
     /// Create a single-partition map (all tables on partition 0).
@@ -339,6 +440,56 @@ mod tests {
             PlacementVersion::new(42),
         );
         assert_eq!(map.placement_version(), PlacementVersion::new(42));
+    }
+
+    #[test]
+    fn test_static_placement_metadata_builds_runtime_partition_map() {
+        let metadata = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=0,projects=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(7),
+        });
+
+        assert_eq!(metadata.source(), PlacementMetadataSource::StaticConfig);
+        assert_eq!(metadata.version(), PlacementVersion::new(7));
+        assert_eq!(metadata.num_partitions(), 2);
+        assert_eq!(
+            metadata
+                .table_assignments()
+                .get(&"projects".parse().unwrap()),
+            Some(&PartitionId(1)),
+        );
+
+        let map = metadata.into_partition_map(PartitionId(1));
+        assert_eq!(
+            map.partition_for_table(&"messages".parse().unwrap()),
+            PartitionId(0),
+        );
+        assert_eq!(
+            map.partition_for_table(&"projects".parse().unwrap()),
+            PartitionId(1),
+        );
+        assert!(map.is_local(&"projects".parse().unwrap()));
+        assert_eq!(map.placement_version(), PlacementVersion::new(7));
+    }
+
+    #[test]
+    fn test_static_placement_metadata_keeps_table_targets_explicit() {
+        let metadata = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=0,projects=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(3),
+        });
+        let rules = metadata.rules();
+
+        assert!(rules.contains(&PlacementRule {
+            target: PlacementTarget::Table("messages".parse().unwrap()),
+            owner: PartitionId(0),
+        }));
+        assert!(rules.contains(&PlacementRule {
+            target: PlacementTarget::Table("projects".parse().unwrap()),
+            owner: PartitionId(1),
+        }));
     }
 
     #[test]

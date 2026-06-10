@@ -8,10 +8,18 @@ rebalancing is introduced.
 
 ## Current State
 
-The table owner map is represented by `PartitionMap` in
-`crates/database/src/partition.rs`. Version `0` means the legacy static startup
-map. Operators may now set `PARTITION_MAP_VERSION` and must bump it whenever
-table ownership changes.
+Placement ownership is now represented in two layers in
+`crates/database/src/partition.rs`:
+
+- `PlacementMetadata` is the versioned control-plane model. It records where
+  the metadata came from, how many partitions exist, and which logical targets
+  are owned by which partitions.
+- `PartitionMap` is the runtime lookup object used by commit, routing, and 2PC
+  paths.
+
+The current metadata source is still static process config. Version `0` means
+the startup-configured map. Operators may now set `PARTITION_MAP_VERSION` and
+must bump it whenever table ownership changes.
 
 Placement metadata is control-plane state, not an application API. Nodes,
 routers, and operators may reason about placement versions and ownership, but
@@ -39,6 +47,8 @@ preparing against the wrong owner.
 
 - Store placement metadata in a replicated system table instead of env vars.
 - Add an authority/lease model for who may publish a new placement version.
+- Make nodes refresh newer placement metadata without a full process restart
+  when they observe a stale-version rejection.
 - Add node membership metadata so new partitions can be added without editing
   every node config by hand.
 - Add an online movement workflow: freeze source writes for the moved range or
