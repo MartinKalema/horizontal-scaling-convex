@@ -3277,6 +3277,26 @@ impl CommitterClient {
         self.node_addresses.as_ref()
     }
 
+    pub fn placement_version(&self) -> crate::partition::PlacementVersion {
+        self.partition_map
+            .as_ref()
+            .map(|partition_map| partition_map.placement_version())
+            .unwrap_or(crate::partition::PlacementVersion::STATIC)
+    }
+
+    pub fn ensure_placement_version(
+        &self,
+        requested: crate::partition::PlacementVersion,
+    ) -> anyhow::Result<()> {
+        let local = self.placement_version();
+        anyhow::ensure!(
+            local == requested,
+            "Placement version mismatch: request used {requested}, local node is on {local}. \
+             Refresh placement metadata before retrying the write."
+        );
+        Ok(())
+    }
+
     pub(crate) fn two_phase_decision_log(&self) -> Arc<dyn crate::two_phase::TwoPhaseDecisionLog> {
         self.two_phase_decision_log.clone()
     }

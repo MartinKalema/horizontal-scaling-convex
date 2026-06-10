@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use database::{
+    partition::PlacementVersion,
     raft_partition::RaftPartitionState,
     two_phase::{
         ParticipantTransaction,
@@ -114,10 +115,20 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             .prepare_ts
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
+        let placement_version = PlacementVersion::from(req.placement_version);
+        self.committer
+            .ensure_placement_version(placement_version)
+            .map_err(|e| Status::failed_precondition(format!("Prepare rejected: {e:#}")))?;
 
         if let Some(client) = self.leader_client().await? {
             let result = client
-                .prepare(&txn_id, transaction, req.write_source.into(), prepare_ts)
+                .prepare(
+                    &txn_id,
+                    transaction,
+                    req.write_source.into(),
+                    prepare_ts,
+                    placement_version,
+                )
                 .await
                 .map_err(|e| Status::internal(format!("Leader Prepare failed: {e:#}")))?;
             return Ok(Response::new(TwoPcPrepareResponse {

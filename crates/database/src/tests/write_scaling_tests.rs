@@ -84,6 +84,7 @@ use crate::{
     partition::{
         PartitionId,
         PartitionMap,
+        PlacementVersion,
     },
     tests::run_query,
     timestamp_oracle::{
@@ -191,6 +192,18 @@ fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1", local_partition, 2)
 }
 
+fn partitioned_map_with_version(
+    local_partition: PartitionId,
+    placement_version: PlacementVersion,
+) -> PartitionMap {
+    PartitionMap::from_config_with_version(
+        "messages=0,projects=1",
+        local_partition,
+        2,
+        placement_version,
+    )
+}
+
 fn partitioned_map_with_tasks(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1,tasks=1", local_partition, 2)
 }
@@ -249,6 +262,9 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
             .prepare_ts
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
+        self.committer
+            .ensure_placement_version(PlacementVersion::from(req.placement_version))
+            .map_err(|e| Status::failed_precondition(format!("Prepare rejected: {e:#}")))?;
 
         let result = self
             .committer
@@ -1410,10 +1426,17 @@ fn test_remote_prepare_over_grpc_is_idempotent() -> anyhow::Result<()> {
                 participant_tx.clone(),
                 write_source.clone(),
                 prepare_ts,
+                partition_map.placement_version(),
             )
             .await?;
         let second = client
-            .prepare(&txn_id, participant_tx, write_source, prepare_ts)
+            .prepare(
+                &txn_id,
+                participant_tx,
+                write_source,
+                prepare_ts,
+                partition_map.placement_version(),
+            )
             .await?;
 
         assert_eq!(first.prepare_ts, prepare_ts);
@@ -1434,6 +1457,68 @@ fn test_remote_prepare_over_grpc_is_idempotent() -> anyhow::Result<()> {
             "duplicate prepare should still publish exactly one committed delta",
         );
         assert_eq!(committed_deltas[0].source_partition, Some(PartitionId(1)));
+
+        server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_remote_prepare_rejects_stale_placement_version() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b_map = partitioned_map_with_version(PartitionId(1), PlacementVersion::new(2));
+        let node_b = create_node_with_options(&rt, log, Some(node_b_map), None, Some(tso)).await?;
+
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+            node_b.committer_for_test(),
+        ))
+        .await?;
+        let client = TwoPhaseCommitGrpcClient::connect(server.addr()).await?;
+
+        let mut tx = node_b.begin(Identity::system()).await?;
+        TestFacingModel::new(&mut tx)
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "stale-placement"),
+            )
+            .await?;
+        let final_tx = tx.finalize()?;
+        let write_indexes: Vec<_> = final_tx
+            .writes
+            .coalesced_writes()
+            .enumerate()
+            .map(|(index, _)| index)
+            .collect();
+        let write_source = WriteSource::new("stale_placement_version_test");
+        let stale_map = partitioned_map_with_version(PartitionId(1), PlacementVersion::new(1));
+        let participant_tx = ParticipantTransaction::from_final_transaction(
+            &final_tx,
+            PartitionId(1),
+            &write_indexes,
+            &stale_map,
+            &write_source,
+        )?;
+
+        let txn_id = TwoPhaseTransactionId::new();
+        let prepare_ts = node_b.committer_for_test().allocate_commit_ts().await?;
+        let err = client
+            .prepare(
+                &txn_id,
+                participant_tx,
+                write_source,
+                prepare_ts,
+                stale_map.placement_version(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Placement version mismatch"),
+            "expected stale placement rejection, got {err:#}",
+        );
 
         server.shutdown().await?;
         Ok(())

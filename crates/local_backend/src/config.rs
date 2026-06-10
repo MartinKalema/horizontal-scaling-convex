@@ -167,6 +167,11 @@ pub struct LocalConfig {
     #[clap(long, env = "PARTITION_MAP")]
     pub partition_map: Option<String>,
 
+    /// Placement map version. Bump this whenever PARTITION_MAP ownership
+    /// changes.
+    #[clap(long, env = "PARTITION_MAP_VERSION")]
+    pub partition_map_version: Option<u64>,
+
     /// Total number of partitions in the cluster.
     #[clap(long, env = "NUM_PARTITIONS")]
     pub num_partitions: Option<u32>,

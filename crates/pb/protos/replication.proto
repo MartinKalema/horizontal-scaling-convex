@@ -138,6 +138,11 @@ message TwoPcPrepareRequest {
 
   // Globally assigned prepare/commit timestamp chosen by the coordinator.
   uint64 prepare_ts = 4;
+
+  // Placement metadata version used by the coordinator to route this prepare.
+  // Participants reject mismatched versions so stale ownership maps cannot
+  // prepare writes on the wrong partition during rebalancing.
+  uint64 placement_version = 5;
 }
 
 message TwoPcPrepareResponse {

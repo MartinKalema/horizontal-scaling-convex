@@ -147,6 +147,7 @@ async fn prepare_participant(
                 participant_tx,
                 write_source.clone(),
                 prepare_ts,
+                partition_map.placement_version(),
             )
             .await?
     };

@@ -358,10 +358,13 @@ pub async fn make_app(
         config.partition_id.map(|id| {
             let partition_map_str = config.partition_map.as_deref().unwrap_or("");
             let num_partitions = config.num_partitions.unwrap_or(1);
-            database::partition::PartitionMap::from_config(
+            database::partition::PartitionMap::from_config_with_version(
                 partition_map_str,
                 database::partition::PartitionId(id),
                 num_partitions,
+                database::partition::PlacementVersion::new(
+                    config.partition_map_version.unwrap_or_default(),
+                ),
             )
         }),
         config
