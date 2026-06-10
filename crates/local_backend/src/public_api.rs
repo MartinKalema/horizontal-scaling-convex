@@ -263,7 +263,13 @@ async fn maybe_forward_public_mutation(
                 );
                 return Ok(None);
             };
-            match MutationForwarderGrpcClient::connect(&leader_grpc_url).await {
+            let client_result = match st.cluster_grpc_auth.clone() {
+                Some(auth) => {
+                    MutationForwarderGrpcClient::connect_with_auth(&leader_grpc_url, auth).await
+                },
+                None => MutationForwarderGrpcClient::connect(&leader_grpc_url).await,
+            };
+            match client_result {
                 Ok(client) => Some(ForwardingMode::RaftFollower(Arc::new(client))),
                 Err(e) => {
                     tracing::warn!(
@@ -991,6 +997,7 @@ mod tests {
         query_forwarding_api::SelectiveQueryForwardingApi,
         router::router,
         test_helpers::setup_backend_for_test,
+        two_phase_service::TwoPhaseCommitGrpcService,
         MAX_CONCURRENT_REQUESTS,
     };
 
@@ -1165,6 +1172,7 @@ mod tests {
         let forwarder = MutationForwarderService::new(
             Arc::new(primary.st.application.clone()),
             primary.st.instance_name.clone(),
+            primary.st.cluster_grpc_auth.clone(),
         );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _server_handle = rt.spawn("test_mutation_forwarder", async move {
@@ -1176,8 +1184,15 @@ mod tests {
                 .await;
         });
 
-        let forwarder_client =
-            MutationForwarderGrpcClient::connect(&format!("http://{grpc_addr}")).await?;
+        let forwarder_client = MutationForwarderGrpcClient::connect_with_auth(
+            &format!("http://{grpc_addr}"),
+            replica
+                .st
+                .cluster_grpc_auth
+                .clone()
+                .context("test backend should have cluster gRPC auth")?,
+        )
+        .await?;
         let mut replica_state = replica.st.clone();
         replica_state.replica_mode = true;
         replica_state.replica_mutation_forwarder = Some(Arc::new(forwarder_client));
@@ -1230,6 +1245,68 @@ mod tests {
             replica_test_docs, 0,
             "replica should not execute the forwarded mutation locally",
         );
+
+        let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_internal_grpc_services_reject_missing_cluster_auth(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt.clone()).await?;
+        let auth = backend
+            .st
+            .cluster_grpc_auth
+            .clone()
+            .context("test backend should have cluster gRPC auth")?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_addr = listener.local_addr()?;
+        let forwarder = MutationForwarderService::new(
+            Arc::new(backend.st.application.clone()),
+            backend.st.instance_name.clone(),
+            Some(auth.clone()),
+        );
+        let two_pc = TwoPhaseCommitGrpcService::new(
+            backend.st.application.database().committer_client(),
+            None,
+            None,
+            None,
+            Some(auth),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _server_handle = rt.spawn("test_internal_grpc_auth", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(forwarder.into_server())
+                .add_service(two_pc.into_server())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let mut mutation_client =
+            pb::replication::mutation_forwarder_client::MutationForwarderClient::connect(format!(
+                "http://{grpc_addr}"
+            ))
+            .await?;
+        let mutation_err = mutation_client
+            .forward_mutation(pb::replication::ForwardMutationRequest::default())
+            .await
+            .expect_err("forwarded mutation without cluster auth must be rejected");
+        assert_eq!(mutation_err.code(), tonic::Code::Unauthenticated);
+
+        let mut two_pc_client =
+            pb::replication::two_phase_commit_service_client::TwoPhaseCommitServiceClient::connect(
+                format!("http://{grpc_addr}"),
+            )
+            .await?;
+        let prepare_err = two_pc_client
+            .prepare(pb::replication::TwoPcPrepareRequest::default())
+            .await
+            .expect_err("2PC Prepare without cluster auth must be rejected");
+        assert_eq!(prepare_err.code(), tonic::Code::Unauthenticated);
 
         let _ = shutdown_tx.send(());
         Ok(())
@@ -1313,6 +1390,7 @@ mod tests {
         let forwarder = MutationForwarderService::new(
             Arc::new(primary.st.application.clone()),
             primary.st.instance_name.clone(),
+            None,
         );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _server_handle = rt.spawn("test_query_forwarder", async move {
@@ -1385,6 +1463,7 @@ mod tests {
         let forwarder = MutationForwarderService::new(
             Arc::new(primary.st.application.clone()),
             primary.st.instance_name.clone(),
+            None,
         );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _server_handle = rt.spawn("test_selective_query_forwarder", async move {
@@ -1402,6 +1481,7 @@ mod tests {
             false,
             Some(PartitionId(1)),
             Some(NodeAddresses::from_config(&format!("0={grpc_addr}"))),
+            None,
             None,
             None,
         ));
@@ -1456,6 +1536,7 @@ mod tests {
         let forwarder = MutationForwarderService::new(
             Arc::new(primary.st.application.clone()),
             primary.st.instance_name.clone(),
+            None,
         );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _server_handle = rt.spawn("test_authority_partition_query_forwarder", async move {
@@ -1482,6 +1563,7 @@ mod tests {
                 1,
             )),
             Some(raft_peer_grpc_urls),
+            None,
         ));
         let query_result = api
             .execute_public_query(
@@ -1516,6 +1598,7 @@ mod tests {
             backend.st.application.database().clone(),
             false,
             Some(PartitionId(1)),
+            None,
             None,
             None,
             None,
@@ -1604,6 +1687,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
 
         let err = api
@@ -1643,6 +1727,7 @@ mod tests {
             backend.st.application.database().clone(),
             false,
             Some(PartitionId(1)),
+            None,
             None,
             None,
             None,
@@ -1715,6 +1800,7 @@ mod tests {
             Arc::new(backend.st.application.clone()),
             backend.st.application.database().clone(),
             true,
+            None,
             None,
             None,
             None,

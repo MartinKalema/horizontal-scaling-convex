@@ -30,7 +30,13 @@ use crate::{
     knobs::HTTP_SERVER_TCP_BACKLOG,
 };
 
+mod auth;
 mod middleware;
+
+pub use auth::{
+    ClusterGrpcAuth,
+    CLUSTER_GRPC_AUTH_HEADER,
+};
 
 // maps the full route `/service.Service/Method` to just `Method`
 type KnownMethods = FnvHashMap<String, &'static str>;

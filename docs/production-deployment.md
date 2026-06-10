@@ -153,8 +153,22 @@ export RAFT_NODE_ID=1
 export RAFT_PEERS="1=http://10.0.1.10:50051,2=http://10.0.1.11:50051,3=http://10.0.1.12:50051"
 export NATS_URL="nats://nats.internal:4222"
 export POSTGRES_URL="postgresql://convex:password@rds.internal:5432"
+export INSTANCE_SECRET="$(cat /run/secrets/convex_instance_secret)"
 ./convex-backend
 ```
+
+## Internal gRPC Authentication
+
+Cluster-internal gRPC services derive a shared metadata token from the
+deployment instance secret. The token is required for mutation/query
+forwarding, 2PC participant RPCs, and Raft transport messages, so all nodes in
+one deployment must use the same `INSTANCE_SECRET` or
+`SHARED_INSTANCE_SECRET_PATH`.
+
+This is a cluster peer authentication layer, not a replacement for network
+isolation. Keep the gRPC port on private networking only, restrict security
+groups/firewall rules to cluster members, and rotate the shared secret by
+rolling every node together.
 
 ## Managed Database (PostgreSQL)
 

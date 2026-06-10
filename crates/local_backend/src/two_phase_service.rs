@@ -12,6 +12,7 @@ use std::{
     sync::Arc,
 };
 
+use common::grpc::ClusterGrpcAuth;
 use database::{
     partition::{
         PlacementMetadataStore,
@@ -51,6 +52,7 @@ pub struct TwoPhaseCommitGrpcService {
     raft_state: Option<RaftPartitionState>,
     raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     placement_metadata_store: Option<Arc<dyn PlacementMetadataStore>>,
+    cluster_auth: Option<ClusterGrpcAuth>,
 }
 
 impl TwoPhaseCommitGrpcService {
@@ -59,12 +61,14 @@ impl TwoPhaseCommitGrpcService {
         raft_state: Option<RaftPartitionState>,
         raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
         placement_metadata_store: Option<Arc<dyn PlacementMetadataStore>>,
+        cluster_auth: Option<ClusterGrpcAuth>,
     ) -> Self {
         Self {
             committer,
             raft_state,
             raft_peer_grpc_urls,
             placement_metadata_store,
+            cluster_auth,
         }
     }
 
@@ -95,15 +99,24 @@ impl TwoPhaseCommitGrpcService {
                     "Missing RAFT_PEERS entry for Raft leader node {leader_id}"
                 ))
             })?;
-        let client = TwoPhaseCommitGrpcClient::connect(&leader_addr)
-            .await
-            .map_err(|e| {
-                Status::unavailable(format!(
-                    "Failed to connect to Raft leader {} at {}: {e:#}",
-                    leader_id, leader_addr
-                ))
-            })?;
+        let client = match self.cluster_auth.clone() {
+            Some(auth) => TwoPhaseCommitGrpcClient::connect_with_auth(&leader_addr, auth).await,
+            None => TwoPhaseCommitGrpcClient::connect(&leader_addr).await,
+        }
+        .map_err(|e| {
+            Status::unavailable(format!(
+                "Failed to connect to Raft leader {} at {}: {e:#}",
+                leader_id, leader_addr
+            ))
+        })?;
         Ok(Some(client))
+    }
+
+    fn authenticate<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if let Some(auth) = &self.cluster_auth {
+            auth.authenticate(request)?;
+        }
+        Ok(())
     }
 
     async fn refresh_placement_metadata(&self) -> Result<(), Status> {
@@ -154,6 +167,7 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
         &self,
         request: Request<TwoPcPrepareRequest>,
     ) -> Result<Response<TwoPcPrepareResponse>, Status> {
+        self.authenticate(&request)?;
         let req = request.into_inner();
         let txn_id = TwoPhaseTransactionId(req.transaction_id);
         let transaction = req
@@ -199,6 +213,7 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
         &self,
         request: Request<TwoPcCommitRequest>,
     ) -> Result<Response<TwoPcCommitResponse>, Status> {
+        self.authenticate(&request)?;
         let req = request.into_inner();
         let txn_id = TwoPhaseTransactionId(req.transaction_id.clone());
 
@@ -225,6 +240,7 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
         &self,
         request: Request<TwoPcRollbackRequest>,
     ) -> Result<Response<TwoPcRollbackResponse>, Status> {
+        self.authenticate(&request)?;
         let req = request.into_inner();
         let txn_id = TwoPhaseTransactionId(req.transaction_id.clone());
 

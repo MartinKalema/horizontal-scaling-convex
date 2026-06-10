@@ -15,6 +15,7 @@ use common::{
         ComponentId,
         ExportPath,
     },
+    grpc::ClusterGrpcAuth,
     http::ResolvedHostname,
     types::{
         ConvexOrigin,
@@ -70,6 +71,7 @@ pub struct SelectiveQueryForwardingApi {
     node_addresses: Option<NodeAddresses>,
     raft_state: Option<RaftPartitionState>,
     raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+    cluster_grpc_auth: Option<ClusterGrpcAuth>,
 }
 
 impl SelectiveQueryForwardingApi {
@@ -81,6 +83,7 @@ impl SelectiveQueryForwardingApi {
         node_addresses: Option<NodeAddresses>,
         raft_state: Option<RaftPartitionState>,
         raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+        cluster_grpc_auth: Option<ClusterGrpcAuth>,
     ) -> Self {
         Self {
             inner,
@@ -90,6 +93,7 @@ impl SelectiveQueryForwardingApi {
             node_addresses,
             raft_state,
             raft_peer_grpc_urls,
+            cluster_grpc_auth,
         }
     }
 
@@ -211,12 +215,16 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<application::RedactedQueryReturn> {
         let result = if let Some(target_grpc_url) = self.public_query_target_grpc_url().await? {
-            let client = MutationForwarderGrpcClient::connect(&target_grpc_url)
-                .await
-                .with_context(|| {
-                    format!("Failed to connect to selective query authority at {target_grpc_url}")
-                })
-                .map_err(|e| anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(e))?;
+            let client = match self.cluster_grpc_auth.clone() {
+                Some(auth) => {
+                    MutationForwarderGrpcClient::connect_with_auth(&target_grpc_url, auth).await
+                },
+                None => MutationForwarderGrpcClient::connect(&target_grpc_url).await,
+            }
+            .with_context(|| {
+                format!("Failed to connect to selective query authority at {target_grpc_url}")
+            })
+            .map_err(|e| anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(e))?;
             client
                 .forward_query(
                     &String::from(path.clone()),

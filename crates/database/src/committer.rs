@@ -45,6 +45,7 @@ use common::{
         initialize_root_from_parent,
         EncodedSpan,
     },
+    grpc::ClusterGrpcAuth,
     knobs::{
         COMMITTER_QUEUE_SIZE,
         COMMIT_TRACE_THRESHOLD,
@@ -485,6 +486,7 @@ impl<RT: Runtime> Committer<RT> {
         partition_map: Option<crate::partition::PartitionMap>,
         node_addresses: Option<crate::two_phase::NodeAddresses>,
         two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
+        cluster_grpc_auth: Option<ClusterGrpcAuth>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
         applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
@@ -533,6 +535,7 @@ impl<RT: Runtime> Committer<RT> {
             placement_state: client_placement_state,
             node_addresses,
             two_phase_decision_log,
+            cluster_grpc_auth,
         }
     }
 
@@ -3294,6 +3297,7 @@ pub struct CommitterClient {
     placement_state: Option<crate::partition::PlacementState>,
     node_addresses: Option<crate::two_phase::NodeAddresses>,
     two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
+    cluster_grpc_auth: Option<ClusterGrpcAuth>,
 }
 
 impl CommitterClient {
@@ -3390,6 +3394,10 @@ impl CommitterClient {
 
     pub(crate) fn node_addresses(&self) -> Option<&crate::two_phase::NodeAddresses> {
         self.node_addresses.as_ref()
+    }
+
+    pub(crate) fn cluster_grpc_auth(&self) -> Option<ClusterGrpcAuth> {
+        self.cluster_grpc_auth.clone()
     }
 
     pub fn placement_version(&self) -> crate::partition::PlacementVersion {
