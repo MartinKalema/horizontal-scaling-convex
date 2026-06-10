@@ -627,6 +627,26 @@ own for distributed changes.
   - `cargo check -p database`
   - `cargo check -p local_backend`
 
+### 2026-06 — Blocked Raft applied-index advancement on state-machine apply failure
+
+- **Status:** complete
+- **Related issue:** `#144`
+- **What this fixes:** committed Raft entries that failed Convex
+  state-machine apply were previously logged and skipped while the Raft loop
+  still advanced. A follower could then believe it had applied a quorum
+  committed entry even though its `Committer`/`SnapshotManager` never accepted
+  the delta.
+- **Behavior:** Raft committed-entry and snapshot apply callbacks now fail the
+  Raft loop before `advance_apply()` when the Convex state-machine apply fails.
+  The local backend Raft callback also propagates `apply_replica_delta`
+  failures instead of swallowing them.
+- **Validation:**
+  - `cargo test -p database test_state_machine_apply_failure_returns_before_advance_apply -- --nocapture`
+  - `cargo test -p database test_three_node_propose_commit -- --nocapture`
+  - `cargo test -p database test_kill_leader_reelection -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

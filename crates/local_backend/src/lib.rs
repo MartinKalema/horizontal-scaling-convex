@@ -1021,11 +1021,11 @@ pub async fn make_app(
                                 common::runtime::block_in_place(|| {
                                     let rt = tokio::runtime::Handle::current();
                                     rt.block_on(async {
-                                        if let Err(e) = committer.apply_replica_delta(delta).await {
-                                            tracing::error!("Raft follower apply failed: {e:#}");
-                                        }
+                                        committer.apply_replica_delta(delta).await.map_err(|e| {
+                                            anyhow::anyhow!("Raft follower apply failed: {e:#}")
+                                        })
                                     })
-                                });
+                                })?;
                             }
 
                             Ok(())
