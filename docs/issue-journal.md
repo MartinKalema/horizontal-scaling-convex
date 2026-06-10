@@ -523,6 +523,24 @@ own for distributed changes.
   - `bash self-hosted/docker/test.sh`
   - result: `ALL 77 TESTS PASSED`, `ALL 10 TESTS PASSED`, `ALL SUITES PASSED`
 
+### 2026-06 — Added NATS retention-gap detection for replica consumers
+
+- **Status:** complete
+- **Related issue:** `#162`
+- **What this fixes:** a durable JetStream consumer could previously resume from
+  the earliest retained message even if finite stream retention had already
+  deleted messages the node still needed. That is a silent-divergence failure
+  mode, so the consumer now compares its durable sequence floor with the
+  stream's first retained sequence before applying any deltas.
+- **Behavior:** if the next required stream sequence is older than
+  `first_seq`, subscription fails closed with an operator-facing rebootstrap
+  error and increments a retention-gap metric instead of applying a truncated
+  history.
+- **Validation:**
+  - `cargo test -p database nats_distributed_log::tests -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current
