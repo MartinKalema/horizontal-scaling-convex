@@ -215,6 +215,7 @@ use crate::{
         ErasedSystemIndex,
         SystemTable,
     },
+    table_number_allocator::TableNumberAllocator,
     table_registry::TableRegistry,
     table_summary::{
         self,
@@ -298,6 +299,7 @@ pub struct Database<RT: Runtime> {
     pub search_storage: Arc<OnceLock<Arc<dyn Storage>>>,
     shared_index_cache: Option<SharedIndexCache>,
     virtual_system_mapping: VirtualSystemMapping,
+    table_number_allocator: Arc<dyn TableNumberAllocator>,
     pub bootstrap_metadata: BootstrapMetadata,
     // Caches of snapshot TableMapping and by_id index ids, which are used repeatedly by
     // /api/list_snapshot.
@@ -989,6 +991,7 @@ impl<RT: Runtime> Database<RT> {
         node_addresses: Option<crate::two_phase::NodeAddresses>,
         two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
+        table_number_allocator: Arc<dyn TableNumberAllocator>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
     ) -> anyhow::Result<Self> {
         let _load_database_timer = metrics::load_database_timer();
@@ -1127,6 +1130,7 @@ impl<RT: Runtime> Database<RT> {
             search_storage: Arc::new(OnceLock::new()),
             shared_index_cache,
             virtual_system_mapping,
+            table_number_allocator,
             bootstrap_metadata,
             table_mapping_snapshot_cache,
             by_id_indexes_snapshot_cache,
@@ -1953,7 +1957,7 @@ impl<RT: Runtime> Database<RT> {
             )),
         );
         let count_snapshot = Arc::new(snapshot.table_summaries);
-        let tx = Transaction::new(
+        let tx = Transaction::new_with_table_number_allocator(
             identity,
             id_generator,
             creation_time,
@@ -1966,6 +1970,7 @@ impl<RT: Runtime> Database<RT> {
             usage_tracker,
             self.retention_manager.clone(),
             self.virtual_system_mapping.clone(),
+            self.table_number_allocator.clone(),
         );
         Ok(tx)
     }

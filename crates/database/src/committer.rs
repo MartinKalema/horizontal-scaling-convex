@@ -2286,29 +2286,16 @@ impl<RT: Runtime> Committer<RT> {
 
         // Phase 1: Apply _tables updates (creates new tables).
         //
-        // Each node assigns table numbers independently (like CockroachDB's
-        // non-transactional descriptor ID allocator or TiDB's PD global ID).
-        // When replicating a _tables entry from another node, the remote
-        // table number may collide with a different local table. We reassign
-        // the table number to a locally-unique value, preserving only the
-        // table name and TabletId (derived from document_id) for remapping.
+        // Clustered deployments allocate user table numbers from a global
+        // allocator, so public document IDs embedded in document values are
+        // portable across nodes. Replica apply must therefore preserve the
+        // source TableMetadata.number exactly. If a local table with the same
+        // name already exists with a different number, fail loudly instead of
+        // silently rewriting IDs into a different table-number namespace.
         if !tables_updates.is_empty() {
-            use value::{
-                DocumentObject,
-                TableNumber,
-            };
+            use value::DocumentObject;
 
             let remap = build_remap(&snapshot, &delta.tablet_id_to_table_name);
-            let mapping = snapshot.table_registry.table_mapping();
-
-            // Find the next available user table number by scanning local tables.
-            // User table numbers start above NUM_RESERVED_SYSTEM_TABLE_NUMBERS (10000).
-            let max_local_number: u32 = mapping
-                .iter()
-                .map(|(_, _, num, _)| u32::from(num))
-                .max()
-                .unwrap_or(10000);
-            let mut next_number = max_local_number + 1;
 
             for update in &tables_updates {
                 let primary_tablet = update.id.tablet_id;
@@ -2344,40 +2331,43 @@ impl<RT: Runtime> Committer<RT> {
                 let metadata: TableMetadata = new_doc.value().0.clone().try_into()?;
 
                 // If the table already exists locally by name, skip this update.
-                // Each node may have independently created the same table.
+                // Each node may have independently created the same table, but
+                // the table number must now be globally stable.
                 if snapshot
                     .table_registry
                     .table_exists(metadata.namespace, &metadata.name)
                 {
-                    tracing::debug!(
-                        "Skipping _tables update for '{}': already exists locally",
+                    let existing = snapshot
+                        .table_registry
+                        .table_mapping()
+                        .namespace(metadata.namespace)
+                        .id(&metadata.name)?;
+                    anyhow::ensure!(
+                        existing.table_number == metadata.number,
+                        "Replicated table '{}' has table number {} but local table uses {}",
                         metadata.name,
+                        u32::from(metadata.number),
+                        u32::from(existing.table_number),
+                    );
+                    tracing::debug!(
+                        "Skipping _tables update for '{}': already exists locally with stable \
+                         table number {}",
+                        metadata.name,
+                        u32::from(metadata.number),
                     );
                     continue;
                 }
 
-                // Reassign the table number to avoid collisions with local tables.
-                // This is the same pattern as CockroachDB's descriptor ID allocator:
-                // each node picks the next available number locally.
-                let local_number = TableNumber::try_from(next_number)?;
-                next_number += 1;
-                let local_metadata = TableMetadata::new_with_state(
-                    metadata.namespace,
-                    metadata.name.clone(),
-                    local_number,
-                    metadata.state,
-                );
-                let local_value: DocumentObject = local_metadata.try_into()?;
+                let local_value: DocumentObject = metadata.clone().try_into()?;
 
                 tracing::info!(
-                    "Creating replicated table '{}' with local number {} (remote was {})",
+                    "Creating replicated table '{}' with stable table number {}",
                     metadata.name,
-                    u32::from(local_number),
                     u32::from(metadata.number),
                 );
 
                 // Build a new ResolvedDocument with the remapped tablet ID and
-                // the locally-assigned table number.
+                // the globally-stable table number from the source metadata.
                 let remapped_id = ResolvedDocumentId {
                     tablet_id: local_tablet,
                     document_id: update.id.document_id,

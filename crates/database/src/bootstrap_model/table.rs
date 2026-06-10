@@ -339,7 +339,14 @@ impl<'a, RT: Runtime> TableModel<'a, RT> {
             candidate_table_number = candidate_table_number.increment()?;
         }
 
-        Ok(candidate_table_number)
+        if is_system {
+            Ok(candidate_table_number)
+        } else {
+            self.tx
+                .table_number_allocator
+                .next_user_table_number(candidate_table_number)
+                .await
+        }
     }
 
     /// Checks for table number conflicts when activating a table, e.g. snapshot

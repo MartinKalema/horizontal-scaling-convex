@@ -67,6 +67,7 @@ use tonic::{
     Status,
 };
 use value::{
+    PublicDocumentId,
     ResolvedDocumentId,
     TableName,
     TableNamespace,
@@ -87,6 +88,10 @@ use crate::{
         PlacementMetadata,
         PlacementVersion,
         StaticPlacementConfig,
+    },
+    table_number_allocator::{
+        testing::InMemoryTableNumberAllocator,
+        TableNumberAllocator,
     },
     tests::run_query,
     timestamp_oracle::{
@@ -135,6 +140,25 @@ async fn create_node_with_options(
     .await
 }
 
+async fn create_node_with_table_number_allocator(
+    rt: &TestRuntime,
+    distributed_log: Arc<InMemoryDistributedLog>,
+    partition_map: Option<PartitionMap>,
+    table_number_allocator: Arc<dyn TableNumberAllocator>,
+) -> anyhow::Result<Database<TestRuntime>> {
+    create_node_with_persistence_and_table_number_allocator(
+        rt,
+        Arc::new(TestPersistence::new()),
+        distributed_log,
+        partition_map,
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator,
+    )
+    .await
+}
+
 async fn create_node_with_options_and_decision_log(
     rt: &TestRuntime,
     distributed_log: Arc<InMemoryDistributedLog>,
@@ -164,6 +188,29 @@ async fn create_node_with_persistence(
     two_phase_decision_log: Arc<dyn TwoPhaseDecisionLog>,
     timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
 ) -> anyhow::Result<Database<TestRuntime>> {
+    create_node_with_persistence_and_table_number_allocator(
+        rt,
+        tp,
+        distributed_log,
+        partition_map,
+        node_addresses,
+        two_phase_decision_log,
+        timestamp_oracle,
+        Arc::new(crate::LocalTableNumberAllocator),
+    )
+    .await
+}
+
+async fn create_node_with_persistence_and_table_number_allocator(
+    rt: &TestRuntime,
+    tp: Arc<TestPersistence>,
+    distributed_log: Arc<InMemoryDistributedLog>,
+    partition_map: Option<PartitionMap>,
+    node_addresses: Option<NodeAddresses>,
+    two_phase_decision_log: Arc<dyn TwoPhaseDecisionLog>,
+    timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
+    table_number_allocator: Arc<dyn TableNumberAllocator>,
+) -> anyhow::Result<Database<TestRuntime>> {
     let searcher: Arc<dyn search::Searcher> = Arc::new(SearcherStub {});
     let (deleted_tablet_sender, _) = tokio::sync::mpsc::channel(100);
     let db = Database::load(
@@ -181,6 +228,7 @@ async fn create_node_with_persistence(
         node_addresses,
         two_phase_decision_log,
         timestamp_oracle,
+        table_number_allocator,
         None,
     )
     .await?;
@@ -208,6 +256,10 @@ fn partitioned_map_with_version(
 
 fn partitioned_map_with_tasks(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1,tasks=1", local_partition, 2)
+}
+
+fn partitioned_map_with_users_and_tasks(local_partition: PartitionId) -> PartitionMap {
+    PartitionMap::from_config("users=0,tasks=1", local_partition, 2)
 }
 
 async fn insert_doc_get_id(
@@ -1241,16 +1293,19 @@ async fn test_replica_table_number_allocation_waits_for_prior_publish(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
-    let node_a = create_node(
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let node_a = create_node_with_table_number_allocator(
         &rt,
         log.clone(),
         Some(partitioned_map_with_tasks(PartitionId(0))),
+        table_numbers.clone(),
     )
     .await?;
-    let node_b = create_node(
+    let node_b = create_node_with_table_number_allocator(
         &rt,
         log.clone(),
         Some(partitioned_map_with_tasks(PartitionId(1))),
+        table_numbers,
     )
     .await?;
 
@@ -1295,21 +1350,102 @@ async fn test_replica_table_number_allocation_waits_for_prior_publish(
 }
 
 #[convex_macro::test_runtime]
+async fn test_replica_preserves_global_table_numbers_for_embedded_ids(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let node_a = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map_with_users_and_tasks(PartitionId(0))),
+        table_numbers.clone(),
+    )
+    .await?;
+    let node_b = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map_with_users_and_tasks(PartitionId(1))),
+        table_numbers,
+    )
+    .await?;
+
+    let user_id = insert_doc_get_id(&node_a, "users", assert_obj!("name" => "Ada")).await?;
+    let user_public_id = PublicDocumentId::from(user_id);
+    let user_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("user insert should publish a delta");
+    node_b
+        .committer_for_test()
+        .apply_replica_delta(user_delta)
+        .await?;
+
+    let mut tx = node_b.begin(Identity::system()).await?;
+    let replica_user_id =
+        tx.resolve_developer_id(&user_public_id, TableNamespace::root_component())?;
+    assert_eq!(
+        replica_user_id, user_id,
+        "replica must resolve the source node's public user ID without table-number translation",
+    );
+    assert!(
+        tx.get(replica_user_id).await?.is_some(),
+        "replica should support a client round-trip lookup with the source public ID",
+    );
+    drop(tx);
+
+    insert_doc(
+        &node_b,
+        "tasks",
+        assert_obj!("title" => "ship", "userId" => user_public_id.encode()),
+    )
+    .await?;
+    let task_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("task insert should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(task_delta)
+        .await?;
+
+    let tasks = run_query(
+        node_a,
+        TableNamespace::root_component(),
+        Query::full_table_scan("tasks".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(
+        tasks[0].value().0.get("userId"),
+        assert_obj!("userId" => user_public_id.encode()).get("userId"),
+        "embedded user ID should stay in the source table-number namespace",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_replica_delta_does_not_erase_pending_local_table_creation(
     rt: TestRuntime,
     pause: PauseController,
 ) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
-    let node_a = create_node(
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let node_a = create_node_with_table_number_allocator(
         &rt,
         log.clone(),
         Some(partitioned_map_with_tasks(PartitionId(0))),
+        table_numbers.clone(),
     )
     .await?;
-    let node_b = create_node(
+    let node_b = create_node_with_table_number_allocator(
         &rt,
         log.clone(),
         Some(partitioned_map_with_tasks(PartitionId(1))),
+        table_numbers,
     )
     .await?;
 
