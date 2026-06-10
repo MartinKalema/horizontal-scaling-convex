@@ -965,55 +965,63 @@ pub async fn make_app(
             let committer = database.committer_client();
             let raft_state_for_apply = raft_state.clone();
             runtime.spawn_background("raft_node", async move {
-                node.run(
-                    |data| {
-                        // Deserialize the CommitDelta from the Raft entry.
-                        let envelope: database::nats_distributed_log::DeltaEnvelope =
-                            serde_json::from_slice(data).map_err(|e| {
-                                anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
-                            })?;
-                        let proposed_locally = envelope.source_raft_node_id() == Some(raft_node_id);
-                        let delta = envelope.to_delta()?;
+                if let Err(e) = node
+                    .run(
+                        |data| {
+                            // Deserialize the CommitDelta from the Raft entry.
+                            let envelope: database::nats_distributed_log::DeltaEnvelope =
+                                serde_json::from_slice(data).map_err(|e| {
+                                    anyhow::anyhow!("Failed to deserialize Raft entry: {e}")
+                                })?;
+                            let proposed_locally =
+                                envelope.source_raft_node_id() == Some(raft_node_id);
+                            let delta = envelope.to_delta()?;
 
-                        // Skip only the entries this node already committed
-                        // locally before proposing them through Raft. Every
-                        // other committed entry must be applied here, even if
-                        // this node later became leader.
-                        if !proposed_locally {
-                            tracing::info!(
-                                "Applying committed Raft delta locally: ts={}, leader_now={}",
-                                u64::from(delta.ts),
-                                raft_state_for_apply.is_leader(),
-                            );
-                            // apply_replica_delta is async — use block_in_place
-                            // since we're in the Raft loop's sync callback.
+                            // Skip only the entries this node already committed
+                            // locally before proposing them through Raft. Every
+                            // other committed entry must be applied here, even if
+                            // this node later became leader.
+                            if !proposed_locally {
+                                tracing::info!(
+                                    "Applying committed Raft delta locally: ts={}, leader_now={}",
+                                    u64::from(delta.ts),
+                                    raft_state_for_apply.is_leader(),
+                                );
+                                // apply_replica_delta is async — use block_in_place
+                                // since we're in the Raft loop's sync callback.
+                                let committer = committer.clone();
+                                common::runtime::block_in_place(|| {
+                                    let rt = tokio::runtime::Handle::current();
+                                    rt.block_on(async {
+                                        if let Err(e) = committer.apply_replica_delta(delta).await {
+                                            tracing::error!("Raft follower apply failed: {e:#}");
+                                        }
+                                    })
+                                });
+                            }
+
+                            Ok(())
+                        },
+                        |snapshot_bytes| {
+                            let checkpoint =
+                                database::snapshot_checkpointer::checkpoint_from_bytes(
+                                    snapshot_bytes,
+                                )?;
                             let committer = committer.clone();
                             common::runtime::block_in_place(|| {
                                 let rt = tokio::runtime::Handle::current();
                                 rt.block_on(async {
-                                    if let Err(e) = committer.apply_replica_delta(delta).await {
-                                        tracing::error!("Raft follower apply failed: {e:#}");
-                                    }
+                                    committer.install_snapshot(checkpoint).await?;
+                                    Ok::<_, anyhow::Error>(())
                                 })
-                            });
-                        }
-
-                        Ok(())
-                    },
-                    |snapshot_bytes| {
-                        let checkpoint =
-                            database::snapshot_checkpointer::checkpoint_from_bytes(snapshot_bytes)?;
-                        let committer = committer.clone();
-                        common::runtime::block_in_place(|| {
-                            let rt = tokio::runtime::Handle::current();
-                            rt.block_on(async {
-                                committer.install_snapshot(checkpoint).await?;
-                                Ok::<_, anyhow::Error>(())
                             })
-                        })
-                    },
-                )
-                .await;
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!("Raft node stopped after fatal error: {e:#}");
+                    panic!("Raft node stopped after fatal error: {e:#}");
+                }
             });
         }
 
