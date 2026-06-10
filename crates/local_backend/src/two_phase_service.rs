@@ -180,6 +180,12 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
         let placement_version = PlacementVersion::from(req.placement_version);
+        let participants = req
+            .participants
+            .iter()
+            .copied()
+            .map(database::partition::PartitionId)
+            .collect::<Vec<_>>();
         self.ensure_placement_version(placement_version).await?;
 
         if let Some(client) = self.leader_client().await? {
@@ -190,6 +196,7 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
                     req.write_source.into(),
                     prepare_ts,
                     placement_version,
+                    &participants,
                 )
                 .await
                 .map_err(|e| Status::internal(format!("Leader Prepare failed: {e:#}")))?;
@@ -200,7 +207,13 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
 
         let result = self
             .committer
-            .prepare_remote(txn_id, transaction, req.write_source.into(), prepare_ts)
+            .prepare_remote(
+                txn_id,
+                transaction,
+                req.write_source.into(),
+                prepare_ts,
+                participants,
+            )
             .await
             .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
 

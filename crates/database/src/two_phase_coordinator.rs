@@ -120,6 +120,7 @@ async fn prepare_participant(
     node_addresses: Option<&NodeAddresses>,
     partition_map: &PartitionMap,
     transaction_id: &TwoPhaseTransactionId,
+    all_participants: &[PartitionId],
     participant: PartitionId,
     participant_tx: ParticipantTransaction,
     write_source: &WriteSource,
@@ -133,6 +134,7 @@ async fn prepare_participant(
                 participant_tx,
                 write_source.clone(),
                 prepare_ts,
+                all_participants.to_vec(),
             )
             .await?
     } else {
@@ -156,6 +158,7 @@ async fn prepare_participant(
                 write_source.clone(),
                 prepare_ts,
                 partition_map.placement_version(),
+                all_participants,
             )
             .await?
     };
@@ -235,10 +238,30 @@ async fn write_decision_record(
     transaction_id: &TwoPhaseTransactionId,
     decision: &TwoPhaseDecision,
 ) -> anyhow::Result<()> {
-    local_committer
-        .two_phase_decision_log()
-        .write_decision(transaction_id, decision)
-        .await
+    let decision_log = local_committer.two_phase_decision_log();
+    if decision_log
+        .write_decision_if_absent(transaction_id, decision)
+        .await?
+    {
+        return Ok(());
+    }
+    let existing = decision_log
+        .get_decision(transaction_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "2PC Coordinator: decision for txn={transaction_id} already existed but could not \
+                 be read"
+            )
+        })?;
+    anyhow::ensure!(
+        existing == *decision,
+        "2PC Coordinator: durable decision for txn={} is already {:?}, cannot overwrite with {:?}",
+        transaction_id,
+        existing,
+        decision,
+    );
+    Ok(())
 }
 
 async fn delete_decision_record(
@@ -279,7 +302,6 @@ pub async fn coordinate_two_phase_commit(
     }
 
     let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
-    let txn_id = TwoPhaseTransactionId::new();
     let node_addresses = local_committer.node_addresses();
     let cluster_auth = local_committer.cluster_grpc_auth();
     let participants: Vec<_> = participant_indexes
@@ -297,11 +319,16 @@ pub async fn coordinate_two_phase_commit(
             ))
         })
         .collect::<anyhow::Result<_>>()?;
+    let all_participants: Vec<_> = participants
+        .iter()
+        .map(|(participant, _)| *participant)
+        .collect();
     metrics::log_two_phase_participants(participants.len());
 
     let mut last_retryable_error = None;
     let mut prepare_attempts = 0usize;
     for attempt in 0..MAX_PREPARE_TS_RETRIES {
+        let txn_id = TwoPhaseTransactionId::new();
         prepare_attempts = attempt + 1;
         let prepare_ts = local_committer.allocate_commit_ts().await?;
         tracing::info!(
@@ -320,6 +347,7 @@ pub async fn coordinate_two_phase_commit(
                 node_addresses,
                 partition_map,
                 &txn_id,
+                &all_participants,
                 *participant,
                 participant_tx.clone(),
                 &write_source,
@@ -337,7 +365,7 @@ pub async fn coordinate_two_phase_commit(
                     );
                     let retryable_prepare_ts_error =
                         is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES;
-                    if !retryable_prepare_ts_error && !prepared_participants.is_empty() {
+                    if !prepared_participants.is_empty() {
                         let decision = TwoPhaseDecision::RolledBack {
                             reason: err.to_string(),
                             participants: prepared_participants.iter().map(|p| p.0).collect(),
@@ -459,8 +487,8 @@ pub async fn coordinate_two_phase_commit(
     metrics::log_two_phase_prepare_attempts(prepare_attempts.max(1));
     Err(last_retryable_error.unwrap_or_else(|| {
         anyhow::anyhow!(
-            "2PC coordinator exhausted prepare timestamp retries for txn={}",
-            txn_id
+            "2PC coordinator exhausted prepare timestamp retries after {} attempt(s)",
+            prepare_attempts.max(1),
         )
     }))
 }
