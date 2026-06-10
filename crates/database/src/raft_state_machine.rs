@@ -1,85 +1,118 @@
-//! State machine bridge: connects Raft committed entries to the Committer.
+//! Serializable entries applied by the Raft state machine.
 //!
-//! When a Raft entry is committed (replicated to a majority), it needs to be
-//! applied to the Convex state machine — the Committer's SnapshotManager,
-//! WriteLog, and Persistence. This module defines the serialization format
-//! for proposals and the apply logic.
-//!
-//! This is TiKV's Apply Worker pattern: committed Raft entries are decoded
-//! and applied to the local state machine in order.
-//!
-//! References:
-//!   - [TiKV: Raft in TiKV](https://www.pingcap.com/blog/raft-in-tikv/)
+//! Raft carries more than one kind of durable state-machine operation. Normal
+//! commits install [`CommitDelta`]s, while 2PC prepare entries install durable
+//! prepared redo records before a participant can acknowledge `Prepared`.
 
+use anyhow::Context;
 use serde::{
     Deserialize,
     Serialize,
 };
 
-/// A client mutation proposal serialized into a Raft log entry.
-///
-/// When a client sends a mutation to the Raft leader, the leader serializes
-/// it into a `RaftProposalData` and proposes it to Raft. Once committed
-/// (replicated to majority), the entry is deserialized and applied to the
-/// Committer on every node in the Raft group.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RaftProposalData {
-    /// The mutation function path (e.g., "messages:send").
-    pub path: String,
-    /// Serialized function arguments.
-    pub args: String,
-    /// Write source identifier for logging.
-    pub write_source: String,
-    /// Unique proposal ID for matching responses.
-    pub proposal_id: String,
+use crate::{
+    commit_delta::CommitDelta,
+    nats_distributed_log::DeltaEnvelope,
+    two_phase::TwoPhaseRedoEntry,
+};
+
+/// Versioned Raft state-machine entry.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum RaftStateMachineEntry {
+    CommitDelta { envelope: DeltaEnvelope },
+    TwoPhasePrepare { redo: TwoPhaseRedoEntry },
 }
 
-impl RaftProposalData {
-    /// Serialize to bytes for Raft log entry.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("RaftProposalData serialization failed")
+impl RaftStateMachineEntry {
+    pub fn commit_delta(delta: &CommitDelta, source_raft_node_id: u64) -> anyhow::Result<Self> {
+        Ok(Self::CommitDelta {
+            envelope: DeltaEnvelope::from_delta(delta, "", Some(source_raft_node_id))?,
+        })
     }
 
-    /// Deserialize from Raft log entry bytes.
+    pub fn two_phase_prepare(redo: TwoPhaseRedoEntry) -> Self {
+        Self::TwoPhasePrepare { redo }
+    }
+
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(self).context("Failed to serialize Raft state-machine entry")
+    }
+
     pub fn from_bytes(data: &[u8]) -> anyhow::Result<Self> {
-        serde_json::from_slice(data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize RaftProposalData: {e}"))
+        match serde_json::from_slice(data) {
+            Ok(entry) => Ok(entry),
+            Err(entry_err) => {
+                // Backward compatibility: older Raft log entries were raw
+                // DeltaEnvelope JSON values without the typed wrapper.
+                let envelope: DeltaEnvelope = serde_json::from_slice(data).with_context(|| {
+                    format!(
+                        "Failed to deserialize typed Raft entry ({entry_err}) or legacy delta \
+                         envelope"
+                    )
+                })?;
+                Ok(Self::CommitDelta { envelope })
+            },
+        }
     }
-}
-
-/// Result of applying a committed Raft entry.
-#[derive(Debug)]
-pub enum ApplyResult {
-    /// The entry was applied successfully.
-    Success { proposal_id: String },
-    /// The entry failed to apply (OCC conflict, validation error, etc.).
-    /// The client should retry.
-    Error { proposal_id: String, error: String },
 }
 
 #[cfg(test)]
 mod tests {
+    use common::types::Timestamp;
+
     use super::*;
+    use crate::write_log::WriteSource;
 
     #[test]
-    fn test_proposal_roundtrip() {
-        let proposal = RaftProposalData {
-            path: "messages:send".to_string(),
-            args: r#"{"text":"hello","author":"test"}"#.to_string(),
-            write_source: "test".to_string(),
-            proposal_id: "abc-123".to_string(),
+    fn commit_delta_entry_roundtrips() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::must(7),
+            document_writes: Default::default(),
+            document_updates: Vec::new(),
+            index_writes: Default::default(),
+            write_source: WriteSource::new("raft-entry-test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: None,
         };
 
-        let bytes = proposal.to_bytes();
-        let decoded = RaftProposalData::from_bytes(&bytes).unwrap();
-
-        assert_eq!(decoded.path, "messages:send");
-        assert_eq!(decoded.proposal_id, "abc-123");
+        let bytes = RaftStateMachineEntry::commit_delta(&delta, 3)?.to_bytes()?;
+        match RaftStateMachineEntry::from_bytes(&bytes)? {
+            RaftStateMachineEntry::CommitDelta { envelope } => {
+                assert_eq!(envelope.source_raft_node_id(), Some(3));
+                assert_eq!(envelope.to_delta()?.ts, delta.ts);
+            },
+            RaftStateMachineEntry::TwoPhasePrepare { .. } => {
+                panic!("expected commit delta entry")
+            },
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_proposal_invalid_bytes() {
-        let result = RaftProposalData::from_bytes(b"not json");
-        assert!(result.is_err());
+    fn legacy_delta_envelope_still_decodes_as_commit_delta() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::must(8),
+            document_writes: Default::default(),
+            document_updates: Vec::new(),
+            index_writes: Default::default(),
+            write_source: WriteSource::new("legacy-raft-entry-test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: None,
+        };
+        let legacy = serde_json::to_vec(&DeltaEnvelope::from_delta(&delta, "", Some(4))?)?;
+
+        match RaftStateMachineEntry::from_bytes(&legacy)? {
+            RaftStateMachineEntry::CommitDelta { envelope } => {
+                assert_eq!(envelope.source_raft_node_id(), Some(4));
+                assert_eq!(envelope.to_delta()?.ts, delta.ts);
+            },
+            RaftStateMachineEntry::TwoPhasePrepare { .. } => {
+                panic!("expected commit delta entry")
+            },
+        }
+        Ok(())
     }
 }

@@ -5,6 +5,7 @@ use std::{
         BTreeSet,
         VecDeque,
     },
+    future::Future,
     ops::Bound,
     sync::Arc,
     time::Duration,
@@ -153,6 +154,7 @@ use crate::{
         user_documents_size_subgauge,
     },
     raft_node::RaftProposalResult,
+    raft_state_machine::RaftStateMachineEntry,
     reads::ReadSet,
     search_index_bootstrap::{
         stream_revision_pairs_for_indexes,
@@ -762,13 +764,39 @@ impl<RT: Runtime> Committer<RT> {
                                     )
                                     .await?;
                             }
-                            let mut sm = self.snapshot_manager.write();
-                            sm.push(commit_ts, snapshot, write_bytes);
-                            if let Some(source_partition) = source_partition {
-                                sm.update_replication_frontier(source_partition, commit_ts)?;
-                                sm.update_replication_write_frontier(source_partition, commit_ts)?;
-                                self.applied_delta_watermarks
-                                    .insert(source_partition, remote_ts);
+                            {
+                                let mut sm = self.snapshot_manager.write();
+                                sm.push(commit_ts, snapshot, write_bytes);
+                                if let Some(source_partition) = source_partition {
+                                    sm.update_replication_frontier(source_partition, commit_ts)?;
+                                    sm.update_replication_write_frontier(
+                                        source_partition,
+                                        commit_ts,
+                                    )?;
+                                    self.applied_delta_watermarks
+                                        .insert(source_partition, remote_ts);
+                                }
+                            }
+                            let committed_prepared_txn = if source_partition
+                                == Some(self.local_partition_for_two_phase())
+                            {
+                                self.remove_prepared_transaction_at_ts(remote_ts)?
+                            } else {
+                                None
+                            };
+                            if let Some(transaction_id) = committed_prepared_txn {
+                                if let Err(err) = Self::delete_two_phase_redo(
+                                    self.persistence.clone(),
+                                    &transaction_id,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "2PC Raft Commit Apply: committed txn={} but failed to \
+                                         delete redo: {err:#}",
+                                        transaction_id,
+                                    );
+                                }
                             }
                             let _ = result.send(Ok(commit_ts));
                         },
@@ -872,6 +900,10 @@ impl<RT: Runtime> Committer<RT> {
                             } else {
                                 commit_id += 1;
                             }
+                        },
+                        Some(CommitterMessage::ApplyRaftPreparedRedo { redo, result }) => {
+                            let r = self.handle_raft_prepared_redo(redo);
+                            let _ = result.send(r);
                         },
                         Some(CommitterMessage::SetRaftState { raft_state, result }) => {
                             tracing::info!(
@@ -1511,8 +1543,11 @@ impl<RT: Runtime> Committer<RT> {
         table_mapping: &TableMapping,
         write_source: WriteSource,
         explicit_commit_ts: Option<Timestamp>,
+        require_leader: bool,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        self.ensure_leader_for_writes()?;
+        if require_leader {
+            self.ensure_leader_for_writes()?;
+        }
         self.ensure_prepare_ownership(&writes, table_mapping, &write_source)?;
         self.validate_remote_read_frontiers(begin_ts, reads, table_mapping, &write_source)?;
 
@@ -1859,6 +1894,41 @@ impl<RT: Runtime> Committer<RT> {
         }
     }
 
+    async fn wait_for_raft_prepare(
+        raft_commit_waiter: RaftCommitWaiter,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+        prepare_ts: Timestamp,
+    ) -> anyhow::Result<Option<u64>> {
+        let Some(raft_commit_waiter) = raft_commit_waiter else {
+            return Ok(None);
+        };
+        match raft_commit_waiter.await {
+            Ok(RaftProposalResult::Committed { index }) => Ok(Some(index)),
+            Ok(RaftProposalResult::Rejected) => anyhow::bail!(
+                "Raft rejected 2PC prepare for txn={} at ts={} before quorum commit",
+                transaction_id,
+                u64::from(prepare_ts),
+            ),
+            Err(_) => anyhow::bail!(
+                "Raft proposal result channel closed before 2PC prepare txn={} at ts={} reached \
+                 quorum",
+                transaction_id,
+                u64::from(prepare_ts),
+            ),
+        }
+    }
+
+    fn block_on_current_runtime<F: Future>(future: F) -> F::Output {
+        block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                futures::executor::block_on(future)
+            } else {
+                rt.block_on(future)
+            }
+        })
+    }
+
     fn fail_committed_write(
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_ts: Timestamp,
@@ -1900,20 +1970,14 @@ impl<RT: Runtime> Committer<RT> {
                 raft.partition_id(),
             );
         }
-        let envelope =
-            crate::nats_distributed_log::DeltaEnvelope::from_delta(delta, "", Some(raft.node_id()))
-                .with_context(|| {
-                    format!(
-                        "Failed to wrap commit delta at ts={} for Raft proposal",
-                        u64::from(delta.ts),
-                    )
-                })?;
-        let data = serde_json::to_vec(&envelope).with_context(|| {
-            format!(
-                "Failed to serialize commit delta at ts={} for Raft proposal",
-                u64::from(delta.ts),
-            )
-        })?;
+        let data = RaftStateMachineEntry::commit_delta(delta, raft.node_id())?
+            .to_bytes()
+            .with_context(|| {
+                format!(
+                    "Failed to serialize commit delta at ts={} for Raft proposal",
+                    u64::from(delta.ts),
+                )
+            })?;
         let (tx, rx) = oneshot::channel();
         raft.send(crate::raft_node::RaftMessage::Propose(
             crate::raft_node::RaftProposal {
@@ -1933,6 +1997,45 @@ impl<RT: Runtime> Committer<RT> {
 
     fn propose_commit_to_raft(&self, delta: &CommitDelta) -> anyhow::Result<RaftCommitWaiter> {
         Self::propose_commit_to_raft_state(self.raft_state.as_ref(), delta)
+    }
+
+    fn propose_two_phase_prepare_to_raft(
+        &self,
+        redo: &crate::two_phase::TwoPhaseRedoEntry,
+    ) -> anyhow::Result<RaftCommitWaiter> {
+        let Some(raft) = self.raft_state.as_ref() else {
+            return Ok(None);
+        };
+        if !raft.is_leader() {
+            anyhow::bail!(
+                "Raft leadership lost before proposing 2PC prepare for txn={} on partition {}",
+                redo.transaction_id,
+                raft.partition_id(),
+            );
+        }
+        let data = RaftStateMachineEntry::two_phase_prepare(redo.clone())
+            .to_bytes()
+            .with_context(|| {
+                format!(
+                    "Failed to serialize 2PC prepare for txn={} for Raft proposal",
+                    redo.transaction_id,
+                )
+            })?;
+        let (tx, rx) = oneshot::channel();
+        raft.send(crate::raft_node::RaftMessage::Propose(
+            crate::raft_node::RaftProposal {
+                data,
+                result_tx: tx,
+            },
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to propose 2PC prepare for txn={} to Raft partition {}",
+                redo.transaction_id,
+                raft.partition_id(),
+            )
+        })?;
+        Ok(Some(rx))
     }
 
     fn build_commit_delta(
@@ -2839,6 +2942,7 @@ impl<RT: Runtime> Committer<RT> {
         transaction: crate::two_phase::ParticipantTransaction,
         write_source: WriteSource,
         prepare_ts: Timestamp,
+        require_leader: bool,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
         let mut table_mapping = self
             .snapshot_manager
@@ -2855,7 +2959,98 @@ impl<RT: Runtime> Committer<RT> {
             &table_mapping,
             write_source,
             Some(prepare_ts),
+            require_leader,
         )
+    }
+
+    fn stage_two_phase_redo_entry(
+        &mut self,
+        entry: &crate::two_phase::TwoPhaseRedoEntry,
+        require_leader: bool,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        let transaction_id = entry.transaction_id();
+        let prepare_ts = entry.prepare_ts()?;
+        let transaction = entry.participant_transaction().with_context(|| {
+            format!(
+                "2PC: failed to decode participant transaction for redo txn={}",
+                transaction_id
+            )
+        })?;
+        anyhow::ensure!(
+            entry.partition_id() == self.local_partition_for_two_phase(),
+            "2PC redo txn={} belongs to partition {}, local partition is {}",
+            transaction_id,
+            entry.partition_id().0,
+            self.local_partition_for_two_phase().0,
+        );
+        self.stage_participant_prepared_transaction(
+            transaction_id,
+            transaction,
+            entry.write_source(),
+            prepare_ts,
+            require_leader,
+        )
+    }
+
+    fn stage_durable_two_phase_redo(
+        &mut self,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+        require_leader: bool,
+    ) -> anyhow::Result<bool> {
+        if self.prepared_transactions.contains_key(transaction_id) {
+            return Ok(false);
+        }
+        let mut records = Self::block_on_current_runtime(Self::load_two_phase_redo_records(
+            self.persistence.clone(),
+        ))?;
+        let Some(entry) = records.remove(&transaction_id.0) else {
+            return Ok(false);
+        };
+        self.stage_two_phase_redo_entry(&entry, require_leader)
+            .with_context(|| format!("2PC: failed to stage durable redo txn={transaction_id}"))?;
+        Ok(true)
+    }
+
+    fn remove_prepared_transaction_at_ts(
+        &mut self,
+        commit_ts: Timestamp,
+    ) -> anyhow::Result<Option<crate::two_phase::TwoPhaseTransactionId>> {
+        let matching = self
+            .prepared_transactions
+            .iter()
+            .filter_map(|(transaction_id, prepared)| {
+                (prepared.commit_ts == commit_ts).then(|| transaction_id.clone())
+            })
+            .collect_vec();
+        anyhow::ensure!(
+            matching.len() <= 1,
+            "Found {} prepared transactions at ts={}; expected at most one",
+            matching.len(),
+            u64::from(commit_ts),
+        );
+        let Some(transaction_id) = matching.into_iter().next() else {
+            return Ok(None);
+        };
+        let prepared = self
+            .prepared_transactions
+            .remove(&transaction_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "2PC cleanup: prepared transaction {} disappeared while cleaning ts={}",
+                    transaction_id,
+                    u64::from(commit_ts),
+                )
+            })?;
+        self.prepared_writes
+            .remove(prepared.prepared_write)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "2PC cleanup: prepared intent for txn={} at ts={} was missing",
+                    transaction_id,
+                    u64::from(commit_ts),
+                )
+            })?;
+        Ok(Some(transaction_id))
     }
 
     async fn recover_two_phase_redo_records(&mut self) -> anyhow::Result<()> {
@@ -2899,15 +3094,10 @@ impl<RT: Runtime> Committer<RT> {
                 continue;
             }
 
-            self.stage_participant_prepared_transaction(
-                transaction_id.clone(),
-                transaction,
-                entry.write_source(),
-                prepare_ts,
-            )
-            .with_context(|| {
-                format!("2PC Recovery: failed to stage prepared txn={transaction_id}")
-            })?;
+            self.stage_two_phase_redo_entry(entry, false)
+                .with_context(|| {
+                    format!("2PC Recovery: failed to stage prepared txn={transaction_id}")
+                })?;
             tracing::info!(
                 "2PC Recovery: restored prepared txn={} at ts={}",
                 transaction_id,
@@ -2942,6 +3132,7 @@ impl<RT: Runtime> Committer<RT> {
             &transaction.table_mapping,
             write_source.clone(),
             None,
+            true,
         )?;
         let redo = crate::two_phase::TwoPhaseRedoEntry::new(
             &transaction_id,
@@ -2950,7 +3141,8 @@ impl<RT: Runtime> Committer<RT> {
             participant_transaction,
             &write_source,
         )?;
-        if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo).await {
+        if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo.clone()).await
+        {
             if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
                 tracing::error!(
                     "2PC Prepare: failed to rollback in-memory txn={} after redo write failure: \
@@ -2959,6 +3151,66 @@ impl<RT: Runtime> Committer<RT> {
                 );
             }
             return Err(err);
+        }
+        let raft_prepare_waiter = match self.propose_two_phase_prepare_to_raft(&redo) {
+            Ok(waiter) => waiter,
+            Err(err) => {
+                if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                    tracing::error!(
+                        "2PC Prepare: failed to rollback in-memory txn={} after Raft proposal \
+                         failure: {rollback_err:#}",
+                        transaction_id,
+                    );
+                }
+                if let Err(delete_err) =
+                    Self::delete_two_phase_redo(self.persistence.clone(), &transaction_id).await
+                {
+                    tracing::warn!(
+                        "2PC Prepare: failed to delete redo for txn={} after Raft proposal \
+                         failure: {delete_err:#}",
+                        transaction_id,
+                    );
+                }
+                return Err(err);
+            },
+        };
+        let raft_applied_index = match Self::wait_for_raft_prepare(
+            raft_prepare_waiter,
+            &transaction_id,
+            result.prepare_ts,
+        )
+        .await
+        {
+            Ok(index) => index,
+            Err(err) => {
+                if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                    tracing::error!(
+                        "2PC Prepare: failed to rollback in-memory txn={} after Raft quorum \
+                         failure: {rollback_err:#}",
+                        transaction_id,
+                    );
+                }
+                if let Err(delete_err) =
+                    Self::delete_two_phase_redo(self.persistence.clone(), &transaction_id).await
+                {
+                    tracing::warn!(
+                        "2PC Prepare: failed to delete redo for txn={} after Raft quorum failure: \
+                         {delete_err:#}",
+                        transaction_id,
+                    );
+                }
+                return Err(err);
+            },
+        };
+        if let Some(raft_applied_index) = raft_applied_index {
+            let Some(raft_state) = self.raft_state.as_ref() else {
+                anyhow::bail!(
+                    "2PC Prepare txn={} returned Raft applied index {} without Raft state",
+                    transaction_id,
+                    raft_applied_index,
+                );
+            };
+            raft_state.mark_applied(raft_applied_index).await?;
         }
         Ok(result)
     }
@@ -2989,8 +3241,10 @@ impl<RT: Runtime> Committer<RT> {
             transaction,
             write_source,
             prepare_ts,
+            true,
         )?;
-        if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo).await {
+        if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo.clone()).await
+        {
             if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
                 tracing::error!(
                     "2PC Prepare: failed to rollback in-memory txn={} after redo write failure: \
@@ -2999,6 +3253,66 @@ impl<RT: Runtime> Committer<RT> {
                 );
             }
             return Err(err);
+        }
+        let raft_prepare_waiter = match self.propose_two_phase_prepare_to_raft(&redo) {
+            Ok(waiter) => waiter,
+            Err(err) => {
+                if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                    tracing::error!(
+                        "2PC Prepare: failed to rollback in-memory txn={} after Raft proposal \
+                         failure: {rollback_err:#}",
+                        transaction_id,
+                    );
+                }
+                if let Err(delete_err) =
+                    Self::delete_two_phase_redo(self.persistence.clone(), &transaction_id).await
+                {
+                    tracing::warn!(
+                        "2PC Prepare: failed to delete redo for txn={} after Raft proposal \
+                         failure: {delete_err:#}",
+                        transaction_id,
+                    );
+                }
+                return Err(err);
+            },
+        };
+        let raft_applied_index = match Self::wait_for_raft_prepare(
+            raft_prepare_waiter,
+            &transaction_id,
+            result.prepare_ts,
+        )
+        .await
+        {
+            Ok(index) => index,
+            Err(err) => {
+                if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                    tracing::error!(
+                        "2PC Prepare: failed to rollback in-memory txn={} after Raft quorum \
+                         failure: {rollback_err:#}",
+                        transaction_id,
+                    );
+                }
+                if let Err(delete_err) =
+                    Self::delete_two_phase_redo(self.persistence.clone(), &transaction_id).await
+                {
+                    tracing::warn!(
+                        "2PC Prepare: failed to delete redo for txn={} after Raft quorum failure: \
+                         {delete_err:#}",
+                        transaction_id,
+                    );
+                }
+                return Err(err);
+            },
+        };
+        if let Some(raft_applied_index) = raft_applied_index {
+            let Some(raft_state) = self.raft_state.as_ref() else {
+                anyhow::bail!(
+                    "2PC Prepare txn={} returned Raft applied index {} without Raft state",
+                    transaction_id,
+                    raft_applied_index,
+                );
+            };
+            raft_state.mark_applied(raft_applied_index).await?;
         }
         Ok(result)
     }
@@ -3009,6 +3323,7 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
     ) -> anyhow::Result<PublishedCommit> {
+        self.stage_durable_two_phase_redo(&transaction_id, true)?;
         let prepared = self
             .prepared_transactions
             .get(&transaction_id)
@@ -3116,6 +3431,19 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
     ) -> anyhow::Result<()> {
+        if !self.prepared_transactions.contains_key(&transaction_id)
+            && Self::block_on_current_runtime(Self::load_two_phase_redo_records(
+                self.persistence.clone(),
+            ))?
+            .contains_key(&transaction_id.0)
+        {
+            tracing::info!(
+                "2PC RollbackPrepared: txn={} only existed as durable redo; deleting redo",
+                transaction_id,
+            );
+            return Ok(());
+        }
+
         let prepared = self
             .prepared_transactions
             .remove(&transaction_id)
@@ -3146,6 +3474,39 @@ impl<RT: Runtime> Committer<RT> {
             })?;
 
         Ok(())
+    }
+
+    fn handle_raft_prepared_redo(
+        &mut self,
+        redo: crate::two_phase::TwoPhaseRedoEntry,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        let transaction_id = redo.transaction_id();
+        let prepare_ts = redo.prepare_ts()?;
+        tracing::info!(
+            "2PC Raft Prepare Apply: txn={}, ts={}",
+            transaction_id,
+            u64::from(prepare_ts),
+        );
+
+        let result = self
+            .stage_two_phase_redo_entry(&redo, false)
+            .with_context(|| {
+                format!("2PC Raft Prepare Apply: failed to stage txn={transaction_id}")
+            })?;
+        if let Err(err) = Self::block_on_current_runtime(Self::persist_two_phase_redo(
+            self.persistence.clone(),
+            redo,
+        )) {
+            if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
+                tracing::error!(
+                    "2PC Raft Prepare Apply: failed to rollback in-memory txn={} after redo \
+                     persistence failure: {rollback_err:#}",
+                    transaction_id,
+                );
+            }
+            return Err(err);
+        }
+        Ok(result)
     }
 
     #[fastrace::trace]
@@ -3553,6 +3914,23 @@ impl CommitterClient {
     pub async fn apply_replica_delta(&self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::ApplyReplicaDelta { delta, result: tx };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
+    /// Apply a 2PC prepare redo record that has reached this node through
+    /// Raft. This installs the prepared intent through the same single-writer
+    /// committer loop used by local prepares, so a promoted follower can
+    /// safely finish or roll back the transaction.
+    pub async fn apply_raft_prepared_redo(
+        &self,
+        redo: crate::two_phase::TwoPhaseRedoEntry,
+    ) -> anyhow::Result<crate::two_phase::PrepareResult> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::ApplyRaftPreparedRedo { redo, result: tx };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -4069,6 +4447,10 @@ enum CommitterMessage {
     ApplyReplicaDelta {
         delta: CommitDelta,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
+    },
+    ApplyRaftPreparedRedo {
+        redo: crate::two_phase::TwoPhaseRedoEntry,
+        result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
     },
     SetRaftState {
         raft_state: crate::raft_partition::RaftPartitionState,
