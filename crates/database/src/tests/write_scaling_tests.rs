@@ -84,7 +84,9 @@ use crate::{
     partition::{
         PartitionId,
         PartitionMap,
+        PlacementMetadata,
         PlacementVersion,
+        StaticPlacementConfig,
     },
     tests::run_query,
     timestamp_oracle::{
@@ -1521,6 +1523,41 @@ fn test_remote_prepare_rejects_stale_placement_version() -> anyhow::Result<()> {
         );
 
         server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_committer_client_refreshes_placement_metadata() -> anyhow::Result<()> {
+    let td = TestDriver::new();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let node = create_node(
+            &rt,
+            log,
+            Some(partitioned_map_with_version(
+                PartitionId(1),
+                PlacementVersion::new(1),
+            )),
+        )
+        .await?;
+        let committer = node.committer_for_test();
+
+        committer.ensure_placement_version(PlacementVersion::new(1))?;
+        assert!(committer
+            .ensure_placement_version(PlacementVersion::new(2))
+            .is_err());
+
+        committer.refresh_placement_metadata(PlacementMetadata::from_static_config(
+            StaticPlacementConfig {
+                table_assignments: "messages=1,projects=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(2),
+            },
+        ))?;
+
+        committer.ensure_placement_version(PlacementVersion::new(2))?;
         Ok(())
     })
 }

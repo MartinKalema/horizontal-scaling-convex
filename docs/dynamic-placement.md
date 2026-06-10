@@ -25,6 +25,12 @@ The current metadata source is still static process config. Version `0` means
 the startup-configured map. Operators may now set `PARTITION_MAP_VERSION` and
 must bump it whenever table ownership changes.
 
+When NATS is configured, startup now initializes or loads the shared
+`convex_placement/current` NATS KV record and refreshes `PlacementState` from
+that authoritative control-plane record. The static env map remains the
+bootstrap fallback so `Database::load` can start before any external placement
+source is available.
+
 Placement metadata is control-plane state, not an application API. Nodes,
 routers, and operators may reason about placement versions and ownership, but
 queries, mutations, actions, and subscriptions should continue to target one
@@ -51,8 +57,8 @@ preparing against the wrong owner.
 
 - Store placement metadata in a replicated system table instead of env vars.
 - Add an authority/lease model for who may publish a new placement version.
-- Plug `PlacementState` into that authoritative source so nodes refresh newer
-  placement metadata when they observe a stale-version rejection.
+- Decide whether NATS KV remains the placement authority long term or becomes a
+  bootstrap/transport layer for a replicated placement system table.
 - Add node membership metadata so new partitions can be added without editing
   every node config by hand.
 - Add an online movement workflow: freeze source writes for the moved range or

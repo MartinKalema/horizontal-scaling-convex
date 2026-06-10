@@ -31,6 +31,12 @@ use std::{
     },
 };
 
+use anyhow::Context;
+use async_trait::async_trait;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use value::TableName;
 
 use crate::write_log::WriteSource;
@@ -176,6 +182,23 @@ impl PlacementMetadata {
         }
     }
 
+    pub fn from_table_assignments(
+        source: PlacementMetadataSource,
+        version: PlacementVersion,
+        num_partitions: u32,
+        assignments: BTreeMap<TableName, PartitionId>,
+    ) -> Self {
+        Self {
+            source,
+            version,
+            num_partitions,
+            rules: assignments
+                .into_iter()
+                .map(|(table, owner)| (PlacementTarget::Table(table), owner))
+                .collect(),
+        }
+    }
+
     pub fn source(&self) -> PlacementMetadataSource {
         self.source
     }
@@ -213,6 +236,128 @@ impl PlacementMetadata {
             local_partition,
             num_partitions: self.num_partitions,
             placement_version: self.version,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedPlacementMetadata {
+    version: u64,
+    num_partitions: u32,
+    table_assignments: BTreeMap<String, u32>,
+}
+
+impl From<&PlacementMetadata> for SerializedPlacementMetadata {
+    fn from(metadata: &PlacementMetadata) -> Self {
+        Self {
+            version: u64::from(metadata.version()),
+            num_partitions: metadata.num_partitions(),
+            table_assignments: metadata
+                .table_assignments()
+                .into_iter()
+                .map(|(table, partition)| (table.to_string(), partition.0))
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<SerializedPlacementMetadata> for PlacementMetadata {
+    type Error = anyhow::Error;
+
+    fn try_from(serialized: SerializedPlacementMetadata) -> anyhow::Result<Self> {
+        let assignments = serialized
+            .table_assignments
+            .into_iter()
+            .map(|(table, partition)| Ok((table.parse::<TableName>()?, PartitionId(partition))))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(PlacementMetadata::from_table_assignments(
+            PlacementMetadataSource::Replicated,
+            PlacementVersion::new(serialized.version),
+            serialized.num_partitions,
+            assignments,
+        ))
+    }
+}
+
+const PLACEMENT_KV_BUCKET: &str = "convex_placement";
+const PLACEMENT_CURRENT_KEY: &str = "current";
+
+#[async_trait]
+pub trait PlacementMetadataStore: Send + Sync + 'static {
+    async fn load(&self) -> anyhow::Result<Option<PlacementMetadata>>;
+    async fn ensure_initialized(
+        &self,
+        bootstrap_metadata: PlacementMetadata,
+    ) -> anyhow::Result<PlacementMetadata>;
+}
+
+pub struct NatsPlacementMetadataStore {
+    kv: async_nats::jetstream::kv::Store,
+}
+
+impl NatsPlacementMetadataStore {
+    pub async fn connect(nats_url: &str) -> anyhow::Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = async_nats::connect(nats_url).await.with_context(|| {
+            format!("Placement metadata: failed to connect to NATS at {nats_url}")
+        })?;
+        let jetstream = async_nats::jetstream::new(client);
+        let kv = jetstream
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: PLACEMENT_KV_BUCKET.to_string(),
+                history: 8,
+                ..Default::default()
+            })
+            .await
+            .context("Placement metadata: failed to create KV bucket")?;
+        Ok(Self { kv })
+    }
+
+    fn encode(metadata: &PlacementMetadata) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(&SerializedPlacementMetadata::from(metadata))
+            .context("Placement metadata: failed to serialize metadata")
+    }
+
+    fn decode(bytes: &[u8]) -> anyhow::Result<PlacementMetadata> {
+        let serialized: SerializedPlacementMetadata = serde_json::from_slice(bytes)
+            .context("Placement metadata: failed to parse metadata")?;
+        serialized.try_into()
+    }
+}
+
+#[async_trait]
+impl PlacementMetadataStore for NatsPlacementMetadataStore {
+    async fn load(&self) -> anyhow::Result<Option<PlacementMetadata>> {
+        let Some(entry) = self
+            .kv
+            .entry(PLACEMENT_CURRENT_KEY)
+            .await
+            .context("Placement metadata: failed to read current metadata")?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self::decode(&entry.value)?))
+    }
+
+    async fn ensure_initialized(
+        &self,
+        bootstrap_metadata: PlacementMetadata,
+    ) -> anyhow::Result<PlacementMetadata> {
+        if let Some(metadata) = self.load().await? {
+            return Ok(metadata);
+        }
+
+        let payload = Self::encode(&bootstrap_metadata)?;
+        match self.kv.create(PLACEMENT_CURRENT_KEY, payload.into()).await {
+            Ok(_) => self
+                .load()
+                .await?
+                .context("Placement metadata: current metadata missing after initialize"),
+            Err(_) => self
+                .load()
+                .await?
+                .context("Placement metadata: current metadata missing after initialize race"),
         }
     }
 }
@@ -655,6 +800,28 @@ mod tests {
             .to_string()
             .contains("Refusing to refresh placement metadata"));
         assert_eq!(state.placement_version(), PlacementVersion::new(3));
+        Ok(())
+    }
+
+    #[test]
+    fn test_placement_metadata_serialization_loads_as_replicated() -> anyhow::Result<()> {
+        let metadata = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=0,projects=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(9),
+        });
+
+        let bytes = NatsPlacementMetadataStore::encode(&metadata)?;
+        let decoded = NatsPlacementMetadataStore::decode(&bytes)?;
+
+        assert_eq!(decoded.source(), PlacementMetadataSource::Replicated);
+        assert_eq!(decoded.version(), PlacementVersion::new(9));
+        assert_eq!(
+            decoded
+                .table_assignments()
+                .get(&"projects".parse().unwrap()),
+            Some(&PartitionId(1)),
+        );
         Ok(())
     }
 

@@ -145,6 +145,7 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
             st.application.database().committer_client(),
             st.raft_state.clone(),
             st.raft_peer_grpc_urls.clone(),
+            st.placement_metadata_store.clone(),
         );
 
         // Add Raft transport server if Raft is enabled.
