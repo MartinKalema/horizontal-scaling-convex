@@ -390,6 +390,14 @@ pub static REPLICATION_FRONTIER_HEARTBEAT_INTERVAL: LazyLock<Duration> = LazyLoc
     ))
 });
 
+/// Maximum time to wait for a remote partition's read frontier before
+/// failing the request. This should be comfortably above the heartbeat interval
+/// so normal idle frontier progress succeeds, but bounded so missing transport
+/// progress does not hang user operations forever.
+pub static REMOTE_READ_FRONTIER_WAIT_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_millis(env_config("REMOTE_READ_FRONTIER_WAIT_TIMEOUT_MS", 5000))
+});
+
 /// This is the max duration between a Commit and bumping max_repeatable_ts.
 /// When reading from a follower persistence, we can only read commits at
 /// timestamps <= max_repeatable_ts (because commits > max_repeatable_ts are

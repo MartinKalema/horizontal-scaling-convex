@@ -16,6 +16,7 @@ use common::{
     assert_obj,
     bootstrap_model::index::database_index::IndexedFields,
     interval::Interval,
+    knobs::REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
     pause::PauseController,
     persistence::{
         NoopRetentionValidator,
@@ -1102,6 +1103,63 @@ async fn test_local_commit_waits_for_remote_frontier(rt: TestRuntime) -> anyhow:
 
     let commit_result = tokio::time::timeout(Duration::from_secs(1), commit).await??;
     commit_result?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_local_commit_times_out_waiting_for_remote_read_frontier(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let initial_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(initial_delta)
+        .await?;
+
+    // Advance node A's local snapshot without advancing partition 1's frontier.
+    insert_doc(&node_a, "messages", assert_obj!("text" => "lag-maker")).await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "timeout"))
+        .await?;
+    let remote_tablet = tx
+        .table_mapping()
+        .namespace(TableNamespace::Global)
+        .name_to_tablet()("projects".parse()?)?;
+    tx.reads.record_indexed_derived(
+        TabletIndexName::by_id(remote_tablet),
+        IndexedFields::by_id(),
+        Interval::all(),
+    );
+
+    let node_a_for_commit = node_a.clone();
+    let commit = tokio::spawn(async move { node_a_for_commit.commit(tx).await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !commit.is_finished(),
+        "commit should wait before the bounded remote read frontier timeout fires",
+    );
+
+    rt.advance_time(*REMOTE_READ_FRONTIER_WAIT_TIMEOUT + Duration::from_millis(1))
+        .await;
+
+    let commit_result = tokio::time::timeout(Duration::from_millis(100), commit).await??;
+    let err = commit_result.expect_err("stale remote frontier should time out");
+    assert!(
+        err.to_string().contains("Timed out after"),
+        "unexpected error: {err:#}",
+    );
     Ok(())
 }
 
