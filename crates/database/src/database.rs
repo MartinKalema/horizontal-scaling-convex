@@ -195,6 +195,7 @@ use crate::{
     search_index_bootstrap::SearchIndexBootstrapWorker,
     snapshot_checkpointer::checkpoint_to_bytes,
     snapshot_manager::{
+        partition_timestamp_map_from_json,
         replication_frontiers_from_json,
         replication_frontiers_to_json,
         Snapshot,
@@ -1052,6 +1053,13 @@ impl<RT: Runtime> Database<RT> {
                 })
                 .unwrap_or_default(),
         };
+        let applied_delta_watermarks = match reader
+            .get_persistence_global(PersistenceGlobalKey::AppliedDeltaWatermarks)
+            .await?
+        {
+            Some(value) => partition_timestamp_map_from_json(value, "applied delta watermarks")?,
+            None => BTreeMap::new(),
+        };
 
         let snapshot_manager = SnapshotManager::new(*ts, snapshot, replication_frontiers);
         let (snapshot_reader, snapshot_writer) = new_split_rw_lock(snapshot_manager);
@@ -1108,6 +1116,7 @@ impl<RT: Runtime> Database<RT> {
             two_phase_decision_log,
             timestamp_oracle,
             raft_state,
+            applied_delta_watermarks,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");

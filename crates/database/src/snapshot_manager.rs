@@ -1045,6 +1045,10 @@ impl SnapshotManager {
 }
 
 pub fn replication_frontiers_to_json(frontiers: &BTreeMap<PartitionId, Timestamp>) -> JsonValue {
+    partition_timestamp_map_to_json(frontiers)
+}
+
+pub fn partition_timestamp_map_to_json(frontiers: &BTreeMap<PartitionId, Timestamp>) -> JsonValue {
     JsonValue::Object(
         frontiers
             .iter()
@@ -1056,8 +1060,15 @@ pub fn replication_frontiers_to_json(frontiers: &BTreeMap<PartitionId, Timestamp
 pub fn replication_frontiers_from_json(
     value: JsonValue,
 ) -> anyhow::Result<BTreeMap<PartitionId, Timestamp>> {
+    partition_timestamp_map_from_json(value, "replication frontiers")
+}
+
+pub fn partition_timestamp_map_from_json(
+    value: JsonValue,
+    name: &str,
+) -> anyhow::Result<BTreeMap<PartitionId, Timestamp>> {
     let JsonValue::Object(entries) = value else {
-        anyhow::bail!("replication frontiers must be a JSON object");
+        anyhow::bail!("{name} must be a JSON object");
     };
 
     entries
