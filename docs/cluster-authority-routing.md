@@ -35,7 +35,7 @@ authority checks.
 | `/api/function`, `/api/run/*`                           | Coordinator owner because the function type is not known before dispatch.                                                                                                           |
 | `/api/query_ts`, `/api/query_batch` timestamp selection | Coordinator owner because latest timestamp selection must not be made from a stale follower/replica.                                                                                |
 | `/api/storage/*`                                        | Coordinator owner until file metadata and storage authorization have explicit clustered routing.                                                                                    |
-| `/api/sync`, `/{client_version}/sync`                   | Coordinator owner for subscription setup until follower-safe subscription ownership is implemented.                                                                                 |
+| `/api/sync`, `/api/{client_version}/sync`               | Coordinator owner for subscription setup until follower-safe subscription ownership is implemented. The router rejects non-authority nodes before accepting the WebSocket upgrade.   |
 
 ## Deploy `DeployRouterState` Routes
 

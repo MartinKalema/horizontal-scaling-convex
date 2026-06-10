@@ -227,6 +227,15 @@ async fn import_export_api_authority_middleware(
     Ok(next.run(req).await)
 }
 
+async fn sync_api_authority_middleware(
+    State(st): State<RouterState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    ensure_local_backend_api_authority(&st, "/sync")?;
+    Ok(next.run(req).await)
+}
+
 async fn snapshot_export_api_authority_middleware(
     State(st): State<ImportExportRouterState>,
     req: axum::extract::Request,
@@ -525,10 +534,39 @@ pub fn router(st: BackendAppState) -> Router {
         .split_for_parts();
     let public_openapi_spec = public_openapi.to_pretty_json().unwrap();
 
-    let migrated_api_routes = Router::new()
+    let router_state = RouterState {
+        api: Arc::new(
+            crate::query_forwarding_api::SelectiveQueryForwardingApi::new(
+                Arc::new(st.application.clone()),
+                st.application.database().clone(),
+                st.replica_mode,
+                st.partition_id,
+                st.node_addresses.clone(),
+                st.raft_state.clone(),
+                st.raft_peer_grpc_urls.clone(),
+            ),
+        ),
+        database: st.application.database().clone(),
+        runtime: st.application.runtime(),
+        replica_mode: st.replica_mode,
+        partition_id: st.partition_id,
+        node_addresses: st.node_addresses.clone(),
+        raft_state: st.raft_state.clone(),
+        raft_peer_grpc_urls: st.raft_peer_grpc_urls.clone(),
+        replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
+    };
+
+    let sync_routes = Router::new()
         .merge(browser_routes)
-        .merge(public_routes)
         .route("/sync", get(sync))
+        .layer(axum::middleware::from_fn_with_state(
+            router_state.clone(),
+            sync_api_authority_middleware,
+        ));
+
+    let migrated_api_routes = Router::new()
+        .merge(sync_routes)
+        .merge(public_routes)
         .route(
             "/public_openapi.json",
             axum::routing::get({
@@ -544,25 +582,7 @@ pub fn router(st: BackendAppState) -> Router {
         // Notably, any layers added here won't apply to common routes
         // added inside `serve_http`
         .nest("/http/", http_action_routes())
-        .with_state(RouterState {
-            api: Arc::new(crate::query_forwarding_api::SelectiveQueryForwardingApi::new(
-                Arc::new(st.application.clone()),
-                st.application.database().clone(),
-                st.replica_mode,
-                st.partition_id,
-                st.node_addresses.clone(),
-                st.raft_state.clone(),
-                st.raft_peer_grpc_urls.clone(),
-            )),
-            database: st.application.database().clone(),
-            runtime: st.application.runtime(),
-            replica_mode: st.replica_mode,
-            partition_id: st.partition_id,
-            node_addresses: st.node_addresses.clone(),
-            raft_state: st.raft_state.clone(),
-            raft_peer_grpc_urls: st.raft_peer_grpc_urls.clone(),
-            replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
-        });
+        .with_state(router_state);
 
     let version = SERVER_VERSION_STR.to_string();
 
@@ -1296,6 +1316,44 @@ mod tests {
         let bytes = body.collect().await?.to_bytes();
         let body = String::from_utf8_lossy(&bytes);
         assert_eq!(parts.status, StatusCode::OK, "{body}");
+
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_sync_routes_reject_non_authority_partition_before_websocket_upgrade(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+
+        let mut partitioned_state = backend.st.clone();
+        partitioned_state.partition_id = Some(PartitionId(1));
+        let partitioned_app = ConvexHttpService::new(
+            router(partitioned_state),
+            "sync_authority_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        for path in ["/api/sync", "/api/1.0.0/sync"] {
+            let req = Request::builder()
+                .uri(path)
+                .method("GET")
+                .header("Host", "localhost")
+                .body(Body::empty())?;
+            let (parts, body) = partitioned_app
+                .router()
+                .clone()
+                .oneshot(req)
+                .await?
+                .into_parts();
+            let bytes = body.collect().await?.to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(body.contains("ServiceUnavailable"), "{body}");
+        }
 
         Ok(())
     }

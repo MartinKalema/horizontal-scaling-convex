@@ -9,6 +9,7 @@ use crate::{
     AdminRouterState,
     DeployRouterState,
     ImportExportRouterState,
+    RouterState,
 };
 
 pub(crate) const CLUSTER_COORDINATOR_PARTITION: PartitionId = PartitionId(0);
@@ -62,6 +63,20 @@ impl ClusterAuthorityContext for ActionCallbackRouterState {
 }
 
 impl ClusterAuthorityContext for ImportExportRouterState {
+    fn replica_mode(&self) -> bool {
+        self.replica_mode
+    }
+
+    fn partition_id(&self) -> Option<PartitionId> {
+        self.partition_id
+    }
+
+    fn raft_state(&self) -> Option<&RaftPartitionState> {
+        self.raft_state.as_ref()
+    }
+}
+
+impl ClusterAuthorityContext for RouterState {
     fn replica_mode(&self) -> bool {
         self.replica_mode
     }
@@ -180,6 +195,13 @@ pub(crate) const LOCAL_BACKEND_API_ROUTE_AUTHORITIES: &[RouteAuthorityRule] = &[
         RouteAuthorityClass::AnyNodeSafe,
         "CLI reads the target node before the deploy protocol push so each node can materialize \
          local modules",
+    ),
+    RouteAuthorityRule::exact(
+        "sync subscription setup",
+        "/sync",
+        RouteAuthorityClass::CoordinatorOwner,
+        "subscription setup creates global sync worker state and must run on the coordinator \
+         owner until follower-safe subscription routing exists",
     ),
     RouteAuthorityRule::prefix(
         "deploy protocol metadata operation",
@@ -396,7 +418,7 @@ fn unsupported_local_backend_cluster_surface_error(
     anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(format!(
         "Local backend API route {surface} ({}) cannot execute locally on this clustered node: \
          {reason}. Route the request to the authoritative node, add an explicit forwarding path, \
-         or migrate the route to RouterState.",
+         or add a route-specific follower-safe read path.",
         class.label()
     ))
 }
@@ -502,6 +524,10 @@ mod tests {
         assert_eq!(
             class_for("/api/deploy/start_push"),
             Some(RouteAuthorityClass::ExplicitForwarding)
+        );
+        assert_eq!(
+            class_for("/api/sync"),
+            Some(RouteAuthorityClass::CoordinatorOwner)
         );
         assert_eq!(
             class_for("/api/actions/mutation"),
