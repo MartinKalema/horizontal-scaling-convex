@@ -688,6 +688,12 @@ impl PendingWrites {
             .map(|(ts, (_, _, snapshot))| (*ts, snapshot.clone()))
     }
 
+    pub fn get(&self, ts: Timestamp) -> Option<(OrderedDocumentWrites, WriteSource, Snapshot)> {
+        self.by_ts.get(&ts).map(|(writes, write_source, snapshot)| {
+            (writes.clone(), write_source.clone(), snapshot.clone())
+        })
+    }
+
     /// Recomputes the snapshot associated with each pending write, rebasing the
     /// pending writes on the new base snapshot provided.
     pub fn recompute_pending_snapshots(&mut self, mut base_snapshot: Snapshot) {
@@ -832,6 +838,12 @@ impl PreparedWrites {
         self.by_ts
             .remove(&expected_ts)
             .map(|(writes, write_source, snapshot)| (expected_ts, writes, write_source, snapshot))
+    }
+
+    pub fn get(&self, ts: Timestamp) -> Option<(OrderedDocumentWrites, WriteSource, Snapshot)> {
+        self.by_ts.get(&ts).map(|(writes, write_source, snapshot)| {
+            (writes.clone(), write_source.clone(), snapshot.clone())
+        })
     }
 
     pub fn len(&self) -> usize {

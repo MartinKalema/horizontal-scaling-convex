@@ -984,9 +984,10 @@ pub async fn make_app(
 
         // Start the Raft node in a background task.
         // TiKV Apply Worker pattern: committed Raft entries are applied
-        // to the state machine. On the leader, on_committed is a no-op
-        // (already applied locally). On followers, on_committed deserializes
-        // the CommitDelta and applies it via apply_replica_delta.
+        // to the state machine. On the leader, the commit future waits for
+        // this Raft decision before applying locally, so on_committed skips
+        // only entries this node proposed. Followers deserialize the
+        // CommitDelta and apply it via apply_replica_delta.
         if let Some(mut node) = manager.take_node() {
             let committer = database.committer_client();
             let raft_state_for_apply = raft_state.clone();
@@ -1003,10 +1004,11 @@ pub async fn make_app(
                                 envelope.source_raft_node_id() == Some(raft_node_id);
                             let delta = envelope.to_delta()?;
 
-                            // Skip only the entries this node already committed
-                            // locally before proposing them through Raft. Every
-                            // other committed entry must be applied here, even if
-                            // this node later became leader.
+                            // Skip only the entries this node proposed: the
+                            // local commit future is waiting for this Raft
+                            // decision and will publish after quorum. Every
+                            // other committed entry must be applied here, even
+                            // if this node later became leader.
                             if !proposed_locally {
                                 tracing::info!(
                                     "Applying committed Raft delta locally: ts={}, leader_now={}",

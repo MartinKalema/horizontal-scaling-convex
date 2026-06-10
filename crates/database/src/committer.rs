@@ -204,9 +204,14 @@ enum PersistenceWrite {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         parent_trace: EncodedSpan,
         commit_id: usize,
-        write_bytes: u64,
-        document_writes: Arc<Vec<DocumentLogEntry>>,
-        index_writes: Arc<Vec<PersistenceIndexEntry>>,
+        delta: CommitDelta,
+    },
+    RejectedBeforePersistence {
+        pending_write: PendingWriteHandle,
+        commit_timer: StatusTimer,
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        commit_id: usize,
+        err: anyhow::Error,
     },
     MaxRepeatableTimestamp {
         new_max_repeatable: Timestamp,
@@ -251,6 +256,7 @@ impl PersistenceWrite {
     fn commit_id(&self) -> usize {
         match self {
             Self::Commit { commit_id, .. } => *commit_id,
+            Self::RejectedBeforePersistence { commit_id, .. } => *commit_id,
             Self::MaxRepeatableTimestamp { commit_id, .. } => *commit_id,
             Self::ReplicaDelta { commit_id, .. } => *commit_id,
             Self::RemoteReadFrontierHeartbeat { commit_id, .. } => *commit_id,
@@ -358,7 +364,6 @@ type RaftCommitWaiter = Option<oneshot::Receiver<bool>>;
 
 struct PublishedCommit {
     commit_ts: Timestamp,
-    raft_commit_waiter: RaftCommitWaiter,
     delta: CommitDelta,
 }
 
@@ -619,9 +624,7 @@ impl<RT: Runtime> Committer<RT> {
                             commit_timer,
                             result,
                             parent_trace,
-                            write_bytes,
-                            document_writes,
-                            index_writes,
+                            delta,
                             ..
                         } => {
                             let parent_span = initialize_root_from_parent("Committer::publish_commit", parent_trace);
@@ -630,7 +633,7 @@ impl<RT: Runtime> Committer<RT> {
                             let commit_ts = pending_write.must_commit_ts();
                             self.dequeue_snapshot(pending_commit_id);
                             let published_commit = match self.publish_commit(
-                                pending_write, write_bytes, document_writes, index_writes,
+                                pending_write, delta,
                             ) {
                                 Ok(published_commit) => published_commit,
                                 Err(err) => {
@@ -643,19 +646,6 @@ impl<RT: Runtime> Committer<RT> {
                                 },
                             };
                             drop(_guard);
-                            if let Err(err) = Self::wait_for_raft_commit(
-                                published_commit.raft_commit_waiter,
-                                published_commit.commit_ts,
-                            )
-                            .await
-                            {
-                                return Self::fail_committed_write(
-                                    result,
-                                    commit_ts,
-                                    "replicate committed write through Raft",
-                                    err,
-                                );
-                            }
                             if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta,
@@ -676,6 +666,27 @@ impl<RT: Runtime> Committer<RT> {
                             if next_bump_wait.is_some() {
                                 next_bump_wait = Some(*MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY);
                             }
+                            commit_timer.finish();
+                        },
+                        PersistenceWrite::RejectedBeforePersistence {
+                            pending_write,
+                            commit_timer,
+                            result,
+                            err,
+                            ..
+                        } => {
+                            self.dequeue_snapshot(pending_commit_id);
+                            let commit_ts = pending_write.must_commit_ts();
+                            self.pending_writes.remove(pending_write).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "pre-persistence rejected commit at ts={} was not pending",
+                                    u64::from(commit_ts),
+                                )
+                            })?;
+                            let (_, latest_snapshot) = self.snapshot_manager.read().latest();
+                            self.pending_writes
+                                .recompute_pending_snapshots(latest_snapshot);
+                            let _ = result.send(Err(err));
                             commit_timer.finish();
                         },
                         PersistenceWrite::MaxRepeatableTimestamp {
@@ -931,19 +942,6 @@ impl<RT: Runtime> Committer<RT> {
                                 },
                             };
                             let commit_ts = published_commit.commit_ts;
-                            if let Err(err) = Self::wait_for_raft_commit(
-                                published_commit.raft_commit_waiter,
-                                commit_ts,
-                            )
-                            .await
-                            {
-                                return Self::fail_committed_write(
-                                    result,
-                                    commit_ts,
-                                    "replicate prepared write through Raft",
-                                    err,
-                                );
-                            }
                             if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta,
@@ -1838,8 +1836,11 @@ impl<RT: Runtime> Committer<RT> {
         })
     }
 
-    fn propose_commit_to_raft(&self, delta: &CommitDelta) -> anyhow::Result<RaftCommitWaiter> {
-        let Some(ref raft) = self.raft_state else {
+    fn propose_commit_to_raft_state(
+        raft_state: Option<&crate::raft_partition::RaftPartitionState>,
+        delta: &CommitDelta,
+    ) -> anyhow::Result<RaftCommitWaiter> {
+        let Some(raft) = raft_state else {
             return Ok(None);
         };
         if !raft.is_leader() {
@@ -1880,17 +1881,61 @@ impl<RT: Runtime> Committer<RT> {
         Ok(Some(rx))
     }
 
+    fn propose_commit_to_raft(&self, delta: &CommitDelta) -> anyhow::Result<RaftCommitWaiter> {
+        Self::propose_commit_to_raft_state(self.raft_state.as_ref(), delta)
+    }
+
+    fn build_commit_delta(
+        commit_ts: Timestamp,
+        ordered_updates: &crate::write_log::OrderedDocumentWrites,
+        write_source: WriteSource,
+        new_snapshot: &Snapshot,
+        write_bytes: u64,
+        document_writes: Arc<Vec<DocumentLogEntry>>,
+        index_writes: Arc<Vec<PersistenceIndexEntry>>,
+        source_partition: Option<crate::partition::PartitionId>,
+    ) -> CommitDelta {
+        let document_updates: Vec<_> = ordered_updates
+            .iter()
+            .map(|(_, update)| update.unpack())
+            .collect();
+        let table_mapping = new_snapshot.table_registry.table_mapping().clone();
+        let mut tablet_id_to_table_name = std::collections::BTreeMap::new();
+        for update in &document_updates {
+            let tablet_id = update.id.tablet_id;
+            if !tablet_id_to_table_name.contains_key(&tablet_id) {
+                if let Ok(name) = table_mapping.tablet_name(tablet_id) {
+                    tablet_id_to_table_name.insert(tablet_id, name);
+                }
+            }
+        }
+        CommitDelta {
+            ts: commit_ts,
+            document_writes,
+            document_updates,
+            index_writes,
+            write_source,
+            write_bytes,
+            tablet_id_to_table_name,
+            source_partition,
+        }
+    }
+
     /// After writing the new rows to persistence, mark the commit as complete
     /// and allow the updated rows to be read by other transactions.
     #[fastrace::trace]
     fn publish_commit(
         &mut self,
         pending_write: PendingWriteHandle,
-        write_bytes: u64,
-        document_writes: Arc<Vec<DocumentLogEntry>>,
-        index_writes: Arc<Vec<PersistenceIndexEntry>>,
+        delta: CommitDelta,
     ) -> anyhow::Result<PublishedCommit> {
         let commit_ts = pending_write.must_commit_ts();
+        anyhow::ensure!(
+            delta.ts == commit_ts,
+            "pending write at ts={} had Raft delta at ts={}",
+            u64::from(commit_ts),
+            u64::from(delta.ts),
+        );
         let (ordered_updates, write_source, new_snapshot) =
             match self.pending_writes.pop_first(pending_write) {
                 None => panic!("commit at {commit_ts} not pending"),
@@ -1907,9 +1952,7 @@ impl<RT: Runtime> Committer<RT> {
             ordered_updates,
             write_source,
             new_snapshot,
-            write_bytes,
-            document_writes,
-            index_writes,
+            delta,
         )
     }
 
@@ -1920,11 +1963,16 @@ impl<RT: Runtime> Committer<RT> {
         ordered_updates: crate::write_log::OrderedDocumentWrites,
         write_source: WriteSource,
         new_snapshot: Snapshot,
-        write_bytes: u64,
-        document_writes: Arc<Vec<DocumentLogEntry>>,
-        index_writes: Arc<Vec<PersistenceIndexEntry>>,
+        delta: CommitDelta,
     ) -> anyhow::Result<PublishedCommit> {
         let apply_timer = metrics::commit_apply_timer();
+        anyhow::ensure!(
+            delta.ts == commit_ts,
+            "publish commit called for ts={} with delta ts={}",
+            u64::from(commit_ts),
+            u64::from(delta.ts),
+        );
+        let write_bytes = delta.write_bytes;
         let latest_snapshot_ts = *self.snapshot_manager.read().latest_ts();
         anyhow::ensure!(
             latest_snapshot_ts < commit_ts,
@@ -1954,18 +2002,12 @@ impl<RT: Runtime> Committer<RT> {
         // Write transaction state at the commit ts to the document store.
         metrics::commit_rows(ordered_updates.len() as u64);
 
-        // Extract document updates for replication before consuming ordered_updates.
-        let document_updates: Vec<_> = ordered_updates
-            .iter()
-            .map(|(_, update)| update.unpack())
-            .collect();
-
         let timer = metrics::pending_writes_to_write_log_timer();
         // See the comment in `overlaps_index_keys` for why it’s safe
         // to use indexes from the current snapshot.
         let writes = index_keys_from_full_documents(ordered_updates, &new_snapshot.index_registry);
         drop(timer);
-        metrics::write_log_commit_bytes(write_bytes as usize);
+        metrics::write_log_commit_bytes(delta.write_bytes as usize);
 
         let timer = metrics::write_log_append_timer();
         self.log.append(commit_ts, writes, write_source.clone());
@@ -1978,45 +2020,13 @@ impl<RT: Runtime> Committer<RT> {
                 .set(table_summaries.user_docs_size as i64);
         }
 
-        // Build TabletId → TableName mapping for Replica ID remapping.
-        let table_mapping = new_snapshot.table_registry.table_mapping().clone();
-
         // Publish the new version of our database metadata and the index.
         let mut snapshot_manager = self.snapshot_manager.write();
         snapshot_manager.push(commit_ts, new_snapshot, write_bytes);
         drop(snapshot_manager);
-        let mut tablet_id_to_table_name = std::collections::BTreeMap::new();
-        for update in &document_updates {
-            let tablet_id = update.id.tablet_id;
-            if !tablet_id_to_table_name.contains_key(&tablet_id) {
-                if let Ok(name) = table_mapping.tablet_name(tablet_id) {
-                    tablet_id_to_table_name.insert(tablet_id, name);
-                }
-            }
-        }
 
-        // Publish delta to distributed log for cross-partition Replica consumption.
-        let delta = CommitDelta {
-            ts: commit_ts,
-            document_writes,
-            document_updates,
-            index_writes,
-            write_source,
-            write_bytes,
-            tablet_id_to_table_name,
-            source_partition: self
-                .placement_state
-                .as_ref()
-                .map(|placement_state| placement_state.local_partition()),
-        };
-
-        let raft_commit_waiter = self.propose_commit_to_raft(&delta)?;
         apply_timer.finish();
-        Ok(PublishedCommit {
-            commit_ts,
-            raft_commit_waiter,
-            delta,
-        })
+        Ok(PublishedCommit { commit_ts, delta })
     }
 
     fn install_snapshot(
@@ -2947,26 +2957,59 @@ impl<RT: Runtime> Committer<RT> {
     ) -> anyhow::Result<PublishedCommit> {
         let prepared = self
             .prepared_transactions
-            .remove(&transaction_id)
+            .get(&transaction_id)
             .ok_or_else(|| {
                 anyhow::anyhow!("2PC CommitPrepared: unknown transaction {}", transaction_id)
             })?;
+        let commit_ts = prepared.commit_ts;
+        let write_bytes = prepared.write_bytes;
+        let document_writes = prepared.document_writes.clone();
+        let index_writes = prepared.index_writes.clone();
 
         tracing::info!(
             "2PC CommitPrepared: txn={}, ts={}",
             transaction_id,
-            u64::from(prepared.commit_ts),
+            u64::from(commit_ts),
         );
+
+        let (ordered_updates, write_source, snapshot) =
+            self.prepared_writes.get(commit_ts).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "2PC CommitPrepared: prepared intent for txn={} at ts={} was missing",
+                    transaction_id,
+                    u64::from(commit_ts),
+                )
+            })?;
+        let source_partition = self
+            .placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.local_partition());
+        let delta = Self::build_commit_delta(
+            commit_ts,
+            &ordered_updates,
+            write_source.clone(),
+            &snapshot,
+            write_bytes,
+            document_writes.clone(),
+            index_writes.clone(),
+            source_partition,
+        );
+        let raft_commit_waiter = self.propose_commit_to_raft(&delta)?;
+        block_in_place(|| {
+            let wait_future = Self::wait_for_raft_commit(raft_commit_waiter, commit_ts);
+            let rt = tokio::runtime::Handle::current();
+            if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                futures::executor::block_on(wait_future)
+            } else {
+                rt.block_on(wait_future)
+            }
+        })?;
 
         // Write to persistence (same as normal commit path).
         block_in_place(|| {
             let write_future = async {
                 self.persistence
-                    .write(
-                        &prepared.document_writes,
-                        &prepared.index_writes,
-                        ConflictStrategy::Error,
-                    )
+                    .write(&document_writes, &index_writes, ConflictStrategy::Error)
                     .await
             };
             let rt = tokio::runtime::Handle::current();
@@ -2977,6 +3020,12 @@ impl<RT: Runtime> Committer<RT> {
             }
         })?;
 
+        let prepared = self
+            .prepared_transactions
+            .remove(&transaction_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("2PC CommitPrepared: unknown transaction {}", transaction_id)
+            })?;
         let (intent_ts, ordered_updates, write_source, snapshot) = self
             .prepared_writes
             .remove(prepared.prepared_write)
@@ -2997,15 +3046,7 @@ impl<RT: Runtime> Committer<RT> {
         );
 
         // Publish commit — makes writes visible to reads.
-        self.publish_commit_from_updates(
-            prepared.commit_ts,
-            ordered_updates,
-            write_source,
-            snapshot,
-            prepared.write_bytes,
-            prepared.document_writes,
-            prepared.index_writes,
-        )
+        self.publish_commit_from_updates(commit_ts, ordered_updates, write_source, snapshot, delta)
     }
 
     /// Rollback a previously prepared transaction: remove from PendingWrites.
@@ -3092,7 +3133,80 @@ impl<RT: Runtime> Committer<RT> {
             .pending_writes
             .latest_snapshot()
             .expect("validated commit should stage a pending snapshot");
-        self.enqueue_snapshot(commit_id, pending_write.must_commit_ts(), queued_snapshot);
+        let commit_ts = pending_write.must_commit_ts();
+        self.enqueue_snapshot(commit_id, commit_ts, queued_snapshot);
+        let virtual_system_mapping = self.virtual_system_mapping.clone();
+
+        Self::track_commit(
+            usage_tracking,
+            &index_writes,
+            &document_writes,
+            &table_mapping,
+            &component_registry,
+            &virtual_system_mapping,
+        );
+
+        let mut write_bytes: u64 = 0;
+        let document_writes = Arc::new(
+            document_writes
+                .into_iter()
+                .map(|write| {
+                    let entry = DocumentLogEntry {
+                        ts: write.commit_ts,
+                        id: write.id,
+                        value: write.write,
+                        prev_ts: write.prev_ts,
+                    };
+                    write_bytes += entry.size();
+                    entry
+                })
+                .collect_vec(),
+        );
+        let index_writes = Arc::new(
+            index_writes
+                .into_iter()
+                .map(|(ts, update)| {
+                    let entry = PersistenceIndexEntry::from_index_update(ts, &update);
+                    write_bytes += entry.size();
+                    entry
+                })
+                .collect_vec(),
+        );
+        let (ordered_updates, staged_write_source, staged_snapshot) = self
+            .pending_writes
+            .get(commit_ts)
+            .expect("validated commit should remain pending");
+        let source_partition = self
+            .placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.local_partition());
+        let delta = Self::build_commit_delta(
+            commit_ts,
+            &ordered_updates,
+            staged_write_source.clone(),
+            &staged_snapshot,
+            write_bytes,
+            document_writes,
+            index_writes,
+            source_partition,
+        );
+        let raft_commit_waiter = match self.propose_commit_to_raft(&delta) {
+            Ok(waiter) => waiter,
+            Err(err) => {
+                return Some(
+                    async move {
+                        Ok(PersistenceWrite::RejectedBeforePersistence {
+                            pending_write,
+                            commit_timer,
+                            result,
+                            commit_id,
+                            err,
+                        })
+                    }
+                    .boxed(),
+                );
+            },
+        };
 
         // necessary because this value is moved
         let parent_trace_copy = parent_trace.clone();
@@ -3102,47 +3216,21 @@ impl<RT: Runtime> Committer<RT> {
         let outer_span = Span::enter_with_parents("outer_write_commit", [root_span, &request_span]);
         let pause_client = self.runtime.pause_client();
         let rt = self.runtime.clone();
-        let virtual_system_mapping = self.virtual_system_mapping.clone();
         Some(
             async move {
-                Self::track_commit(
-                    usage_tracking,
-                    &index_writes,
-                    &document_writes,
-                    &table_mapping,
-                    &component_registry,
-                    &virtual_system_mapping,
-                );
+                if let Err(err) = Self::wait_for_raft_commit(raft_commit_waiter, commit_ts).await {
+                    return Ok(PersistenceWrite::RejectedBeforePersistence {
+                        pending_write,
+                        commit_timer,
+                        result,
+                        commit_id,
+                        err,
+                    });
+                }
 
                 let mut backoff = Backoff::new(
                     INITIAL_PERSISTENCE_WRITES_BACKOFF,
                     MAX_PERSISTENCE_WRITES_BACKOFF,
-                );
-                let mut write_bytes: u64 = 0;
-                let document_writes = Arc::new(
-                    document_writes
-                        .into_iter()
-                        .map(|write| {
-                            let entry = DocumentLogEntry {
-                                ts: write.commit_ts,
-                                id: write.id,
-                                value: write.write,
-                                prev_ts: write.prev_ts,
-                            };
-                            write_bytes += entry.size();
-                            entry
-                        })
-                        .collect_vec(),
-                );
-                let index_writes = Arc::new(
-                    index_writes
-                        .into_iter()
-                        .map(|(ts, update)| {
-                            let entry = PersistenceIndexEntry::from_index_update(ts, &update);
-                            write_bytes += entry.size();
-                            entry
-                        })
-                        .collect_vec(),
                 );
                 loop {
                     // Inline try_join so we don't recapture the stacktrace on error
@@ -3151,9 +3239,9 @@ impl<RT: Runtime> Committer<RT> {
                         name,
                         Self::write_to_persistence(
                             persistence.clone(),
-                            index_writes.clone(),
-                            document_writes.clone(),
-                            write_source.clone(),
+                            delta.index_writes.clone(),
+                            delta.document_writes.clone(),
+                            delta.write_source.clone(),
                         )
                         .in_span(Span::enter_with_local_parent(name)),
                     ));
@@ -3176,9 +3264,7 @@ impl<RT: Runtime> Committer<RT> {
                             result,
                             parent_trace: parent_trace_copy,
                             commit_id,
-                            write_bytes,
-                            document_writes,
-                            index_writes,
+                            delta,
                         });
                     }
                 }

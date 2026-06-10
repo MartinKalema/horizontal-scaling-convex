@@ -606,6 +606,27 @@ own for distributed changes.
   - `cargo test -p database test_cross_partition_commit_uses_remote_prepare_over_grpc -- --nocapture`
   - `cargo check -p database`
 
+### 2026-06 — Moved local partition visibility behind Raft quorum
+
+- **Status:** complete
+- **Related issue:** `#146`
+- **What this fixes:** Raft-backed leaders previously wrote local persistence,
+  appended the write log, and pushed `SnapshotManager` before the Raft proposal
+  reached quorum. A rejected proposal could therefore leave a non-quorum write
+  visible locally or reloadable from the node's persistence.
+- **Behavior:** local commits now build the exact `CommitDelta`, propose it to
+  Raft, and wait for quorum before writing local persistence or publishing to
+  the readable snapshot/write log. `CommitPrepared` follows the same ordering.
+  Non-Raft single-node mode still writes directly.
+- **Validation:**
+  - `cargo test -p database test_failed_raft_proposal_does_not_publish_or_persist -- --nocapture`
+  - `cargo test -p database test_cross_partition_commit_uses_remote_prepare_over_grpc -- --nocapture`
+  - `cargo test -p database test_prepared_participant_recovers_from_redo_after_restart -- --nocapture`
+  - `cargo test -p database test_remote_single_partition_write_routes_to_owner_over_grpc -- --nocapture`
+  - `cargo test -p database test_local_commit_retries_while_prepare_is_unresolved -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current
