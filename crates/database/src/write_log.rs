@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{
         BTreeMap,
+        BTreeSet,
         VecDeque,
     },
     sync::Arc,
@@ -74,7 +75,8 @@ impl HeapSize for PackedDocumentUpdate {
     }
 }
 
-type OrderedDocumentWrites = WithHeapSize<Vec<(ResolvedDocumentId, PackedDocumentUpdate)>>;
+pub(crate) type OrderedDocumentWrites =
+    WithHeapSize<Vec<(ResolvedDocumentId, PackedDocumentUpdate)>>;
 
 impl PackedDocumentUpdate {
     pub fn pack(update: &impl DocumentUpdateRef) -> Self {
@@ -718,10 +720,14 @@ impl PendingWrites {
     pub fn is_stale(
         &self,
         reads: &ReadSet,
-        reads_ts: Timestamp,
+        _reads_ts: Timestamp,
         ts: Timestamp,
     ) -> anyhow::Result<Option<ConflictingReadWithWriteSource>> {
-        Ok(reads.writes_overlap_docs(self.iter(reads_ts.succ()?, ts)))
+        // Prepared writes are not visible in snapshots, so a reader can start
+        // after the prepare timestamp and still miss the intent. Treat every
+        // unresolved prepared write up to the candidate commit timestamp as a
+        // potential conflict.
+        Ok(reads.writes_overlap_docs(self.iter(Timestamp::MIN, ts)))
     }
 
     pub fn pop_first(
@@ -763,6 +769,90 @@ impl PendingWriteHandle {
         self.0.expect("pending write already committed")
     }
 }
+
+/// Prepared writes are 2PC intents: they participate in OCC conflict checks,
+/// but they are not part of the normal persistence/publish FIFO.
+pub struct PreparedWrites {
+    by_ts: BTreeMap<Timestamp, (OrderedDocumentWrites, WriteSource, Snapshot)>,
+}
+
+impl PreparedWrites {
+    pub fn new() -> Self {
+        Self {
+            by_ts: BTreeMap::new(),
+        }
+    }
+
+    pub fn insert(
+        &mut self,
+        ts: Timestamp,
+        writes: OrderedDocumentWrites,
+        write_source: WriteSource,
+        snapshot: Snapshot,
+    ) -> PreparedWriteHandle {
+        assert!(
+            self.by_ts
+                .insert(ts, (writes, write_source, snapshot))
+                .is_none(),
+            "prepared write already staged at {ts}",
+        );
+        PreparedWriteHandle(Some(ts))
+    }
+
+    pub fn iter(
+        &self,
+        from: Timestamp,
+        to: Timestamp,
+    ) -> impl Iterator<
+        Item = (
+            &Timestamp,
+            impl Iterator<Item = &(ResolvedDocumentId, PackedDocumentUpdate)>,
+            &WriteSource,
+        ),
+    > {
+        self.by_ts
+            .range(from..=to)
+            .map(|(ts, (w, source, _snapshot))| (ts, w.iter(), source))
+    }
+
+    pub fn is_stale(
+        &self,
+        reads: &ReadSet,
+        reads_ts: Timestamp,
+        ts: Timestamp,
+    ) -> anyhow::Result<Option<ConflictingReadWithWriteSource>> {
+        Ok(reads.writes_overlap_docs(self.iter(reads_ts.succ()?, ts)))
+    }
+
+    pub fn remove(
+        &mut self,
+        mut handle: PreparedWriteHandle,
+    ) -> Option<(Timestamp, OrderedDocumentWrites, WriteSource, Snapshot)> {
+        let expected_ts = handle.0.take()?;
+        self.by_ts
+            .remove(&expected_ts)
+            .map(|(writes, write_source, snapshot)| (expected_ts, writes, write_source, snapshot))
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_ts.len()
+    }
+
+    pub fn conflicts_document_ids(
+        &self,
+        ids: impl IntoIterator<Item = ResolvedDocumentId>,
+    ) -> Option<(Timestamp, WriteSource)> {
+        let ids: BTreeSet<_> = ids.into_iter().collect();
+        for (ts, (writes, write_source, _snapshot)) in &self.by_ts {
+            if writes.iter().any(|(id, _)| ids.contains(id)) {
+                return Some((*ts, write_source.clone()));
+            }
+        }
+        None
+    }
+}
+
+pub struct PreparedWriteHandle(Option<Timestamp>);
 
 #[cfg(test)]
 mod tests {

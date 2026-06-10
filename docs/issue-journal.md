@@ -582,6 +582,30 @@ own for distributed changes.
   - `cargo test -p local_backend test_internal_grpc_services_reject_missing_cluster_auth -- --nocapture`
   - `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
 
+### 2026-06 — Separated 2PC prepared intents from the commit publish queue
+
+- **Status:** complete
+- **Related issue:** `#154`
+- **What this fixes:** 2PC prepare previously staged prepared writes in the
+  same `PendingWrites` FIFO used by the normal publish path. That made a
+  prepared transaction look like the next publishable commit and forced the
+  committer to block all local writes while a prepare was unresolved.
+- **Behavior:** prepared writes are now tracked as separate intents. They still
+  participate in OCC conflict checks and document-ID write locks, but they are
+  removed by `CommitPrepared`/`RollbackPrepared` directly instead of being
+  popped from the normal publish FIFO. Because the current 2PC protocol fixes
+  the prepare timestamp as the final visibility timestamp, normal commits still
+  retry while a prepare is unresolved; allowing unrelated commits to publish
+  ahead of a prepared transaction belongs with the later timestamp-domain /
+  rebasable snapshot work.
+- **Validation:**
+  - `cargo test -p database test_local_commit_retries_while_prepare_is_unresolved -- --nocapture`
+  - `cargo test -p database test_prepare_retries_while_local_commit_is_pending -- --nocapture`
+  - `cargo test -p database test_remote_prepare_over_grpc_is_idempotent -- --nocapture`
+  - `cargo test -p database test_prepared_participant_recovers_from_redo_after_restart -- --nocapture`
+  - `cargo test -p database test_cross_partition_commit_uses_remote_prepare_over_grpc -- --nocapture`
+  - `cargo check -p database`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

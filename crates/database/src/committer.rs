@@ -175,6 +175,8 @@ use crate::{
         PackedDocumentUpdate,
         PendingWriteHandle,
         PendingWrites,
+        PreparedWriteHandle,
+        PreparedWrites,
         WriteSource,
     },
     ComponentRegistry,
@@ -188,7 +190,7 @@ const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
 
 /// State held for a 2PC-prepared transaction awaiting commit/rollback.
 struct PreparedTransaction {
-    pending_write: PendingWriteHandle,
+    prepared_write: PreparedWriteHandle,
     commit_ts: Timestamp,
     write_bytes: u64,
     document_writes: Arc<Vec<DocumentLogEntry>>,
@@ -363,6 +365,9 @@ struct PublishedCommit {
 pub struct Committer<RT: Runtime> {
     // Internal staged commits for conflict checking.
     pending_writes: PendingWrites,
+    // 2PC prepared intents for conflict checking. These are intentionally
+    // separate from `pending_writes`, whose FIFO is only for publishable commits.
+    prepared_writes: PreparedWrites,
     // External log of writes for subscriptions.
     log: LogWriter,
 
@@ -395,8 +400,8 @@ pub struct Committer<RT: Runtime> {
     timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
 
     // 2PC prepared transactions awaiting CommitPrepared or RollbackPrepared.
-    // Keyed by TwoPhaseTransactionId, storing the PendingWriteHandle and
-    // metadata needed to finalize the commit. (Vitess redo log pattern)
+    // Keyed by TwoPhaseTransactionId, storing the prepared intent and metadata
+    // needed to finalize the commit. (Vitess redo log pattern)
     prepared_transactions:
         std::collections::HashMap<crate::two_phase::TwoPhaseTransactionId, PreparedTransaction>,
 
@@ -492,14 +497,14 @@ impl<RT: Runtime> Committer<RT> {
         applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
-        let conflict_checker = PendingWrites::new();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
         let snapshot_reader = snapshot_manager.reader();
         let placement_state =
             partition_map.map(crate::partition::PlacementState::from_partition_map);
         let client_placement_state = placement_state.clone();
         let committer = Self {
-            pending_writes: conflict_checker,
+            pending_writes: PendingWrites::new(),
+            prepared_writes: PreparedWrites::new(),
             log,
             snapshot_manager,
             persistence,
@@ -757,6 +762,7 @@ impl<RT: Runtime> Committer<RT> {
                             ..
                         } => {
                             self.pending_writes = PendingWrites::new();
+                            self.prepared_writes = PreparedWrites::new();
                             self.prepared_transactions.clear();
                             self.queued_snapshots.clear();
                             self.log.reset(snapshot_ts);
@@ -1522,7 +1528,7 @@ impl<RT: Runtime> Committer<RT> {
         let (document_writes, index_writes, snapshot) =
             self.compute_writes(commit_ts, &ordered_update_refs)?;
 
-        let pending_write = self.pending_writes.push_back(
+        let prepared_write = self.prepared_writes.insert(
             commit_ts,
             writes
                 .into_iter()
@@ -1558,7 +1564,7 @@ impl<RT: Runtime> Committer<RT> {
         self.prepared_transactions.insert(
             transaction_id.clone(),
             PreparedTransaction {
-                pending_write,
+                prepared_write,
                 commit_ts,
                 write_bytes,
                 document_writes: Arc::new(doc_entries),
@@ -1595,7 +1601,7 @@ impl<RT: Runtime> Committer<RT> {
             anyhow::bail!(anyhow::anyhow!(metadata).context(format!(
                 "Commit blocked by {} unresolved 2PC prepared transaction(s); retry after the \
                  prepared transaction commits or rolls back",
-                self.prepared_transactions.len(),
+                self.prepared_writes.len(),
             )));
         }
 
@@ -1623,6 +1629,21 @@ impl<RT: Runtime> Committer<RT> {
                     }
                 }
             }
+        }
+
+        if let Some((intent_ts, intent_source)) = self
+            .prepared_writes
+            .conflicts_document_ids(transaction.writes.coalesced_writes().map(|write| write.id))
+        {
+            let metadata = ErrorMetadata::system_occ(
+                Some(u64::from(*transaction.begin_timestamp)),
+                write_source.as_str().map(|source| source.to_string()),
+            );
+            anyhow::bail!(anyhow::anyhow!(metadata).context(format!(
+                "Commit conflicts with unresolved 2PC prepared intent at ts={} from {:?}",
+                u64::from(intent_ts),
+                intent_source,
+            )));
         }
 
         self.validate_remote_read_frontiers(
@@ -1737,6 +1758,9 @@ impl<RT: Runtime> Committer<RT> {
             return Ok(Some(conflicting_read));
         }
         if let Some(conflicting_read) = self.pending_writes.is_stale(reads, reads_ts, commit_ts)? {
+            return Ok(Some(conflicting_read));
+        }
+        if let Some(conflicting_read) = self.prepared_writes.is_stale(reads, reads_ts, commit_ts)? {
             return Ok(Some(conflicting_read));
         }
         Ok(None)
@@ -1866,8 +1890,48 @@ impl<RT: Runtime> Committer<RT> {
         document_writes: Arc<Vec<DocumentLogEntry>>,
         index_writes: Arc<Vec<PersistenceIndexEntry>>,
     ) -> anyhow::Result<PublishedCommit> {
-        let apply_timer = metrics::commit_apply_timer();
         let commit_ts = pending_write.must_commit_ts();
+        let (ordered_updates, write_source, new_snapshot) =
+            match self.pending_writes.pop_first(pending_write) {
+                None => panic!("commit at {commit_ts} not pending"),
+                Some((ts, document_updates, write_source, snapshot)) => {
+                    if ts != commit_ts {
+                        panic!("commits out of order {ts} != {commit_ts}");
+                    }
+                    (document_updates, write_source, snapshot)
+                },
+            };
+
+        self.publish_commit_from_updates(
+            commit_ts,
+            ordered_updates,
+            write_source,
+            new_snapshot,
+            write_bytes,
+            document_writes,
+            index_writes,
+        )
+    }
+
+    #[fastrace::trace]
+    fn publish_commit_from_updates(
+        &mut self,
+        commit_ts: Timestamp,
+        ordered_updates: crate::write_log::OrderedDocumentWrites,
+        write_source: WriteSource,
+        new_snapshot: Snapshot,
+        write_bytes: u64,
+        document_writes: Arc<Vec<DocumentLogEntry>>,
+        index_writes: Arc<Vec<PersistenceIndexEntry>>,
+    ) -> anyhow::Result<PublishedCommit> {
+        let apply_timer = metrics::commit_apply_timer();
+        let latest_snapshot_ts = *self.snapshot_manager.read().latest_ts();
+        anyhow::ensure!(
+            latest_snapshot_ts < commit_ts,
+            "Commit at ts={} can no longer publish because latest snapshot is {}",
+            u64::from(commit_ts),
+            latest_snapshot_ts,
+        );
 
         if let Some(ref tso) = self.timestamp_oracle {
             let tso = tso.clone();
@@ -1886,17 +1950,6 @@ impl<RT: Runtime> Committer<RT> {
                 );
             }
         }
-
-        let (ordered_updates, write_source, new_snapshot) =
-            match self.pending_writes.pop_first(pending_write) {
-                None => panic!("commit at {commit_ts} not pending"),
-                Some((ts, document_updates, write_source, snapshot)) => {
-                    if ts != commit_ts {
-                        panic!("commits out of order {ts} != {commit_ts}");
-                    }
-                    (document_updates, write_source, snapshot)
-                },
-            };
 
         // Write transaction state at the commit ts to the document store.
         metrics::commit_rows(ordered_updates.len() as u64);
@@ -2924,9 +2977,31 @@ impl<RT: Runtime> Committer<RT> {
             }
         })?;
 
+        let (intent_ts, ordered_updates, write_source, snapshot) = self
+            .prepared_writes
+            .remove(prepared.prepared_write)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "2PC CommitPrepared: prepared intent for txn={} at ts={} was missing",
+                    transaction_id,
+                    u64::from(prepared.commit_ts),
+                )
+            })?;
+        anyhow::ensure!(
+            intent_ts == prepared.commit_ts,
+            "2PC CommitPrepared: prepared intent for txn={} had ts={} but transaction expected \
+             ts={}",
+            transaction_id,
+            intent_ts,
+            prepared.commit_ts,
+        );
+
         // Publish commit — makes writes visible to reads.
-        self.publish_commit(
-            prepared.pending_write,
+        self.publish_commit_from_updates(
+            prepared.commit_ts,
+            ordered_updates,
+            write_source,
+            snapshot,
             prepared.write_bytes,
             prepared.document_writes,
             prepared.index_writes,
@@ -2954,14 +3029,14 @@ impl<RT: Runtime> Committer<RT> {
             u64::from(prepared.commit_ts),
         );
 
-        // Remove this exact prepared intent from PendingWrites so it no longer
-        // blocks conflicting transactions. Do not pop the FIFO head here: an
-        // older local commit may be pending ahead of this prepared transaction.
-        self.pending_writes
-            .remove(prepared.pending_write)
+        // Remove this exact prepared intent so it no longer blocks conflicting
+        // transactions. Prepared intents are not stored in PendingWrites, whose
+        // FIFO is reserved for normal commit publication.
+        self.prepared_writes
+            .remove(prepared.prepared_write)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "2PC RollbackPrepared: pending write for txn={} at ts={} was missing",
+                    "2PC RollbackPrepared: prepared intent for txn={} at ts={} was missing",
                     transaction_id,
                     u64::from(prepared.commit_ts),
                 )
