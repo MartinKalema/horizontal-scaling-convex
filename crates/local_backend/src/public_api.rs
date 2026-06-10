@@ -463,15 +463,12 @@ pub async fn public_function_post_with_path(
             "Path or function name not provided in path, e.g. /api/run/messages/list",
         ))
     };
-    println!("{path:?}");
-
     // messages/list -> ["messages", "list"]
     let mut path_parts = path
         .as_str()
         .split('/')
         .map(|p| urlencoding::decode(p).map_err(|_e| bad_request_error()))
         .try_collect::<Vec<_>>()?;
-    println!("{path_parts:?}");
     if path_parts.len() < 2 {
         return Err(bad_request_error().into());
     }
@@ -1790,17 +1787,52 @@ mod tests {
             Duration::from_secs(125),
             NoopRouteMapper,
         );
+        let admin_header = backend.admin_auth_header.0.encode();
 
-        for (method, uri) in [
-            (Method::POST, "/api/query_ts"),
-            (Method::POST, "/api/storage/upload?token=not-a-real-token"),
-            (Method::GET, "/http/anything"),
+        for (method, uri, body, include_admin_auth) in [
+            (Method::POST, "/api/query_ts", "{}", false),
+            (Method::POST, "/api/query_batch", r#"{"queries":[]}"#, false),
+            (
+                Method::POST,
+                "/api/action",
+                r#"{"path":"values:intAction","args":{}}"#,
+                false,
+            ),
+            (
+                Method::POST,
+                "/api/function",
+                r#"{"path":"values:intMutation","args":{}}"#,
+                true,
+            ),
+            (
+                Method::POST,
+                "/api/run/values/intMutation",
+                r#"{"args":{}}"#,
+                true,
+            ),
+            (
+                Method::POST,
+                "/api/storage/upload?token=not-a-real-token",
+                "",
+                false,
+            ),
+            (
+                Method::GET,
+                "/api/storage/00000000-0000-0000-0000-000000000000",
+                "",
+                false,
+            ),
+            (Method::GET, "/http/anything", "", false),
         ] {
-            let req = Request::builder()
+            let mut req = Request::builder()
                 .uri(uri)
                 .method(method)
                 .header("Host", "localhost")
-                .body(Body::empty())?;
+                .header("Content-Type", "application/json");
+            if include_admin_auth {
+                req = req.header("Authorization", admin_header.clone());
+            }
+            let req = req.body(Body::from(body))?;
             let (parts, body) = replica_app
                 .router()
                 .clone()
