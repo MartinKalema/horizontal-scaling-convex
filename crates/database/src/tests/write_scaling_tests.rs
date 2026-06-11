@@ -463,42 +463,6 @@ impl TwoPhaseCommitService for FailingPrepareGrpcService {
     }
 }
 
-struct FailingCommitAfterPrepareGrpcService;
-
-#[tonic::async_trait]
-impl TwoPhaseCommitService for FailingCommitAfterPrepareGrpcService {
-    async fn prepare(
-        &self,
-        request: Request<TwoPcPrepareRequest>,
-    ) -> Result<Response<TwoPcPrepareResponse>, Status> {
-        let req = request.into_inner();
-        let prepare_ts: Timestamp = req
-            .prepare_ts
-            .try_into()
-            .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
-
-        Ok(Response::new(TwoPcPrepareResponse {
-            prepare_ts: u64::from(prepare_ts),
-        }))
-    }
-
-    async fn commit_prepared(
-        &self,
-        _request: Request<TwoPcCommitRequest>,
-    ) -> Result<Response<TwoPcCommitResponse>, Status> {
-        Err(Status::unavailable(
-            "forced commit failure after durable decision",
-        ))
-    }
-
-    async fn rollback_prepared(
-        &self,
-        _request: Request<TwoPcRollbackRequest>,
-    ) -> Result<Response<TwoPcRollbackResponse>, Status> {
-        Ok(Response::new(TwoPcRollbackResponse {}))
-    }
-}
-
 struct FailingRollbackAfterPrepareGrpcService {
     db: Database<TestRuntime>,
     committer: CommitterClient,
@@ -514,6 +478,117 @@ impl FailingRollbackAfterPrepareGrpcService {
             local_partition,
             fail_next_rollback: AtomicBool::new(true),
         }
+    }
+}
+
+struct FailingCommitAfterLocalPrepareGrpcService {
+    db: Database<TestRuntime>,
+    committer: CommitterClient,
+    local_partition: PartitionId,
+    fail_next_commit: AtomicBool,
+}
+
+impl FailingCommitAfterLocalPrepareGrpcService {
+    fn new(db: Database<TestRuntime>, local_partition: PartitionId) -> Self {
+        Self {
+            committer: db.committer_for_test(),
+            db,
+            local_partition,
+            fail_next_commit: AtomicBool::new(true),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl TwoPhaseCommitService for FailingCommitAfterLocalPrepareGrpcService {
+    async fn prepare(
+        &self,
+        request: Request<TwoPcPrepareRequest>,
+    ) -> Result<Response<TwoPcPrepareResponse>, Status> {
+        let req = request.into_inner();
+        let txn_id = TwoPhaseTransactionId(req.transaction_id);
+        let prepare_ts: Timestamp = req
+            .prepare_ts
+            .try_into()
+            .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
+        let write_source = WriteSource::new(req.write_source);
+        let mut tx =
+            self.db.begin(Identity::system()).await.map_err(|e| {
+                Status::internal(format!("Failed to begin local prepare tx: {e:#}"))
+            })?;
+        TestFacingModel::new(&mut tx)
+            .insert(
+                &"projects"
+                    .parse()
+                    .map_err(|e| Status::internal(format!("Invalid test table name: {e:#}")))?,
+                assert_obj!("name" => "prepared-before-commit-rpc-failure"),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to build local prepare tx: {e:#}")))?;
+        let final_tx = tx
+            .finalize()
+            .map_err(|e| Status::internal(format!("Failed to finalize local prepare tx: {e:#}")))?;
+        let write_indexes: Vec<_> = final_tx
+            .writes
+            .coalesced_writes()
+            .enumerate()
+            .map(|(index, _)| index)
+            .collect();
+        let partition_map = partitioned_map(self.local_partition);
+        let transaction = ParticipantTransaction::from_final_transaction(
+            &final_tx,
+            self.local_partition,
+            &write_indexes,
+            &partition_map,
+            &write_source,
+        )
+        .map_err(|e| Status::internal(format!("Failed to build local participant tx: {e:#}")))?;
+        let result = self
+            .committer
+            .prepare_remote(
+                txn_id,
+                transaction,
+                write_source,
+                prepare_ts,
+                req.participants.iter().copied().map(PartitionId).collect(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
+        Ok(Response::new(TwoPcPrepareResponse {
+            prepare_ts: u64::from(result.prepare_ts),
+        }))
+    }
+
+    async fn commit_prepared(
+        &self,
+        request: Request<TwoPcCommitRequest>,
+    ) -> Result<Response<TwoPcCommitResponse>, Status> {
+        let req = request.into_inner();
+        if self.fail_next_commit.swap(false, Ordering::SeqCst) {
+            return Err(Status::unavailable(
+                "forced commit failure after durable decision",
+            ));
+        }
+        let commit_ts = self
+            .committer
+            .commit_prepared(TwoPhaseTransactionId(req.transaction_id))
+            .await
+            .map_err(|e| Status::internal(format!("CommitPrepared failed: {e:#}")))?;
+        Ok(Response::new(TwoPcCommitResponse {
+            commit_ts: u64::from(commit_ts),
+        }))
+    }
+
+    async fn rollback_prepared(
+        &self,
+        request: Request<TwoPcRollbackRequest>,
+    ) -> Result<Response<TwoPcRollbackResponse>, Status> {
+        let req = request.into_inner();
+        self.committer
+            .rollback_prepared(TwoPhaseTransactionId(req.transaction_id))
+            .await
+            .map_err(|e| Status::internal(format!("RollbackPrepared failed: {e:#}")))?;
+        Ok(Response::new(TwoPcRollbackResponse {}))
     }
 }
 
@@ -2747,18 +2822,10 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
             format!("{err:#}").contains("forced prepare failure"),
             "expected remote prepare failure, got: {err:#}",
         );
-        let decisions = decision_log.decisions();
-        assert_eq!(decisions.len(), 1);
-        let decision = decisions
-            .values()
-            .next()
-            .expect("rollback decision should be durable");
-        match decision {
-            TwoPhaseDecision::RolledBack { participants, .. } => {
-                assert_eq!(participants, &vec![0]);
-            },
-            other => panic!("expected rollback decision, got {other:?}"),
-        }
+        assert!(
+            decision_log.decisions().is_empty(),
+            "rollback decision should be deleted once every prepared participant resolved",
+        );
 
         let mut retry_tx = node_a.begin(Identity::system()).await?;
         UserFacingModel::new(&mut retry_tx, TableNamespace::test_user())
@@ -2829,16 +2896,10 @@ async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
     .await?;
     assert_eq!(resolved, 1);
 
-    let decisions = decision_log.decisions();
-    let decision = decisions
-        .get(&txn_id.0)
-        .expect("watcher should write a durable rollback decision");
-    match decision {
-        TwoPhaseDecision::RolledBack { participants, .. } => {
-            assert_eq!(participants, &vec![1]);
-        },
-        other => panic!("expected rollback decision, got {other:?}"),
-    }
+    assert!(
+        decision_log.decisions().is_empty(),
+        "single-participant timeout rollback should delete the decision after local resolution",
+    );
 
     insert_doc(
         &node,
@@ -2917,7 +2978,11 @@ fn test_rollback_decision_survives_failed_rollback_rpc_for_watcher() -> anyhow::
             .next()
             .expect("rollback decision should survive failed rollback RPC");
         match decision {
-            TwoPhaseDecision::RolledBack { participants, .. } => {
+            TwoPhaseDecision::RolledBack {
+                participants,
+                resolved_participants,
+                ..
+            } => {
                 assert!(
                     participants.contains(&1),
                     "rollback decision must include the prepared remote participant",
@@ -2925,6 +2990,12 @@ fn test_rollback_decision_survives_failed_rollback_rpc_for_watcher() -> anyhow::
                 assert!(
                     !participants.contains(&2),
                     "rollback decision must not include the participant whose prepare failed",
+                );
+                assert_eq!(
+                    resolved_participants,
+                    &vec![0],
+                    "local coordinator participant should be marked resolved while failed remote \
+                     rollback remains pending",
                 );
             },
             other => panic!("expected rollback decision, got {other:?}"),
@@ -2936,7 +3007,11 @@ fn test_rollback_decision_survives_failed_rollback_rpc_for_watcher() -> anyhow::
             TwoPhaseTransactionId(txn_id.clone()),
             decision.clone(),
         )
-        .await;
+        .await?;
+        assert!(
+            decision_log.decisions().is_empty(),
+            "decision should be deleted after the delayed participant resolves",
+        );
         insert_doc(
             &node_b,
             "projects",
@@ -2959,15 +3034,20 @@ fn test_commit_decision_survives_failed_participant_commit() -> anyhow::Result<(
         let log = Arc::new(InMemoryDistributedLog::new());
         let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
         let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
-        let node_b = create_node_with_options(
+        let node_b = create_node_with_options_and_decision_log(
             &rt,
             log.clone(),
             Some(partitioned_map(PartitionId(1))),
             None,
             Some(tso.clone()),
+            decision_log.clone(),
         )
         .await?;
-        let server = start_two_pc_server(FailingCommitAfterPrepareGrpcService).await?;
+        let server = start_two_pc_server(FailingCommitAfterLocalPrepareGrpcService::new(
+            node_b.clone(),
+            PartitionId(1),
+        ))
+        .await?;
 
         let node_a = create_node_with_options_and_decision_log(
             &rt,
@@ -3031,16 +3111,51 @@ fn test_commit_decision_survives_failed_participant_commit() -> anyhow::Result<(
 
         let decisions = decision_log.decisions();
         assert_eq!(decisions.len(), 1);
-        let decision = decisions
-            .values()
+        let (txn_id, decision) = decisions
+            .iter()
             .next()
             .expect("commit decision should remain for watcher recovery");
         match decision {
-            TwoPhaseDecision::Committed { participants, .. } => {
+            TwoPhaseDecision::Committed {
+                participants,
+                resolved_participants,
+                ..
+            } => {
                 assert_eq!(participants, &vec![0, 1]);
+                assert_eq!(
+                    resolved_participants,
+                    &vec![0],
+                    "local participant should be marked resolved while failed remote commit \
+                     remains pending",
+                );
             },
             other => panic!("expected commit decision, got {other:?}"),
         }
+
+        crate::two_phase_watcher::resolve_decision_for_local_partition(
+            &node_b.committer_for_test(),
+            PartitionId(1),
+            TwoPhaseTransactionId(txn_id.clone()),
+            decision.clone(),
+        )
+        .await?;
+        assert!(
+            decision_log.decisions().is_empty(),
+            "commit decision should be deleted after the delayed participant resolves",
+        );
+        let projects = run_query(
+            node_b,
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        assert!(
+            projects.iter().any(|project| {
+                project.value().0.get("name")
+                    == Some(&assert_val!("prepared-before-commit-rpc-failure"))
+            }),
+            "watcher recovery should commit the delayed remote participant",
+        );
 
         server.shutdown().await?;
         Ok(())

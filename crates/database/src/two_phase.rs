@@ -123,12 +123,79 @@ pub enum TwoPhaseDecision {
     Committed {
         commit_ts: u64,
         participants: Vec<u32>,
+        #[serde(default)]
+        resolved_participants: Vec<u32>,
     },
     /// A participant failed to prepare, or coordinator timed out. Rollback.
     RolledBack {
         reason: String,
         participants: Vec<u32>,
+        #[serde(default)]
+        resolved_participants: Vec<u32>,
     },
+}
+
+impl TwoPhaseDecision {
+    pub fn committed(commit_ts: u64, participants: Vec<u32>) -> Self {
+        Self::Committed {
+            commit_ts,
+            participants,
+            resolved_participants: Vec::new(),
+        }
+    }
+
+    pub fn rolled_back(reason: String, participants: Vec<u32>) -> Self {
+        Self::RolledBack {
+            reason,
+            participants,
+            resolved_participants: Vec::new(),
+        }
+    }
+
+    pub fn participants(&self) -> &[u32] {
+        match self {
+            Self::Committed { participants, .. } | Self::RolledBack { participants, .. } => {
+                participants
+            },
+        }
+    }
+
+    pub fn resolved_participants(&self) -> &[u32] {
+        match self {
+            Self::Committed {
+                resolved_participants,
+                ..
+            }
+            | Self::RolledBack {
+                resolved_participants,
+                ..
+            } => resolved_participants,
+        }
+    }
+
+    pub fn mark_participant_resolved(&mut self, participant: PartitionId) {
+        let resolved = match self {
+            Self::Committed {
+                resolved_participants,
+                ..
+            }
+            | Self::RolledBack {
+                resolved_participants,
+                ..
+            } => resolved_participants,
+        };
+        if !resolved.contains(&participant.0) {
+            resolved.push(participant.0);
+            resolved.sort_unstable();
+            resolved.dedup();
+        }
+    }
+
+    pub fn all_participants_resolved(&self) -> bool {
+        self.participants()
+            .iter()
+            .all(|participant| self.resolved_participants().contains(participant))
+    }
 }
 
 /// Result from a successful Prepare on a participant.
@@ -306,6 +373,19 @@ pub mod testing {
             Ok(self.decisions.lock().get(&transaction_id.0).cloned())
         }
 
+        async fn mark_participant_resolved(
+            &self,
+            transaction_id: &TwoPhaseTransactionId,
+            participant: PartitionId,
+        ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+            let mut decisions = self.decisions.lock();
+            let Some(decision) = decisions.get_mut(&transaction_id.0) else {
+                return Ok(None);
+            };
+            decision.mark_participant_resolved(participant);
+            Ok(Some(decision.clone()))
+        }
+
         async fn delete_decision(
             &self,
             transaction_id: &TwoPhaseTransactionId,
@@ -321,9 +401,6 @@ pub const TWO_PHASE_KV_PREFIX: &str = "2pc_";
 
 /// NATS KV bucket for 2PC state.
 pub const TWO_PHASE_KV_BUCKET: &str = "convex_2pc";
-
-/// Retain resolved 2PC decision records long enough for watcher recovery.
-pub const TWO_PHASE_DECISION_TTL_SECS: u64 = 3600;
 
 /// Timeout for prepared transactions before the watcher rolls them back.
 pub const PREPARE_TIMEOUT_SECS: u64 = 30;
@@ -356,6 +433,12 @@ pub trait TwoPhaseDecisionLog: Send + Sync + 'static {
         Ok(None)
     }
 
+    async fn mark_participant_resolved(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        participant: PartitionId,
+    ) -> anyhow::Result<Option<TwoPhaseDecision>>;
+
     async fn delete_decision(&self, transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()>;
 }
 
@@ -379,6 +462,14 @@ impl TwoPhaseDecisionLog for NoopTwoPhaseDecisionLog {
         Ok(true)
     }
 
+    async fn mark_participant_resolved(
+        &self,
+        _transaction_id: &TwoPhaseTransactionId,
+        _participant: PartitionId,
+    ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+        Ok(None)
+    }
+
     async fn delete_decision(&self, _transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()> {
         Ok(())
     }
@@ -400,7 +491,6 @@ impl NatsTwoPhaseDecisionLog {
             .create_key_value(async_nats::jetstream::kv::Config {
                 bucket: TWO_PHASE_KV_BUCKET.to_string(),
                 history: 1,
-                max_age: Duration::from_secs(TWO_PHASE_DECISION_TTL_SECS),
                 ..Default::default()
             })
             .await
@@ -457,6 +547,50 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
         serde_json::from_slice(&entry.value)
             .with_context(|| format!("2PC: Failed to parse decision for {transaction_id}"))
             .map(Some)
+    }
+
+    async fn mark_participant_resolved(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        participant: PartitionId,
+    ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+        let key = two_phase_decision_key(transaction_id);
+        for _ in 0..10 {
+            let Some(entry) =
+                self.kv.entry(key.clone()).await.with_context(|| {
+                    format!("2PC: Failed to read decision for {transaction_id}")
+                })?
+            else {
+                return Ok(None);
+            };
+            let mut decision: TwoPhaseDecision = serde_json::from_slice(&entry.value)
+                .with_context(|| format!("2PC: Failed to parse decision for {transaction_id}"))?;
+            decision.mark_participant_resolved(participant);
+            let payload = serde_json::to_vec(&decision).with_context(|| {
+                format!("2PC: Failed to serialize decision for {transaction_id}")
+            })?;
+            match self
+                .kv
+                .update(key.clone(), payload.into(), entry.revision)
+                .await
+            {
+                Ok(_) => return Ok(Some(decision)),
+                Err(err)
+                    if err.kind()
+                        == async_nats::jetstream::kv::UpdateErrorKind::WrongLastRevision =>
+                {
+                    continue;
+                },
+                Err(err) => {
+                    anyhow::bail!(
+                        "2PC: Failed to mark {participant} resolved for {transaction_id}: {err:#}"
+                    );
+                },
+            }
+        }
+        anyhow::bail!(
+            "2PC: Failed to mark {participant} resolved for {transaction_id} after CAS retries"
+        )
     }
 
     async fn delete_decision(&self, transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()> {
@@ -1050,19 +1184,19 @@ mod tests {
 
     #[test]
     fn test_decision_serialization() {
-        let decision = TwoPhaseDecision::Committed {
-            commit_ts: 12345,
-            participants: vec![0, 1],
-        };
+        let mut decision = TwoPhaseDecision::committed(12345, vec![0, 1]);
+        decision.mark_participant_resolved(PartitionId(0));
         let json = serde_json::to_string(&decision).unwrap();
         let back: TwoPhaseDecision = serde_json::from_str(&json).unwrap();
         match back {
             TwoPhaseDecision::Committed {
                 commit_ts,
                 participants,
+                resolved_participants,
             } => {
                 assert_eq!(commit_ts, 12345);
                 assert_eq!(participants, vec![0, 1]);
+                assert_eq!(resolved_participants, vec![0]);
             },
             _ => panic!("Wrong variant"),
         }

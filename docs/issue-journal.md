@@ -714,6 +714,30 @@ own for distributed changes.
   - `cargo check -p database`
   - `cargo check -p local_backend`
 
+### 2026-06 — Retained 2PC decisions until every participant resolved
+
+- **Status:** complete
+- **Related issue:** `#151`
+- **What this fixes:** final 2PC decisions were still treated as TTL-scoped
+  recovery hints. The NATS KV bucket used a fixed max age, and the coordinator
+  deleted committed decisions after its immediate participant RPCs returned.
+  A participant that was down, slow, or unreachable after the final decision
+  could therefore lose the only durable source of truth for whether to commit
+  or roll back.
+- **Behavior:** committed and rolled-back decision records now carry a
+  `resolved_participants` set. The coordinator and watcher mark a participant
+  resolved only after that participant has durably committed or rolled back
+  locally. NATS decision updates use compare-and-swap so concurrent resolvers
+  do not clobber each other, the fixed one-hour bucket retention was removed,
+  and final decisions are deleted only after all participants are resolved.
+- **Validation:**
+  - `cargo test -p database decision_survives -- --nocapture`
+  - `cargo test -p database two_phase -- --nocapture`
+  - `cargo test -p database failed_remote_prepare_rolls_back_local_participant -- --nocapture`
+  - `cargo test -p database watcher_rolls_back_abandoned_prepare_without_decision -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
 ### 2026-06 — Split Raft full-state apply from cross-partition replica filtering
 
 - **Status:** complete

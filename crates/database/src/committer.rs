@@ -3450,6 +3450,10 @@ impl<RT: Runtime> Committer<RT> {
                 "2PC RollbackPrepared: txn={} only existed as durable redo; deleting redo",
                 transaction_id,
             );
+            Self::block_on_current_runtime(Self::delete_two_phase_redo(
+                self.persistence.clone(),
+                &transaction_id,
+            ))?;
             return Ok(());
         }
 
