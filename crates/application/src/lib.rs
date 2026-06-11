@@ -13,7 +13,13 @@ use std::{
         HashSet,
     },
     ops::Bound,
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
     time::{
         Duration,
         SystemTime,
@@ -112,6 +118,7 @@ use common::{
     runtime::{
         JoinSet,
         Runtime,
+        SpawnHandle,
         UnixTimestamp,
     },
     schemas::{
@@ -610,6 +617,38 @@ pub struct Application<RT: Runtime> {
     app_auth: Arc<ApplicationAuth>,
     log_manager_client: LogManagerClient,
     oidc_http_client: CachedHttpClient,
+    scheduled_and_cron_worker_starts_allowed: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduledAndCronWorkerStartup {
+    Start,
+    Disabled,
+}
+
+fn start_scheduled_and_cron_workers<RT: Runtime>(
+    runtime: RT,
+    instance_name: String,
+    database: Database<RT>,
+    runner: Arc<ApplicationFunctionRunner<RT>>,
+    function_log: FunctionExecutionLog<RT>,
+) -> (ScheduledJobRunner, Box<dyn SpawnHandle>) {
+    let scheduled_job_runner = ScheduledJobRunner::start(
+        runtime.clone(),
+        instance_name.clone(),
+        database.clone(),
+        runner.clone(),
+        function_log.clone(),
+    );
+    let cron_job_executor_fut = CronJobExecutor::run(
+        runtime.clone(),
+        instance_name,
+        database,
+        runner,
+        function_log,
+    );
+    let cron_job_executor = runtime.spawn("cron_job_executor", cron_job_executor_fut);
+    (scheduled_job_runner, cron_job_executor)
 }
 
 /// Create storage based on the storage type configuration
@@ -706,6 +745,7 @@ impl<RT: Runtime> Application<RT> {
         export_provider: Arc<dyn ExportProvider<RT>>,
         deleted_tablet_receiver: tokio::sync::mpsc::Receiver<TabletId>,
         oidc_http_client: CachedHttpClient,
+        scheduled_and_cron_worker_startup: ScheduledAndCronWorkerStartup,
     ) -> anyhow::Result<Self> {
         let module_cache =
             ModuleCache::new(runtime.clone(), application_storage.modules_storage.clone()).await;
@@ -812,24 +852,25 @@ impl<RT: Runtime> Application<RT> {
         ));
         function_runner.set_action_callbacks(runner.clone());
 
-        let scheduled_job_runner = ScheduledJobRunner::start(
-            runtime.clone(),
-            instance_name.clone(),
-            database.clone(),
-            runner.clone(),
-            function_log.clone(),
-        );
-
-        let cron_job_executor_fut = CronJobExecutor::run(
-            runtime.clone(),
-            instance_name.clone(),
-            database.clone(),
-            runner.clone(),
-            function_log.clone(),
-        );
-        let cron_job_executor = Arc::new(Mutex::new(
-            runtime.spawn("cron_job_executor", cron_job_executor_fut),
-        ));
+        let (scheduled_job_runner, cron_job_executor) = match scheduled_and_cron_worker_startup {
+            ScheduledAndCronWorkerStartup::Start => {
+                let (scheduled_job_runner, cron_job_executor) = start_scheduled_and_cron_workers(
+                    runtime.clone(),
+                    instance_name.clone(),
+                    database.clone(),
+                    runner.clone(),
+                    function_log.clone(),
+                );
+                (Some(scheduled_job_runner), Some(cron_job_executor))
+            },
+            ScheduledAndCronWorkerStartup::Disabled => {
+                tracing::info!(
+                    "Scheduled job and cron workers are disabled until this node has cluster \
+                     authority"
+                );
+                (None, None)
+            },
+        };
 
         let export_worker = ExportWorker::new(
             runtime.clone(),
@@ -875,8 +916,8 @@ impl<RT: Runtime> Application<RT> {
 
         let workers = WorkerHandles {
             usage_gauges_tracking_worker,
-            scheduled_job_runner,
-            cron_job_executor,
+            scheduled_job_runner: Arc::new(Mutex::new(scheduled_job_runner)),
+            cron_job_executor: Arc::new(Mutex::new(cron_job_executor)),
             index_worker,
             fast_forward_worker,
             search_worker,
@@ -907,11 +948,59 @@ impl<RT: Runtime> Application<RT> {
             app_auth,
             log_manager_client,
             oidc_http_client,
+            scheduled_and_cron_worker_starts_allowed: Arc::new(AtomicBool::new(true)),
         })
     }
 
     pub fn runtime(&self) -> RT {
         self.runtime.clone()
+    }
+
+    pub fn start_scheduled_and_cron_workers(&self) {
+        if !self
+            .scheduled_and_cron_worker_starts_allowed
+            .load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let mut scheduled_job_runner = self.workers.scheduled_job_runner.lock();
+        let mut cron_job_executor = self.workers.cron_job_executor.lock();
+        if scheduled_job_runner.is_some() || cron_job_executor.is_some() {
+            return;
+        }
+
+        tracing::info!("Starting scheduled job and cron workers on cluster authority node");
+        let (new_scheduled_job_runner, new_cron_job_executor) = start_scheduled_and_cron_workers(
+            self.runtime.clone(),
+            self.instance_name.clone(),
+            self.database.clone(),
+            self.runner.clone(),
+            self.function_log.clone(),
+        );
+        *scheduled_job_runner = Some(new_scheduled_job_runner);
+        *cron_job_executor = Some(new_cron_job_executor);
+    }
+
+    pub fn stop_scheduled_and_cron_workers(&self) {
+        let scheduled_job_runner = self.workers.scheduled_job_runner.lock().take();
+        let cron_job_executor = self.workers.cron_job_executor.lock().take();
+        if scheduled_job_runner.is_none() && cron_job_executor.is_none() {
+            return;
+        }
+
+        tracing::info!("Stopping scheduled job and cron workers on non-authority node");
+        if let Some(scheduled_job_runner) = scheduled_job_runner {
+            scheduled_job_runner.shutdown();
+        }
+        if let Some(mut cron_job_executor) = cron_job_executor {
+            cron_job_executor.shutdown();
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn scheduled_and_cron_workers_running_for_test(&self) -> bool {
+        self.workers.scheduled_job_runner.lock().is_some()
+            && self.workers.cron_job_executor.lock().is_some()
     }
 
     pub fn modules_storage(&self) -> &Arc<dyn Storage> {
@@ -3609,6 +3698,8 @@ impl<RT: Runtime> Application<RT> {
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.scheduled_and_cron_worker_starts_allowed
+            .store(false, Ordering::SeqCst);
         self.workers.shutdown().await?;
         self.log_manager_client.shutdown().await?;
         self.runner.shutdown().await?;

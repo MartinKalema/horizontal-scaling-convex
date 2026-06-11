@@ -758,6 +758,27 @@ own for distributed changes.
   - `cargo check -p database`
   - `cargo check -p local_backend`
 
+### 2026-06 — Gated scheduled jobs and crons behind cluster singleton authority
+
+- **Status:** complete
+- **Related issue:** `#149`
+- **What this fixes:** scheduled-job and cron executors were started by
+  `Application::new` on every backend process. In clustered mode those workers
+  bypass foreground route authority and could poll or execute deployment-global
+  work from replicas, non-coordinator partitions, or Raft followers.
+- **Behavior:** `Application` now supports starting scheduled-job and cron
+  workers disabled, then toggling them explicitly. Single-node deployments keep
+  the old eager startup behavior. Clustered local-backend nodes start with the
+  workers disabled and run a coordinator-authority supervisor: replicas and
+  non-zero partitions stay idle, partition 0 runs the workers only while it is
+  allowed to own coordinator-singleton work, and partition-0 Raft followers
+  stop them until leadership returns.
+- **Validation:**
+  - `cargo test -p application test_scheduled_and_cron_workers_can_start_disabled -- --nocapture`
+  - `cargo test -p local_backend cluster_singleton_workers_follow_coordinator_authority -- --nocapture`
+  - `cargo check -p application`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current
