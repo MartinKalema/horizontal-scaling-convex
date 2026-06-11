@@ -460,6 +460,15 @@ fn ensure_cluster_coordinator_authority(
             "the coordinator partition is running as a Raft follower".to_string(),
         ));
     }
+    if let Some(raft_state) = st.raft_state()
+        && !raft_state.has_leader_serving_lease()
+    {
+        return Err(unsupported_local_backend_cluster_surface_error(
+            surface,
+            class,
+            "the coordinator partition does not have a fresh Raft serving lease".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -491,12 +500,39 @@ pub(crate) fn ensure_local_backend_api_authority(
 
 #[cfg(test)]
 mod tests {
+    use database::{
+        partition::PartitionId,
+        raft_partition::RaftPartitionState,
+    };
+
     use super::{
         classify_local_backend_api_route,
+        ensure_local_backend_api_authority,
         normalize_local_backend_api_path,
+        ClusterAuthorityContext,
         RouteAuthorityClass,
         LOCAL_BACKEND_API_ROUTE_AUTHORITIES,
     };
+
+    struct TestAuthorityContext {
+        replica_mode: bool,
+        partition_id: Option<PartitionId>,
+        raft_state: Option<RaftPartitionState>,
+    }
+
+    impl ClusterAuthorityContext for TestAuthorityContext {
+        fn replica_mode(&self) -> bool {
+            self.replica_mode
+        }
+
+        fn partition_id(&self) -> Option<PartitionId> {
+            self.partition_id
+        }
+
+        fn raft_state(&self) -> Option<&RaftPartitionState> {
+            self.raft_state.as_ref()
+        }
+    }
 
     fn class_for(path: &str) -> Option<RouteAuthorityClass> {
         classify_local_backend_api_route(path).map(|rule| rule.class)
@@ -557,5 +593,25 @@ mod tests {
         assert!(LOCAL_BACKEND_API_ROUTE_AUTHORITIES
             .iter()
             .all(|rule| !rule.surface.is_empty() && !rule.rationale.is_empty()));
+    }
+
+    #[test]
+    fn test_coordinator_owner_requires_fresh_raft_serving_lease() {
+        let raft_state = RaftPartitionState::new_for_test(true, 1, PartitionId(0), 1);
+        let st = TestAuthorityContext {
+            replica_mode: false,
+            partition_id: Some(PartitionId(0)),
+            raft_state: Some(raft_state.clone()),
+        };
+        ensure_local_backend_api_authority(&st, "/api/sync")
+            .expect("fresh coordinator leader should serve sync");
+
+        raft_state.expire_leader_serving_lease_for_test();
+        let err = ensure_local_backend_api_authority(&st, "/api/sync")
+            .expect_err("stale coordinator leader should not serve sync");
+        assert!(
+            format!("{err:#}").contains("fresh Raft serving lease"),
+            "unexpected error: {err:#}",
+        );
     }
 }
