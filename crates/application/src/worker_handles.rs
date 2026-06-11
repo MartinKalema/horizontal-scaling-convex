@@ -16,8 +16,8 @@ use crate::{
 #[derive(Clone)]
 pub struct WorkerHandles {
     pub(crate) usage_gauges_tracking_worker: UsageGaugesTrackingWorker,
-    pub(crate) scheduled_job_runner: ScheduledJobRunner,
-    pub(crate) cron_job_executor: Arc<Mutex<Box<dyn SpawnHandle>>>,
+    pub(crate) scheduled_job_runner: Arc<Mutex<Option<ScheduledJobRunner>>>,
+    pub(crate) cron_job_executor: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
     pub(crate) index_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
     pub(crate) fast_forward_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
     pub(crate) search_worker: Arc<Mutex<SearchIndexWorkers>>,
@@ -51,8 +51,14 @@ impl WorkerHandles {
         if let Some(snapshot_import_worker) = snapshot_import_worker {
             shutdown_and_join(snapshot_import_worker).await?;
         }
-        self.scheduled_job_runner.shutdown();
-        self.cron_job_executor.lock().shutdown();
+        let scheduled_job_runner = self.scheduled_job_runner.lock().take();
+        if let Some(scheduled_job_runner) = scheduled_job_runner {
+            scheduled_job_runner.shutdown();
+        }
+        let cron_job_executor = self.cron_job_executor.lock().take();
+        if let Some(mut cron_job_executor) = cron_job_executor {
+            cron_job_executor.shutdown();
+        }
         let migration_worker = self.migration_worker.lock().take();
         if let Some(migration_worker) = migration_worker {
             shutdown_and_join(migration_worker).await?;

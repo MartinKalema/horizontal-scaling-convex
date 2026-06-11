@@ -26,6 +26,7 @@ use application::{
     log_visibility::RedactLogsToClient,
     Application,
     QueryCache,
+    ScheduledAndCronWorkerStartup,
 };
 use common::{
     self,
@@ -287,6 +288,57 @@ fn replica_delta_consumer_start_ts(
     } else {
         local_snapshot_ts
     }
+}
+
+fn should_run_cluster_singleton_workers(
+    replica_mode: bool,
+    partition_id: Option<database::partition::PartitionId>,
+    raft_state: Option<&database::raft_partition::RaftPartitionState>,
+) -> bool {
+    if !replica_mode && partition_id.is_none() {
+        return true;
+    }
+    if replica_mode {
+        return false;
+    }
+    let Some(partition_id) = partition_id else {
+        return true;
+    };
+    if partition_id != route_authority::CLUSTER_COORDINATOR_PARTITION {
+        return false;
+    }
+    raft_state.is_none_or(|raft_state| raft_state.is_leader())
+}
+
+fn start_cluster_singleton_worker_supervisor(
+    runtime: ProdRuntime,
+    application: Application<ProdRuntime>,
+    replica_mode: bool,
+    partition_id: Option<database::partition::PartitionId>,
+    raft_state: Option<database::raft_partition::RaftPartitionState>,
+) {
+    if !replica_mode && partition_id.is_none() {
+        return;
+    }
+    let supervisor_runtime = runtime.clone();
+    runtime.spawn_background("cluster_singleton_worker_authority", async move {
+        let mut running = false;
+        loop {
+            let should_run = should_run_cluster_singleton_workers(
+                replica_mode,
+                partition_id,
+                raft_state.as_ref(),
+            );
+            if should_run && !running {
+                application.start_scheduled_and_cron_workers();
+                running = true;
+            } else if !should_run && running {
+                application.stop_scheduled_and_cron_workers();
+                running = false;
+            }
+            supervisor_runtime.wait(Duration::from_millis(250)).await;
+        }
+    });
 }
 
 pub async fn make_app(
@@ -570,6 +622,12 @@ pub async fn make_app(
             fetch_client.clone(),
         )?);
 
+    let scheduled_and_cron_worker_startup =
+        if config.replication_mode == "replica" || config.partition_id.is_some() {
+            ScheduledAndCronWorkerStartup::Disabled
+        } else {
+            ScheduledAndCronWorkerStartup::Start
+        };
     let application = Application::new(
         runtime.clone(),
         database.clone(),
@@ -598,6 +656,7 @@ pub async fn make_app(
         Arc::new(InProcessExportProvider),
         deleted_tablet_receiver,
         oidc_http_client,
+        scheduled_and_cron_worker_startup,
     )
     .await?;
 
@@ -1095,6 +1154,14 @@ pub async fn make_app(
         );
     }
 
+    start_cluster_singleton_worker_supervisor(
+        runtime.clone(),
+        application.clone(),
+        config.replication_mode == "replica",
+        partition_id,
+        raft_state_for_app.clone(),
+    );
+
     let app_state = BackendAppState {
         origin,
         site_origin: config.convex_site_url()?,
@@ -1185,6 +1252,26 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn cluster_singleton_workers_follow_coordinator_authority() {
+        assert!(super::should_run_cluster_singleton_workers(
+            false, None, None,
+        ));
+        assert!(!super::should_run_cluster_singleton_workers(
+            true, None, None,
+        ));
+        assert!(super::should_run_cluster_singleton_workers(
+            false,
+            Some(database::partition::PartitionId(0)),
+            None,
+        ));
+        assert!(!super::should_run_cluster_singleton_workers(
+            false,
+            Some(database::partition::PartitionId(1)),
+            None,
+        ));
     }
 
     #[test]

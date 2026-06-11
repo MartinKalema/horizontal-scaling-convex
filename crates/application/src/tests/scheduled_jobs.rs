@@ -85,6 +85,7 @@ use crate::{
         OBJECTS_TABLE_COMPONENT,
     },
     Application,
+    ScheduledAndCronWorkerStartup,
 };
 
 /// Create a scheduled job in the old format with arguments inline in the
@@ -136,6 +137,25 @@ async fn wait_for_scheduled_job_execution(hold_guard: HoldGuard) {
     if let Some(pause_guard) = hold_guard.wait_for_blocked().await {
         pause_guard.unpause();
     }
+}
+
+#[convex_macro::test_runtime]
+async fn test_scheduled_and_cron_workers_can_start_disabled(rt: TestRuntime) -> anyhow::Result<()> {
+    let application = Application::new_for_tests_with_args(
+        &rt,
+        ApplicationFixtureArgs {
+            scheduled_and_cron_worker_startup: Some(ScheduledAndCronWorkerStartup::Disabled),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    assert!(!application.scheduled_and_cron_workers_running_for_test());
+    application.start_scheduled_and_cron_workers();
+    assert!(application.scheduled_and_cron_workers_running_for_test());
+    application.stop_scheduled_and_cron_workers();
+    assert!(!application.scheduled_and_cron_workers_running_for_test());
+    Ok(())
 }
 
 #[convex_macro::test_runtime]
