@@ -22,7 +22,6 @@ use crate::{
         TwoPhaseDecision,
         TwoPhaseTransactionId,
         PREPARE_TIMEOUT_SECS,
-        TWO_PHASE_DECISION_TTL_SECS,
         TWO_PHASE_KV_BUCKET,
         TWO_PHASE_KV_PREFIX,
     },
@@ -34,11 +33,11 @@ pub async fn resolve_decision_for_local_partition(
     local_partition: PartitionId,
     txn_id: TwoPhaseTransactionId,
     decision: TwoPhaseDecision,
-) {
-    match decision {
+) -> anyhow::Result<bool> {
+    let resolved = match decision {
         TwoPhaseDecision::Committed { participants, .. } => {
             if !participants.contains(&local_partition.0) {
-                return;
+                return Ok(false);
             }
             // Transaction was committed but the coordinator may have crashed
             // before sending CommitPrepared to all participants. Try to commit
@@ -50,6 +49,7 @@ pub async fn resolve_decision_for_local_partition(
                         txn_id,
                         u64::from(ts),
                     );
+                    true
                 },
                 Err(e) => {
                     // "unknown transaction" means it was already committed or
@@ -59,29 +59,59 @@ pub async fn resolve_decision_for_local_partition(
                             "2PC Watcher: committed txn={} already resolved locally",
                             txn_id,
                         );
+                        true
                     } else {
                         tracing::debug!(
                             "2PC Watcher: CommitPrepared for {txn_id} not ready: {e:#}"
                         );
+                        false
                     }
                 },
             }
         },
         TwoPhaseDecision::RolledBack { participants, .. } => {
             if !participants.contains(&local_partition.0) {
-                return;
+                return Ok(false);
             }
             // Transaction was rolled back but cleanup may be incomplete.
             match committer.rollback_prepared(txn_id.clone()).await {
-                Ok(()) | Err(_) => {
+                Ok(()) => {
                     tracing::debug!(
                         "2PC Watcher: rolled back txn={} locally or it was already gone",
                         txn_id,
                     );
+                    true
+                },
+                Err(e) if e.to_string().contains("unknown transaction") => {
+                    tracing::debug!(
+                        "2PC Watcher: rollback txn={} already resolved locally",
+                        txn_id,
+                    );
+                    true
+                },
+                Err(e) => {
+                    tracing::debug!("2PC Watcher: RollbackPrepared for {txn_id} not ready: {e:#}");
+                    false
                 },
             }
         },
+    };
+
+    if resolved {
+        let decision_log = committer.two_phase_decision_log();
+        if let Some(updated) = decision_log
+            .mark_participant_resolved(&txn_id, local_partition)
+            .await?
+            && updated.all_participants_resolved()
+        {
+            decision_log.delete_decision(&txn_id).await?;
+            tracing::info!(
+                "2PC Watcher: deleted fully resolved decision for txn={}",
+                txn_id,
+            );
+        }
     }
+    Ok(resolved)
 }
 
 /// Resolve local prepared transactions that no longer have a coordinator
@@ -109,13 +139,13 @@ pub async fn rollback_expired_local_prepares(
                     .into_iter()
                     .map(|partition| partition.0)
                     .collect();
-                let rollback = TwoPhaseDecision::RolledBack {
-                    reason: format!(
+                let rollback = TwoPhaseDecision::rolled_back(
+                    format!(
                         "2PC prepare timed out after {:?} without a durable coordinator decision",
                         timeout,
                     ),
                     participants,
-                };
+                );
                 if decision_log
                     .write_decision_if_absent(&txn_id, &rollback)
                     .await?
@@ -136,8 +166,11 @@ pub async fn rollback_expired_local_prepares(
                 }
             },
         };
-        resolve_decision_for_local_partition(committer, local_partition, txn_id, decision).await;
-        resolved += 1;
+        if resolve_decision_for_local_partition(committer, local_partition, txn_id, decision)
+            .await?
+        {
+            resolved += 1;
+        }
     }
     Ok(resolved)
 }
@@ -167,7 +200,6 @@ pub fn start<RT: Runtime>(
             .create_key_value(async_nats::jetstream::kv::Config {
                 bucket: TWO_PHASE_KV_BUCKET.to_string(),
                 history: 1,
-                max_age: Duration::from_secs(TWO_PHASE_DECISION_TTL_SECS),
                 ..Default::default()
             })
             .await
@@ -220,8 +252,16 @@ pub fn start<RT: Runtime>(
                     },
                 };
 
-                resolve_decision_for_local_partition(&committer, local_partition, txn_id, decision)
-                    .await;
+                if let Err(err) = resolve_decision_for_local_partition(
+                    &committer,
+                    local_partition,
+                    txn_id,
+                    decision,
+                )
+                .await
+                {
+                    tracing::debug!("2PC Watcher: failed to resolve local decision: {err:#}");
+                }
             }
 
             if let Err(err) = rollback_expired_local_prepares(

@@ -264,14 +264,26 @@ async fn write_decision_record(
     Ok(())
 }
 
-async fn delete_decision_record(
+async fn mark_participant_resolved(
     local_committer: &CommitterClient,
     transaction_id: &TwoPhaseTransactionId,
+    participant: PartitionId,
 ) -> anyhow::Result<()> {
-    local_committer
-        .two_phase_decision_log()
-        .delete_decision(transaction_id)
-        .await
+    let decision_log = local_committer.two_phase_decision_log();
+    let Some(decision) = decision_log
+        .mark_participant_resolved(transaction_id, participant)
+        .await?
+    else {
+        return Ok(());
+    };
+    if decision.all_participants_resolved() {
+        decision_log.delete_decision(transaction_id).await?;
+        tracing::info!(
+            "2PC Coordinator: deleted fully resolved decision for txn={}",
+            transaction_id,
+        );
+    }
+    Ok(())
 }
 
 fn is_retryable_prepare_ts_error(err: &anyhow::Error) -> bool {
@@ -366,10 +378,10 @@ pub async fn coordinate_two_phase_commit(
                     let retryable_prepare_ts_error =
                         is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES;
                     if !prepared_participants.is_empty() {
-                        let decision = TwoPhaseDecision::RolledBack {
-                            reason: err.to_string(),
-                            participants: prepared_participants.iter().map(|p| p.0).collect(),
-                        };
+                        let decision = TwoPhaseDecision::rolled_back(
+                            err.to_string(),
+                            prepared_participants.iter().map(|p| p.0).collect(),
+                        );
                         write_decision_record(local_committer, &txn_id, &decision)
                             .await
                             .with_context(|| {
@@ -380,7 +392,7 @@ pub async fn coordinate_two_phase_commit(
                             })?;
                     }
                     for prepared in prepared_participants.iter().rev().copied() {
-                        if let Err(rollback_err) = rollback_participant(
+                        match rollback_participant(
                             local_committer,
                             node_addresses,
                             partition_map,
@@ -390,12 +402,27 @@ pub async fn coordinate_two_phase_commit(
                         )
                         .await
                         {
-                            tracing::error!(
-                                "2PC Coordinator: rollback failed on {} for txn={}: \
-                                 {rollback_err:#}",
-                                prepared,
-                                txn_id,
-                            );
+                            Ok(()) => {
+                                if let Err(mark_err) =
+                                    mark_participant_resolved(local_committer, &txn_id, prepared)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        "2PC Coordinator: rollback resolved on {} for txn={} but \
+                                         failed to mark participant resolved: {mark_err:#}",
+                                        prepared,
+                                        txn_id,
+                                    );
+                                }
+                            },
+                            Err(rollback_err) => {
+                                tracing::error!(
+                                    "2PC Coordinator: rollback failed on {} for txn={}: \
+                                     {rollback_err:#}",
+                                    prepared,
+                                    txn_id,
+                                );
+                            },
                         }
                     }
 
@@ -424,10 +451,10 @@ pub async fn coordinate_two_phase_commit(
             continue;
         }
 
-        let decision = TwoPhaseDecision::Committed {
-            commit_ts: u64::from(prepare_ts),
-            participants: prepared_participants.iter().map(|p| p.0).collect(),
-        };
+        let decision = TwoPhaseDecision::committed(
+            u64::from(prepare_ts),
+            prepared_participants.iter().map(|p| p.0).collect(),
+        );
         write_decision_record(local_committer, &txn_id, &decision)
             .await
             .with_context(|| {
@@ -452,6 +479,14 @@ pub async fn coordinate_two_phase_commit(
                     return Err(err);
                 },
             };
+            mark_participant_resolved(local_committer, &txn_id, *participant)
+                .await
+                .with_context(|| {
+                    format!(
+                        "2PC Coordinator: participant {participant} committed txn={txn_id} but \
+                         resolution acknowledgement failed"
+                    )
+                })?;
             commit_results.push((*participant, commit_ts));
         }
 
@@ -472,12 +507,6 @@ pub async fn coordinate_two_phase_commit(
         );
         metrics::log_two_phase_prepare_attempts(prepare_attempts);
         metrics::log_two_phase_decision("commit");
-        if let Err(err) = delete_decision_record(local_committer, &txn_id).await {
-            tracing::warn!(
-                "2PC Coordinator: committed txn={} but failed to delete durable decision: {err:#}",
-                txn_id,
-            );
-        }
         timer.finish();
         return Ok(prepare_ts);
     }
