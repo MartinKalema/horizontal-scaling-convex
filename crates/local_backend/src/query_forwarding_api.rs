@@ -110,7 +110,12 @@ impl SelectiveQueryForwardingApi {
             return Ok(None);
         };
         if raft_state.is_leader() {
-            return Ok(None);
+            if raft_state.has_leader_serving_lease() {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "Coordinator partition is leader but does not have a fresh Raft serving lease"
+            );
         }
         let peer_grpc_urls = self.raft_peer_grpc_urls.as_ref().context(
             "Follower public query forwarding requires RAFT_PEERS gRPC URLs to find the current \
@@ -186,6 +191,14 @@ impl SelectiveQueryForwardingApi {
             return Err(self.unsupported_cluster_surface_error(
                 surface,
                 "the coordinator partition is running as a Raft follower".to_string(),
+            ));
+        }
+        if let Some(raft_state) = self.raft_state.as_ref()
+            && !raft_state.has_leader_serving_lease()
+        {
+            return Err(self.unsupported_cluster_surface_error(
+                surface,
+                "the coordinator partition does not have a fresh Raft serving lease".to_string(),
             ));
         }
         Ok(())

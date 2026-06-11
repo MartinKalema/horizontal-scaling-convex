@@ -307,7 +307,8 @@ fn should_run_cluster_singleton_workers(
     if partition_id != route_authority::CLUSTER_COORDINATOR_PARTITION {
         return false;
     }
-    raft_state.is_none_or(|raft_state| raft_state.is_leader())
+    raft_state
+        .is_none_or(|raft_state| raft_state.is_leader() && raft_state.has_leader_serving_lease())
 }
 
 fn start_cluster_singleton_worker_supervisor(
@@ -1271,6 +1272,23 @@ mod tests {
             false,
             Some(database::partition::PartitionId(1)),
             None,
+        ));
+        let raft_state = database::raft_partition::RaftPartitionState::new_for_test(
+            true,
+            1,
+            database::partition::PartitionId(0),
+            1,
+        );
+        assert!(super::should_run_cluster_singleton_workers(
+            false,
+            Some(database::partition::PartitionId(0)),
+            Some(&raft_state),
+        ));
+        raft_state.expire_leader_serving_lease_for_test();
+        assert!(!super::should_run_cluster_singleton_workers(
+            false,
+            Some(database::partition::PartitionId(0)),
+            Some(&raft_state),
         ));
     }
 

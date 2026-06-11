@@ -89,6 +89,7 @@ use crate::{
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long before lack of client response causes a timeout.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
+const SYNC_AUTHORITY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 struct SyncSocketDropToken {
     partition_id_label: String,
@@ -252,7 +253,44 @@ async fn run_sync_socket(
         r
     };
 
-    let result = try_join!(receive_messages, send_messages, sync_worker_go);
+    let authority_monitor = async {
+        loop {
+            if st.replica_mode {
+                anyhow::bail!("Sync socket authority lost: node is running in replica mode");
+            }
+            if let Some(partition_id) = st.partition_id {
+                if partition_id != crate::route_authority::CLUSTER_COORDINATOR_PARTITION {
+                    anyhow::bail!(
+                        "Sync socket authority lost: partition {} is not the coordinator",
+                        partition_id.0,
+                    );
+                }
+            }
+            if let Some(raft_state) = st.raft_state.as_ref() {
+                if !raft_state.is_leader() {
+                    anyhow::bail!(
+                        "Sync socket authority lost: coordinator partition is a Raft follower"
+                    );
+                }
+                if !raft_state.has_leader_serving_lease() {
+                    anyhow::bail!(
+                        "Sync socket authority lost: coordinator partition does not have a fresh \
+                         Raft serving lease"
+                    );
+                }
+            }
+            st.runtime.wait(SYNC_AUTHORITY_CHECK_INTERVAL).await;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let result = try_join!(
+        receive_messages,
+        send_messages,
+        sync_worker_go,
+        authority_monitor
+    );
 
     // This should only fail if we accidentally pass the wrong receiver to
     // `reunite`.

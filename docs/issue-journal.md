@@ -779,6 +779,31 @@ own for distributed changes.
   - `cargo check -p application`
   - `cargo check -p local_backend`
 
+### 2026-06 — Fenced coordinator-owned reads and sync behind a Raft serving lease
+
+- **Status:** complete
+- **Related issue:** `#152`
+- **What this fixes:** coordinator-owned routes such as sync setup, latest
+  queries, actions, and deployment-global request surfaces previously trusted
+  only the local Raft leadership bit. A partition-0 leader isolated from quorum
+  could continue serving stale reads or accepting WebSocket sync setup until
+  its next Raft soft-state transition marked it non-leader.
+- **Behavior:** Raft now maintains a separate short coordinator serving lease.
+  Leadership election grants an initial lease, and leaders refresh it only
+  after observing recent peer quorum responses. Coordinator-owned route
+  authority, latest-query local execution, and cluster-singleton worker
+  ownership now require both Raft leadership and a fresh serving lease. If the
+  lease expires, the node fails closed instead of serving stale coordinator
+  work. Active sync WebSockets also monitor the same authority and close so
+  clients reconnect to the current coordinator.
+- **Validation:**
+  - `cargo test -p local_backend coordinator_owner_requires_fresh_raft_serving_lease -- --nocapture`
+  - `cargo test -p local_backend cluster_singleton_workers_follow_coordinator_authority -- --nocapture`
+  - `cargo test -p database leadership_callback -- --nocapture`
+  - `cargo test -p database single_node_election -- --nocapture`
+  - `cargo check -p database`
+  - `cargo check -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

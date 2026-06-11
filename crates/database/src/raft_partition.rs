@@ -44,8 +44,10 @@ use std::{
         },
         Arc,
     },
+    time::Instant,
 };
 
+use parking_lot::Mutex;
 use raft::prelude::Message;
 use tokio::sync::mpsc;
 
@@ -74,12 +76,23 @@ pub struct RaftPartitionState {
     partition_id: PartitionId,
     /// This node's ID within the Raft group.
     node_id: u64,
+    /// Local serving lease for coordinator-owned reads/subscriptions.
+    leader_serving_lease_valid_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl RaftPartitionState {
     /// Check if this node is the leader for this partition.
     pub fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::SeqCst)
+    }
+
+    pub fn has_leader_serving_lease(&self) -> bool {
+        if !self.is_leader() {
+            return false;
+        }
+        self.leader_serving_lease_valid_until
+            .lock()
+            .is_some_and(|valid_until| valid_until > Instant::now())
     }
 
     /// Get the current leader's node ID.
@@ -132,7 +145,17 @@ impl RaftPartitionState {
             proposal_tx,
             partition_id,
             node_id,
+            leader_serving_lease_valid_until: Arc::new(Mutex::new(if is_leader {
+                Some(Instant::now() + std::time::Duration::from_secs(60))
+            } else {
+                None
+            })),
         }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn expire_leader_serving_lease_for_test(&self) {
+        *self.leader_serving_lease_valid_until.lock() = Some(Instant::now());
     }
 }
 
@@ -169,9 +192,13 @@ impl RaftPartitionManager {
 
         let is_leader = Arc::new(AtomicBool::new(false));
         let leader_id = Arc::new(AtomicU64::new(0));
+        let leader_serving_lease_valid_until = Arc::new(Mutex::new(None));
+        let leader_serving_lease_duration = config.leader_serving_lease_duration();
 
         // Set up leadership callbacks that update shared atomic state.
         let is_leader_cb = is_leader.clone();
+        let serving_lease_refresh = leader_serving_lease_valid_until.clone();
+        let serving_lease_duration_refresh = leader_serving_lease_duration;
         let partition_id = config.partition_id;
 
         node.set_leadership_callbacks(LeadershipCallbacks {
@@ -185,9 +212,11 @@ impl RaftPartitionManager {
             }),
             on_lost_leadership: Box::new({
                 let is_leader_lost = is_leader.clone();
+                let serving_lease_lost = leader_serving_lease_valid_until.clone();
                 let partition_id_lost = partition_id;
                 move || {
                     is_leader_lost.store(false, Ordering::SeqCst);
+                    *serving_lease_lost.lock() = None;
                     metrics::log_raft_is_leader(partition_id_lost, false);
                     metrics::reset_raft_replication_health(partition_id_lost);
                     tracing::info!(
@@ -195,6 +224,10 @@ impl RaftPartitionManager {
                         partition_id_lost,
                     );
                 }
+            }),
+            on_leader_serving_lease_refreshed: Box::new(move || {
+                *serving_lease_refresh.lock() =
+                    Some(Instant::now() + serving_lease_duration_refresh);
             }),
             on_leader_changed: Box::new({
                 let leader_id_changed = leader_id.clone();
@@ -221,6 +254,7 @@ impl RaftPartitionManager {
             proposal_tx: mailbox_tx.clone(),
             partition_id: config.partition_id,
             node_id: config.node_id,
+            leader_serving_lease_valid_until,
         };
         metrics::log_raft_is_leader(config.partition_id, false);
         metrics::log_raft_leader_id(config.partition_id, 0);

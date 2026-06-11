@@ -67,6 +67,18 @@ impl Default for RaftNodeConfig {
     }
 }
 
+impl RaftNodeConfig {
+    /// The Raft run loop ticks every 100ms.
+    pub const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+    pub fn leader_serving_lease_duration(&self) -> Duration {
+        let heartbeat = Self::TICK_INTERVAL * self.heartbeat_tick as u32;
+        let election = Self::TICK_INTERVAL * self.election_tick as u32;
+        let max_lease = election.saturating_sub(Self::TICK_INTERVAL);
+        (heartbeat * 2).min(max_lease).max(Self::TICK_INTERVAL)
+    }
+}
+
 /// A proposal from a client waiting to be committed via Raft.
 pub struct RaftProposal {
     /// Serialized mutation data.
@@ -111,6 +123,9 @@ pub struct LeadershipCallbacks {
     /// Called whenever the known leader changes (including on other nodes).
     /// Receives the new leader's node ID (0 if unknown).
     pub on_leader_changed: Box<dyn FnMut(u64) + Send>,
+    /// Called when the current leader observes enough recent peer responses
+    /// to keep serving coordinator-owned reads and subscriptions.
+    pub on_leader_serving_lease_refreshed: Box<dyn FnMut() + Send>,
 }
 
 impl Default for LeadershipCallbacks {
@@ -119,6 +134,7 @@ impl Default for LeadershipCallbacks {
             on_became_leader: Box::new(|| {}),
             on_lost_leadership: Box::new(|| {}),
             on_leader_changed: Box::new(|_| {}),
+            on_leader_serving_lease_refreshed: Box::new(|| {}),
         }
     }
 }
@@ -147,6 +163,37 @@ pub struct RaftNode {
     durable_applied_index: u64,
     /// Applied entries above `durable_applied_index` waiting for earlier gaps.
     applied_indexes_pending_persistence: BTreeSet<u64>,
+}
+
+fn is_leader_quorum_response(msg: &Message) -> bool {
+    matches!(
+        msg.get_msg_type(),
+        MessageType::MsgAppendResponse
+            | MessageType::MsgHeartbeatResponse
+            | MessageType::MsgSnapStatus
+    )
+}
+
+fn has_recent_peer_quorum(
+    node_id: u64,
+    peers: &[u64],
+    recent_peer_responses: &HashMap<u64, Instant>,
+    now: Instant,
+    lease_duration: Duration,
+) -> bool {
+    let mut recent_voters = 1usize; // self
+    for peer in peers {
+        if *peer == node_id {
+            continue;
+        }
+        if recent_peer_responses
+            .get(peer)
+            .is_some_and(|response_at| now.duration_since(*response_at) <= lease_duration)
+        {
+            recent_voters += 1;
+        }
+    }
+    recent_voters * 2 > peers.len()
 }
 
 impl RaftNode {
@@ -282,7 +329,9 @@ impl RaftNode {
         mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()>,
         mut on_snapshot: impl FnMut(&[u8]) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let tick_interval = Duration::from_millis(100);
+        let tick_interval = RaftNodeConfig::TICK_INTERVAL;
+        let leader_serving_lease_duration = self.config.leader_serving_lease_duration();
+        let mut recent_peer_responses = HashMap::new();
         let mut last_tick = Instant::now();
 
         loop {
@@ -290,6 +339,22 @@ impl RaftNode {
             loop {
                 match self.mailbox.try_recv() {
                     Ok(RaftMessage::Raft(msg)) => {
+                        if self.raw_node.raft.state == StateRole::Leader
+                            && is_leader_quorum_response(&msg)
+                            && msg.from != self.config.node_id
+                        {
+                            let now = Instant::now();
+                            recent_peer_responses.insert(msg.from, now);
+                            if has_recent_peer_quorum(
+                                self.config.node_id,
+                                &self.config.peers,
+                                &recent_peer_responses,
+                                now,
+                                leader_serving_lease_duration,
+                            ) {
+                                (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
+                            }
+                        }
                         if let Err(e) = self.raw_node.step(msg) {
                             tracing::warn!("Raft step error: {e}");
                         }
@@ -327,6 +392,9 @@ impl RaftNode {
             // Tick the election/heartbeat timer.
             if last_tick.elapsed() >= tick_interval {
                 self.raw_node.tick();
+                if self.raw_node.raft.state == StateRole::Leader && self.config.peers.len() == 1 {
+                    (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
+                }
                 last_tick = Instant::now();
             }
 
@@ -391,6 +459,7 @@ impl RaftNode {
                         );
                         self.is_leader_flag = true;
                         (self.leadership_callbacks.on_became_leader)();
+                        (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
                     } else if !now_leader && self.is_leader_flag {
                         tracing::info!(
                             "Raft node {}: lost leadership for partition {}",
@@ -598,6 +667,7 @@ impl RaftNode {
             if now_leader && !self.is_leader_flag {
                 self.is_leader_flag = true;
                 (self.leadership_callbacks.on_became_leader)();
+                (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
             } else if !now_leader && self.is_leader_flag {
                 self.is_leader_flag = false;
                 (self.leadership_callbacks.on_lost_leadership)();
@@ -868,6 +938,7 @@ mod tests {
                 observed_leader_id_clone.store(leader_id, std::sync::atomic::Ordering::SeqCst);
             }),
             on_lost_leadership: Box::new(|| {}),
+            on_leader_serving_lease_refreshed: Box::new(|| {}),
         });
 
         assert!(!became_leader.load(std::sync::atomic::Ordering::SeqCst));
