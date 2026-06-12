@@ -126,6 +126,7 @@ use value::{
     heap_size::WithHeapSize,
     id_v6::PublicDocumentId,
     InternalDocumentId,
+    ResolvedDocumentId,
     TableMapping,
     TableName,
 };
@@ -367,6 +368,123 @@ fn checkpoint_index_entries(
     }
     index_entries.sort();
     index_entries
+}
+
+fn remap_index_metadata_document(
+    document: &ResolvedDocument,
+    local_index_tablet: value::TabletId,
+    tablet_remap: &BTreeMap<value::TabletId, value::TabletId>,
+    downgrade_query_ready_state: bool,
+) -> anyhow::Result<ResolvedDocument> {
+    let remote_metadata =
+        common::bootstrap_model::index::TabletIndexMetadata::from_document(document.clone())?
+            .into_value();
+    let mut local_metadata = remote_metadata.map_table(&|remote_tablet| {
+        tablet_remap.get(&remote_tablet).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot remap replicated _index metadata for source TabletId {:?}: table is not \
+                 mapped locally",
+                remote_tablet,
+            )
+        })
+    })?;
+    if downgrade_query_ready_state {
+        downgrade_replicated_index_metadata(&mut local_metadata);
+    }
+    let remapped_id = ResolvedDocumentId {
+        tablet_id: local_index_tablet,
+        document_id: document.id().document_id,
+    };
+    ResolvedDocument::new(
+        remapped_id,
+        document.creation_time(),
+        local_metadata.try_into()?,
+    )
+}
+
+fn remap_index_metadata_update(
+    update: &common::document::DocumentUpdate,
+    local_index_tablet: value::TabletId,
+    tablet_remap: &BTreeMap<value::TabletId, value::TabletId>,
+    downgrade_query_ready_state: bool,
+) -> anyhow::Result<common::document::DocumentUpdate> {
+    let remapped_id = ResolvedDocumentId {
+        tablet_id: local_index_tablet,
+        document_id: update.id.document_id,
+    };
+    Ok(common::document::DocumentUpdate {
+        id: remapped_id,
+        old_document: update
+            .old_document
+            .as_ref()
+            .map(|document| {
+                remap_index_metadata_document(
+                    document,
+                    local_index_tablet,
+                    tablet_remap,
+                    downgrade_query_ready_state,
+                )
+            })
+            .transpose()?,
+        new_document: update
+            .new_document
+            .as_ref()
+            .map(|document| {
+                remap_index_metadata_document(
+                    document,
+                    local_index_tablet,
+                    tablet_remap,
+                    downgrade_query_ready_state,
+                )
+            })
+            .transpose()?,
+    })
+}
+
+fn downgrade_replicated_index_metadata(
+    metadata: &mut common::bootstrap_model::index::TabletIndexMetadata,
+) {
+    use common::bootstrap_model::index::{
+        database_index::{
+            DatabaseIndexBackfillState,
+            DatabaseIndexState,
+        },
+        text_index::{
+            TextIndexBackfillState,
+            TextIndexState,
+        },
+        vector_index::{
+            VectorIndexBackfillState,
+            VectorIndexState,
+        },
+        IndexConfig,
+    };
+
+    match &mut metadata.config {
+        IndexConfig::Database { on_disk_state, .. } => {
+            let staged = on_disk_state.is_staged();
+            if !matches!(on_disk_state, DatabaseIndexState::Backfilling(_)) {
+                *on_disk_state = DatabaseIndexState::Backfilling(DatabaseIndexBackfillState {
+                    index_created_lower_bound: Timestamp::MIN,
+                    retention_started: false,
+                    staged,
+                });
+            }
+        },
+        IndexConfig::Text { on_disk_state, .. } => {
+            let staged = on_disk_state.is_staged();
+            if !matches!(on_disk_state, TextIndexState::Backfilling(_)) {
+                *on_disk_state = TextIndexState::Backfilling(TextIndexBackfillState::new(staged));
+            }
+        },
+        IndexConfig::Vector { on_disk_state, .. } => {
+            let staged = on_disk_state.is_staged();
+            if !matches!(on_disk_state, VectorIndexState::Backfilling(_)) {
+                *on_disk_state =
+                    VectorIndexState::Backfilling(VectorIndexBackfillState::new(staged));
+            }
+        },
+    }
 }
 
 type RaftCommitWaiter = Option<oneshot::Receiver<RaftProposalResult>>;
@@ -2946,19 +3064,32 @@ impl<RT: Runtime> Committer<RT> {
                     return Ok(());
                 },
             };
-            let remapped = DocumentUpdate {
-                id: ResolvedDocumentId {
-                    tablet_id: local_tablet,
-                    document_id: update.id.document_id,
-                },
-                old_document: update
-                    .old_document
-                    .as_ref()
-                    .map(|d| d.to_remapped(local_tablet)),
-                new_document: update
-                    .new_document
-                    .as_ref()
-                    .map(|d| d.to_remapped(local_tablet)),
+            let remapped = if delta
+                .tablet_id_to_table_name
+                .get(&primary_tablet)
+                .is_some_and(|name| name == index_table_name)
+            {
+                remap_index_metadata_update(
+                    update,
+                    local_tablet,
+                    &remap,
+                    mode == ReplicaDeltaApplyMode::CrossPartitionReplica,
+                )?
+            } else {
+                DocumentUpdate {
+                    id: ResolvedDocumentId {
+                        tablet_id: local_tablet,
+                        document_id: update.id.document_id,
+                    },
+                    old_document: update
+                        .old_document
+                        .as_ref()
+                        .map(|d| d.to_remapped(local_tablet)),
+                    new_document: update
+                        .new_document
+                        .as_ref()
+                        .map(|d| d.to_remapped(local_tablet)),
+                }
             };
             let (idx_updates, ..) = snapshot.update(&remapped, commit_ts)?;
             all_index_updates.extend(idx_updates);
@@ -4801,6 +4932,7 @@ fn is_retryable_system_generated_id_conflict(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         str::FromStr,
         sync::{
             atomic::{
@@ -4813,17 +4945,39 @@ mod tests {
 
     use async_trait::async_trait;
     use common::{
+        bootstrap_model::index::{
+            database_index::IndexedFields,
+            IndexMetadata,
+            TabletIndexMetadata,
+        },
+        document::{
+            CreationTime,
+            DocumentUpdate,
+            ResolvedDocument,
+        },
         persistence::Persistence,
         testing::TestPersistence,
+        types::{
+            GenericIndexName,
+            IndexDescriptor,
+        },
     };
     use futures::stream::BoxStream;
     use runtime::testing::TestRuntime;
     use sync_types::Timestamp;
     use tokio::sync::oneshot;
-    use value::TableName;
+    use value::{
+        InternalId,
+        PublicDocumentId,
+        ResolvedDocumentId,
+        TableName,
+        TableNumber,
+        TabletId,
+    };
 
     use super::{
         is_retryable_system_generated_id_conflict,
+        remap_index_metadata_update,
         Committer,
     };
     use crate::{
@@ -4889,6 +5043,90 @@ mod tests {
             tablet_id_to_table_name: Default::default(),
             source_partition: Some(PartitionId(0)),
         }
+    }
+
+    fn test_tablet(byte: u8) -> TabletId {
+        TabletId(InternalId([byte; 16]))
+    }
+
+    fn test_resolved_id(
+        tablet_id: TabletId,
+        table_number: u32,
+        document_byte: u8,
+    ) -> anyhow::Result<ResolvedDocumentId> {
+        Ok(ResolvedDocumentId::new(
+            tablet_id,
+            PublicDocumentId::new(
+                TableNumber::try_from(table_number)?,
+                InternalId([document_byte; 16]),
+            ),
+        ))
+    }
+
+    fn test_index_metadata_update(
+        source_index_tablet: TabletId,
+        source_index_table_number: u32,
+        source_user_tablet: TabletId,
+    ) -> anyhow::Result<DocumentUpdate> {
+        let metadata = IndexMetadata::new_enabled(
+            GenericIndexName::new(
+                source_user_tablet,
+                IndexDescriptor::new("by_status".to_string())?,
+            )?,
+            IndexedFields::by_id(),
+        );
+        let document = ResolvedDocument::new(
+            test_resolved_id(source_index_tablet, source_index_table_number, 99)?,
+            CreationTime::ONE,
+            metadata.try_into()?,
+        )?;
+        Ok(DocumentUpdate {
+            id: document.id(),
+            old_document: None,
+            new_document: Some(document),
+        })
+    }
+
+    #[test]
+    fn replicated_index_metadata_remaps_target_tablet_and_downgrades_query_ready_state(
+    ) -> anyhow::Result<()> {
+        let source_index_tablet = test_tablet(1);
+        let local_index_tablet = test_tablet(2);
+        let source_user_tablet = test_tablet(3);
+        let local_user_tablet = test_tablet(4);
+        let update = test_index_metadata_update(source_index_tablet, 2, source_user_tablet)?;
+        let tablet_remap = BTreeMap::from([(source_user_tablet, local_user_tablet)]);
+
+        let remapped =
+            remap_index_metadata_update(&update, local_index_tablet, &tablet_remap, true)?;
+
+        assert_eq!(remapped.id.tablet_id, local_index_tablet);
+        let metadata =
+            TabletIndexMetadata::from_document(remapped.new_document.unwrap())?.into_value();
+        assert_eq!(*metadata.name.table(), local_user_tablet);
+        assert!(metadata.config.is_backfilling());
+        assert!(!metadata.config.is_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn raft_index_metadata_remap_preserves_query_ready_state() -> anyhow::Result<()> {
+        let source_index_tablet = test_tablet(11);
+        let local_index_tablet = test_tablet(12);
+        let source_user_tablet = test_tablet(13);
+        let local_user_tablet = test_tablet(14);
+        let update = test_index_metadata_update(source_index_tablet, 2, source_user_tablet)?;
+        let tablet_remap = BTreeMap::from([(source_user_tablet, local_user_tablet)]);
+
+        let remapped =
+            remap_index_metadata_update(&update, local_index_tablet, &tablet_remap, false)?;
+
+        assert_eq!(remapped.id.tablet_id, local_index_tablet);
+        let metadata =
+            TabletIndexMetadata::from_document(remapped.new_document.unwrap())?.into_value();
+        assert_eq!(*metadata.name.table(), local_user_tablet);
+        assert!(metadata.config.is_enabled());
+        Ok(())
     }
 
     #[tokio::test]
