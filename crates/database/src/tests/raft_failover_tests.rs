@@ -70,6 +70,14 @@ fn create_three_node_group() -> Vec<RaftNode> {
 /// Run one Raft tick cycle: tick all nodes, process ready, route messages.
 /// `active` controls which nodes participate (for simulating kills/partitions).
 fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
+    tick_cycle_with_message_filter(nodes, active, |_, _, _| true)
+}
+
+fn tick_cycle_with_message_filter(
+    nodes: &mut [RaftNode],
+    active: &[bool],
+    mut should_deliver: impl FnMut(u64, u64, &raft::prelude::Message) -> bool,
+) -> Vec<Vec<u8>> {
     let mut committed = Vec::new();
 
     for (i, node) in nodes.iter_mut().enumerate() {
@@ -134,7 +142,7 @@ fn tick_cycle(nodes: &mut [RaftNode], active: &[bool]) -> Vec<Vec<u8>> {
         let is_snapshot = msg.get_msg_type() == raft::prelude::MessageType::MsgSnapshot;
         let mut delivered = false;
         for (i, node) in nodes.iter_mut().enumerate() {
-            if active[i] && node.node_id() == to {
+            if active[i] && node.node_id() == to && should_deliver(from, to, &msg) {
                 let _ = node.raw_node.step(msg.clone());
                 delivered = true;
                 break;
@@ -362,6 +370,70 @@ async fn test_network_partition_minority_isolated() {
     assert!(
         committed.iter().any(|d| d == b"during partition"),
         "Majority should still commit during minority partition"
+    );
+}
+
+#[tokio::test]
+async fn test_asymmetric_leader_to_follower_message_loss_recovers() {
+    let mut nodes = create_three_node_group();
+    let leader_id = elect_leader(&mut nodes);
+    let leader_idx = node_idx(&nodes, leader_id);
+    let lagging_follower_id = nodes
+        .iter()
+        .find(|node| node.node_id() != leader_id)
+        .expect("expected a follower")
+        .node_id();
+    let lagging_follower_idx = node_idx(&nodes, lagging_follower_id);
+    let all_active = vec![true; 3];
+
+    nodes[leader_idx]
+        .raw_node
+        .propose(vec![], b"asymmetric-loss".to_vec())
+        .unwrap();
+
+    let mut committed = Vec::new();
+    for _ in 0..30 {
+        committed.extend(tick_cycle_with_message_filter(
+            &mut nodes,
+            &all_active,
+            |from, to, _| !(from == leader_id && to == lagging_follower_id),
+        ));
+        if committed.iter().any(|data| data == b"asymmetric-loss") {
+            break;
+        }
+    }
+
+    assert!(
+        committed.iter().any(|data| data == b"asymmetric-loss"),
+        "leader plus the other follower should still form a quorum under one-way message loss",
+    );
+    assert!(
+        nodes[lagging_follower_idx].storage.last_index().unwrap()
+            < nodes[leader_idx].storage.last_index().unwrap(),
+        "the follower that cannot receive leader messages should actually lag before the link \
+         heals",
+    );
+
+    for _ in 0..80 {
+        tick_cycle(&mut nodes, &all_active);
+        if nodes[lagging_follower_idx].storage.last_index().unwrap()
+            == nodes[leader_idx].storage.last_index().unwrap()
+            && nodes[lagging_follower_idx].raw_node.raft.raft_log.committed
+                == nodes[leader_idx].raw_node.raft.raft_log.committed
+        {
+            break;
+        }
+    }
+
+    assert_eq!(
+        nodes[lagging_follower_idx].storage.last_index().unwrap(),
+        nodes[leader_idx].storage.last_index().unwrap(),
+        "lagging follower should catch up after asymmetric message loss heals",
+    );
+    assert_eq!(
+        nodes[lagging_follower_idx].raw_node.raft.raft_log.committed,
+        nodes[leader_idx].raw_node.raft.raft_log.committed,
+        "lagging follower should recover the leader's committed index",
     );
 }
 
