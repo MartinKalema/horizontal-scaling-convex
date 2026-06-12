@@ -56,6 +56,7 @@ use common::{
     knobs::{
         DEFAULT_DOCUMENTS_PAGE_SIZE,
         LIST_SNAPSHOT_MAX_AGE_SECS,
+        REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
         SNAPSHOT_LIST_TIME_LIMIT,
     },
     pause::Fault,
@@ -1062,7 +1063,12 @@ impl<RT: Runtime> Database<RT> {
             None => BTreeMap::new(),
         };
 
-        let snapshot_manager = SnapshotManager::new(*ts, snapshot, replication_frontiers);
+        let snapshot_manager = SnapshotManager::new(
+            *ts,
+            snapshot,
+            replication_frontiers,
+            applied_delta_watermarks.clone(),
+        );
         let (snapshot_reader, snapshot_writer) = new_split_rw_lock(snapshot_manager);
 
         let retention_workers = retention_worker_seed
@@ -1725,6 +1731,40 @@ impl<RT: Runtime> Database<RT> {
             .lock()
             .wait_for_replication_write_frontier(partition, write_ts);
         fut.await;
+    }
+
+    /// Wait until a new read on this node can satisfy a portable
+    /// read-after-write token produced by a mutation response.
+    ///
+    /// Tokens from this node's own partition use the local snapshot timestamp.
+    /// Tokens from a remote partition use the origin-partition watermark, since
+    /// replica deltas can be applied at a translated local timestamp.
+    pub async fn wait_for_read_after_write_fence(
+        &self,
+        source_partition: Option<crate::partition::PartitionId>,
+        write_ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        let local_partition = self.committer.local_partition();
+        if source_partition.is_none() || source_partition == local_partition {
+            self.wait_for_write_ts(write_ts).await;
+            return Ok(());
+        }
+
+        let source_partition = source_partition.expect("checked above");
+        let fut = self
+            .snapshot_manager
+            .lock()
+            .wait_for_applied_delta_watermark(source_partition, write_ts);
+        match tokio::time::timeout(*REMOTE_READ_FRONTIER_WAIT_TIMEOUT, fut).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(
+                anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(format!(
+                    "Timed out after {:?} waiting for read-after-write fence from partition {} at \
+                     ts {}",
+                    *REMOTE_READ_FRONTIER_WAIT_TIMEOUT, source_partition.0, write_ts,
+                )),
+            ),
+        }
     }
 
     pub async fn begin_system(&self) -> anyhow::Result<Transaction<RT>> {

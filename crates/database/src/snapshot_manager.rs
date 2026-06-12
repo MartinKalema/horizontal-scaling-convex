@@ -94,10 +94,13 @@ pub struct SnapshotManager {
     versions: VecDeque<(Timestamp, Snapshot)>,
     replication_frontiers: BTreeMap<PartitionId, Timestamp>,
     replication_write_frontiers: BTreeMap<PartitionId, Timestamp>,
+    applied_delta_watermarks: BTreeMap<PartitionId, Timestamp>,
     write_throughput_limiter: WriteThroughputLimiter,
     waiters: Mutex<VecDeque<(Timestamp, oneshot::Sender<()>)>>,
     replication_waiters: Mutex<BTreeMap<PartitionId, VecDeque<(Timestamp, oneshot::Sender<()>)>>>,
     replication_write_waiters:
+        Mutex<BTreeMap<PartitionId, VecDeque<(Timestamp, oneshot::Sender<()>)>>>,
+    applied_delta_watermark_waiters:
         Mutex<BTreeMap<PartitionId, VecDeque<(Timestamp, oneshot::Sender<()>)>>>,
 }
 
@@ -591,6 +594,7 @@ impl SnapshotManager {
         initial_ts: Timestamp,
         initial_snapshot: Snapshot,
         replication_frontiers: BTreeMap<PartitionId, Timestamp>,
+        applied_delta_watermarks: BTreeMap<PartitionId, Timestamp>,
     ) -> Self {
         let replication_write_frontiers = replication_frontiers
             .iter()
@@ -611,10 +615,12 @@ impl SnapshotManager {
             persisted_max_repeatable_ts: initial_ts,
             replication_frontiers,
             replication_write_frontiers,
+            applied_delta_watermarks,
             write_throughput_limiter: WriteThroughputLimiter::new(),
             waiters: Mutex::new(VecDeque::new()),
             replication_waiters: Mutex::new(BTreeMap::new()),
             replication_write_waiters: Mutex::new(BTreeMap::new()),
+            applied_delta_watermark_waiters: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -716,6 +722,30 @@ impl SnapshotManager {
         }
     }
 
+    fn notify_applied_delta_watermark_waiters(&self, partition: PartitionId) {
+        let Some(watermark) = self.applied_delta_watermarks.get(&partition).copied() else {
+            return;
+        };
+        let mut waiters = self.applied_delta_watermark_waiters.lock();
+        let Some(partition_waiters) = waiters.get_mut(&partition) else {
+            return;
+        };
+        let mut i = 0;
+        while i < partition_waiters.len() {
+            if watermark >= partition_waiters[i].0 || partition_waiters[i].1.is_closed() {
+                let waiter = partition_waiters
+                    .swap_remove_back(i)
+                    .expect("checked above");
+                let _ = waiter.1.send(());
+                continue;
+            }
+            i += 1;
+        }
+        if partition_waiters.is_empty() {
+            waiters.remove(&partition);
+        }
+    }
+
     /// Returns a future that blocks until the snapshot manager has advanced
     /// past the given timestamp.
     pub fn wait_for_higher_ts(&self, target_ts: Timestamp) -> impl Future<Output = ()> + use<> {
@@ -747,6 +777,10 @@ impl SnapshotManager {
 
     pub fn replication_write_frontier(&self, partition: PartitionId) -> Option<Timestamp> {
         self.replication_write_frontiers.get(&partition).copied()
+    }
+
+    pub fn applied_delta_watermark(&self, partition: PartitionId) -> Option<Timestamp> {
+        self.applied_delta_watermarks.get(&partition).copied()
     }
 
     pub fn update_replication_frontier(
@@ -787,6 +821,25 @@ impl SnapshotManager {
         self.replication_write_frontiers.insert(partition, ts);
         metrics::log_replication_write_frontier_ts(partition, ts);
         self.notify_replication_write_waiters(partition);
+        Ok(true)
+    }
+
+    pub fn update_applied_delta_watermark(
+        &mut self,
+        partition: PartitionId,
+        ts: Timestamp,
+    ) -> anyhow::Result<bool> {
+        if let Some(current) = self.applied_delta_watermarks.get(&partition) {
+            anyhow::ensure!(
+                ts >= *current,
+                "applied delta watermark for {partition} went backward from {current:?} to {ts:?}",
+            );
+            if ts == *current {
+                return Ok(false);
+            }
+        }
+        self.applied_delta_watermarks.insert(partition, ts);
+        self.notify_applied_delta_watermark_waiters(partition);
         Ok(true)
     }
 
@@ -836,6 +889,36 @@ impl SnapshotManager {
         } else {
             let (sender, receiver) = oneshot::channel();
             self.replication_write_waiters
+                .lock()
+                .entry(partition)
+                .or_default()
+                .push_back((target_ts, sender));
+            Some(receiver)
+        };
+
+        async move {
+            if let Some(receiver) = receiver {
+                _ = receiver.await;
+            }
+        }
+    }
+
+    pub fn wait_for_applied_delta_watermark(
+        &self,
+        partition: PartitionId,
+        target_ts: Timestamp,
+    ) -> impl Future<Output = ()> + use<> {
+        self.notify_applied_delta_watermark_waiters(partition);
+
+        let receiver = if self
+            .applied_delta_watermarks
+            .get(&partition)
+            .is_some_and(|watermark| *watermark >= target_ts)
+        {
+            None
+        } else {
+            let (sender, receiver) = oneshot::channel();
+            self.applied_delta_watermark_waiters
                 .lock()
                 .entry(partition)
                 .or_default()
@@ -984,6 +1067,7 @@ impl SnapshotManager {
         ts: Timestamp,
         snapshot: Snapshot,
         replication_frontiers: BTreeMap<PartitionId, Timestamp>,
+        applied_delta_watermarks: BTreeMap<PartitionId, Timestamp>,
     ) {
         let replication_write_frontiers = replication_frontiers
             .iter()
@@ -994,6 +1078,7 @@ impl SnapshotManager {
         self.persisted_max_repeatable_ts = ts;
         self.replication_frontiers = replication_frontiers;
         self.replication_write_frontiers = replication_write_frontiers;
+        self.applied_delta_watermarks = applied_delta_watermarks;
         metrics::log_latest_repeatable_ts(ts);
         metrics::log_persisted_max_repeatable_ts(ts);
         for (partition, frontier) in &self.replication_frontiers {
@@ -1007,6 +1092,10 @@ impl SnapshotManager {
         for partition in partitions {
             self.notify_replication_waiters(partition);
             self.notify_replication_write_waiters(partition);
+        }
+        let partitions: Vec<_> = self.applied_delta_watermarks.keys().copied().collect();
+        for partition in partitions {
+            self.notify_applied_delta_watermark_waiters(partition);
         }
     }
 

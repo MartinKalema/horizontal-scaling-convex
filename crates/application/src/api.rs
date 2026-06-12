@@ -24,6 +24,7 @@ use common::{
     RequestId,
 };
 use database::{
+    partition::PartitionId,
     Database,
     LogReader,
     ReadSet,
@@ -82,6 +83,12 @@ pub enum ExecuteQueryTimestamp {
     At(Timestamp),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadAfterWriteFence {
+    pub source_partition: Option<PartitionId>,
+    pub ts: Timestamp,
+}
+
 // A trait that abstracts the backend API. It all state and validation logic
 // so http routes can be kept thin and stateless. The implementor is also
 // responsible for routing the request to the appropriate backend in the hosted
@@ -107,6 +114,7 @@ pub trait ApplicationApi: Send + Sync {
         args: SerializedArgs,
         caller: FunctionCaller,
         ts: ExecuteQueryTimestamp,
+        read_after_write: Option<ReadAfterWriteFence>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<RedactedQueryReturn>;
 
@@ -283,12 +291,18 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         args: SerializedArgs,
         caller: FunctionCaller,
         ts: ExecuteQueryTimestamp,
+        read_after_write: Option<ReadAfterWriteFence>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<RedactedQueryReturn> {
         anyhow::ensure!(
             caller.allowed_visibility() == AllowedVisibility::PublicOnly,
             "This method should not be used by internal callers."
         );
+        if let Some(fence) = read_after_write {
+            self.database
+                .wait_for_read_after_write_fence(fence.source_partition, fence.ts)
+                .await?;
+        }
         let ts = match ts {
             ExecuteQueryTimestamp::Latest => *self.now_ts_for_reads(),
             ExecuteQueryTimestamp::At(ts) => ts,

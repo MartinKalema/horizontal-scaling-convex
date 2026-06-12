@@ -961,6 +961,7 @@ impl<RT: Runtime> SyncWorker<RT> {
                                             query.args.clone(),
                                             caller.clone(),
                                             ExecuteQueryTimestamp::At(new_ts),
+                                            None,
                                             query.journal.clone(),
                                         )
                                         .await

@@ -14,6 +14,7 @@ use application::{
     api::{
         ApplicationApi,
         ExecuteQueryTimestamp,
+        ReadAfterWriteFence,
     },
     RedactedQueryReturn,
 };
@@ -24,7 +25,10 @@ use common::{
     version::ClientVersion,
     RequestId,
 };
-use database::Token;
+use database::{
+    partition::PartitionId,
+    Token,
+};
 use keybroker::Identity;
 use pb::replication::{
     forward_mutation_response,
@@ -207,6 +211,15 @@ impl MutationForwarder for MutationForwarderService {
             })?),
             None => ExecuteQueryTimestamp::Latest,
         };
+        let read_after_write = match req.read_after_write_ts {
+            Some(ts) => Some(ReadAfterWriteFence {
+                source_partition: req.read_after_write_source_partition.map(PartitionId),
+                ts: ts.try_into().map_err(|e: anyhow::Error| {
+                    Status::invalid_argument(format!("Invalid read-after-write ts: {e}"))
+                })?,
+            }),
+            None => None,
+        };
 
         let result = self
             .api
@@ -218,6 +231,7 @@ impl MutationForwarder for MutationForwarderService {
                 args,
                 caller,
                 ts,
+                read_after_write,
                 Some(req.journal),
             )
             .await;
@@ -338,6 +352,7 @@ impl MutationForwarderGrpcClient {
         identity: Identity,
         caller: FunctionCaller,
         ts: Option<u64>,
+        read_after_write: Option<ReadAfterWriteFence>,
         journal: Option<String>,
     ) -> anyhow::Result<RedactedQueryReturn> {
         let identity_proto: pb::convex_identity::UncheckedIdentity = identity.into();
@@ -348,6 +363,9 @@ impl MutationForwarderGrpcClient {
             caller: Some(caller.into()),
             ts,
             journal,
+            read_after_write_source_partition: read_after_write
+                .and_then(|fence| fence.source_partition.map(|partition| partition.0)),
+            read_after_write_ts: read_after_write.map(|fence| u64::from(fence.ts)),
         };
         let response = self
             .client
