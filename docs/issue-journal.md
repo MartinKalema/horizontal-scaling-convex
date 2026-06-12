@@ -829,6 +829,27 @@ own for distributed changes.
   - `cargo test -p local_backend application_workers_fail_closed_for_clustered_nodes -- --nocapture`
   - `cargo check -p application -p local_backend`
 
+### 2026-06 — Added durable Raft-to-NATS replay outbox
+
+- **Status:** complete
+- **Related issue:** `#147`
+- **What this fixes:** after a partition write reached Raft quorum and local
+  durability, cross-partition NATS publication could fail and leave the commit
+  visible only inside the source partition. The write was no longer roll-backable
+  but remote partitions had no durable replay source for the missing delta.
+- **Behavior:** partitioned Raft commit deltas are recorded in a node-local
+  `RaftNatsOutbox` persistence global before NATS publication and removed only
+  after the distributed log publish succeeds. Same-partition Raft followers also
+  record the outbox entry when applying the committed Raft delta, so a promoted
+  follower can replay the delta. The committer periodically drains the outbox
+  only while it is the partition's Raft leader; failed publishes leave the entry
+  in place for retry. Replica-side applied-delta watermarks keep replayed
+  duplicates idempotent.
+- **Validation:**
+  - `cargo test -p database raft_nats_outbox -- --nocapture`
+  - `cargo test -p common test_persistence_global_roundtrips -- --nocapture`
+  - `cargo check -p database -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

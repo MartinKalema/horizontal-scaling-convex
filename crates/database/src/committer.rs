@@ -153,6 +153,7 @@ use crate::{
         table_summary_finish_bootstrap_timer,
         user_documents_size_subgauge,
     },
+    nats_distributed_log::DeltaEnvelope,
     raft_node::RaftProposalResult,
     raft_state_machine::RaftStateMachineEntry,
     reads::ReadSet,
@@ -190,6 +191,9 @@ use crate::{
 
 const INITIAL_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
+const RAFT_NATS_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
+
+type RaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
 
 /// State held for a 2PC-prepared transaction awaiting commit/rollback.
 struct PreparedTransaction {
@@ -236,6 +240,7 @@ enum PersistenceWrite {
         write_bytes: u64,
         source_partition: Option<crate::partition::PartitionId>,
         applied_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
+        raft_nats_outbox_delta: Option<CommitDelta>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -556,10 +561,20 @@ impl<RT: Runtime> Committer<RT> {
 
     async fn go(mut self, mut rx: mpsc::Receiver<CommitterMessage>) -> anyhow::Result<()> {
         self.recover_two_phase_redo_records().await?;
+        if self.should_replay_raft_nats_outbox()
+            && let Err(err) = Self::replay_raft_nats_outbox_once(
+                self.persistence.clone(),
+                self.distributed_log.clone(),
+            )
+            .await
+        {
+            tracing::warn!("Failed to replay Raft->NATS outbox during committer startup: {err:#}");
+        }
 
         let mut last_bumped_repeatable_ts = self.runtime.monotonic_now();
         let mut last_remote_read_frontier_heartbeat = self.runtime.monotonic_now();
         let mut last_remote_read_frontier_heartbeat_ts = Timestamp::MIN;
+        let mut last_raft_nats_outbox_replay = self.runtime.monotonic_now();
         // Assume there were commits just before the backend restarted, so first do a
         // quick bump.
         // None means a bump is ongoing. Avoid parallel bumps in case they
@@ -600,6 +615,20 @@ impl<RT: Runtime> Committer<RT> {
             } else {
                 Either::Right(std::future::pending())
             };
+            let raft_nats_outbox_replay_fut = if self
+                .placement_state
+                .as_ref()
+                .is_some_and(|placement_state| placement_state.num_partitions() > 1)
+            {
+                Either::Left(
+                    self.runtime.wait(
+                        RAFT_NATS_OUTBOX_REPLAY_INTERVAL
+                            .saturating_sub(last_raft_nats_outbox_replay.elapsed()),
+                    ),
+                )
+            } else {
+                Either::Right(std::future::pending())
+            };
             select_biased! {
                 _ = bump_fut.fuse() => {
                     let committer_span = committer_span.get_or_insert_with(|| {
@@ -619,6 +648,25 @@ impl<RT: Runtime> Committer<RT> {
                         &mut last_remote_read_frontier_heartbeat_ts,
                     );
                     last_remote_read_frontier_heartbeat = self.runtime.monotonic_now();
+                }
+                _ = raft_nats_outbox_replay_fut.fuse() => {
+                    if self.should_replay_raft_nats_outbox() {
+                        match Self::replay_raft_nats_outbox_once(
+                            self.persistence.clone(),
+                            self.distributed_log.clone(),
+                        )
+                        .await
+                        {
+                            Ok(replayed) if replayed > 0 => {
+                                tracing::info!("Replayed {replayed} Raft->NATS outbox deltas");
+                            },
+                            Ok(_) => {},
+                            Err(err) => {
+                                tracing::warn!("Failed to replay Raft->NATS outbox: {err:#}");
+                            },
+                        }
+                    }
+                    last_raft_nats_outbox_replay = self.runtime.monotonic_now();
                 }
                 result = self.persistence_writes.select_next_some() => {
                     let pending_commit = result.context("Write failed. Unsure if transaction committed to disk.")?;
@@ -675,17 +723,53 @@ impl<RT: Runtime> Committer<RT> {
                                     );
                                 }
                             }
-                            if let Err(err) = Self::publish_commit_delta(
-                                self.distributed_log.clone(),
-                                published_commit.delta,
-                            )
-                            .await
+                            let use_raft_nats_outbox =
+                                Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
+                            if use_raft_nats_outbox
+                                && let Err(err) = Self::add_raft_nats_outbox_delta(
+                                    self.persistence.clone(),
+                                    &published_commit.delta,
+                                )
+                                .await
                             {
                                 return Self::fail_committed_write(
                                     result,
                                     commit_ts,
-                                    "publish committed write to replication log",
+                                    "record committed write in Raft->NATS outbox",
                                     err,
+                                );
+                            }
+                            if let Err(err) = Self::publish_commit_delta(
+                                self.distributed_log.clone(),
+                                published_commit.delta.clone(),
+                            )
+                            .await
+                            {
+                                if use_raft_nats_outbox {
+                                    tracing::error!(
+                                        "Failed to publish committed write at ts={} to replication \
+                                         log; leaving Raft->NATS outbox entry for replay: {err:#}",
+                                        u64::from(commit_ts),
+                                    );
+                                } else {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "publish committed write to replication log",
+                                        err,
+                                    );
+                                }
+                            } else if use_raft_nats_outbox
+                                && let Err(err) = Self::delete_raft_nats_outbox_delta(
+                                    self.persistence.clone(),
+                                    commit_ts,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Published committed write at ts={} to replication log but \
+                                     failed to clear Raft->NATS outbox entry: {err:#}",
+                                    u64::from(commit_ts),
                                 );
                             }
                             let _ = result.send(Ok(commit_ts));
@@ -743,6 +827,7 @@ impl<RT: Runtime> Committer<RT> {
                             write_bytes,
                             source_partition,
                             applied_delta_watermarks,
+                            raft_nats_outbox_delta,
                             result,
                             ..
                         } => {
@@ -763,6 +848,13 @@ impl<RT: Runtime> Committer<RT> {
                                         partition_timestamp_map_to_json(&frontiers),
                                     )
                                     .await?;
+                            }
+                            if let Some(delta) = raft_nats_outbox_delta.as_ref() {
+                                Self::add_raft_nats_outbox_delta(
+                                    self.persistence.clone(),
+                                    delta,
+                                )
+                                .await?;
                             }
                             {
                                 let mut sm = self.snapshot_manager.write();
@@ -1032,17 +1124,53 @@ impl<RT: Runtime> Committer<RT> {
                                     );
                                 }
                             }
-                            if let Err(err) = Self::publish_commit_delta(
-                                self.distributed_log.clone(),
-                                published_commit.delta,
-                            )
-                            .await
+                            let use_raft_nats_outbox =
+                                Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
+                            if use_raft_nats_outbox
+                                && let Err(err) = Self::add_raft_nats_outbox_delta(
+                                    self.persistence.clone(),
+                                    &published_commit.delta,
+                                )
+                                .await
                             {
                                 return Self::fail_committed_write(
                                     result,
                                     commit_ts,
-                                    "publish prepared write to replication log",
+                                    "record prepared write in Raft->NATS outbox",
                                     err,
+                                );
+                            }
+                            if let Err(err) = Self::publish_commit_delta(
+                                self.distributed_log.clone(),
+                                published_commit.delta.clone(),
+                            )
+                            .await
+                            {
+                                if use_raft_nats_outbox {
+                                    tracing::error!(
+                                        "Failed to publish prepared write at ts={} to replication \
+                                         log; leaving Raft->NATS outbox entry for replay: {err:#}",
+                                        u64::from(commit_ts),
+                                    );
+                                } else {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "publish prepared write to replication log",
+                                        err,
+                                    );
+                                }
+                            } else if use_raft_nats_outbox
+                                && let Err(err) = Self::delete_raft_nats_outbox_delta(
+                                    self.persistence.clone(),
+                                    commit_ts,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Published prepared write at ts={} to replication log but \
+                                     failed to clear Raft->NATS outbox entry: {err:#}",
+                                    u64::from(commit_ts),
                                 );
                             }
                             if let Err(err) = Self::delete_two_phase_redo(
@@ -1964,6 +2092,96 @@ impl<RT: Runtime> Committer<RT> {
         })
     }
 
+    fn raft_nats_outbox_key(ts: Timestamp) -> String {
+        u64::from(ts).to_string()
+    }
+
+    async fn load_raft_nats_outbox_records(
+        persistence: Arc<dyn Persistence>,
+    ) -> anyhow::Result<RaftNatsOutboxRecords> {
+        let Some(value) = persistence
+            .reader()
+            .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+            .await?
+        else {
+            return Ok(BTreeMap::new());
+        };
+        serde_json::from_value(value).context("Failed to parse Raft->NATS outbox records")
+    }
+
+    async fn write_raft_nats_outbox_records(
+        persistence: Arc<dyn Persistence>,
+        records: &RaftNatsOutboxRecords,
+    ) -> anyhow::Result<()> {
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::RaftNatsOutbox,
+                serde_json::to_value(records)
+                    .context("Failed to serialize Raft->NATS outbox records")?,
+            )
+            .await
+    }
+
+    async fn add_raft_nats_outbox_delta(
+        persistence: Arc<dyn Persistence>,
+        delta: &CommitDelta,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_raft_nats_outbox_records(persistence.clone()).await?;
+        let envelope = DeltaEnvelope::from_delta(delta, "", None)
+            .context("Failed to encode Raft->NATS outbox delta")?;
+        records.insert(
+            Self::raft_nats_outbox_key(delta.ts),
+            serde_json::to_value(envelope)
+                .context("Failed to serialize Raft->NATS outbox delta")?,
+        );
+        Self::write_raft_nats_outbox_records(persistence, &records).await
+    }
+
+    async fn delete_raft_nats_outbox_delta(
+        persistence: Arc<dyn Persistence>,
+        ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_raft_nats_outbox_records(persistence.clone()).await?;
+        records.remove(&Self::raft_nats_outbox_key(ts));
+        Self::write_raft_nats_outbox_records(persistence, &records).await
+    }
+
+    async fn replay_raft_nats_outbox_once(
+        persistence: Arc<dyn Persistence>,
+        distributed_log: Arc<dyn DistributedLog>,
+    ) -> anyhow::Result<usize> {
+        let records = Self::load_raft_nats_outbox_records(persistence.clone()).await?;
+        let mut replayed = 0usize;
+        for (key, value) in records {
+            let envelope: DeltaEnvelope = serde_json::from_value(value)
+                .with_context(|| format!("Failed to parse Raft->NATS outbox delta {key}"))?;
+            let delta = envelope
+                .to_delta()
+                .with_context(|| format!("Failed to decode Raft->NATS outbox delta {key}"))?;
+            let delta_ts = delta.ts;
+            Self::publish_commit_delta(distributed_log.clone(), delta).await?;
+            Self::delete_raft_nats_outbox_delta(persistence.clone(), delta_ts).await?;
+            replayed += 1;
+        }
+        Ok(replayed)
+    }
+
+    fn should_record_raft_nats_outbox_delta(delta: &CommitDelta) -> bool {
+        delta.source_partition.is_some()
+    }
+
+    fn should_replay_raft_nats_outbox(&self) -> bool {
+        let Some(placement_state) = self.placement_state.as_ref() else {
+            return false;
+        };
+        if placement_state.num_partitions() <= 1 {
+            return false;
+        }
+        self.raft_state
+            .as_ref()
+            .is_none_or(|raft_state| raft_state.is_leader())
+    }
+
     fn propose_commit_to_raft_state(
         raft_state: Option<&crate::raft_partition::RaftPartitionState>,
         delta: &CommitDelta,
@@ -2796,6 +3014,9 @@ impl<RT: Runtime> Committer<RT> {
             self.applied_delta_watermarks
                 .insert(source_partition, remote_ts);
         }
+        let raft_nats_outbox_delta = (mode == ReplicaDeltaApplyMode::FullRaftState
+            && delta.source_partition.is_some())
+        .then(|| delta.clone());
 
         let persistence = self.persistence.clone();
         self.enqueue_snapshot(commit_id, commit_ts, snapshot.clone());
@@ -2838,6 +3059,7 @@ impl<RT: Runtime> Committer<RT> {
                     write_bytes: delta.write_bytes,
                     source_partition,
                     applied_delta_watermarks,
+                    raft_nats_outbox_delta,
                     result,
                     commit_id,
                 })
@@ -4578,8 +4800,23 @@ fn is_retryable_system_generated_id_conflict(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        str::FromStr,
+        sync::{
+            atomic::{
+                AtomicBool,
+                Ordering,
+            },
+            Arc,
+        },
+    };
 
+    use async_trait::async_trait;
+    use common::{
+        persistence::Persistence,
+        testing::TestPersistence,
+    };
+    use futures::stream::BoxStream;
     use runtime::testing::TestRuntime;
     use sync_types::Timestamp;
     use tokio::sync::oneshot;
@@ -4589,7 +4826,70 @@ mod tests {
         is_retryable_system_generated_id_conflict,
         Committer,
     };
-    use crate::raft_node::RaftProposalResult;
+    use crate::{
+        commit_delta::{
+            CommitDelta,
+            DistributedLog,
+            ReplicationMessage,
+        },
+        partition::PartitionId,
+        raft_node::RaftProposalResult,
+        write_log::WriteSource,
+    };
+
+    #[derive(Default)]
+    struct RecordingDistributedLog {
+        fail_publishes: AtomicBool,
+        published: parking_lot::Mutex<Vec<Timestamp>>,
+    }
+
+    impl RecordingDistributedLog {
+        fn failing() -> Self {
+            Self {
+                fail_publishes: AtomicBool::new(true),
+                published: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn allow_publishes(&self) {
+            self.fail_publishes.store(false, Ordering::SeqCst);
+        }
+
+        fn published(&self) -> Vec<Timestamp> {
+            self.published.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl DistributedLog for RecordingDistributedLog {
+        async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+            if self.fail_publishes.load(Ordering::SeqCst) {
+                anyhow::bail!("injected publish failure");
+            }
+            self.published.lock().push(delta.ts);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _from_ts: Timestamp,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    fn test_outbox_delta(ts: Timestamp) -> CommitDelta {
+        CommitDelta {
+            ts,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("test_outbox_delta"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(0)),
+        }
+    }
 
     #[tokio::test]
     async fn raft_commit_waiter_accepts_committed_proposal() -> anyhow::Result<()> {
@@ -4618,6 +4918,75 @@ mod tests {
         let applied_index =
             Committer::<TestRuntime>::wait_for_raft_commit(None, Timestamp::must(1)).await?;
         assert_eq!(applied_index, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_replay_publishes_and_clears() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let log = Arc::new(RecordingDistributedLog::default());
+        let ts = Timestamp::must(10);
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts),
+        )
+        .await?;
+
+        let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+            persistence.clone(),
+            log.clone(),
+        )
+        .await?;
+
+        assert_eq!(replayed, 1);
+        assert_eq!(log.published(), vec![ts]);
+        assert!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_replay_keeps_record_on_publish_failure() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let log = Arc::new(RecordingDistributedLog::failing());
+        let ts = Timestamp::must(11);
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts),
+        )
+        .await?;
+
+        let err = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+            persistence.clone(),
+            log.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("injected publish failure"));
+        assert_eq!(log.published(), Vec::<Timestamp>::new());
+        assert_eq!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence.clone())
+                .await?
+                .len(),
+            1
+        );
+
+        log.allow_publishes();
+        let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+            persistence.clone(),
+            log.clone(),
+        )
+        .await?;
+        assert_eq!(replayed, 1);
+        assert_eq!(log.published(), vec![ts]);
+        assert!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 
