@@ -102,6 +102,7 @@ use crate::{
         StaticPlacementConfig,
     },
     raft_partition::RaftPartitionState,
+    snapshot_manager::partition_timestamp_map_from_json,
     table_number_allocator::{
         testing::InMemoryTableNumberAllocator,
         TableNumberAllocator,
@@ -2248,6 +2249,106 @@ async fn test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts(
         projects_after.len(),
         1,
         "heartbeat should not erase replica-queryable state",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_replica_delta_timestamp_translation_records_origin_watermark(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let target_persistence = Arc::new(TestPersistence::new());
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers.clone(),
+    )
+    .await?;
+    let target = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        target_persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_numbers,
+    )
+    .await?;
+
+    insert_doc(&source, "projects", assert_obj!("name" => "remote")).await?;
+    let mut remote_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("remote project insert should publish a delta");
+
+    let local_ts = insert_doc(&target, "messages", assert_obj!("text" => "local")).await?;
+    let remote_ts = local_ts.pred()?;
+    remote_delta.ts = remote_ts;
+    assert!(
+        remote_ts < local_ts,
+        "test setup should apply an older origin timestamp after newer local state",
+    );
+
+    let applied_ts = target
+        .committer_for_test()
+        .apply_replica_delta(remote_delta.clone())
+        .await?;
+    assert!(
+        applied_ts > local_ts,
+        "replica apply should translate to the next local visibility timestamp",
+    );
+    assert_ne!(
+        applied_ts, remote_ts,
+        "this regression must exercise the explicit timestamp translation path",
+    );
+    assert_eq!(
+        target.replication_frontier_for_test(PartitionId(1)),
+        Some(applied_ts),
+        "remote read frontier tracks this node's local visibility timestamp",
+    );
+    assert_eq!(
+        target.replication_write_frontier_for_test(PartitionId(1)),
+        Some(applied_ts),
+        "write frontier tracks local visibility for real replicated writes",
+    );
+
+    let persisted_watermarks = target_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDeltaWatermarks)
+        .await?
+        .context("applied delta watermark should be persisted")?;
+    let persisted_watermarks =
+        partition_timestamp_map_from_json(persisted_watermarks, "applied delta watermarks")?;
+    assert_eq!(
+        persisted_watermarks.get(&PartitionId(1)).copied(),
+        Some(remote_ts),
+        "origin watermark remains in the source partition timestamp domain",
+    );
+
+    let duplicate_apply_ts = target
+        .committer_for_test()
+        .apply_replica_delta(remote_delta)
+        .await?;
+    assert_eq!(
+        duplicate_apply_ts, remote_ts,
+        "duplicate detection uses the persisted origin timestamp watermark",
+    );
+    let projects = run_query(
+        target,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        projects.len(),
+        1,
+        "duplicate redelivery must not re-apply the translated write",
     );
 
     Ok(())

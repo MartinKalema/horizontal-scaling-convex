@@ -42,7 +42,11 @@ use crate::{
 /// 3. Maintain ordering (via the commit timestamp)
 #[derive(Clone, Debug)]
 pub struct CommitDelta {
-    /// The commit timestamp assigned by the Committer.
+    /// The commit timestamp assigned by the source partition's Committer.
+    ///
+    /// Receivers may translate this into a later local apply timestamp for
+    /// their own MVCC/write-log state, but this value remains the origin
+    /// timestamp used for source-partition watermarks and redelivery dedup.
     pub ts: Timestamp,
 
     /// Document writes for persistence replay. Contains document ID, new value,
