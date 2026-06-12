@@ -370,6 +370,26 @@ fn checkpoint_index_entries(
     index_entries
 }
 
+fn insert_delta_table_mapping(
+    table_mapping: &TableMapping,
+    tablet_id_to_table_name: &mut BTreeMap<value::TabletId, TableName>,
+    tablet_id: value::TabletId,
+) {
+    if !tablet_id_to_table_name.contains_key(&tablet_id) {
+        if let Ok(name) = table_mapping.tablet_name(tablet_id) {
+            tablet_id_to_table_name.insert(tablet_id, name);
+        }
+    }
+}
+
+fn index_metadata_tablet_id(document: &ResolvedDocument) -> Option<value::TabletId> {
+    let table_id_field = "table_id".parse::<common::types::FieldName>().ok()?;
+    let value::ConvexValue::String(table_id) = document.value().0.get(&table_id_field)? else {
+        return None;
+    };
+    table_id.parse().ok()
+}
+
 fn remap_index_metadata_document(
     document: &ResolvedDocument,
     local_index_tablet: value::TabletId,
@@ -2424,11 +2444,23 @@ impl<RT: Runtime> Committer<RT> {
             .collect();
         let table_mapping = new_snapshot.table_registry.table_mapping().clone();
         let mut tablet_id_to_table_name = std::collections::BTreeMap::new();
+        let index_table_name: &TableName = &common::bootstrap_model::index::INDEX_TABLE;
         for update in &document_updates {
             let tablet_id = update.id.tablet_id;
-            if !tablet_id_to_table_name.contains_key(&tablet_id) {
-                if let Ok(name) = table_mapping.tablet_name(tablet_id) {
-                    tablet_id_to_table_name.insert(tablet_id, name);
+            insert_delta_table_mapping(&table_mapping, &mut tablet_id_to_table_name, tablet_id);
+
+            if tablet_id_to_table_name
+                .get(&tablet_id)
+                .is_some_and(|name| name == index_table_name)
+            {
+                for document in update.old_document.iter().chain(update.new_document.iter()) {
+                    if let Some(indexed_tablet_id) = index_metadata_tablet_id(document) {
+                        insert_delta_table_mapping(
+                            &table_mapping,
+                            &mut tablet_id_to_table_name,
+                            indexed_tablet_id,
+                        );
+                    }
                 }
             }
         }
