@@ -626,6 +626,40 @@ pub enum ScheduledAndCronWorkerStartup {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorityGatedWorkerStartup {
+    Start,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplicationWorkerStartupPolicy {
+    pub scheduled_and_cron: ScheduledAndCronWorkerStartup,
+    pub authority_gated: AuthorityGatedWorkerStartup,
+}
+
+impl ApplicationWorkerStartupPolicy {
+    pub fn single_node() -> Self {
+        Self {
+            scheduled_and_cron: ScheduledAndCronWorkerStartup::Start,
+            authority_gated: AuthorityGatedWorkerStartup::Start,
+        }
+    }
+
+    pub fn clustered_fail_closed() -> Self {
+        Self {
+            scheduled_and_cron: ScheduledAndCronWorkerStartup::Disabled,
+            authority_gated: AuthorityGatedWorkerStartup::Disabled,
+        }
+    }
+}
+
+impl Default for ApplicationWorkerStartupPolicy {
+    fn default() -> Self {
+        Self::single_node()
+    }
+}
+
 fn start_scheduled_and_cron_workers<RT: Runtime>(
     runtime: RT,
     instance_name: String,
@@ -745,7 +779,7 @@ impl<RT: Runtime> Application<RT> {
         export_provider: Arc<dyn ExportProvider<RT>>,
         deleted_tablet_receiver: tokio::sync::mpsc::Receiver<TabletId>,
         oidc_http_client: CachedHttpClient,
-        scheduled_and_cron_worker_startup: ScheduledAndCronWorkerStartup,
+        worker_startup_policy: ApplicationWorkerStartupPolicy,
     ) -> anyhow::Result<Self> {
         let module_cache =
             ModuleCache::new(runtime.clone(), application_storage.modules_storage.clone()).await;
@@ -756,8 +790,17 @@ impl<RT: Runtime> Application<RT> {
             CONVEX_SITE.clone() => convex_site.parse()?
         };
 
+        let authority_gated_workers_enabled =
+            worker_startup_policy.authority_gated == AuthorityGatedWorkerStartup::Start;
+        if !authority_gated_workers_enabled {
+            tracing::info!(
+                "Authority-gated application workers are disabled until this clustered node has a \
+                 dedicated worker authority model"
+            );
+        }
+
         let mut index_worker = Arc::new(Mutex::new(None));
-        if *ENABLE_INDEX_BACKFILL {
+        if authority_gated_workers_enabled && *ENABLE_INDEX_BACKFILL {
             let index_worker_fut = IndexWorker::new(
                 runtime.clone(),
                 persistence.clone(),
@@ -770,42 +813,67 @@ impl<RT: Runtime> Application<RT> {
                 runtime.spawn("index_worker", index_worker_fut),
             )));
         };
-        let fast_forward_worker =
-            FastForwardIndexWorker::create_and_start(runtime.clone(), database.clone());
-        let fast_forward_worker = Arc::new(Mutex::new(
-            runtime.spawn("fast_forward_worker", fast_forward_worker),
-        ));
-        let search_worker = SearchIndexWorkers::create_and_start(
-            runtime.clone(),
-            database.clone(),
-            persistence.reader(),
-            application_storage.search_storage.clone(),
-            searcher,
-            segment_term_metadata_fetcher,
-        );
+        let fast_forward_worker = if authority_gated_workers_enabled {
+            let fast_forward_worker =
+                FastForwardIndexWorker::create_and_start(runtime.clone(), database.clone());
+            Some(runtime.spawn("fast_forward_worker", fast_forward_worker))
+        } else {
+            None
+        };
+        let fast_forward_worker = Arc::new(Mutex::new(fast_forward_worker));
+        let search_worker = if authority_gated_workers_enabled {
+            Some(SearchIndexWorkers::create_and_start(
+                runtime.clone(),
+                database.clone(),
+                persistence.reader(),
+                application_storage.search_storage.clone(),
+                searcher,
+                segment_term_metadata_fetcher,
+            ))
+        } else {
+            None
+        };
         let search_worker = Arc::new(Mutex::new(search_worker));
+        let search_and_vector_bootstrap_worker = if authority_gated_workers_enabled {
+            Some(database.start_search_and_vector_bootstrap())
+        } else {
+            None
+        };
         let search_and_vector_bootstrap_worker =
-            Arc::new(Mutex::new(database.start_search_and_vector_bootstrap()));
-        let table_summary_worker = TableSummaryWorker::start(
-            runtime.clone(),
-            database.clone(),
-            persistence.clone(),
-            lease_lost_shutdown,
-        );
-        let schema_worker = Arc::new(Mutex::new(runtime.spawn(
-            "schema_worker",
-            SchemaWorker::start(runtime.clone(), database.clone()),
-        )));
+            Arc::new(Mutex::new(search_and_vector_bootstrap_worker));
+        let table_summary_worker = if authority_gated_workers_enabled {
+            Some(TableSummaryWorker::start(
+                runtime.clone(),
+                database.clone(),
+                persistence.clone(),
+                lease_lost_shutdown,
+            ))
+        } else {
+            None
+        };
+        let table_summary_worker = Arc::new(Mutex::new(table_summary_worker));
+        let schema_worker = if authority_gated_workers_enabled {
+            Some(runtime.spawn(
+                "schema_worker",
+                SchemaWorker::start(runtime.clone(), database.clone()),
+            ))
+        } else {
+            None
+        };
+        let schema_worker = Arc::new(Mutex::new(schema_worker));
 
-        let system_table_cleanup_worker = SystemTableCleanupWorker::new(
-            runtime.clone(),
-            database.clone(),
-            application_storage.exports_storage.clone(),
-            deleted_tablet_receiver,
-        );
-        let system_table_cleanup_worker = Arc::new(Mutex::new(
-            runtime.spawn("system_table_cleanup_worker", system_table_cleanup_worker),
-        ));
+        let system_table_cleanup_worker = if authority_gated_workers_enabled {
+            let system_table_cleanup_worker = SystemTableCleanupWorker::new(
+                runtime.clone(),
+                database.clone(),
+                application_storage.exports_storage.clone(),
+                deleted_tablet_receiver,
+            );
+            Some(runtime.spawn("system_table_cleanup_worker", system_table_cleanup_worker))
+        } else {
+            None
+        };
+        let system_table_cleanup_worker = Arc::new(Mutex::new(system_table_cleanup_worker));
 
         // If local_log_sink is passed in, this is a local instance, so we enable log
         // streaming by default. Otherwise, it's hard to grant the
@@ -852,7 +920,9 @@ impl<RT: Runtime> Application<RT> {
         ));
         function_runner.set_action_callbacks(runner.clone());
 
-        let (scheduled_job_runner, cron_job_executor) = match scheduled_and_cron_worker_startup {
+        let (scheduled_job_runner, cron_job_executor) = match worker_startup_policy
+            .scheduled_and_cron
+        {
             ScheduledAndCronWorkerStartup::Start => {
                 let (scheduled_job_runner, cron_job_executor) = start_scheduled_and_cron_workers(
                     runtime.clone(),
@@ -872,39 +942,48 @@ impl<RT: Runtime> Application<RT> {
             },
         };
 
-        let export_worker = ExportWorker::new(
-            runtime.clone(),
-            database.clone(),
-            application_storage.exports_storage.clone(),
-            application_storage.files_storage.clone(),
-            export_provider,
-            usage_counter.clone(),
-            instance_name.clone(),
-        );
-        let export_worker = Arc::new(Mutex::new(Some(
-            runtime.spawn("export_worker", export_worker),
-        )));
+        let export_worker = if authority_gated_workers_enabled {
+            let export_worker = ExportWorker::new(
+                runtime.clone(),
+                database.clone(),
+                application_storage.exports_storage.clone(),
+                application_storage.files_storage.clone(),
+                export_provider,
+                usage_counter.clone(),
+                instance_name.clone(),
+            );
+            Some(runtime.spawn("export_worker", export_worker))
+        } else {
+            None
+        };
+        let export_worker = Arc::new(Mutex::new(export_worker));
 
-        let snapshot_import_worker = SnapshotImportWorker::start(
-            runtime.clone(),
-            database.clone(),
-            application_storage.snapshot_imports_storage.clone(),
-            file_storage.clone(),
-            usage_counter.clone(),
-        );
-        let snapshot_import_worker = Arc::new(Mutex::new(Some(
-            runtime.spawn("snapshot_import_worker", snapshot_import_worker),
-        )));
+        let snapshot_import_worker = if authority_gated_workers_enabled {
+            let snapshot_import_worker = SnapshotImportWorker::start(
+                runtime.clone(),
+                database.clone(),
+                application_storage.snapshot_imports_storage.clone(),
+                file_storage.clone(),
+                usage_counter.clone(),
+            );
+            Some(runtime.spawn("snapshot_import_worker", snapshot_import_worker))
+        } else {
+            None
+        };
+        let snapshot_import_worker = Arc::new(Mutex::new(snapshot_import_worker));
 
-        let migration_worker = MigrationWorker::new(
-            runtime.clone(),
-            persistence.clone(),
-            database.clone(),
-            application_storage.modules_storage.clone(),
-        );
-        let migration_worker = Arc::new(Mutex::new(Some(
-            runtime.spawn("migration_worker", migration_worker.go()),
-        )));
+        let migration_worker = if authority_gated_workers_enabled {
+            let migration_worker = MigrationWorker::new(
+                runtime.clone(),
+                persistence.clone(),
+                database.clone(),
+                application_storage.modules_storage.clone(),
+            );
+            Some(runtime.spawn("migration_worker", migration_worker.go()))
+        } else {
+            None
+        };
+        let migration_worker = Arc::new(Mutex::new(migration_worker));
 
         let usage_gauges_tracking_worker = UsageGaugesTrackingWorker::start(
             runtime.clone(),
@@ -1001,6 +1080,23 @@ impl<RT: Runtime> Application<RT> {
     pub fn scheduled_and_cron_workers_running_for_test(&self) -> bool {
         self.workers.scheduled_job_runner.lock().is_some()
             && self.workers.cron_job_executor.lock().is_some()
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn authority_gated_workers_running_for_test(&self) -> bool {
+        self.workers.fast_forward_worker.lock().is_some()
+            && self.workers.search_worker.lock().is_some()
+            && self
+                .workers
+                .search_and_vector_bootstrap_worker
+                .lock()
+                .is_some()
+            && self.workers.table_summary_worker.lock().is_some()
+            && self.workers.schema_worker.lock().is_some()
+            && self.workers.snapshot_import_worker.lock().is_some()
+            && self.workers.export_worker.lock().is_some()
+            && self.workers.system_table_cleanup_worker.lock().is_some()
+            && self.workers.migration_worker.lock().is_some()
     }
 
     pub fn modules_storage(&self) -> &Arc<dyn Storage> {

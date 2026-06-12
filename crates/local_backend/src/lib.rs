@@ -25,8 +25,8 @@ use application::{
     api::ApplicationApi,
     log_visibility::RedactLogsToClient,
     Application,
+    ApplicationWorkerStartupPolicy,
     QueryCache,
-    ScheduledAndCronWorkerStartup,
 };
 use common::{
     self,
@@ -342,6 +342,17 @@ fn start_cluster_singleton_worker_supervisor(
     });
 }
 
+fn application_worker_startup_policy(
+    replication_mode: &str,
+    partition_id: Option<database::partition::PartitionId>,
+) -> ApplicationWorkerStartupPolicy {
+    if replication_mode == "replica" || partition_id.is_some() {
+        ApplicationWorkerStartupPolicy::clustered_fail_closed()
+    } else {
+        ApplicationWorkerStartupPolicy::single_node()
+    }
+}
+
 pub async fn make_app(
     runtime: ProdRuntime,
     config: LocalConfig,
@@ -623,12 +634,10 @@ pub async fn make_app(
             fetch_client.clone(),
         )?);
 
-    let scheduled_and_cron_worker_startup =
-        if config.replication_mode == "replica" || config.partition_id.is_some() {
-            ScheduledAndCronWorkerStartup::Disabled
-        } else {
-            ScheduledAndCronWorkerStartup::Start
-        };
+    let worker_startup_policy = application_worker_startup_policy(
+        &config.replication_mode,
+        config.partition_id.map(database::partition::PartitionId),
+    );
     let application = Application::new(
         runtime.clone(),
         database.clone(),
@@ -657,7 +666,7 @@ pub async fn make_app(
         Arc::new(InProcessExportProvider),
         deleted_tablet_receiver,
         oidc_http_client,
-        scheduled_and_cron_worker_startup,
+        worker_startup_policy,
     )
     .await?;
 
@@ -1290,6 +1299,32 @@ mod tests {
             Some(database::partition::PartitionId(0)),
             Some(&raft_state),
         ));
+    }
+
+    #[test]
+    fn application_workers_fail_closed_for_clustered_nodes() {
+        assert_eq!(
+            super::application_worker_startup_policy("primary", None),
+            application::ApplicationWorkerStartupPolicy::single_node(),
+        );
+        assert_eq!(
+            super::application_worker_startup_policy("replica", None),
+            application::ApplicationWorkerStartupPolicy::clustered_fail_closed(),
+        );
+        assert_eq!(
+            super::application_worker_startup_policy(
+                "primary",
+                Some(database::partition::PartitionId(0)),
+            ),
+            application::ApplicationWorkerStartupPolicy::clustered_fail_closed(),
+        );
+        assert_eq!(
+            super::application_worker_startup_policy(
+                "primary",
+                Some(database::partition::PartitionId(1)),
+            ),
+            application::ApplicationWorkerStartupPolicy::clustered_fail_closed(),
+        );
     }
 
     #[test]

@@ -113,6 +113,20 @@ explicit smaller route state:
 | `ActionCallbackRouterState` | Internal node action callback surfaces.                                           |
 | `ImportExportRouterState`   | Snapshot and streaming import/export surfaces.                                    |
 
+## Background Worker Authority
+
+Foreground route authority is not enough on its own: background workers can
+mutate the same deployment-global metadata or derived indexes without passing
+through HTTP middleware. The local backend therefore chooses an
+`ApplicationWorkerStartupPolicy` during `make_app`.
+
+| Worker surface                                                                                         | Cluster-mode behavior                                                                                                                                      |
+| ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scheduled jobs and crons                                                                               | Start disabled, then run only on the coordinator singleton while partition 0 is Raft leader and has a fresh serving lease.                                  |
+| Index backfill, fast-forward indexing, search/vector indexing, schema validation, table summaries       | Fail closed in clustered mode until each worker has a documented owner, failover, and idempotency model.                                                   |
+| System-table cleanup, snapshot import, export, and migration workers                                    | Fail closed in clustered mode because they mutate deployment-global job/system state or external side-effect state without a clustered ownership protocol. |
+| Usage gauges and log manager                                                                           | Continue to run as local observational/reporting plumbing. If they become authoritative state mutators, they must move into an explicit worker authority.   |
+
 ## Adding A Route
 
 Every new local-backend route must choose one authority class before it is

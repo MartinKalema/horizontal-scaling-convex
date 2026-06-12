@@ -19,30 +19,49 @@ pub struct WorkerHandles {
     pub(crate) scheduled_job_runner: Arc<Mutex<Option<ScheduledJobRunner>>>,
     pub(crate) cron_job_executor: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
     pub(crate) index_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
-    pub(crate) fast_forward_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    pub(crate) search_worker: Arc<Mutex<SearchIndexWorkers>>,
-    pub(crate) search_and_vector_bootstrap_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    pub(crate) table_summary_worker: TableSummaryClient,
-    pub(crate) schema_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
+    pub(crate) fast_forward_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
+    pub(crate) search_worker: Arc<Mutex<Option<SearchIndexWorkers>>>,
+    pub(crate) search_and_vector_bootstrap_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
+    pub(crate) table_summary_worker: Arc<Mutex<Option<TableSummaryClient>>>,
+    pub(crate) schema_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
     pub(crate) snapshot_import_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
     pub(crate) export_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
-    pub(crate) system_table_cleanup_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
+    pub(crate) system_table_cleanup_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
     pub(crate) migration_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
 }
 
 impl WorkerHandles {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.usage_gauges_tracking_worker.shutdown().await?;
-        self.table_summary_worker.shutdown().await?;
-        self.system_table_cleanup_worker.lock().shutdown();
-        self.schema_worker.lock().shutdown();
+        let table_summary_worker = self.table_summary_worker.lock().take();
+        if let Some(table_summary_worker) = table_summary_worker {
+            table_summary_worker.shutdown().await?;
+        }
+        let system_table_cleanup_worker = self.system_table_cleanup_worker.lock().take();
+        if let Some(mut system_table_cleanup_worker) = system_table_cleanup_worker {
+            system_table_cleanup_worker.shutdown();
+        }
+        let schema_worker = self.schema_worker.lock().take();
+        if let Some(mut schema_worker) = schema_worker {
+            schema_worker.shutdown();
+        }
         let index_worker = self.index_worker.lock().take();
         if let Some(index_worker) = index_worker {
             shutdown_and_join(index_worker).await?;
         }
-        self.search_worker.lock().shutdown();
-        self.search_and_vector_bootstrap_worker.lock().shutdown();
-        self.fast_forward_worker.lock().shutdown();
+        let search_worker = self.search_worker.lock().take();
+        if let Some(mut search_worker) = search_worker {
+            search_worker.shutdown();
+        }
+        let search_and_vector_bootstrap_worker =
+            self.search_and_vector_bootstrap_worker.lock().take();
+        if let Some(mut search_and_vector_bootstrap_worker) = search_and_vector_bootstrap_worker {
+            search_and_vector_bootstrap_worker.shutdown();
+        }
+        let fast_forward_worker = self.fast_forward_worker.lock().take();
+        if let Some(mut fast_forward_worker) = fast_forward_worker {
+            fast_forward_worker.shutdown();
+        }
         let export_worker = self.export_worker.lock().take();
         if let Some(export_worker) = export_worker {
             shutdown_and_join(export_worker).await?;

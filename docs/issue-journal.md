@@ -804,6 +804,31 @@ own for distributed changes.
   - `cargo check -p database`
   - `cargo check -p local_backend`
 
+### 2026-06 — Failed closed authority-sensitive application workers in cluster mode
+
+- **Status:** complete
+- **Related issue:** `#150`
+- **What this fixes:** several background workers still started eagerly in
+  every clustered backend process even though their work mutates
+  deployment-global metadata or maintains derived state that does not yet have
+  a per-partition ownership protocol. Scheduled jobs and crons were already
+  moved behind the cluster-singleton supervisor in `#149`; the remaining worker
+  surfaces needed an explicit fail-closed startup policy instead of accidental
+  local execution.
+- **Behavior:** `Application::new` now takes an
+  `ApplicationWorkerStartupPolicy`. Single-node deployments keep eager worker
+  startup. Clustered local-backend nodes start with scheduled/crons disabled
+  for the existing coordinator-authority supervisor and keep the remaining
+  authority-gated workers disabled until each surface is migrated. This covers
+  index backfill/fast-forward, search/vector index workers and bootstrap,
+  table summary checkpoints, schema validation, system-table cleanup, snapshot
+  import, export, and migration workers. Usage gauges and log manager remain
+  local observational/reporting plumbing.
+- **Validation:**
+  - `cargo test -p application start_disabled -- --nocapture`
+  - `cargo test -p local_backend application_workers_fail_closed_for_clustered_nodes -- --nocapture`
+  - `cargo check -p application -p local_backend`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

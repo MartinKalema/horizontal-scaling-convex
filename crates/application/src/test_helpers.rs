@@ -121,7 +121,7 @@ use crate::{
     log_visibility::RedactLogsToClient,
     scheduled_jobs::ScheduledJobContext,
     Application,
-    ScheduledAndCronWorkerStartup,
+    ApplicationWorkerStartupPolicy,
 };
 
 pub static OBJECTS_TABLE: LazyLock<TableName> = LazyLock::new(|| "objects".parse().unwrap());
@@ -132,7 +132,7 @@ pub struct ApplicationFixtureArgs {
     pub tp: Option<TestPersistence>,
     pub event_logger: Option<Arc<dyn UsageEventLogger>>,
     pub node_executor: Option<Arc<dyn NodeExecutor>>,
-    pub scheduled_and_cron_worker_startup: Option<ScheduledAndCronWorkerStartup>,
+    pub worker_startup_policy: Option<ApplicationWorkerStartupPolicy>,
 }
 
 impl ApplicationFixtureArgs {
@@ -306,8 +306,7 @@ impl<RT: Runtime> ApplicationTestExt<RT> for Application<RT> {
             Arc::new(InProcessExportProvider),
             deleted_tablet_receiver,
             oidc_http_client,
-            args.scheduled_and_cron_worker_startup
-                .unwrap_or(ScheduledAndCronWorkerStartup::Start),
+            args.worker_startup_policy.unwrap_or_default(),
         )
         .await?;
 
