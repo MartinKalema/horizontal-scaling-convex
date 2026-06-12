@@ -46,7 +46,7 @@ We added the last three rows while keeping the first four — the things that ma
 
 **CockroachDB's solution**: Global descriptor ID allocator — a single counter (`/system/desc-idgen`) incremented non-transactionally. Every table gets a cluster-unique ID.
 
-**What we built**: When `apply_replica_delta` receives a `_tables` entry for a table that doesn't exist locally, it reassigns the table number to a locally-unique value by scanning the table registry for the next available number. The TabletId (derived from `developer_id`) stays the same for correct remapping.
+**What we built**: User table numbers now come from a cluster-wide allocator, so public document IDs embedded in values stay portable across nodes. `apply_replica_delta` preserves the source table number and fails loudly if a local table name already exists with a conflicting number.
 
 **Problem 2**: Async max_repeatable_ts bumps race with synchronous replica delta applies, causing timestamp ordering violations in the write log.
 
@@ -62,7 +62,7 @@ We added the last three rows while keeping the first four — the things that ma
 
 **YugabyteDB's solution**: "Hybrid timestamps assigned to committed Raft log entries in the same tablet always keep increasing, even if there are leader changes. This is because the new leader always has all committed entries from previous leaders, and it makes sure to update its hybrid clock with the timestamp of the last committed entry before appending new entries."
 
-**What we built**: Replica delta apply uses only monotonic counters (`max(latest_ts + 1, last_assigned_ts + 1)`) — no TSO (reserved for local commits), no system clock (would leap ahead of TSO range). The same two counters that `next_commit_ts()` writes to, staying in the same numeric domain.
+**What we built**: Replica delta apply uses an explicit timestamp translation model. The source partition timestamp is persisted as the origin watermark for deduplication/freshness, while the receiver publishes the replicated state at `max(origin_ts, latest_ts + 1, last_assigned_ts + 1)`. No TSO is consumed during apply, and no system clock value is mixed into the local commit counter.
 
 **Source**: [YugabyteDB Raft consensus](https://docs.yugabyte.com/stable/architecture/docdb-replication/raft/), [YugabyteDB Jepsen testing](https://docs.yugabyte.com/stable/benchmark/resilience/jepsen-testing/)
 
@@ -72,7 +72,7 @@ We added the last three rows while keeping the first four — the things that ma
 
 **Spanner's solution**: TrueTime assigns timestamps with bounded uncertainty. "Writes with earlier timestamps are applied before those with later timestamps, with Paxos leaders using TrueTime to assign timestamps." A commit wait phase guarantees the commit timestamp is in the past for all replicas.
 
-**What we built**: Our TSO provides the same global ordering guarantee as TrueTime but without GPS clocks — batch allocation from a central counter is simpler and correctness is easier to verify. The Raft-pattern persistence pipeline ensures all writes are applied in timestamp order.
+**What we built**: Our TSO provides a global timestamp source for commit decisions without GPS clocks. Replica apply currently uses explicit origin-to-local timestamp translation, so portable read-after-write guarantees still require the follow-up read-fencing work rather than assuming every node has an identical MVCC timeline.
 
 **Source**: [Spanner TrueTime](https://docs.google.com/spanner/docs/true-time-external-consistency), [Spanner paper](https://research.google.com/pubs/archive/45855.pdf)
 

@@ -460,6 +460,10 @@ fn downgrade_replicated_index_metadata(
         IndexConfig,
     };
 
+    if metadata.name.is_by_id_or_creation_time() {
+        return;
+    }
+
     match &mut metadata.config {
         IndexConfig::Database { on_disk_state, .. } => {
             let staged = on_disk_state.is_staged();
@@ -485,6 +489,28 @@ fn downgrade_replicated_index_metadata(
             }
         },
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplicaDeltaTimestamps {
+    /// Timestamp assigned by the source partition when it committed the write.
+    origin_ts: Timestamp,
+    /// Timestamp at which this node can safely publish the replicated state.
+    local_apply_ts: Timestamp,
+}
+
+fn replica_delta_timestamps(
+    origin_ts: Timestamp,
+    latest_local_ts: Timestamp,
+    last_assigned_ts: Timestamp,
+) -> anyhow::Result<ReplicaDeltaTimestamps> {
+    Ok(ReplicaDeltaTimestamps {
+        origin_ts,
+        local_apply_ts: cmp::max(
+            origin_ts,
+            cmp::max(latest_local_ts.succ()?, last_assigned_ts.succ()?),
+        ),
+    })
 }
 
 type RaftCommitWaiter = Option<oneshot::Receiver<RaftProposalResult>>;
@@ -2730,11 +2756,13 @@ impl<RT: Runtime> Committer<RT> {
             let _ = result.send(Ok(remote_ts));
             return Ok(());
         }
-        let latest_ts = self.snapshot_manager.read().latest_ts();
-        let commit_ts = cmp::max(
+        let timestamps = replica_delta_timestamps(
             remote_ts,
-            cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
-        );
+            *self.snapshot_manager.read().latest_ts(),
+            self.last_assigned_ts,
+        )?;
+        let remote_ts = timestamps.origin_ts;
+        let commit_ts = timestamps.local_apply_ts;
         self.last_assigned_ts = commit_ts;
         tracing::info!(
             "Applying replica delta: remote_ts={}, local_ts={}, {} document updates, {} tablet \
@@ -4978,6 +5006,7 @@ mod tests {
     use super::{
         is_retryable_system_generated_id_conflict,
         remap_index_metadata_update,
+        replica_delta_timestamps,
         Committer,
     };
     use crate::{
@@ -5087,6 +5116,27 @@ mod tests {
         })
     }
 
+    fn test_by_id_index_metadata_update(
+        source_index_tablet: TabletId,
+        source_index_table_number: u32,
+        source_user_tablet: TabletId,
+    ) -> anyhow::Result<DocumentUpdate> {
+        let metadata = IndexMetadata::new_enabled(
+            GenericIndexName::by_id(source_user_tablet),
+            IndexedFields::by_id(),
+        );
+        let document = ResolvedDocument::new(
+            test_resolved_id(source_index_tablet, source_index_table_number, 98)?,
+            CreationTime::ONE,
+            metadata.try_into()?,
+        )?;
+        Ok(DocumentUpdate {
+            id: document.id(),
+            old_document: None,
+            new_document: Some(document),
+        })
+    }
+
     #[test]
     fn replicated_index_metadata_remaps_target_tablet_and_downgrades_query_ready_state(
     ) -> anyhow::Result<()> {
@@ -5110,6 +5160,25 @@ mod tests {
     }
 
     #[test]
+    fn replicated_builtin_index_metadata_remains_query_ready() -> anyhow::Result<()> {
+        let source_index_tablet = test_tablet(21);
+        let local_index_tablet = test_tablet(22);
+        let source_user_tablet = test_tablet(23);
+        let local_user_tablet = test_tablet(24);
+        let update = test_by_id_index_metadata_update(source_index_tablet, 2, source_user_tablet)?;
+        let tablet_remap = BTreeMap::from([(source_user_tablet, local_user_tablet)]);
+
+        let remapped =
+            remap_index_metadata_update(&update, local_index_tablet, &tablet_remap, true)?;
+
+        let metadata =
+            TabletIndexMetadata::from_document(remapped.new_document.unwrap())?.into_value();
+        assert_eq!(*metadata.name.table(), local_user_tablet);
+        assert!(metadata.config.is_enabled());
+        Ok(())
+    }
+
+    #[test]
     fn raft_index_metadata_remap_preserves_query_ready_state() -> anyhow::Result<()> {
         let source_index_tablet = test_tablet(11);
         let local_index_tablet = test_tablet(12);
@@ -5126,6 +5195,19 @@ mod tests {
             TabletIndexMetadata::from_document(remapped.new_document.unwrap())?.into_value();
         assert_eq!(*metadata.name.table(), local_user_tablet);
         assert!(metadata.config.is_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn replica_delta_timestamps_distinguish_origin_from_local_apply_ts() -> anyhow::Result<()> {
+        let timestamps = replica_delta_timestamps(
+            Timestamp::must(10),
+            Timestamp::must(30),
+            Timestamp::must(40),
+        )?;
+
+        assert_eq!(timestamps.origin_ts, Timestamp::must(10));
+        assert_eq!(timestamps.local_apply_ts, Timestamp::must(41));
         Ok(())
     }
 

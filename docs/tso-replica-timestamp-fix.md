@@ -59,7 +59,7 @@ All three systems follow the same rule: **the global timestamp allocator is cons
 | CockroachDB | Leaseholder (HLC on propose) | Advance local HLC to command's timestamp |
 | TiDB | Leader (TSO on commit) | Apply with the leader's commitTS |
 | Vitess | Source shard (MySQL auto-increment) | Target replays with source positioning |
-| Convex (fixed) | Local Committer (TSO on commit) | Local clock + monotonic counter |
+| Convex (current) | Source partition on commit | Explicit translation: source `origin_ts`, receiver `local_apply_ts` |
 
 ## Our Fix
 
@@ -73,14 +73,23 @@ let commit_ts = self.next_commit_ts()?;
 After:
 
 ```rust
-// Monotonic counters only: no TSO, no system clock.
-// Stays in the same timestamp domain as next_commit_ts().
+// Explicit timestamp translation: keep the source timestamp for dedup/freshness
+// watermarks, but publish the state at the receiver's next safe local timestamp.
+let origin_ts = delta.ts;
 let latest_ts = self.snapshot_manager.read().latest_ts();
-let commit_ts = cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?);
-self.last_assigned_ts = commit_ts;
+let local_apply_ts = cmp::max(
+    origin_ts,
+    cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
+);
+self.last_assigned_ts = local_apply_ts;
 ```
 
-No TSO (reserved for local commits), no system clock (would leap ahead of TSO range and poison `last_assigned_ts`). Only the two monotonic counters that stay in the same domain as `next_commit_ts()`: the snapshot manager's latest timestamp and the last assigned timestamp.
+No TSO (reserved for local commits), no system clock (would leap ahead of TSO range and poison `last_assigned_ts`). Replica apply now has two explicit timestamps:
+
+- `origin_ts`: the source partition's commit timestamp. This is persisted in `AppliedDeltaWatermarks` and used for duplicate/redelivery detection.
+- `local_apply_ts`: the receiver's visibility timestamp. This is used for the local snapshot, write log, and `ReplicationFrontiers` / `ReplicationWriteFrontiers`.
+
+This is a translation model, not timestamp identity. It is safe for the current single read-authority/fail-closed routing model, but portable client cursors and follower-safe reads must use the follow-up read-fencing work before relying on timestamps across nodes.
 
 ## Why System Clock Was Also Wrong (Second Fix)
 
@@ -110,15 +119,16 @@ All three systems follow the same rule on their apply paths:
 2. Timestamp domain mixing (system clock vs TSO range)
 3. Contention between apply and local commit paths
 
-### The Correct Fix
+### Current Translation Model
 
-Use only monotonic counters that stay in the same domain as `next_commit_ts()`:
+The current implementation intentionally keeps both timestamps:
 
 ```rust
-let commit_ts = cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?);
+let origin_ts = delta.ts;
+let local_apply_ts = cmp::max(origin_ts, cmp::max(latest_ts.succ()?, last_assigned_ts.succ()?));
 ```
 
-No TSO. No system clock. These two values are always in the same numeric range as TSO-assigned timestamps because they're derived from the same `last_assigned_ts` counter that `next_commit_ts()` writes to.
+No TSO. No system clock. `origin_ts` remains durable in `AppliedDeltaWatermarks`; `local_apply_ts` is the local MVCC/write-log timestamp. A future timestamp-identity model would need a reorder buffer/watermark merge so every node can safely apply replicated deltas at exactly `origin_ts`.
 
 ## Third Fix: Async bump_max_repeatable_ts Racing with apply_replica_delta
 
