@@ -502,4 +502,8 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
     async fn partition_id(&self, host: &ResolvedHostname) -> anyhow::Result<u64> {
         self.inner.partition_id(host).await
     }
+
+    fn read_after_write_source_partition(&self) -> Option<u32> {
+        self.inner.read_after_write_source_partition()
+    }
 }

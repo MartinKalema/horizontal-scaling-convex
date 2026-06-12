@@ -564,6 +564,7 @@ pub mod tests {
             request_id: 0,
             result: result.into(),
             ts: Some(new_version.ts),
+            read_after_write: None,
             log_lines: LogLinesMessage(vec![]),
         };
         (mutation_response, transition_response)
@@ -844,6 +845,7 @@ pub mod tests {
                         query_id,
                         udf_path: "getValue1".parse()?,
                         args: SerializedArgs::from_args(vec![json!({})])?,
+                        read_after_write: None,
                         journal: None,
                         component_path: None,
                     })]
@@ -1012,6 +1014,7 @@ pub mod tests {
                         query_id: subscription1.query_id(),
                         udf_path: "getValue1".parse()?,
                         args: SerializedArgs::from_args(vec![json!({})])?,
+                        read_after_write: None,
                         journal: None,
                         component_path: None,
                     })]
@@ -1023,6 +1026,7 @@ pub mod tests {
                         query_id: subscription2.query_id(),
                         udf_path: "getValue2".parse()?,
                         args: SerializedArgs::from_args(vec![json!({})])?,
+                        read_after_write: None,
                         journal: None,
                         component_path: None,
                     })]
@@ -1034,6 +1038,7 @@ pub mod tests {
                         query_id: subscription3.query_id(),
                         udf_path: "getValue2".parse()?,
                         args: SerializedArgs::from_args(vec![json!({"hello": "world"})])?,
+                        read_after_write: None,
                         journal: None,
                         component_path: None,
                     })]
@@ -1073,6 +1078,7 @@ pub mod tests {
                         query_id,
                         udf_path: "getValue".parse()?,
                         args: SerializedArgs::from_args(vec![json!({})])?,
+                        read_after_write: None,
                         journal: None,
                         component_path: None,
                     })]

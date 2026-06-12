@@ -28,6 +28,7 @@ use crate::{
     Query,
     QueryId,
     QuerySetModification,
+    ReadAfterWriteToken,
     SerializedQueryJournal,
     ServerMessage,
     SessionRequestSeqNumber,
@@ -78,11 +79,42 @@ struct QueryJson {
     udf_path: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    read_after_write: Option<ReadAfterWriteTokenJson>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "double_option")]
     journal: Option<SerializedQueryJournal>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     component_path: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadAfterWriteTokenJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_partition: Option<u32>,
+    ts: String,
+}
+
+impl From<ReadAfterWriteToken> for ReadAfterWriteTokenJson {
+    fn from(token: ReadAfterWriteToken) -> Self {
+        Self {
+            source_partition: token.source_partition,
+            ts: u64_to_string(token.ts.into()),
+        }
+    }
+}
+
+impl TryFrom<ReadAfterWriteTokenJson> for ReadAfterWriteToken {
+    type Error = anyhow::Error;
+
+    fn try_from(token: ReadAfterWriteTokenJson) -> Result<Self, Self::Error> {
+        Ok(Self {
+            source_partition: token.source_partition,
+            ts: Timestamp::try_from(string_to_u64(&token.ts)?)?,
+        })
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -113,6 +145,7 @@ impl TryFrom<QuerySetModification> for JsonValue {
                 let query_json = QueryJson {
                     query_id: q.query_id,
                     udf_path: String::from(q.udf_path),
+                    read_after_write: q.read_after_write.map(Into::into),
                     journal: q.journal,
                     component_path: q.component_path,
                 };
@@ -144,6 +177,7 @@ impl TryFrom<JsonValue> for QuerySetModification {
                     query_id: q.query_id,
                     udf_path: q.udf_path.parse()?,
                     args: SerializedArgs(args.unwrap_or_default()),
+                    read_after_write: q.read_after_write.map(TryInto::try_into).transpose()?,
                     journal: q.journal,
                     component_path: q.component_path,
                 };
@@ -602,6 +636,7 @@ impl<V: Into<JsonValue>> From<ServerMessage<V>> for JsonValue {
                 request_id,
                 result: Ok(value),
                 ts,
+                read_after_write,
                 log_lines,
             } => {
                 let jv: JsonValue = value.into();
@@ -611,6 +646,7 @@ impl<V: Into<JsonValue>> From<ServerMessage<V>> for JsonValue {
                     "success": true,
                     "result": jv,
                     "ts": ts.map(|ts| u64_to_string(ts.into())),
+                    "readAfterWrite": read_after_write.map(ReadAfterWriteTokenJson::from),
                     "logLines": log_lines,
                 })
             },
@@ -618,6 +654,7 @@ impl<V: Into<JsonValue>> From<ServerMessage<V>> for JsonValue {
                 request_id,
                 result: Err(error_payload),
                 ts,
+                read_after_write,
                 log_lines,
             } => {
                 let mut response = json!({
@@ -626,6 +663,7 @@ impl<V: Into<JsonValue>> From<ServerMessage<V>> for JsonValue {
                     "success": false,
                     "result": error_payload.get_message(),
                     "ts": ts.map(|ts| u64_to_string(ts.into())),
+                    "readAfterWrite": read_after_write.map(ReadAfterWriteTokenJson::from),
                     "logLines": log_lines,
                 });
                 if let ErrorPayload::ErrorData { data, .. } = error_payload {
@@ -724,6 +762,7 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for Server
                 success: bool,
                 result: JsonValue,
                 ts: Option<String>,
+                read_after_write: Option<ReadAfterWriteTokenJson>,
                 log_lines: LogLinesMessage,
                 #[serde(default, deserialize_with = "deserialize_some")]
                 error_data: Option<JsonValue>,
@@ -778,6 +817,7 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for Server
                 success,
                 result,
                 ts,
+                read_after_write,
                 log_lines,
                 error_data,
             } => {
@@ -802,6 +842,7 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for Server
                         .transpose()?
                         .map(Timestamp::try_from)
                         .transpose()?,
+                    read_after_write: read_after_write.map(TryInto::try_into).transpose()?,
                     log_lines,
                 }
             },
@@ -1026,8 +1067,12 @@ mod tests {
     };
     use crate::{
         testing::assert_roundtrips,
+        types::SerializedArgs,
         ClientMessage,
+        Query,
         QueryId,
+        QuerySetModification,
+        ReadAfterWriteToken,
         ServerMessage,
         StateModification,
         Timestamp,
@@ -1139,6 +1184,7 @@ mod tests {
                 data: TestValue(JsonValue::Null),
             }),
             ts: None,
+            read_after_write: None,
             log_lines: crate::LogLinesMessage(vec![]),
         });
     }
@@ -1166,6 +1212,57 @@ mod tests {
             client_clock_skew: Some(1),
             server_ts: Some(Timestamp::must(1)),
         });
+    }
+
+    #[test]
+    fn query_read_after_write_token_roundtrips() -> anyhow::Result<()> {
+        let modification = QuerySetModification::Add(Query {
+            query_id: QueryId::new(7),
+            udf_path: "messages:list".parse()?,
+            args: SerializedArgs::from_args(vec![json!({"channel": "general"})])?,
+            read_after_write: Some(ReadAfterWriteToken {
+                source_partition: Some(3),
+                ts: Timestamp::must(42),
+            }),
+            journal: None,
+            component_path: None,
+        });
+
+        let json = JsonValue::try_from(modification.clone())?;
+        assert_eq!(
+            json.get("readAfterWrite"),
+            Some(&json!({
+                "sourcePartition": 3,
+                "ts": u64_to_string(42),
+            }))
+        );
+        assert_eq!(QuerySetModification::try_from(json)?, modification);
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_response_read_after_write_token_roundtrips() -> anyhow::Result<()> {
+        let message = ServerMessage::MutationResponse {
+            request_id: 8,
+            result: Ok(TestValue(JsonValue::String("ok".to_string()))),
+            ts: Some(Timestamp::must(42)),
+            read_after_write: Some(ReadAfterWriteToken {
+                source_partition: Some(3),
+                ts: Timestamp::must(42),
+            }),
+            log_lines: crate::LogLinesMessage(vec![]),
+        };
+
+        let json = JsonValue::from(message.clone());
+        assert_eq!(
+            json.get("readAfterWrite"),
+            Some(&json!({
+                "sourcePartition": 3,
+                "ts": u64_to_string(42),
+            }))
+        );
+        assert_eq!(ServerMessage::<TestValue>::try_from(json)?, message);
+        Ok(())
     }
 
     #[test]

@@ -65,6 +65,7 @@ use sync_types::{
     Query,
     QueryId,
     QuerySetModification,
+    ReadAfterWriteToken,
     StateModification,
     UserIdentityAttributes,
 };
@@ -239,12 +240,21 @@ impl<RT: Runtime> TestSyncWorker<RT> {
             request_id: outgoing_mutation_id,
             result,
             ts,
+            read_after_write,
             ..
         } = self.receive().await?);
         // Check that the mutation ID on the outgoing message matches to
         // confirm we intercepted the right message
         assert_eq!(request_id, outgoing_mutation_id);
-        Ok((result.unwrap().unpack()?, ts.unwrap()))
+        let ts = ts.unwrap();
+        assert_eq!(
+            read_after_write,
+            Some(ReadAfterWriteToken {
+                source_partition: None,
+                ts,
+            })
+        );
+        Ok((result.unwrap().unpack()?, ts))
     }
 
     async fn shutdown(self) -> anyhow::Result<()> {
@@ -288,11 +298,15 @@ async fn test_basic_account(rt: TestRuntime) -> anyhow::Result<()> {
     assert_eq!(result, ConvexValue::Null);
     must_let!(let ServerMessage::Transition { .. } = sync_worker.receive().await?);
 
-    // 2. Start a new subscription.
+    // 2. Start a new subscription fenced behind the mutation we just observed.
     let query = Query {
         query_id: QueryId::new(0),
         udf_path: "sync:accountBalance".parse()?,
         args: SerializedArgs::from_args(vec![assert_obj!("name" => name1.clone()).into()])?,
+        read_after_write: Some(ReadAfterWriteToken {
+            source_partition: None,
+            ts: initialization_ts,
+        }),
         journal: None,
         component_path: None,
     };
@@ -348,6 +362,7 @@ async fn test_basic_account(rt: TestRuntime) -> anyhow::Result<()> {
         query_id: QueryId::new(1),
         udf_path: "sync:accountBalance".parse()?,
         args: SerializedArgs::from_args(vec![assert_obj!("name" => name2.clone()).into()])?,
+        read_after_write: None,
         journal: None,
         component_path: None,
     };
@@ -442,6 +457,7 @@ async fn test_remove_in_progress_query(rt: TestRuntime) -> anyhow::Result<()> {
         query_id,
         udf_path: "sync:accountBalance".parse()?,
         args: SerializedArgs::from_args(vec![assert_obj!("name" => name1.clone()).into()])?,
+        read_after_write: None,
         journal: None,
         component_path: None,
     };
@@ -482,6 +498,7 @@ async fn test_query_failure(rt: TestRuntime) -> anyhow::Result<()> {
         query_id: QueryId::new(0),
         udf_path: "sync:fail".parse()?,
         args: SerializedArgs::from_args(vec![assert_obj!("i" => ConvexValue::from(0.0)).into()])?,
+        read_after_write: None,
         journal: None,
         component_path: None,
     };
@@ -489,6 +506,7 @@ async fn test_query_failure(rt: TestRuntime) -> anyhow::Result<()> {
         query_id: QueryId::new(1),
         udf_path: "sync:fail".parse()?,
         args: SerializedArgs::from_args(vec![assert_obj!("i" => ConvexValue::from(3.0)).into()])?,
+        read_after_write: None,
         journal: None,
         component_path: None,
     };
@@ -523,6 +541,7 @@ async fn test_query_failure(rt: TestRuntime) -> anyhow::Result<()> {
         query_id: QueryId::new(2),
         udf_path: "sync:succeed".parse()?,
         args: SerializedArgs::from_args(vec![json!({})])?,
+        read_after_write: None,
         journal: None,
         component_path: None,
     };
@@ -749,6 +768,7 @@ async fn test_value_deduplication_success(rt: TestRuntime) -> anyhow::Result<()>
         args: SerializedArgs::from_args(vec![
             assert_obj!("throwError" => ConvexValue::from(false)).into(),
         ])?,
+        read_after_write: None,
         journal: None,
         component_path: None,
     };
@@ -808,6 +828,7 @@ async fn test_value_deduplication_failure(rt: TestRuntime) -> anyhow::Result<()>
         args: SerializedArgs::from_args(vec![
             assert_obj!("throwError" => ConvexValue::from(true)).into(),
         ])?,
+        read_after_write: None,
         journal: None,
         component_path: None,
     };

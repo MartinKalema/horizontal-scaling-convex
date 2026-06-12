@@ -1767,6 +1767,10 @@ impl<RT: Runtime> Database<RT> {
         }
     }
 
+    pub fn local_partition(&self) -> Option<crate::partition::PartitionId> {
+        self.committer.local_partition()
+    }
+
     pub async fn begin_system(&self) -> anyhow::Result<Transaction<RT>> {
         self.begin(Identity::system()).await
     }

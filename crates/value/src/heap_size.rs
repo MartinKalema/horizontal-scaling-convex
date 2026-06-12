@@ -42,6 +42,7 @@ use sync_types::{
     ErrorPayload,
     FunctionName,
     LogLinesMessage,
+    ReadAfterWriteToken,
     ServerMessage,
     SessionId,
     StateModification,
@@ -496,6 +497,13 @@ impl HeapSize for Timestamp {
     }
 }
 
+impl HeapSize for ReadAfterWriteToken {
+    #[inline]
+    fn heap_size(&self) -> usize {
+        0
+    }
+}
+
 impl HeapSize for CanonicalizedUdfPath {
     fn heap_size(&self) -> usize {
         // We use the string length as an approximation since we don't have
@@ -939,9 +947,14 @@ impl<V: HeapSize> HeapSize for ServerMessage<V> {
                 request_id,
                 result,
                 ts,
+                read_after_write,
                 log_lines,
             } => {
-                request_id.heap_size() + result.heap_size() + ts.heap_size() + log_lines.heap_size()
+                request_id.heap_size()
+                    + result.heap_size()
+                    + ts.heap_size()
+                    + read_after_write.heap_size()
+                    + log_lines.heap_size()
             },
             ServerMessage::ActionResponse {
                 request_id,

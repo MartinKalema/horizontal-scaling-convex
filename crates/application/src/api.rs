@@ -89,6 +89,15 @@ pub struct ReadAfterWriteFence {
     pub ts: Timestamp,
 }
 
+impl ReadAfterWriteFence {
+    pub fn from_source_partition(source_partition: Option<u32>, ts: Timestamp) -> Self {
+        Self {
+            source_partition: source_partition.map(PartitionId),
+            ts,
+        }
+    }
+}
+
 // A trait that abstracts the backend API. It all state and validation logic
 // so http routes can be kept thin and stateless. The implementor is also
 // responsible for routing the request to the appropriate backend in the hosted
@@ -267,6 +276,8 @@ pub trait ApplicationApi: Send + Sync {
 
     /// To be used for metrics only.
     async fn partition_id(&self, host: &ResolvedHostname) -> anyhow::Result<u64>;
+
+    fn read_after_write_source_partition(&self) -> Option<u32>;
 }
 
 // Implements ApplicationApi via Application.
@@ -561,6 +572,12 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
     async fn partition_id(&self, _host: &ResolvedHostname) -> anyhow::Result<u64> {
         // Not relevant; just return something
         Ok(0)
+    }
+
+    fn read_after_write_source_partition(&self) -> Option<u32> {
+        self.database
+            .local_partition()
+            .map(|partition| partition.0)
     }
 }
 
