@@ -13,10 +13,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use common::{
-    grpc::ClusterGrpcAuth,
-    types::Timestamp,
-};
+use common::types::Timestamp;
 
 use crate::{
     committer::CommitterClient,
@@ -30,7 +27,6 @@ use crate::{
     two_phase::{
         NodeAddresses,
         ParticipantTransaction,
-        TwoPhaseCommitGrpcClient,
         TwoPhaseDecision,
         TwoPhaseTransactionId,
     },
@@ -125,7 +121,6 @@ async fn prepare_participant(
     participant_tx: ParticipantTransaction,
     write_source: &WriteSource,
     prepare_ts: Timestamp,
-    cluster_auth: Option<ClusterGrpcAuth>,
 ) -> anyhow::Result<()> {
     let result = if participant == partition_map.local_partition() {
         local_committer
@@ -147,10 +142,7 @@ async fn prepare_participant(
         let addr = node_addresses
             .address_for(participant)
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
-        let client = match cluster_auth {
-            Some(auth) => TwoPhaseCommitGrpcClient::connect_with_auth(addr, auth).await?,
-            None => TwoPhaseCommitGrpcClient::connect(addr).await?,
-        };
+        let client = local_committer.two_phase_client(addr).await?;
         client
             .prepare(
                 transaction_id,
@@ -179,7 +171,6 @@ async fn rollback_participant(
     partition_map: &PartitionMap,
     transaction_id: &TwoPhaseTransactionId,
     participant: PartitionId,
-    cluster_auth: Option<ClusterGrpcAuth>,
 ) -> anyhow::Result<()> {
     if participant == partition_map.local_partition() {
         local_committer
@@ -195,10 +186,7 @@ async fn rollback_participant(
         let addr = node_addresses
             .address_for(participant)
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
-        let client = match cluster_auth {
-            Some(auth) => TwoPhaseCommitGrpcClient::connect_with_auth(addr, auth).await?,
-            None => TwoPhaseCommitGrpcClient::connect(addr).await?,
-        };
+        let client = local_committer.two_phase_client(addr).await?;
         client.rollback_prepared(transaction_id).await
     }
 }
@@ -209,7 +197,6 @@ async fn commit_participant(
     partition_map: &PartitionMap,
     transaction_id: &TwoPhaseTransactionId,
     participant: PartitionId,
-    cluster_auth: Option<ClusterGrpcAuth>,
 ) -> anyhow::Result<Timestamp> {
     if participant == partition_map.local_partition() {
         local_committer
@@ -225,10 +212,7 @@ async fn commit_participant(
         let addr = node_addresses
             .address_for(participant)
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
-        let client = match cluster_auth {
-            Some(auth) => TwoPhaseCommitGrpcClient::connect_with_auth(addr, auth).await?,
-            None => TwoPhaseCommitGrpcClient::connect(addr).await?,
-        };
+        let client = local_committer.two_phase_client(addr).await?;
         Ok(client.commit_prepared(transaction_id).await?.try_into()?)
     }
 }
@@ -315,7 +299,6 @@ pub async fn coordinate_two_phase_commit(
 
     let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
     let node_addresses = local_committer.node_addresses();
-    let cluster_auth = local_committer.cluster_grpc_auth();
     let participants: Vec<_> = participant_indexes
         .iter()
         .map(|(participant, write_indexes)| -> anyhow::Result<_> {
@@ -364,7 +347,6 @@ pub async fn coordinate_two_phase_commit(
                 participant_tx.clone(),
                 &write_source,
                 prepare_ts,
-                cluster_auth.clone(),
             )
             .await
             {
@@ -398,7 +380,6 @@ pub async fn coordinate_two_phase_commit(
                             partition_map,
                             &txn_id,
                             prepared,
-                            cluster_auth.clone(),
                         )
                         .await
                         {
@@ -469,7 +450,6 @@ pub async fn coordinate_two_phase_commit(
                 partition_map,
                 &txn_id,
                 *participant,
-                cluster_auth.clone(),
             )
             .await
             {

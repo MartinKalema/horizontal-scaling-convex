@@ -7,7 +7,10 @@
 //! supported public requests to the authoritative node when local execution is
 //! not appropriate.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use anyhow::Context;
 use application::{
@@ -48,6 +51,7 @@ use pb::replication::{
 };
 use serde_json::Value as JsonValue;
 use sync_types::types::SerializedArgs;
+use tokio::sync::Mutex;
 use tonic::{
     transport::Channel,
     Request,
@@ -280,6 +284,46 @@ pub struct MutationForwarderGrpcClient {
     cluster_auth: Option<ClusterGrpcAuth>,
 }
 
+fn normalize_grpc_url(url: &str) -> String {
+    if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("http://{url}")
+    }
+}
+
+#[derive(Clone)]
+pub struct MutationForwarderGrpcClientPool {
+    cluster_auth: Option<ClusterGrpcAuth>,
+    clients: Arc<Mutex<BTreeMap<String, Arc<MutationForwarderGrpcClient>>>>,
+}
+
+impl MutationForwarderGrpcClientPool {
+    pub fn new(cluster_auth: Option<ClusterGrpcAuth>) -> Self {
+        Self {
+            cluster_auth,
+            clients: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub async fn client(&self, url: &str) -> anyhow::Result<Arc<MutationForwarderGrpcClient>> {
+        let normalized_url = normalize_grpc_url(url);
+        if let Some(client) = self.clients.lock().await.get(&normalized_url).cloned() {
+            return Ok(client);
+        }
+
+        let client = Arc::new(
+            MutationForwarderGrpcClient::connect_inner(&normalized_url, self.cluster_auth.clone())
+                .await?,
+        );
+        let mut clients = self.clients.lock().await;
+        Ok(clients
+            .entry(normalized_url)
+            .or_insert_with(|| client.clone())
+            .clone())
+    }
+}
+
 impl MutationForwarderGrpcClient {
     /// Connect to the Primary's gRPC mutation forwarding service.
     pub async fn connect(primary_url: &str) -> anyhow::Result<Self> {
@@ -297,11 +341,7 @@ impl MutationForwarderGrpcClient {
         primary_url: &str,
         cluster_auth: Option<ClusterGrpcAuth>,
     ) -> anyhow::Result<Self> {
-        let normalized_url = if primary_url.contains("://") {
-            primary_url.to_string()
-        } else {
-            format!("http://{primary_url}")
-        };
+        let normalized_url = normalize_grpc_url(primary_url);
         let client = TonicMutationForwarderClient::connect(normalized_url.clone())
             .await
             .with_context(|| format!("Failed to connect to Primary at {normalized_url}"))?;

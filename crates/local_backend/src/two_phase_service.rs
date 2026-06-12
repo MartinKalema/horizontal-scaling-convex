@@ -22,6 +22,7 @@ use database::{
     two_phase::{
         ParticipantTransaction,
         TwoPhaseCommitGrpcClient,
+        TwoPhaseCommitGrpcClientPool,
         TwoPhaseTransactionId,
     },
     CommitterClient,
@@ -53,6 +54,7 @@ pub struct TwoPhaseCommitGrpcService {
     raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     placement_metadata_store: Option<Arc<dyn PlacementMetadataStore>>,
     cluster_auth: Option<ClusterGrpcAuth>,
+    client_pool: TwoPhaseCommitGrpcClientPool,
 }
 
 impl TwoPhaseCommitGrpcService {
@@ -68,6 +70,7 @@ impl TwoPhaseCommitGrpcService {
             raft_state,
             raft_peer_grpc_urls,
             placement_metadata_store,
+            client_pool: TwoPhaseCommitGrpcClientPool::new(cluster_auth.clone()),
             cluster_auth,
         }
     }
@@ -76,7 +79,7 @@ impl TwoPhaseCommitGrpcService {
         TonicTwoPcServer::new(self)
     }
 
-    async fn leader_client(&self) -> Result<Option<TwoPhaseCommitGrpcClient>, Status> {
+    async fn leader_client(&self) -> Result<Option<Arc<TwoPhaseCommitGrpcClient>>, Status> {
         let Some(raft_state) = self.raft_state.as_ref() else {
             return Ok(None);
         };
@@ -99,11 +102,7 @@ impl TwoPhaseCommitGrpcService {
                     "Missing RAFT_PEERS entry for Raft leader node {leader_id}"
                 ))
             })?;
-        let client = match self.cluster_auth.clone() {
-            Some(auth) => TwoPhaseCommitGrpcClient::connect_with_auth(&leader_addr, auth).await,
-            None => TwoPhaseCommitGrpcClient::connect(&leader_addr).await,
-        }
-        .map_err(|e| {
+        let client = self.client_pool.client(&leader_addr).await.map_err(|e| {
             Status::unavailable(format!(
                 "Failed to connect to Raft leader {} at {}: {e:#}",
                 leader_id, leader_addr

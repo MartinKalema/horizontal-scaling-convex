@@ -719,7 +719,9 @@ impl<RT: Runtime> Committer<RT> {
             placement_state: client_placement_state,
             node_addresses,
             two_phase_decision_log,
-            cluster_grpc_auth,
+            two_phase_client_pool: Arc::new(crate::two_phase::TwoPhaseCommitGrpcClientPool::new(
+                cluster_grpc_auth,
+            )),
         }
     }
 
@@ -4324,7 +4326,7 @@ pub struct CommitterClient {
     placement_state: Option<crate::partition::PlacementState>,
     node_addresses: Option<crate::two_phase::NodeAddresses>,
     two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
-    cluster_grpc_auth: Option<ClusterGrpcAuth>,
+    two_phase_client_pool: Arc<crate::two_phase::TwoPhaseCommitGrpcClientPool>,
 }
 
 impl CommitterClient {
@@ -4470,8 +4472,11 @@ impl CommitterClient {
         self.node_addresses.as_ref()
     }
 
-    pub(crate) fn cluster_grpc_auth(&self) -> Option<ClusterGrpcAuth> {
-        self.cluster_grpc_auth.clone()
+    pub(crate) async fn two_phase_client(
+        &self,
+        addr: &str,
+    ) -> anyhow::Result<Arc<crate::two_phase::TwoPhaseCommitGrpcClient>> {
+        self.two_phase_client_pool.client(addr).await
     }
 
     pub fn placement_version(&self) -> crate::partition::PlacementVersion {

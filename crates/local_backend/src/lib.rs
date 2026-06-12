@@ -141,6 +141,7 @@ pub struct BackendAppState {
     pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
     pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub cluster_grpc_auth: Option<common::grpc::ClusterGrpcAuth>,
+    pub mutation_forwarder_pool: mutation_forwarder::MutationForwarderGrpcClientPool,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
     pub placement_metadata_store: Option<Arc<dyn database::partition::PlacementMetadataStore>>,
     /// Raft partition mailbox for receiving Raft messages from peers.
@@ -171,6 +172,7 @@ pub struct RouterState {
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
     pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub cluster_grpc_auth: Option<common::grpc::ClusterGrpcAuth>,
+    pub mutation_forwarder_pool: mutation_forwarder::MutationForwarderGrpcClientPool,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
 }
 
@@ -426,16 +428,12 @@ pub async fn make_app(
     let instance_secret = config.secret()?;
     let cluster_grpc_auth =
         common::grpc::ClusterGrpcAuth::from_shared_secret(instance_secret.as_bytes())?;
+    let mutation_forwarder_pool =
+        mutation_forwarder::MutationForwarderGrpcClientPool::new(Some(cluster_grpc_auth.clone()));
 
     let replica_mutation_forwarder = if config.replication_mode == "replica" {
         match config.primary_grpc_url.as_deref() {
-            Some(primary_grpc_url) => Some(Arc::new(
-                mutation_forwarder::MutationForwarderGrpcClient::connect_with_auth(
-                    primary_grpc_url,
-                    cluster_grpc_auth.clone(),
-                )
-                .await?,
-            )),
+            Some(primary_grpc_url) => Some(mutation_forwarder_pool.client(primary_grpc_url).await?),
             None => None,
         }
     } else {
@@ -1186,6 +1184,7 @@ pub async fn make_app(
         raft_peer_http_origins,
         raft_peer_grpc_urls,
         replica_mutation_forwarder,
+        mutation_forwarder_pool,
         placement_metadata_store,
         raft_mailbox_tx,
         cluster_grpc_auth: Some(cluster_grpc_auth),

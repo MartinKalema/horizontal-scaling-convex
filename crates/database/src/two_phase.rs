@@ -17,6 +17,7 @@
 
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{
         Duration,
         SystemTime,
@@ -71,6 +72,7 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use tokio::sync::Mutex;
 use tonic::{
     transport::Channel,
     Request,
@@ -1059,6 +1061,46 @@ pub struct TwoPhaseCommitGrpcClient {
     cluster_auth: Option<ClusterGrpcAuth>,
 }
 
+fn normalize_grpc_addr(addr: &str) -> String {
+    if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
+#[derive(Clone)]
+pub struct TwoPhaseCommitGrpcClientPool {
+    cluster_auth: Option<ClusterGrpcAuth>,
+    clients: Arc<Mutex<BTreeMap<String, Arc<TwoPhaseCommitGrpcClient>>>>,
+}
+
+impl TwoPhaseCommitGrpcClientPool {
+    pub fn new(cluster_auth: Option<ClusterGrpcAuth>) -> Self {
+        Self {
+            cluster_auth,
+            clients: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub async fn client(&self, addr: &str) -> anyhow::Result<Arc<TwoPhaseCommitGrpcClient>> {
+        let normalized_addr = normalize_grpc_addr(addr);
+        if let Some(client) = self.clients.lock().await.get(&normalized_addr).cloned() {
+            return Ok(client);
+        }
+
+        let client = Arc::new(
+            TwoPhaseCommitGrpcClient::connect_inner(&normalized_addr, self.cluster_auth.clone())
+                .await?,
+        );
+        let mut clients = self.clients.lock().await;
+        Ok(clients
+            .entry(normalized_addr)
+            .or_insert_with(|| client.clone())
+            .clone())
+    }
+}
+
 impl TwoPhaseCommitGrpcClient {
     pub async fn connect(addr: &str) -> anyhow::Result<Self> {
         Self::connect_inner(addr, None).await
@@ -1075,11 +1117,7 @@ impl TwoPhaseCommitGrpcClient {
         addr: &str,
         cluster_auth: Option<ClusterGrpcAuth>,
     ) -> anyhow::Result<Self> {
-        let normalized_addr = if addr.contains("://") {
-            addr.to_string()
-        } else {
-            format!("http://{addr}")
-        };
+        let normalized_addr = normalize_grpc_addr(addr);
         let client = TonicTwoPcClient::connect(normalized_addr.clone())
             .await
             .with_context(|| format!("Failed to connect to 2PC service at {normalized_addr}"))?;

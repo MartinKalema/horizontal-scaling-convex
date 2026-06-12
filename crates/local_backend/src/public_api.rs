@@ -307,14 +307,9 @@ async fn maybe_forward_public_mutation(
                 );
                 return Ok(None);
             };
-            let client_result = match st.cluster_grpc_auth.clone() {
-                Some(auth) => {
-                    MutationForwarderGrpcClient::connect_with_auth(&leader_grpc_url, auth).await
-                },
-                None => MutationForwarderGrpcClient::connect(&leader_grpc_url).await,
-            };
+            let client_result = st.mutation_forwarder_pool.client(&leader_grpc_url).await;
             match client_result {
-                Ok(client) => Some(ForwardingMode::RaftFollower(Arc::new(client))),
+                Ok(client) => Some(ForwardingMode::RaftFollower(client)),
                 Err(e) => {
                     tracing::warn!(
                         "Skipping follower mutation forwarding because leader {} at {} is not \
