@@ -174,6 +174,11 @@ pub enum PersistenceGlobalKey {
     /// transactions. This must not be copied into checkpoints.
     TwoPhaseRedoRecords,
 
+    /// Node-local durable outbox of Raft-committed deltas that still need to
+    /// be published to the cross-partition replication log. This must not be
+    /// copied into checkpoints.
+    RaftNatsOutbox,
+
     /// Internal id of _tables.by_id index, for bootstrapping.
     TablesByIdIndex,
     /// Internal id of _tables table, for bootstrapping.
@@ -204,6 +209,7 @@ impl From<PersistenceGlobalKey> for String {
             PersistenceGlobalKey::AppliedDeltaWatermarks => "applied_delta_watermarks".to_string(),
             PersistenceGlobalKey::TableSummary => "table_summary".to_string(),
             PersistenceGlobalKey::TwoPhaseRedoRecords => "two_phase_redo_records".to_string(),
+            PersistenceGlobalKey::RaftNatsOutbox => "raft_nats_outbox".to_string(),
             PersistenceGlobalKey::TablesByIdIndex => "tables_by_id".to_string(),
             PersistenceGlobalKey::IndexByIdIndex => "index_by_id".to_string(),
             // NB: For compatibility, these are referred to as "table_id"s, not "tablet_id"s.
@@ -226,6 +232,7 @@ impl FromStr for PersistenceGlobalKey {
             "applied_delta_watermarks" => Ok(Self::AppliedDeltaWatermarks),
             "table_summary" => Ok(Self::TableSummary),
             "two_phase_redo_records" => Ok(Self::TwoPhaseRedoRecords),
+            "raft_nats_outbox" => Ok(Self::RaftNatsOutbox),
             "tables_by_id" => Ok(Self::TablesByIdIndex),
             "tables_table_id" => Ok(Self::TablesTabletId),
             "index_by_id" => Ok(Self::IndexByIdIndex),
@@ -243,7 +250,7 @@ impl PersistenceGlobalKey {
     pub fn checkpoint_keys() -> Vec<Self> {
         Self::all_keys()
             .into_iter()
-            .filter(|key| *key != Self::TwoPhaseRedoRecords)
+            .filter(|key| !matches!(key, Self::TwoPhaseRedoRecords | Self::RaftNatsOutbox))
             .collect()
     }
 }
