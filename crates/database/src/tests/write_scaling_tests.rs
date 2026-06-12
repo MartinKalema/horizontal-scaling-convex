@@ -2460,6 +2460,65 @@ async fn test_replica_delta_timestamp_translation_records_origin_watermark(
 }
 
 #[convex_macro::test_runtime]
+async fn test_read_after_write_fence_waits_for_remote_origin_watermark(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_numbers: Arc<dyn TableNumberAllocator> =
+        Arc::new(InMemoryTableNumberAllocator::default());
+    let target = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        table_numbers.clone(),
+    )
+    .await?;
+    let source = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers,
+    )
+    .await?;
+
+    insert_doc(&source, "projects", assert_obj!("name" => "remote fence")).await?;
+    let mut remote_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("remote project insert should publish a delta");
+    let local_ts = insert_doc(&target, "messages", assert_obj!("text" => "local fence")).await?;
+    let remote_ts = local_ts.pred()?;
+    remote_delta.ts = remote_ts;
+
+    let pending = tokio::time::timeout(
+        Duration::from_millis(50),
+        target.wait_for_read_after_write_fence(Some(PartitionId(1)), remote_ts),
+    )
+    .await;
+    assert!(
+        pending.is_err(),
+        "read-after-write fence should wait until the remote origin watermark is applied",
+    );
+
+    let applied_ts = target
+        .committer_for_test()
+        .apply_replica_delta(remote_delta)
+        .await?;
+    assert_ne!(
+        applied_ts, remote_ts,
+        "test should exercise translated local apply timestamps",
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        target.wait_for_read_after_write_fence(Some(PartitionId(1)), remote_ts),
+    )
+    .await??;
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_replica_table_number_allocation_waits_for_prior_publish(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {

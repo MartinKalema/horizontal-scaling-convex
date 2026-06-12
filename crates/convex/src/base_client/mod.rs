@@ -152,6 +152,7 @@ impl LocalSyncState {
             udf_path,
             args: SerializedArgs::from_args(vec![Value::Object(args.clone()).into()])
                 .expect("Could not serialize query arguments"),
+            read_after_write: None,
             journal: None,
             component_path: None,
         });
@@ -277,6 +278,7 @@ impl LocalSyncState {
                     Value::Object(local_query.args.clone()).into()
                 ])
                 .expect("Could not serialize query arguments"),
+                read_after_write: None,
                 journal: None,
                 component_path: None,
             });
@@ -668,6 +670,7 @@ impl BaseConvexClient {
                 request_id,
                 result,
                 ts,
+                read_after_write: _,
                 log_lines,
             } => {
                 for log_line in log_lines.0 {

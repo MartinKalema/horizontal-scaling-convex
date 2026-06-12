@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use application::{
-    api::ExecuteQueryTimestamp,
+    api::{
+        ExecuteQueryTimestamp,
+        ReadAfterWriteFence,
+    },
     redaction::{
         RedactedJsError,
         RedactedLogLines,
@@ -37,6 +40,7 @@ use common::{
     types::FunctionCaller,
     version::ClientVersion,
 };
+use database::partition::PartitionId;
 use errors::ErrorMetadata;
 use isolate::UdfArgsJson;
 use serde::{
@@ -70,6 +74,9 @@ pub struct UdfPostRequest {
     #[schema(value_type = Object)]
     pub args: UdfArgsJson,
 
+    #[serde(default)]
+    pub read_after_write: Option<ReadAfterWriteToken>,
+
     pub format: Option<String>,
 }
 
@@ -87,10 +94,13 @@ pub struct UdfPostWithTsRequest {
     pub args: UdfArgsJson,
     pub ts: SerializedTs,
 
+    #[serde(default)]
+    pub read_after_write: Option<ReadAfterWriteToken>,
+
     pub format: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct SerializedTs(String);
 
 impl From<Timestamp> for SerializedTs {
@@ -118,7 +128,18 @@ pub struct UdfArgsQuery {
     pub path: String,
     pub args: UdfArgsJson,
 
+    #[serde(default)]
+    pub read_after_write: Option<ReadAfterWriteToken>,
+
     pub format: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadAfterWriteToken {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_partition: Option<u32>,
+    pub ts: SerializedTs,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -128,6 +149,9 @@ pub enum UdfResponse {
     #[serde(rename_all = "camelCase")]
     Success {
         value: JsonValue,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
+        read_after_write: Option<ReadAfterWriteToken>,
 
         #[serde(skip_serializing_if = "RedactedLogLines::is_empty")]
         #[schema(value_type = Vec<String>)]
@@ -194,6 +218,26 @@ impl UdfResponse {
             log_lines,
         })
     }
+}
+
+fn mutation_read_after_write_token(st: &RouterState, ts: Timestamp) -> ReadAfterWriteToken {
+    ReadAfterWriteToken {
+        source_partition: st.partition_id.map(|partition| partition.0),
+        ts: ts.into(),
+    }
+}
+
+fn read_after_write_fence(
+    token: Option<ReadAfterWriteToken>,
+) -> anyhow::Result<Option<ReadAfterWriteFence>> {
+    token
+        .map(|token| {
+            Ok(ReadAfterWriteFence {
+                source_partition: token.source_partition.map(PartitionId),
+                ts: Timestamp::try_from(token.ts)?,
+            })
+        })
+        .transpose()
 }
 
 async fn wait_for_local_mutation_visibility(
@@ -337,6 +381,10 @@ async fn maybe_forward_public_mutation(
             )?;
             UdfResponse::Success {
                 value: export_value(packed.unpack()?, value_format, client_version.clone())?,
+                read_after_write: Some(mutation_read_after_write_token(
+                    st,
+                    Timestamp::try_from(success.ts)?,
+                )),
                 log_lines: RedactedLogLines::from_vec(success.log_lines),
             }
         },
@@ -413,6 +461,7 @@ pub async fn public_function_post(
     let response = match udf_result {
         Ok(write_return) => UdfResponse::Success {
             value: export_value(write_return.value.unpack()?, value_format, client_version)?,
+            read_after_write: None,
             log_lines: write_return.log_lines,
         },
         Err(write_error) => UdfResponse::error(
@@ -504,6 +553,7 @@ pub async fn public_function_post_with_path(
     let response = match udf_result {
         Ok(write_return) => UdfResponse::Success {
             value: export_value(write_return.value.unpack()?, value_format, client_version)?,
+            read_after_write: None,
             log_lines: write_return.log_lines,
         },
         Err(write_error) => UdfResponse::error(
@@ -572,6 +622,7 @@ pub async fn public_query_get(
             req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::Latest,
+            read_after_write_fence(req.read_after_write)?,
             journal,
         )
         .await?;
@@ -580,6 +631,7 @@ pub async fn public_query_get(
     let response = match query_result.result {
         Ok(value) => UdfResponse::Success {
             value: export_value(value.unpack()?, value_format, client_version)?,
+            read_after_write: None,
             log_lines,
         },
         Err(error) => UdfResponse::error(error, log_lines, value_format, client_version)?,
@@ -626,6 +678,7 @@ pub async fn public_query_post(
             req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::Latest,
+            read_after_write_fence(req.read_after_write)?,
             journal,
         )
         .await?;
@@ -633,6 +686,7 @@ pub async fn public_query_post(
     let response = match query_return.result {
         Ok(value) => UdfResponse::Success {
             value: export_value(value.unpack()?, value_format, client_version)?,
+            read_after_write: None,
             log_lines: query_return.log_lines,
         },
         Err(error) => {
@@ -700,6 +754,7 @@ pub async fn public_query_at_ts_post(
             req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::At(ts),
+            read_after_write_fence(req.read_after_write)?,
             journal,
         )
         .await?;
@@ -707,6 +762,7 @@ pub async fn public_query_at_ts_post(
     let response = match query_return.result {
         Ok(value) => UdfResponse::Success {
             value: export_value(value.unpack()?, value_format, client_version)?,
+            read_after_write: None,
             log_lines: query_return.log_lines,
         },
         Err(error) => {
@@ -745,13 +801,22 @@ pub async fn public_query_batch_post(
     Json(req_batch): Json<QueryBatchArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let mut results = vec![];
-    // All queries execute at the same timestamp.
-    let ts = st.api.latest_timestamp(&host, request_id.clone()).await?;
     let identity = st
         .api
         .authenticate(&host, request_id.clone(), auth_token)
         .await?;
-    for req in req_batch.queries {
+    let queries = req_batch.queries;
+    for req in &queries {
+        if let Some(fence) = read_after_write_fence(req.read_after_write.clone())? {
+            st.database
+                .wait_for_read_after_write_fence(fence.source_partition, fence.ts)
+                .await?;
+        }
+    }
+    // All queries execute at the same timestamp, after any portable freshness
+    // fences have been satisfied.
+    let ts = st.api.latest_timestamp(&host, request_id.clone()).await?;
+    for req in queries {
         let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
         let export_path = parse_export_path(&req.path)?;
         let udf_return = st
@@ -765,11 +830,13 @@ pub async fn public_query_batch_post(
                 FunctionCaller::HttpApi(client_version.clone()),
                 ExecuteQueryTimestamp::At(*ts),
                 None,
+                None,
             )
             .await?;
         let response = match udf_return.result {
             Ok(value) => UdfResponse::Success {
                 value: export_value(value.unpack()?, value_format, client_version.clone())?,
+                read_after_write: None,
                 log_lines: udf_return.log_lines,
             },
             Err(error) => UdfResponse::error(
@@ -844,6 +911,7 @@ pub async fn public_mutation_post(
             wait_for_local_mutation_visibility(&st, write_return.ts, false).await;
             UdfResponse::Success {
                 value: export_value(write_return.value.unpack()?, value_format, client_version)?,
+                read_after_write: Some(mutation_read_after_write_token(&st, write_return.ts)),
                 log_lines: write_return.log_lines,
             }
         },
@@ -901,6 +969,7 @@ pub async fn public_action_post(
     let response = match action_result {
         Ok(action_return) => UdfResponse::Success {
             value: export_value(action_return.value.unpack()?, value_format, client_version)?,
+            read_after_write: None,
             log_lines: action_return.log_lines,
         },
         Err(action_error) => UdfResponse::error(
@@ -1048,13 +1117,22 @@ mod tests {
         match expected {
             Ok(expected) => {
                 let result: JsonValue = backend.expect_success(req).await?;
-                assert_eq!(
-                    result,
-                    json!({
-                        "status": "success",
-                        "value": expected,
-                    })
-                );
+                assert_eq!(result["status"], "success");
+                assert_eq!(result["value"], expected);
+                if uri == "/api/mutation" {
+                    assert!(
+                        result["readAfterWrite"]["ts"].as_str().is_some(),
+                        "mutation responses should include a portable read-after-write token"
+                    );
+                } else {
+                    assert_eq!(
+                        result,
+                        json!({
+                            "status": "success",
+                            "value": expected,
+                        })
+                    );
+                }
             },
             Err(expected) => {
                 backend
@@ -1158,6 +1236,44 @@ mod tests {
             Ok(json!("1")),
         )
         .await
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_http_query_accepts_read_after_write_token(rt: ProdRuntime) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt).await?;
+        backend.st.application.load_udf_tests_modules().await?;
+
+        let inserted: JsonValue = backend
+            .expect_success(post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "fenced read" } },
+                }),
+            )?)
+            .await?;
+        let token = inserted["readAfterWrite"].clone();
+        assert!(
+            token["ts"].as_str().is_some(),
+            "mutation response should include a read-after-write token"
+        );
+        let inserted_id = inserted["value"]
+            .as_str()
+            .context("insertObject should return a document id string")?
+            .to_string();
+
+        let queried: JsonValue = backend
+            .expect_success(post_request(
+                "/api/query",
+                json!({
+                    "path": "values:getObject",
+                    "args": { "id": inserted_id },
+                    "readAfterWrite": token,
+                }),
+            )?)
+            .await?;
+        assert_eq!(queried["value"]["hello"], "fenced read");
+        Ok(())
     }
 
     #[convex_macro::prod_rt_test]
@@ -1413,6 +1529,7 @@ mod tests {
                 FunctionCaller::HttpApi(ClientVersion::unknown()),
                 None,
                 None,
+                None,
             )
             .await?;
 
@@ -1498,6 +1615,7 @@ mod tests {
                 FunctionCaller::HttpApi(ClientVersion::unknown()),
                 ExecuteQueryTimestamp::Latest,
                 None,
+                None,
             )
             .await?;
 
@@ -1577,6 +1695,7 @@ mod tests {
                 SerializedArgs::from_args(vec![json!({ "id": inserted_id })])?,
                 FunctionCaller::HttpApi(ClientVersion::unknown()),
                 ExecuteQueryTimestamp::Latest,
+                None,
                 None,
             )
             .await?;

@@ -15,6 +15,7 @@ use application::{
     api::{
         ApplicationApi,
         ExecuteQueryTimestamp,
+        ReadAfterWriteFence,
         SubscriptionClient,
         SubscriptionTrait,
         SubscriptionValidity,
@@ -87,6 +88,7 @@ use sync_types::{
     QueryId,
     QuerySetModification,
     QuerySetVersion,
+    ReadAfterWriteToken,
     SerializedQueryJournal,
     SessionId,
     StateModification,
@@ -597,6 +599,10 @@ impl<RT: Runtime> SyncWorker<RT> {
                                 request_id,
                                 result: Ok(udf_return.value),
                                 ts: Some(udf_return.ts),
+                                read_after_write: Some(ReadAfterWriteToken {
+                                    source_partition: api.read_after_write_source_partition(),
+                                    ts: udf_return.ts,
+                                }),
                                 log_lines: udf_return.log_lines.into(),
                             },
                             Err(RedactedMutationError { error, log_lines }) => {
@@ -604,6 +610,7 @@ impl<RT: Runtime> SyncWorker<RT> {
                                     request_id,
                                     result: Err(error.into_error_payload()),
                                     ts: None,
+                                    read_after_write: None,
                                     log_lines: log_lines.into(),
                                 }
                             },
@@ -961,6 +968,12 @@ impl<RT: Runtime> SyncWorker<RT> {
                                             query.args.clone(),
                                             caller.clone(),
                                             ExecuteQueryTimestamp::At(new_ts),
+                                            query.read_after_write.as_ref().map(|token| {
+                                                ReadAfterWriteFence::from_source_partition(
+                                                    token.source_partition,
+                                                    token.ts,
+                                                )
+                                            }),
                                             query.journal.clone(),
                                         )
                                         .await

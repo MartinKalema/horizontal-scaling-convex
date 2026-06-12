@@ -225,6 +225,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         args: SerializedArgs,
         caller: FunctionCaller,
         ts: application::api::ExecuteQueryTimestamp,
+        read_after_write: Option<application::api::ReadAfterWriteFence>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<application::RedactedQueryReturn> {
         let result = if let Some(target_grpc_url) = self.public_query_target_grpc_url().await? {
@@ -248,13 +249,24 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
                         application::api::ExecuteQueryTimestamp::Latest => None,
                         application::api::ExecuteQueryTimestamp::At(ts) => Some(u64::from(ts)),
                     },
+                    read_after_write,
                     journal.flatten(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(e))?
         } else {
             self.inner
-                .execute_public_query(host, request_id, identity, path, args, caller, ts, journal)
+                .execute_public_query(
+                    host,
+                    request_id,
+                    identity,
+                    path,
+                    args,
+                    caller,
+                    ts,
+                    read_after_write,
+                    journal,
+                )
                 .await?
         };
         self.note_recent_interest(&result.token);
@@ -489,5 +501,9 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
 
     async fn partition_id(&self, host: &ResolvedHostname) -> anyhow::Result<u64> {
         self.inner.partition_id(host).await
+    }
+
+    fn read_after_write_source_partition(&self) -> Option<u32> {
+        self.inner.read_after_write_source_partition()
     }
 }

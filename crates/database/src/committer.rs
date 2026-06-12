@@ -1029,6 +1029,10 @@ impl<RT: Runtime> Committer<RT> {
                                         source_partition,
                                         commit_ts,
                                     )?;
+                                    sm.update_applied_delta_watermark(
+                                        source_partition,
+                                        remote_ts,
+                                    )?;
                                     self.applied_delta_watermarks
                                         .insert(source_partition, remote_ts);
                                 }
@@ -1069,9 +1073,15 @@ impl<RT: Runtime> Committer<RT> {
                                     partition_timestamp_map_to_json(&applied_delta_watermarks),
                                 )
                                 .await?;
+                            let origin_watermark = applied_delta_watermarks
+                                .get(&source_partition)
+                                .copied()
+                                .unwrap_or(commit_ts);
+                            self.applied_delta_watermarks = applied_delta_watermarks;
                             self.publish_replication_frontier_progress(
                                 commit_ts,
                                 source_partition,
+                                origin_watermark,
                             )?;
                             let _ = result.send(Ok(commit_ts));
                         },
@@ -1089,11 +1099,12 @@ impl<RT: Runtime> Committer<RT> {
                             self.queued_snapshots.clear();
                             self.log.reset(snapshot_ts);
                             self.last_assigned_ts = snapshot_ts;
-                            self.applied_delta_watermarks = applied_delta_watermarks;
+                            self.applied_delta_watermarks = applied_delta_watermarks.clone();
                             self.snapshot_manager.write().replace(
                                 snapshot_ts,
                                 snapshot,
                                 replication_frontiers,
+                                applied_delta_watermarks,
                             );
                             let _ = result.send(Ok(snapshot_ts));
                         },
@@ -1651,6 +1662,7 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         frontier_ts: Timestamp,
         source_partition: crate::partition::PartitionId,
+        origin_watermark: Timestamp,
     ) -> anyhow::Result<()> {
         // Idle replica heartbeats advance the safe frontier for remote reads,
         // but they do not publish a newer readable snapshot. Keep that
@@ -1659,6 +1671,7 @@ impl<RT: Runtime> Committer<RT> {
         // exist.
         let mut snapshot_manager = self.snapshot_manager.write();
         snapshot_manager.update_replication_frontier(source_partition, frontier_ts)?;
+        snapshot_manager.update_applied_delta_watermark(source_partition, origin_watermark)?;
         Ok(())
     }
 
@@ -4315,6 +4328,12 @@ pub struct CommitterClient {
 }
 
 impl CommitterClient {
+    pub fn local_partition(&self) -> Option<crate::partition::PartitionId> {
+        self.placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.local_partition())
+    }
+
     pub async fn finish_search_and_vector_bootstrap(
         &self,
         bootstrapped_indexes: BootstrappedSearchIndexes,

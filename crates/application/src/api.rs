@@ -24,6 +24,7 @@ use common::{
     RequestId,
 };
 use database::{
+    partition::PartitionId,
     Database,
     LogReader,
     ReadSet,
@@ -82,6 +83,21 @@ pub enum ExecuteQueryTimestamp {
     At(Timestamp),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadAfterWriteFence {
+    pub source_partition: Option<PartitionId>,
+    pub ts: Timestamp,
+}
+
+impl ReadAfterWriteFence {
+    pub fn from_source_partition(source_partition: Option<u32>, ts: Timestamp) -> Self {
+        Self {
+            source_partition: source_partition.map(PartitionId),
+            ts,
+        }
+    }
+}
+
 // A trait that abstracts the backend API. It all state and validation logic
 // so http routes can be kept thin and stateless. The implementor is also
 // responsible for routing the request to the appropriate backend in the hosted
@@ -107,6 +123,7 @@ pub trait ApplicationApi: Send + Sync {
         args: SerializedArgs,
         caller: FunctionCaller,
         ts: ExecuteQueryTimestamp,
+        read_after_write: Option<ReadAfterWriteFence>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<RedactedQueryReturn>;
 
@@ -259,6 +276,8 @@ pub trait ApplicationApi: Send + Sync {
 
     /// To be used for metrics only.
     async fn partition_id(&self, host: &ResolvedHostname) -> anyhow::Result<u64>;
+
+    fn read_after_write_source_partition(&self) -> Option<u32>;
 }
 
 // Implements ApplicationApi via Application.
@@ -283,12 +302,18 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         args: SerializedArgs,
         caller: FunctionCaller,
         ts: ExecuteQueryTimestamp,
+        read_after_write: Option<ReadAfterWriteFence>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<RedactedQueryReturn> {
         anyhow::ensure!(
             caller.allowed_visibility() == AllowedVisibility::PublicOnly,
             "This method should not be used by internal callers."
         );
+        if let Some(fence) = read_after_write {
+            self.database
+                .wait_for_read_after_write_fence(fence.source_partition, fence.ts)
+                .await?;
+        }
         let ts = match ts {
             ExecuteQueryTimestamp::Latest => *self.now_ts_for_reads(),
             ExecuteQueryTimestamp::At(ts) => ts,
@@ -547,6 +572,12 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
     async fn partition_id(&self, _host: &ResolvedHostname) -> anyhow::Result<u64> {
         // Not relevant; just return something
         Ok(0)
+    }
+
+    fn read_after_write_source_partition(&self) -> Option<u32> {
+        self.database
+            .local_partition()
+            .map(|partition| partition.0)
     }
 }
 

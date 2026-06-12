@@ -85,10 +85,21 @@ fn string_json_arg_strategy() -> impl proptest::strategy::Strategy<Value = JsonV
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
+pub struct ReadAfterWriteToken {
+    pub source_partition: Option<u32>,
+    pub ts: Timestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct Query {
     pub query_id: QueryId,
     pub udf_path: UdfPath,
     pub args: SerializedArgs,
+
+    /// Optional causal fence for subscription startup. When present, the
+    /// backend waits until this write is visible before running the query.
+    pub read_after_write: Option<ReadAfterWriteToken>,
 
     /// Query journals are only specified on reconnect. Also old clients
     /// (<=0.2.1) don't send them.
@@ -379,6 +390,7 @@ pub enum ServerMessage<V: 'static> {
         request_id: SessionRequestSeqNumber,
         result: Result<V, ErrorPayload<V>>,
         ts: Option<Timestamp>,
+        read_after_write: Option<ReadAfterWriteToken>,
         log_lines: LogLinesMessage,
     },
     ActionResponse {

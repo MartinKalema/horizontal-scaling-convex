@@ -27,6 +27,7 @@ pub use crate::{
         QueryId,
         QuerySetModification,
         QuerySetVersion,
+        ReadAfterWriteToken,
         SerializedQueryJournal,
         ServerMessage,
         SessionId,

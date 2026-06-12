@@ -333,6 +333,7 @@ pub async fn run_test_function(
     let response = match udf_return {
         Ok(result) => UdfResponse::Success {
             value: export_value(result.value.unpack()?, value_format, client_version)?,
+            read_after_write: None,
             log_lines: result.log_lines,
         },
         Err(error) => {
