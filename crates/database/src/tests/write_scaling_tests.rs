@@ -23,6 +23,7 @@ use common::{
     bootstrap_model::index::database_index::IndexedFields,
     interval::Interval,
     knobs::REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
+    maybe_val,
     pause::PauseController,
     persistence::{
         NoopRetentionValidator,
@@ -32,8 +33,11 @@ use common::{
         TimestampRange,
     },
     query::{
+        IndexRange,
+        IndexRangeExpression,
         Order,
         Query,
+        QuerySource,
     },
     runtime::{
         new_unlimited_rate_limiter,
@@ -45,6 +49,8 @@ use common::{
     shutdown::ShutdownSignal,
     testing::TestPersistence,
     types::{
+        IndexDescriptor,
+        IndexName,
         TabletIndexName,
         Timestamp,
     },
@@ -86,6 +92,7 @@ use value::{
 };
 
 use crate::{
+    bootstrap_model::index::IndexModel,
     commit_delta::{
         testing::InMemoryDistributedLog,
         CommitDelta,
@@ -1837,6 +1844,104 @@ async fn test_replica_delta_fails_for_unmapped_user_table(rt: TestRuntime) -> an
             .replication_frontier_for_test(PartitionId(1))
             .is_some_and(|frontier| frontier > Timestamp::MIN),
         "retry after metadata should apply and advance the frontier",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_replicated_index_metadata_stays_pending_until_local_backfill(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_number_allocator = Arc::new(InMemoryTableNumberAllocator::default());
+    let node_a = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let node_b_persistence = Arc::new(TestPersistence::new());
+    let node_b = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        node_b_persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator,
+    )
+    .await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+
+    let projects_table: TableName = "projects".parse()?;
+    let index_name = IndexName::new(projects_table, IndexDescriptor::new("by_name")?)?;
+    node_b
+        .create_backfilled_index_for_test(
+            node_b_persistence.clone(),
+            TableNamespace::test_user(),
+            index_name.clone(),
+            vec!["name".parse()?].try_into()?,
+        )
+        .await?;
+
+    for delta in log
+        .deltas()
+        .into_iter()
+        .filter(|delta| delta.source_partition == Some(PartitionId(1)))
+    {
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(delta)
+            .await?;
+    }
+
+    let mut owner_tx = node_b.begin_system().await?;
+    let mut owner_indexes = IndexModel::new(&mut owner_tx);
+    assert!(
+        owner_indexes
+            .enabled_index_metadata(TableNamespace::test_user(), &index_name)?
+            .is_some(),
+        "owner partition should finish and enable the index"
+    );
+
+    let mut replica_tx = node_a.begin_system().await?;
+    let mut replica_indexes = IndexModel::new(&mut replica_tx);
+    let pending = replica_indexes
+        .pending_index_metadata(TableNamespace::test_user(), &index_name)?
+        .context("replica should store replicated index metadata as pending")?;
+    assert!(
+        pending.config.is_backfilling(),
+        "replica must rebuild the index locally before queries can use it"
+    );
+    assert!(
+        replica_indexes
+            .enabled_index_metadata(TableNamespace::test_user(), &index_name)?
+            .is_none(),
+        "replica must not expose remote-built index metadata as query-ready"
+    );
+    drop(replica_tx);
+
+    let indexed_query = Query {
+        source: QuerySource::IndexRange(IndexRange {
+            index_name,
+            range: vec![IndexRangeExpression::Eq(
+                "name".parse()?,
+                maybe_val!("seed"),
+            )],
+            order: Order::Asc,
+        }),
+        operators: vec![],
+    };
+    let err = run_query(node_a, TableNamespace::test_user(), indexed_query)
+        .await
+        .expect_err("replica should reject indexed reads while local index backfill is pending");
+    assert!(
+        format!("{err:?}").contains("Index projects.by_name is currently backfilling"),
+        "unexpected error: {err:#}",
     );
 
     Ok(())
