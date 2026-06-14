@@ -7,8 +7,9 @@
 //! ## Design (inspired by Vitess sequence tables)
 //!
 //! A central counter is stored in NATS KV. Each node reserves a batch of
-//! timestamps (e.g., 1000 at a time). Within the batch, timestamps are
-//! assigned locally with zero network calls. When the batch is exhausted,
+//! timestamps (e.g., 1000 at a time). Within the batch, the local counter can
+//! advance without reserving a new range, while still checking the global
+//! committed-timestamp floor before assignment. When the batch is exhausted,
 //! the node reserves another batch from the central counter.
 //!
 //! This gives the performance of local timestamp assignment with the
@@ -28,6 +29,8 @@ use common::{
     types::Timestamp,
 };
 use parking_lot::Mutex;
+
+use crate::metrics;
 
 /// Trait for assigning globally unique, monotonically increasing timestamps.
 ///
@@ -114,8 +117,9 @@ impl<RT: Runtime> TimestampOracle for LocalTimestampOracle<RT> {
 /// Batch timestamp oracle for multi-node deployments.
 ///
 /// Reserves ranges of timestamps from a central NATS KV counter.
-/// Within a range, timestamps are assigned locally with zero network calls.
-/// When the range is exhausted, a new range is reserved.
+/// Within a range, timestamps can advance without reserving a new range.
+/// Each allocation still reads the global committed-timestamp floor so a node
+/// with an older reserved batch does not continue below the cluster watermark.
 ///
 /// Example with batch_size=1000:
 /// - Node A reserves [1000, 1999]
@@ -124,8 +128,7 @@ impl<RT: Runtime> TimestampOracle for LocalTimestampOracle<RT> {
 /// - Node B assigns 2000, 2001, 2002... locally
 /// - No overlap, no coordination within a batch
 pub struct BatchTimestampOracle {
-    nats_client: async_nats::Client,
-    kv_bucket: String,
+    kv: async_nats::jetstream::kv::Store,
     batch_size: u64,
     state: Mutex<BatchState>,
 }
@@ -193,14 +196,12 @@ impl BatchTimestampOracle {
             Err(_) => tracing::info!("TSO: Counter already exists"),
         }
 
-        let bucket = "convex_tso".to_string();
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
 
         tracing::info!("TSO: Connected to NATS KV, batch_size={batch_size}");
 
         Ok(Self {
-            nats_client: client,
-            kv_bucket: bucket,
+            kv,
             batch_size,
             state: Mutex::new(BatchState {
                 current: 0,
@@ -214,15 +215,11 @@ impl BatchTimestampOracle {
     /// Uses NATS KV atomic update (CAS) to ensure no two nodes get
     /// overlapping ranges.
     async fn reserve_batch_at_or_above(&self, min_next: u64) -> anyhow::Result<(u64, u64)> {
-        let jetstream = async_nats::jetstream::new(self.nats_client.clone());
-        let kv = jetstream
-            .get_key_value(&self.kv_bucket)
-            .await
-            .context("TSO: Failed to get KV bucket")?;
-
+        let timer = metrics::tso_operation_timer("batch_reserve");
         // Retry loop for CAS conflicts.
         for attempt in 0..10 {
-            let entry = kv
+            let entry = self
+                .kv
                 .entry(TSO_COUNTER_KEY)
                 .await
                 .context("TSO: Failed to read counter")?
@@ -244,7 +241,8 @@ impl BatchTimestampOracle {
 
             // Atomic compare-and-swap: only succeeds if no other node
             // modified the counter since we read it.
-            match kv
+            match self
+                .kv
                 .update(TSO_COUNTER_KEY, new_value.into(), entry.revision)
                 .await
             {
@@ -252,6 +250,7 @@ impl BatchTimestampOracle {
                     tracing::info!(
                         "TSO: Reserved batch [{new_lower}, {new_upper}) on attempt {attempt}"
                     );
+                    timer.finish();
                     return Ok((new_lower, new_upper));
                 },
                 Err(_) => {
@@ -269,120 +268,138 @@ impl BatchTimestampOracle {
 #[async_trait]
 impl TimestampOracle for BatchTimestampOracle {
     async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp> {
-        let committed_floor = self.max_committed_ts().await?;
-        let min_next_ts = std::cmp::max(min_ts, committed_floor.succ()?);
-        let min_next = u64::from(min_next_ts);
+        let timer = metrics::tso_operation_timer("next_ts_at_or_after");
+        let result = async {
+            let committed_floor = self.max_committed_ts().await?;
+            let min_next_ts = std::cmp::max(min_ts, committed_floor.succ()?);
+            let min_next = u64::from(min_next_ts);
 
-        loop {
-            let candidate = {
+            loop {
+                let candidate = {
+                    let mut state = self.state.lock();
+                    if committed_floor > state.max_committed {
+                        state.max_committed = committed_floor;
+                    }
+
+                    if let Some((ts, next_current)) =
+                        next_ts_from_reserved_batch(state.current, state.upper_bound, min_next)
+                    {
+                        state.current = next_current;
+                        Some(ts)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(ts) = candidate {
+                    return Timestamp::try_from(ts);
+                }
+
+                let (lower, upper) = self.reserve_batch_at_or_above(min_next).await?;
                 let mut state = self.state.lock();
-                if committed_floor > state.max_committed {
-                    state.max_committed = committed_floor;
-                }
-
-                if let Some((ts, next_current)) =
-                    next_ts_from_reserved_batch(state.current, state.upper_bound, min_next)
-                {
-                    state.current = next_current;
-                    Some(ts)
-                } else {
-                    None
-                }
-            };
-
-            if let Some(ts) = candidate {
-                return Timestamp::try_from(ts);
+                state.current = lower;
+                state.upper_bound = upper;
             }
-
-            let (lower, upper) = self.reserve_batch_at_or_above(min_next).await?;
-            let mut state = self.state.lock();
-            state.current = lower;
-            state.upper_bound = upper;
         }
+        .await;
+        if result.is_ok() {
+            timer.finish();
+        }
+        result
     }
 
     async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
-        // Read from NATS KV for cross-node consistency.
-        let jetstream = async_nats::jetstream::new(self.nats_client.clone());
-        let kv = jetstream
-            .get_key_value(&self.kv_bucket)
-            .await
-            .context("TSO: Failed to get KV bucket")?;
-
-        match kv.entry(TSO_MAX_COMMITTED_KEY).await? {
-            Some(entry) => {
-                let ts = u64::from_be_bytes(
-                    entry
-                        .value
-                        .as_ref()
-                        .try_into()
-                        .context("TSO: Invalid max_committed value")?,
-                );
-                Timestamp::try_from(ts)
-            },
-            None => Ok(Timestamp::MIN),
-        }
-    }
-
-    async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
-        let ts_u64 = u64::from(ts);
-
-        // Update local state.
-        {
-            let mut state = self.state.lock();
-            if ts > state.max_committed {
-                state.max_committed = ts;
-            }
-        }
-
-        let jetstream = async_nats::jetstream::new(self.nats_client.clone());
-        let kv = jetstream
-            .get_key_value(&self.kv_bucket)
-            .await
-            .context("TSO: Failed to get KV bucket")?;
-
-        let value = ts_u64.to_be_bytes().to_vec();
-        for attempt in 0..10 {
-            match kv.entry(TSO_MAX_COMMITTED_KEY).await? {
+        let timer = metrics::tso_operation_timer("max_committed_read");
+        let result = async {
+            match self.kv.entry(TSO_MAX_COMMITTED_KEY).await? {
                 Some(entry) => {
-                    let current = u64::from_be_bytes(
+                    let ts = u64::from_be_bytes(
                         entry
                             .value
                             .as_ref()
                             .try_into()
                             .context("TSO: Invalid max_committed value")?,
                     );
-                    if current >= ts_u64 {
-                        return Ok(());
-                    }
+                    Timestamp::try_from(ts)
+                },
+                None => Ok(Timestamp::MIN),
+            }
+        }
+        .await;
+        if result.is_ok() {
+            timer.finish();
+        }
+        result
+    }
 
-                    match kv
-                        .update(TSO_MAX_COMMITTED_KEY, value.clone().into(), entry.revision)
+    async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
+        let timer = metrics::tso_operation_timer("advance_committed");
+        let result = async {
+            let ts_u64 = u64::from(ts);
+
+            // Update local state.
+            {
+                let mut state = self.state.lock();
+                if ts > state.max_committed {
+                    state.max_committed = ts;
+                }
+            }
+
+            let value = ts_u64.to_be_bytes().to_vec();
+            for attempt in 0..10 {
+                match self.kv.entry(TSO_MAX_COMMITTED_KEY).await? {
+                    Some(entry) => {
+                        let current = u64::from_be_bytes(
+                            entry
+                                .value
+                                .as_ref()
+                                .try_into()
+                                .context("TSO: Invalid max_committed value")?,
+                        );
+                        if current >= ts_u64 {
+                            return Ok(());
+                        }
+
+                        match self
+                            .kv
+                            .update(TSO_MAX_COMMITTED_KEY, value.clone().into(), entry.revision)
+                            .await
+                        {
+                            Ok(_) => return Ok(()),
+                            Err(_) => {
+                                tracing::debug!(
+                                    "TSO: max_committed CAS conflict on attempt {attempt}, \
+                                     retrying"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(1 << attempt))
+                                    .await;
+                            },
+                        }
+                    },
+                    None => match self
+                        .kv
+                        .create(TSO_MAX_COMMITTED_KEY, value.clone().into())
                         .await
                     {
                         Ok(_) => return Ok(()),
                         Err(_) => {
                             tracing::debug!(
-                                "TSO: max_committed CAS conflict on attempt {attempt}, retrying"
+                                "TSO: max_committed create conflict on attempt {attempt}, retrying"
                             );
                             tokio::time::sleep(std::time::Duration::from_millis(1 << attempt))
                                 .await;
                         },
-                    }
-                },
-                None => match kv.create(TSO_MAX_COMMITTED_KEY, value.clone().into()).await {
-                    Ok(_) => return Ok(()),
-                    Err(_) => {
-                        tracing::debug!(
-                            "TSO: max_committed create conflict on attempt {attempt}, retrying"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(1 << attempt)).await;
                     },
-                },
+                }
             }
-        }
 
-        anyhow::bail!("TSO: Failed to advance max_committed after 10 attempts")
+            anyhow::bail!("TSO: Failed to advance max_committed after 10 attempts")
+        }
+        .await;
+        if result.is_ok() {
+            timer.finish();
+        }
+        result
     }
 }
 

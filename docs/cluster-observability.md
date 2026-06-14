@@ -119,6 +119,20 @@ Two important scrape behaviors to know up front:
   coordinated by that node.
 - `database_two_phase_prepare_retries_total`
   Counter of 2PC prepare timestamp retries.
+- `database_commit_hot_path_stage_seconds{path="local|2pc_participant|tso|raft_nats_outbox_replay",stage="...",status="success|error"}`
+  Histogram of foreground latency paid by individual commit hot-path stages.
+  Important stage values include `timestamp_allocate`, `raft_quorum_wait`,
+  `persistence_write`, `tso_advance_committed`, `apply_visible`,
+  `raft_mark_applied`, `raft_nats_outbox_record`,
+  `raft_nats_outbox_clear`, `replication_publish`, and `two_phase_redo`.
+  Use this metric to identify which synchronous stage is dominating write
+  latency before changing the commit path.
+- `database_tso_operation_seconds{operation="...",status="success|error"}`
+  Histogram of timestamp-oracle operation latency. Important operation values
+  include `next_ts_at_or_after`, `max_committed_read`, `batch_reserve`, and
+  `advance_committed`. This is the first place to look when timestamp
+  allocation is slower than expected or batch allocation is falling back to
+  NATS KV too often.
 - `database_replication_transport_publish_seconds`
   Histogram of JetStream publish latency for replication messages.
 - `database_replication_transport_message_bytes{phase="publish|consume"}`
@@ -181,6 +195,12 @@ Two important scrape behaviors to know up front:
   `database_two_phase_participants_total`, or
   `database_two_phase_prepare_attempts_total` drifts upward because that often
   precedes visible write latency regressions.
+- Commit hot-path latency:
+  investigate when `database_commit_hot_path_stage_seconds` shifts upward for
+  `raft_quorum_wait`, `persistence_write`, `replication_publish`,
+  `tso_advance_committed`, or `timestamp_allocate`. Use
+  `database_tso_operation_seconds` to break timestamp allocation into TSO
+  sub-operations.
 
 ## Runbooks
 
@@ -258,14 +278,38 @@ Two important scrape behaviors to know up front:
 2. If `prepare` retries are climbing, inspect
    `database_two_phase_prepare_retries_total`; this usually means timestamp
    allocation pressure or stale participant state.
-3. Compare `database_two_phase_coordinator_seconds`,
+3. If 2PC commits are slow but not failing, inspect
+   `database_commit_hot_path_stage_seconds{path="2pc_participant"}` to split
+   the participant-side cost between `two_phase_redo`, `raft_quorum_wait`,
+   `persistence_write`, `apply_visible`, and `replication_publish`.
+4. Compare `database_two_phase_coordinator_seconds`,
    `database_two_phase_participants_total`, and
    `database_two_phase_prepare_attempts_total` to see whether the failures are
    tied to wider fanout or repeated prepare retries.
-4. If `commit` errors are climbing, inspect the participant logs and confirm
+5. If `commit` errors are climbing, inspect the participant logs and confirm
    which partition owner is failing.
-5. Treat repeated 2PC rollbacks as a correctness-risk signal even if retries
+6. Treat repeated 2PC rollbacks as a correctness-risk signal even if retries
    hide the issue from clients.
+
+### Commit Hot Path Latency
+
+1. Start with `database_commit_seconds{status="success"}` to confirm the
+   user-visible commit latency shift.
+2. Break that latency down with `database_commit_hot_path_stage_seconds`.
+   For normal single-partition writes, focus on `path="local"`. For
+   cross-partition participant cost, focus on `path="2pc_participant"`.
+3. If `stage="timestamp_allocate"` is high, inspect
+   `database_tso_operation_seconds`. A high `max_committed_read` points at the
+   per-allocation committed-floor read. A high `batch_reserve` points at TSO KV
+   range reservation or CAS contention.
+4. If `stage="raft_quorum_wait"` is high, correlate with
+   `database_raft_lagging_followers_info`,
+   `database_raft_max_follower_lag_entries_info`, and node/network logs.
+5. If `stage="replication_publish"` is high, compare against
+   `database_replication_transport_publish_seconds` and JetStream/NATS health.
+6. If `stage="persistence_write"` or `stage="apply_visible"` is high, inspect
+   persistence latency, snapshot size, and write-log/index update work before
+   making protocol changes.
 
 ## Scope Notes
 

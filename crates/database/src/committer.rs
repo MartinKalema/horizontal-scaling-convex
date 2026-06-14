@@ -918,6 +918,8 @@ impl<RT: Runtime> Committer<RT> {
                             };
                             drop(_guard);
                             if let Some(raft_applied_index) = raft_applied_index {
+                                let raft_mark_timer =
+                                    metrics::commit_hot_path_stage_timer("local", "raft_mark_applied");
                                 let Some(raft_state) = self.raft_state.as_ref() else {
                                     return Self::fail_committed_write(
                                         result,
@@ -939,13 +941,15 @@ impl<RT: Runtime> Committer<RT> {
                                         err,
                                     );
                                 }
+                                raft_mark_timer.finish();
                             }
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox
-                                && let Err(err) = Self::add_raft_nats_outbox_delta(
+                                && let Err(err) = Self::record_raft_nats_outbox_delta(
                                     self.persistence.clone(),
                                     &published_commit.delta,
+                                    "local",
                                 )
                                 .await
                             {
@@ -959,6 +963,7 @@ impl<RT: Runtime> Committer<RT> {
                             if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta.clone(),
+                                "local",
                             )
                             .await
                             {
@@ -977,9 +982,10 @@ impl<RT: Runtime> Committer<RT> {
                                     );
                                 }
                             } else if use_raft_nats_outbox
-                                && let Err(err) = Self::delete_raft_nats_outbox_delta(
+                                && let Err(err) = Self::clear_raft_nats_outbox_delta(
                                     self.persistence.clone(),
                                     commit_ts,
+                                    "local",
                                 )
                                 .await
                             {
@@ -1349,6 +1355,10 @@ impl<RT: Runtime> Committer<RT> {
                             };
                             let commit_ts = published_commit.commit_ts;
                             if let Some(raft_applied_index) = published_commit.raft_applied_index {
+                                let raft_mark_timer = metrics::commit_hot_path_stage_timer(
+                                    "2pc_participant",
+                                    "raft_mark_applied",
+                                );
                                 let Some(raft_state) = self.raft_state.as_ref() else {
                                     return Self::fail_committed_write(
                                         result,
@@ -1370,13 +1380,15 @@ impl<RT: Runtime> Committer<RT> {
                                         err,
                                     );
                                 }
+                                raft_mark_timer.finish();
                             }
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox
-                                && let Err(err) = Self::add_raft_nats_outbox_delta(
+                                && let Err(err) = Self::record_raft_nats_outbox_delta(
                                     self.persistence.clone(),
                                     &published_commit.delta,
+                                    "2pc_participant",
                                 )
                                 .await
                             {
@@ -1390,6 +1402,7 @@ impl<RT: Runtime> Committer<RT> {
                             if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta.clone(),
+                                "2pc_participant",
                             )
                             .await
                             {
@@ -1408,9 +1421,10 @@ impl<RT: Runtime> Committer<RT> {
                                     );
                                 }
                             } else if use_raft_nats_outbox
-                                && let Err(err) = Self::delete_raft_nats_outbox_delta(
+                                && let Err(err) = Self::clear_raft_nats_outbox_delta(
                                     self.persistence.clone(),
                                     commit_ts,
+                                    "2pc_participant",
                                 )
                                 .await
                             {
@@ -2296,12 +2310,17 @@ impl<RT: Runtime> Committer<RT> {
     async fn wait_for_raft_commit(
         raft_commit_waiter: RaftCommitWaiter,
         commit_ts: Timestamp,
+        path: &'static str,
     ) -> anyhow::Result<Option<u64>> {
         let Some(raft_commit_waiter) = raft_commit_waiter else {
             return Ok(None);
         };
+        let timer = metrics::commit_hot_path_stage_timer(path, "raft_quorum_wait");
         match raft_commit_waiter.await {
-            Ok(RaftProposalResult::Committed { index }) => Ok(Some(index)),
+            Ok(RaftProposalResult::Committed { index }) => {
+                timer.finish();
+                Ok(Some(index))
+            },
             Ok(RaftProposalResult::Rejected) => anyhow::bail!(
                 "Raft rejected commit at ts={} before quorum commit",
                 u64::from(commit_ts),
@@ -2365,14 +2384,20 @@ impl<RT: Runtime> Committer<RT> {
     async fn publish_commit_delta(
         distributed_log: Arc<dyn DistributedLog>,
         delta: CommitDelta,
+        path: &'static str,
     ) -> anyhow::Result<()> {
+        let timer = metrics::commit_hot_path_stage_timer(path, "replication_publish");
         let delta_ts = delta.ts;
-        distributed_log.publish(delta).await.with_context(|| {
+        let result = distributed_log.publish(delta).await.with_context(|| {
             format!(
                 "Failed to publish commit delta at ts={}",
                 u64::from(delta_ts)
             )
-        })
+        });
+        if result.is_ok() {
+            timer.finish();
+        }
+        result
     }
 
     fn raft_nats_outbox_key(ts: Timestamp) -> String {
@@ -2420,6 +2445,19 @@ impl<RT: Runtime> Committer<RT> {
         Self::write_raft_nats_outbox_records(persistence, &records).await
     }
 
+    async fn record_raft_nats_outbox_delta(
+        persistence: Arc<dyn Persistence>,
+        delta: &CommitDelta,
+        path: &'static str,
+    ) -> anyhow::Result<()> {
+        let timer = metrics::commit_hot_path_stage_timer(path, "raft_nats_outbox_record");
+        let result = Self::add_raft_nats_outbox_delta(persistence, delta).await;
+        if result.is_ok() {
+            timer.finish();
+        }
+        result
+    }
+
     async fn delete_raft_nats_outbox_delta(
         persistence: Arc<dyn Persistence>,
         ts: Timestamp,
@@ -2427,6 +2465,19 @@ impl<RT: Runtime> Committer<RT> {
         let mut records = Self::load_raft_nats_outbox_records(persistence.clone()).await?;
         records.remove(&Self::raft_nats_outbox_key(ts));
         Self::write_raft_nats_outbox_records(persistence, &records).await
+    }
+
+    async fn clear_raft_nats_outbox_delta(
+        persistence: Arc<dyn Persistence>,
+        ts: Timestamp,
+        path: &'static str,
+    ) -> anyhow::Result<()> {
+        let timer = metrics::commit_hot_path_stage_timer(path, "raft_nats_outbox_clear");
+        let result = Self::delete_raft_nats_outbox_delta(persistence, ts).await;
+        if result.is_ok() {
+            timer.finish();
+        }
+        result
     }
 
     async fn replay_raft_nats_outbox_once(
@@ -2442,8 +2493,14 @@ impl<RT: Runtime> Committer<RT> {
                 .to_delta()
                 .with_context(|| format!("Failed to decode Raft->NATS outbox delta {key}"))?;
             let delta_ts = delta.ts;
-            Self::publish_commit_delta(distributed_log.clone(), delta).await?;
-            Self::delete_raft_nats_outbox_delta(persistence.clone(), delta_ts).await?;
+            Self::publish_commit_delta(distributed_log.clone(), delta, "raft_nats_outbox_replay")
+                .await?;
+            Self::clear_raft_nats_outbox_delta(
+                persistence.clone(),
+                delta_ts,
+                "raft_nats_outbox_replay",
+            )
+            .await?;
             replayed += 1;
         }
         Ok(replayed)
@@ -2627,6 +2684,7 @@ impl<RT: Runtime> Committer<RT> {
             write_source,
             new_snapshot,
             delta,
+            "local",
         )
     }
 
@@ -2638,6 +2696,7 @@ impl<RT: Runtime> Committer<RT> {
         write_source: WriteSource,
         new_snapshot: Snapshot,
         delta: CommitDelta,
+        path: &'static str,
     ) -> anyhow::Result<PublishedCommit> {
         let apply_timer = metrics::commit_apply_timer();
         anyhow::ensure!(
@@ -2657,14 +2716,20 @@ impl<RT: Runtime> Committer<RT> {
 
         if let Some(ref tso) = self.timestamp_oracle {
             let tso = tso.clone();
-            if let Err(err) = block_in_place(|| {
+            let tso_advance_timer =
+                metrics::commit_hot_path_stage_timer(path, "tso_advance_committed");
+            let advance_result = block_in_place(|| {
                 let rt = tokio::runtime::Handle::current();
                 if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
                     futures::executor::block_on(tso.advance_committed_ts(commit_ts))
                 } else {
                     rt.block_on(tso.advance_committed_ts(commit_ts))
                 }
-            }) {
+            });
+            if advance_result.is_ok() {
+                tso_advance_timer.finish();
+            }
+            if let Err(err) = advance_result {
                 tracing::warn!(
                     "Failed to advance global max_committed to {} before publishing commit: \
                      {err:#}",
@@ -2674,6 +2739,7 @@ impl<RT: Runtime> Committer<RT> {
         }
 
         // Write transaction state at the commit ts to the document store.
+        let hot_path_apply_timer = metrics::commit_hot_path_stage_timer(path, "apply_visible");
         metrics::commit_rows(ordered_updates.len() as u64);
 
         let timer = metrics::pending_writes_to_write_log_timer();
@@ -2700,6 +2766,7 @@ impl<RT: Runtime> Committer<RT> {
         drop(snapshot_manager);
 
         apply_timer.finish();
+        hot_path_apply_timer.finish();
         Ok(PublishedCommit {
             commit_ts,
             delta,
@@ -4087,7 +4154,10 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
     ) -> anyhow::Result<PublishedCommit> {
+        let redo_stage_timer =
+            metrics::commit_hot_path_stage_timer("2pc_participant", "two_phase_redo");
         self.stage_durable_two_phase_redo(&transaction_id, true)?;
+        redo_stage_timer.finish();
         let prepared = self
             .prepared_transactions
             .get(&transaction_id)
@@ -4129,7 +4199,8 @@ impl<RT: Runtime> Committer<RT> {
         );
         let raft_commit_waiter = self.propose_commit_to_raft(&delta)?;
         let raft_applied_index = block_in_place(|| {
-            let wait_future = Self::wait_for_raft_commit(raft_commit_waiter, commit_ts);
+            let wait_future =
+                Self::wait_for_raft_commit(raft_commit_waiter, commit_ts, "2pc_participant");
             let rt = tokio::runtime::Handle::current();
             if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
                 futures::executor::block_on(wait_future)
@@ -4139,7 +4210,9 @@ impl<RT: Runtime> Committer<RT> {
         })?;
 
         // Write to persistence (same as normal commit path).
-        block_in_place(|| {
+        let persistence_stage_timer =
+            metrics::commit_hot_path_stage_timer("2pc_participant", "persistence_write");
+        let persistence_result = block_in_place(|| {
             let write_future = async {
                 self.persistence
                     .write(&document_writes, &index_writes, ConflictStrategy::Error)
@@ -4151,7 +4224,11 @@ impl<RT: Runtime> Committer<RT> {
             } else {
                 rt.block_on(write_future)
             }
-        })?;
+        });
+        if persistence_result.is_ok() {
+            persistence_stage_timer.finish();
+        }
+        persistence_result?;
 
         let prepared = self
             .prepared_transactions
@@ -4185,6 +4262,7 @@ impl<RT: Runtime> Committer<RT> {
             write_source,
             snapshot,
             delta,
+            "2pc_participant",
         )?;
         published_commit.raft_applied_index = raft_applied_index;
         Ok(published_commit)
@@ -4415,19 +4493,26 @@ impl<RT: Runtime> Committer<RT> {
         let rt = self.runtime.clone();
         Some(
             async move {
-                let raft_applied_index =
-                    match Self::wait_for_raft_commit(raft_commit_waiter, commit_ts).await {
-                        Ok(index) => index,
-                        Err(err) => {
-                            return Ok(PersistenceWrite::RejectedBeforePersistence {
-                                pending_write,
-                                commit_timer,
-                                result,
-                                commit_id,
-                                err,
-                            });
-                        },
-                    };
+                let raft_applied_index = match Self::wait_for_raft_commit(
+                    raft_commit_waiter,
+                    commit_ts,
+                    "local",
+                )
+                .await
+                {
+                    Ok(index) => index,
+                    Err(err) => {
+                        return Ok(PersistenceWrite::RejectedBeforePersistence {
+                            pending_write,
+                            commit_timer,
+                            result,
+                            commit_id,
+                            err,
+                        });
+                    },
+                };
+                let persistence_stage_timer =
+                    metrics::commit_hot_path_stage_timer("local", "persistence_write");
                 let mut backoff = Backoff::new(
                     INITIAL_PERSISTENCE_WRITES_BACKOFF,
                     MAX_PERSISTENCE_WRITES_BACKOFF,
@@ -4458,6 +4543,7 @@ impl<RT: Runtime> Committer<RT> {
                         }
                     } else {
                         pause_client.wait(AFTER_PENDING_WRITE_SNAPSHOT).await;
+                        persistence_stage_timer.finish();
                         return Ok(PersistenceWrite::Commit {
                             pending_write,
                             commit_timer,
@@ -4584,12 +4670,19 @@ impl<RT: Runtime> Committer<RT> {
     fn next_commit_ts(&mut self) -> anyhow::Result<Timestamp> {
         let _timer = next_commit_ts_seconds();
         let local_floor = self.local_commit_floor()?;
+        let timestamp_stage_path = if self.timestamp_oracle.is_some() {
+            "tso"
+        } else {
+            "local"
+        };
+        let timestamp_stage_timer =
+            metrics::commit_hot_path_stage_timer(timestamp_stage_path, "timestamp_allocate");
 
         // When a global TSO is configured (TiDB PD pattern), draw timestamps
         // from it instead of the local clock. This ensures globally unique,
         // monotonically increasing timestamps across all nodes in the cluster.
-        // The BatchTimestampOracle's fast path is a local mutex increment
-        // (zero network calls), so block_in_place is safe here.
+        // The BatchTimestampOracle keeps range reservation batched, but still
+        // checks the global committed floor before assignment.
         if let Some(ref tso) = self.timestamp_oracle {
             let tso = tso.clone();
             let ts = block_in_place(|| {
@@ -4607,12 +4700,14 @@ impl<RT: Runtime> Committer<RT> {
                 local_floor,
             );
             self.last_assigned_ts = ts;
+            timestamp_stage_timer.finish();
             return Ok(ts);
         }
 
         // Single-node mode: existing behavior (local clock + monotonic counter).
         let max = cmp::max(local_floor, self.runtime.generate_timestamp()?);
         self.last_assigned_ts = max;
+        timestamp_stage_timer.finish();
         Ok(max)
     }
 
@@ -5623,7 +5718,8 @@ mod tests {
         tx.send(RaftProposalResult::Committed { index: 7 }).unwrap();
 
         let applied_index =
-            Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1)).await?;
+            Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1), "test")
+                .await?;
         assert_eq!(applied_index, Some(7));
         Ok(())
     }
@@ -5633,16 +5729,18 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(RaftProposalResult::Rejected).unwrap();
 
-        let err = Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1))
-            .await
-            .unwrap_err();
+        let err =
+            Committer::<TestRuntime>::wait_for_raft_commit(Some(rx), Timestamp::must(1), "test")
+                .await
+                .unwrap_err();
         assert!(format!("{err:#}").contains("Raft rejected commit"));
     }
 
     #[tokio::test]
     async fn raft_commit_waiter_allows_non_raft_commit() -> anyhow::Result<()> {
         let applied_index =
-            Committer::<TestRuntime>::wait_for_raft_commit(None, Timestamp::must(1)).await?;
+            Committer::<TestRuntime>::wait_for_raft_commit(None, Timestamp::must(1), "test")
+                .await?;
         assert_eq!(applied_index, None);
         Ok(())
     }
