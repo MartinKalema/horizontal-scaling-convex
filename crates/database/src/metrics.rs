@@ -43,6 +43,12 @@ const PARTITION_LABELS: [&str; 1] = ["partition"];
 const SOURCE_PARTITION_LABELS: [&str; 1] = ["source_partition"];
 const OUTCOME_LABELS: [&str; 1] = ["outcome"];
 const PHASE_LABELS: [&str; 1] = ["phase"];
+const COMMIT_PATH_LABEL: &str = "path";
+const COMMIT_STAGE_LABEL: &str = "stage";
+const TSO_OPERATION_LABEL: &str = "operation";
+const COMMIT_HOT_PATH_STAGE_LABELS: [&str; 3] =
+    [COMMIT_PATH_LABEL, COMMIT_STAGE_LABEL, STATUS_LABEL[0]];
+const TSO_OPERATION_LABELS: [&str; 2] = [TSO_OPERATION_LABEL, STATUS_LABEL[0]];
 
 fn partition_label(partition: PartitionId) -> StaticMetricLabel {
     StaticMetricLabel::new("partition", partition.0.to_string())
@@ -58,6 +64,18 @@ fn outcome_label(outcome: &'static str) -> StaticMetricLabel {
 
 fn phase_label(phase: &'static str) -> StaticMetricLabel {
     StaticMetricLabel::new("phase", phase)
+}
+
+fn commit_path_label(path: &'static str) -> StaticMetricLabel {
+    StaticMetricLabel::new(COMMIT_PATH_LABEL, path)
+}
+
+fn commit_stage_label(stage: &'static str) -> StaticMetricLabel {
+    StaticMetricLabel::new(COMMIT_STAGE_LABEL, stage)
+}
+
+fn tso_operation_label(operation: &'static str) -> StaticMetricLabel {
+    StaticMetricLabel::new(TSO_OPERATION_LABEL, operation)
 }
 
 register_convex_gauge!(
@@ -792,6 +810,29 @@ pub fn commit_timer() -> StatusTimer {
 }
 
 register_convex_histogram!(
+    DATABASE_COMMIT_HOT_PATH_STAGE_SECONDS,
+    "Foreground latency paid by individual database commit hot-path stages",
+    &COMMIT_HOT_PATH_STAGE_LABELS
+);
+pub fn commit_hot_path_stage_timer(path: &'static str, stage: &'static str) -> StatusTimer {
+    let mut timer = StatusTimer::new(&DATABASE_COMMIT_HOT_PATH_STAGE_SECONDS);
+    timer.add_label(commit_path_label(path));
+    timer.add_label(commit_stage_label(stage));
+    timer
+}
+
+register_convex_histogram!(
+    DATABASE_TSO_OPERATION_SECONDS,
+    "Latency of timestamp-oracle operations on the commit hot path",
+    &TSO_OPERATION_LABELS
+);
+pub fn tso_operation_timer(operation: &'static str) -> StatusTimer {
+    let mut timer = StatusTimer::new(&DATABASE_TSO_OPERATION_SECONDS);
+    timer.add_label(tso_operation_label(operation));
+    timer
+}
+
+register_convex_histogram!(
     DATABASE_COMMIT_ID_REUSE_SECONDS,
     "Time to check if IDs have been reused",
     &STATUS_LABEL
@@ -965,7 +1006,10 @@ pub fn bump_repeatable_ts_timer() -> Timer<VMHistogram> {
     Timer::new(&BUMP_REPEATABLE_TS_SECONDS)
 }
 
-register_convex_histogram!(NEXT_COMMIT_TS_SECONDS, "Time to bump max_repeatable_ts");
+register_convex_histogram!(
+    NEXT_COMMIT_TS_SECONDS,
+    "Time to allocate the next commit timestamp"
+);
 pub fn next_commit_ts_seconds() -> Timer<VMHistogram> {
     Timer::new(&NEXT_COMMIT_TS_SECONDS)
 }
