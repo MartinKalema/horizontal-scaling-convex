@@ -149,6 +149,7 @@ impl MutationForwarder for MutationForwarderService {
                         value: ret.value.as_str().to_string(),
                         log_lines: ret.log_lines.iter().cloned().collect(),
                         ts: u64::from(ret.ts),
+                        source_partition: ret.source_partition.map(|partition| partition.0),
                     },
                 )),
             })),

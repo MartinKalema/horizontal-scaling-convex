@@ -1062,6 +1062,15 @@ impl<RT: Runtime> Database<RT> {
             Some(value) => partition_timestamp_map_from_json(value, "applied delta watermarks")?,
             None => BTreeMap::new(),
         };
+        let applied_data_delta_watermarks = match reader
+            .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaWatermarks)
+            .await?
+        {
+            Some(value) => {
+                partition_timestamp_map_from_json(value, "applied data delta watermarks")?
+            },
+            None => BTreeMap::new(),
+        };
 
         let snapshot_manager = SnapshotManager::new(
             *ts,
@@ -1125,6 +1134,7 @@ impl<RT: Runtime> Database<RT> {
             timestamp_oracle,
             raft_state,
             applied_delta_watermarks,
+            applied_data_delta_watermarks,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
@@ -2133,11 +2143,23 @@ impl<RT: Runtime> Database<RT> {
         transaction: Transaction<RT>,
         write_source: impl Into<WriteSource>,
     ) -> anyhow::Result<Timestamp> {
+        Ok(self
+            .commit_with_write_source_outcome(transaction, write_source)
+            .await?
+            .ts)
+    }
+
+    #[fastrace::trace]
+    pub async fn commit_with_write_source_outcome(
+        &self,
+        transaction: Transaction<RT>,
+        write_source: impl Into<WriteSource>,
+    ) -> anyhow::Result<crate::committer::CommitOutcome> {
         task::consume_budget().await;
         let readonly = transaction.is_readonly();
         let result = self
             .committer
-            .commit(transaction, write_source.into())
+            .commit_outcome(transaction, write_source.into())
             .await?;
         if !readonly {
             self.write_commits_since_load.fetch_add(1, Ordering::SeqCst);

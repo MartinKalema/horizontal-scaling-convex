@@ -575,9 +575,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
     }
 
     fn read_after_write_source_partition(&self) -> Option<u32> {
-        self.database
-            .local_partition()
-            .map(|partition| partition.0)
+        self.database.local_partition().map(|partition| partition.0)
     }
 }
 

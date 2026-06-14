@@ -5,18 +5,41 @@
 //! 2. Allocates one global commit timestamp
 //! 3. Sends Prepare to each participant
 //! 4. If all succeed: sends CommitPrepared to all
-//! 5. If any fail: sends RollbackPrepared to prepared participants
+//! 5. If any fail: records rollback for participants that may have prepared
 //!
 //! The coordinator runs on the node where the mutation was received.
 //! Remote partitions are reached via gRPC.
 
 use std::collections::BTreeMap;
 
-use anyhow::Context;
-use common::types::Timestamp;
+use anyhow::{
+    anyhow,
+    Context,
+};
+use common::{
+    bootstrap_model::{
+        index::{
+            TabletIndexMetadata,
+            INDEX_TABLE,
+        },
+        tables::{
+            TableMetadata,
+            TABLES_TABLE,
+        },
+    },
+    document::{
+        DocumentUpdateWithPrevTs,
+        ParseDocument,
+        ResolvedDocument,
+    },
+    types::Timestamp,
+};
 
 use crate::{
-    committer::CommitterClient,
+    committer::{
+        CommitOutcome,
+        CommitterClient,
+    },
     metrics,
     partition::{
         routed_partition_for_table,
@@ -60,13 +83,10 @@ pub fn classify_transaction(
     let mut partitions: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
 
     for (i, write) in transaction.writes.coalesced_writes().enumerate() {
-        let tablet_id = write.id.tablet_id;
-        if let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) {
-            if let Some(partition) =
-                routed_partition_for_table(&table_name, partition_map, write_source)
-            {
-                partitions.entry(partition).or_default().push(i);
-            }
+        if let Some(partition) =
+            routed_partition_for_write(transaction, write, partition_map, write_source)
+        {
+            partitions.entry(partition).or_default().push(i);
         }
     }
 
@@ -87,20 +107,19 @@ pub fn classify_transaction(
     }
 }
 
-fn participant_write_indexes(
+pub(crate) fn participant_write_indexes(
     transaction: &FinalTransaction,
     partition_map: &PartitionMap,
     write_source: &WriteSource,
 ) -> BTreeMap<PartitionId, Vec<usize>> {
     let mut participant_indexes: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
-    let local_partition = partition_map.local_partition();
 
     for (index, write) in transaction.writes.coalesced_writes().enumerate() {
-        let Ok(table_name) = transaction.table_mapping.tablet_name(write.id.tablet_id) else {
+        let Some(participant) =
+            routed_partition_for_write(transaction, write, partition_map, write_source)
+        else {
             continue;
         };
-        let participant = routed_partition_for_table(&table_name, partition_map, write_source)
-            .unwrap_or(local_partition);
         participant_indexes
             .entry(participant)
             .or_default()
@@ -109,6 +128,57 @@ fn participant_write_indexes(
 
     participant_indexes.retain(|_, indexes| !indexes.is_empty());
     participant_indexes
+}
+
+fn routed_partition_for_write(
+    transaction: &FinalTransaction,
+    write: &DocumentUpdateWithPrevTs,
+    partition_map: &PartitionMap,
+    write_source: &WriteSource,
+) -> Option<PartitionId> {
+    let table_name = transaction
+        .table_mapping
+        .tablet_name(write.id.tablet_id)
+        .ok()?;
+    if let Some(partition) = routed_partition_for_table(&table_name, partition_map, write_source) {
+        return Some(partition);
+    }
+    routed_partition_for_catalog_write(transaction, write, partition_map)
+}
+
+fn routed_partition_for_catalog_write(
+    transaction: &FinalTransaction,
+    write: &DocumentUpdateWithPrevTs,
+    partition_map: &PartitionMap,
+) -> Option<PartitionId> {
+    let catalog_table = transaction
+        .table_mapping
+        .tablet_name(write.id.tablet_id)
+        .ok()?;
+    if &catalog_table != &*TABLES_TABLE && &catalog_table != &*INDEX_TABLE {
+        return None;
+    }
+    let document = write
+        .new_document
+        .as_ref()
+        .or_else(|| write.old_document.as_ref().map(|(document, _)| document))?;
+    let user_table = if &catalog_table == &*TABLES_TABLE {
+        catalog_write_user_table(document)?
+    } else {
+        let index: common::document::ParsedDocument<TabletIndexMetadata> = document.parse().ok()?;
+        let index = index.into_value();
+        let indexed_tablet = *index.name.table();
+        transaction.table_mapping.tablet_name(indexed_tablet).ok()?
+    };
+    if user_table.is_system() {
+        return None;
+    }
+    Some(partition_map.partition_for_table(&user_table))
+}
+
+fn catalog_write_user_table(document: &ResolvedDocument) -> Option<value::TableName> {
+    let metadata: common::document::ParsedDocument<TableMetadata> = document.parse().ok()?;
+    Some(metadata.into_value().name)
 }
 
 async fn prepare_participant(
@@ -139,30 +209,58 @@ async fn prepare_participant(
                  {participant}"
             )
         })?;
-        let addr = node_addresses
-            .address_for(participant)
+        let addresses = node_addresses
+            .addresses_for(participant)
+            .filter(|addresses| !addresses.is_empty())
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
-        let client = local_committer.two_phase_client(addr).await?;
-        client
-            .prepare(
-                transaction_id,
-                participant_tx,
-                write_source.clone(),
-                prepare_ts,
-                partition_map.placement_version(),
-                all_participants,
-            )
-            .await?
+        let mut last_err = None;
+        for addr in addresses {
+            match local_committer.two_phase_client(addr).await {
+                Ok(client) => {
+                    match client
+                        .prepare(
+                            transaction_id,
+                            participant_tx.clone(),
+                            write_source.clone(),
+                            prepare_ts,
+                            partition_map.placement_version(),
+                            all_participants,
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            return verify_prepare_result(participant, prepare_ts, result)
+                        },
+                        Err(err) if should_try_next_participant_address(&err) => {
+                            tracing::warn!(
+                                "2PC Coordinator: prepare to participant {} via {} failed, trying \
+                                 next address: {err:#}",
+                                participant,
+                                addr,
+                            );
+                            last_err = Some(err);
+                        },
+                        Err(err) => return Err(err),
+                    }
+                },
+                Err(err) if should_try_next_participant_address(&err) => {
+                    tracing::warn!(
+                        "2PC Coordinator: failed to connect to participant {} via {}, trying next \
+                         address: {err:#}",
+                        participant,
+                        addr,
+                    );
+                    last_err = Some(err);
+                },
+                Err(err) => return Err(err),
+            }
+        }
+        return Err(last_err.unwrap_or_else(|| {
+            anyhow!("2PC: No usable NODE_ADDRESSES entry for participant {participant}")
+        }));
     };
 
-    anyhow::ensure!(
-        result.prepare_ts == prepare_ts,
-        "Participant {} prepared at ts={} but coordinator assigned ts={}",
-        participant,
-        result.prepare_ts,
-        prepare_ts,
-    );
-    Ok(())
+    verify_prepare_result(participant, prepare_ts, result)
 }
 
 async fn rollback_participant(
@@ -183,11 +281,15 @@ async fn rollback_participant(
                  {participant}"
             )
         })?;
-        let addr = node_addresses
-            .address_for(participant)
+        let addresses = node_addresses
+            .addresses_for(participant)
+            .filter(|addresses| !addresses.is_empty())
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
-        let client = local_committer.two_phase_client(addr).await?;
-        client.rollback_prepared(transaction_id).await
+        try_participant_addresses("rollback", participant, addresses, |addr| async move {
+            let client = local_committer.two_phase_client(addr).await?;
+            client.rollback_prepared(transaction_id).await
+        })
+        .await
     }
 }
 
@@ -209,12 +311,62 @@ async fn commit_participant(
                  {participant}"
             )
         })?;
-        let addr = node_addresses
-            .address_for(participant)
+        let addresses = node_addresses
+            .addresses_for(participant)
+            .filter(|addresses| !addresses.is_empty())
             .with_context(|| format!("Missing NODE_ADDRESSES entry for {participant}"))?;
-        let client = local_committer.two_phase_client(addr).await?;
-        Ok(client.commit_prepared(transaction_id).await?.try_into()?)
+        try_participant_addresses("commit", participant, addresses, |addr| async move {
+            let client = local_committer.two_phase_client(addr).await?;
+            Ok(client.commit_prepared(transaction_id).await?.try_into()?)
+        })
+        .await
     }
+}
+
+fn verify_prepare_result(
+    participant: PartitionId,
+    prepare_ts: Timestamp,
+    result: crate::two_phase::PrepareResult,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        result.prepare_ts == prepare_ts,
+        "Participant {} prepared at ts={} but coordinator assigned ts={}",
+        participant,
+        result.prepare_ts,
+        prepare_ts,
+    );
+    Ok(())
+}
+
+async fn try_participant_addresses<'a, T, Fut>(
+    operation: &'static str,
+    participant: PartitionId,
+    addresses: &'a [String],
+    mut call: impl FnMut(&'a str) -> Fut,
+) -> anyhow::Result<T>
+where
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut last_err = None;
+    for addr in addresses {
+        match call(addr).await {
+            Ok(result) => return Ok(result),
+            Err(err) if should_try_next_participant_address(&err) => {
+                tracing::warn!(
+                    "2PC Coordinator: {} to participant {} via {} failed, trying next address: \
+                     {err:#}",
+                    operation,
+                    participant,
+                    addr,
+                );
+                last_err = Some(err);
+            },
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        anyhow!("2PC: No usable NODE_ADDRESSES entry for participant {participant}")
+    }))
 }
 
 async fn write_decision_record(
@@ -275,6 +427,31 @@ fn is_retryable_prepare_ts_error(err: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("2PC Prepare assigned ts="))
 }
 
+fn is_ambiguous_prepare_error(err: &anyhow::Error) -> bool {
+    should_try_next_participant_address(err)
+}
+
+fn should_try_next_participant_address(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("transport error")
+        || message.contains("connection error")
+        || message.contains("connection refused")
+        || message.contains("broken pipe")
+        || message.contains("deadline has elapsed")
+        || message.contains("timed out")
+        || message.contains("unavailable")
+        || message.contains("no elected raft leader")
+        || message.contains("missing raft_peers entry for raft leader")
+        || message.contains("failed to connect to raft leader")
+        || message.contains("leader prepare failed")
+        || message.contains("leader commitprepared failed")
+        || message.contains("leader rollbackprepared failed")
+}
+
+fn is_unknown_rollback_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("unknown transaction")
+}
+
 /// Execute the 2PC protocol for a transaction that cannot commit on the local
 /// fast path.
 pub async fn coordinate_two_phase_commit(
@@ -282,9 +459,9 @@ pub async fn coordinate_two_phase_commit(
     transaction: FinalTransaction,
     write_source: WriteSource,
     partition_map: &PartitionMap,
-) -> anyhow::Result<Timestamp> {
+) -> anyhow::Result<CommitOutcome> {
     let timer = metrics::two_phase_coordinator_timer();
-    match classify_transaction(&transaction, partition_map, &write_source) {
+    let source_partition = match classify_transaction(&transaction, partition_map, &write_source) {
         TransactionClassification::SinglePartition => {
             anyhow::bail!("2PC coordinator called for a local single-partition transaction");
         },
@@ -293,9 +470,10 @@ pub async fn coordinate_two_phase_commit(
                 "2PC Coordinator: routing single-partition transaction to remote owner {}",
                 owner,
             );
+            Some(owner)
         },
-        TransactionClassification::CrossPartition { partitions: _ } => {},
-    }
+        TransactionClassification::CrossPartition { partitions: _ } => None,
+    };
 
     let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
     let node_addresses = local_committer.node_addresses();
@@ -335,8 +513,10 @@ pub async fn coordinate_two_phase_commit(
         );
 
         let mut prepared_participants = Vec::new();
+        let mut attempted_participants = Vec::new();
         let mut retry_prepare = false;
         for (participant, participant_tx) in &participants {
+            attempted_participants.push(*participant);
             match prepare_participant(
                 local_committer,
                 node_addresses,
@@ -359,10 +539,15 @@ pub async fn coordinate_two_phase_commit(
                     );
                     let retryable_prepare_ts_error =
                         is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES;
-                    if !prepared_participants.is_empty() {
+                    let rollback_participants = if is_ambiguous_prepare_error(&err) {
+                        attempted_participants.clone()
+                    } else {
+                        prepared_participants.clone()
+                    };
+                    if !rollback_participants.is_empty() {
                         let decision = TwoPhaseDecision::rolled_back(
                             err.to_string(),
-                            prepared_participants.iter().map(|p| p.0).collect(),
+                            rollback_participants.iter().map(|p| p.0).collect(),
                         );
                         write_decision_record(local_committer, &txn_id, &decision)
                             .await
@@ -373,7 +558,7 @@ pub async fn coordinate_two_phase_commit(
                                 )
                             })?;
                     }
-                    for prepared in prepared_participants.iter().rev().copied() {
+                    for prepared in rollback_participants.iter().rev().copied() {
                         match rollback_participant(
                             local_committer,
                             node_addresses,
@@ -391,6 +576,20 @@ pub async fn coordinate_two_phase_commit(
                                     tracing::warn!(
                                         "2PC Coordinator: rollback resolved on {} for txn={} but \
                                          failed to mark participant resolved: {mark_err:#}",
+                                        prepared,
+                                        txn_id,
+                                    );
+                                }
+                            },
+                            Err(rollback_err) if is_unknown_rollback_error(&rollback_err) => {
+                                if let Err(mark_err) =
+                                    mark_participant_resolved(local_committer, &txn_id, prepared)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        "2PC Coordinator: rollback on {} for txn={} was already \
+                                         clean but failed to mark participant resolved: \
+                                         {mark_err:#}",
                                         prepared,
                                         txn_id,
                                     );
@@ -488,7 +687,10 @@ pub async fn coordinate_two_phase_commit(
         metrics::log_two_phase_prepare_attempts(prepare_attempts);
         metrics::log_two_phase_decision("commit");
         timer.finish();
-        return Ok(prepare_ts);
+        return Ok(CommitOutcome {
+            ts: prepare_ts,
+            source_partition,
+        });
     }
 
     metrics::log_two_phase_error("prepare");
@@ -504,7 +706,10 @@ pub async fn coordinate_two_phase_commit(
 
 #[cfg(test)]
 mod tests {
-    use super::is_retryable_prepare_ts_error;
+    use super::{
+        is_ambiguous_prepare_error,
+        is_retryable_prepare_ts_error,
+    };
 
     #[test]
     fn retryable_prepare_ts_error_detects_wrapped_grpc_status() {
@@ -519,5 +724,23 @@ mod tests {
     fn retryable_prepare_ts_error_rejects_unrelated_errors() {
         let err = anyhow::anyhow!("gRPC Prepare failed");
         assert!(!is_retryable_prepare_ts_error(&err));
+    }
+
+    #[test]
+    fn ambiguous_prepare_error_detects_transport_failure() {
+        let err = anyhow::anyhow!(
+            "gRPC Prepare failed: status: Unknown, message: \"transport error\", details: [], \
+             metadata: MetadataMap {{ headers: {{}} }}: transport error: connection error: stream \
+             closed because of a broken pipe"
+        );
+        assert!(is_ambiguous_prepare_error(&err));
+    }
+
+    #[test]
+    fn ambiguous_prepare_error_rejects_application_failure() {
+        let err = anyhow::anyhow!(
+            "gRPC Prepare failed: status: Internal, message: \"forced prepare failure\""
+        );
+        assert!(!is_ambiguous_prepare_error(&err));
     }
 }

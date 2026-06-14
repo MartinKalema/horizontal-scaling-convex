@@ -472,6 +472,7 @@ pub struct MutationReturn {
     pub value: JsonPackedValue,
     pub log_lines: LogLines,
     pub ts: Timestamp,
+    pub source_partition: Option<database::partition::PartitionId>,
 }
 
 #[derive(Debug)]
@@ -479,6 +480,7 @@ pub struct RedactedMutationReturn {
     pub value: JsonPackedValue,
     pub log_lines: RedactedLogLines,
     pub ts: Timestamp,
+    pub source_partition: Option<database::partition::PartitionId>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1410,6 +1412,7 @@ impl<RT: Runtime> Application<RT> {
                     block_logging,
                 ),
                 ts: mutation_return.ts,
+                source_partition: mutation_return.source_partition,
             }),
             Ok(Err(mutation_error)) => Err(RedactedMutationError {
                 error: RedactedJsError::from_js_error(

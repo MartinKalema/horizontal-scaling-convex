@@ -916,13 +916,14 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             // errors from the log.
             let result = match self
                 .database
-                .commit_with_write_source(tx, udf_path_string.clone())
+                .commit_with_write_source_outcome(tx, udf_path_string.clone())
                 .await
             {
-                Ok(ts) => Ok(MutationReturn {
+                Ok(outcome) => Ok(MutationReturn {
                     value,
                     log_lines,
-                    ts,
+                    ts: outcome.ts,
+                    source_partition: outcome.source_partition,
                 }),
                 Err(e) => {
                     if e.is_deterministic_user_error() {
@@ -1914,6 +1915,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     value: result,
                     log_lines,
                     ts,
+                    source_partition: None,
                 })
             },
             None => return Ok(None),
