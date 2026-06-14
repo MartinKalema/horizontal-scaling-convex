@@ -322,6 +322,70 @@ impl RaftNode {
         }
     }
 
+    fn process_mailbox_message(
+        &mut self,
+        msg: RaftMessage,
+        recent_peer_responses: &mut HashMap<u64, Instant>,
+        leader_serving_lease_duration: Duration,
+    ) -> anyhow::Result<bool> {
+        match msg {
+            RaftMessage::Raft(msg) => {
+                if self.raw_node.raft.state == StateRole::Leader
+                    && is_leader_quorum_response(&msg)
+                    && msg.from != self.config.node_id
+                {
+                    let now = Instant::now();
+                    recent_peer_responses.insert(msg.from, now);
+                    if has_recent_peer_quorum(
+                        self.config.node_id,
+                        &self.config.peers,
+                        recent_peer_responses,
+                        now,
+                        leader_serving_lease_duration,
+                    ) {
+                        (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
+                    }
+                }
+                if let Err(e) = self.raw_node.step(msg) {
+                    tracing::warn!("Raft step error: {e}");
+                }
+                Ok(false)
+            },
+            RaftMessage::Propose(proposal) => {
+                if self.raw_node.raft.state == StateRole::Leader {
+                    let index = self.raw_node.raft.raft_log.last_index() + 1;
+                    if let Err(e) = self.raw_node.propose(vec![], proposal.data) {
+                        tracing::warn!("Raft propose error: {e}");
+                        let _ = proposal.result_tx.send(RaftProposalResult::Rejected);
+                    } else {
+                        self.pending_proposals.insert(index, proposal.result_tx);
+                    }
+                } else {
+                    // Not leader — reject.
+                    let _ = proposal.result_tx.send(RaftProposalResult::Rejected);
+                }
+                Ok(false)
+            },
+            RaftMessage::MarkApplied { index, result_tx } => {
+                let result = self.record_applied_index(index);
+                let _ = result_tx.send(result);
+                Ok(false)
+            },
+            RaftMessage::Shutdown => {
+                tracing::info!("Raft node {} shutting down", self.config.node_id);
+                Ok(true)
+            },
+        }
+    }
+
+    fn tick_election_and_heartbeat(&mut self, last_tick: &mut Instant) {
+        self.raw_node.tick();
+        if self.raw_node.raft.state == StateRole::Leader && self.config.peers.len() == 1 {
+            (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
+        }
+        *last_tick = Instant::now();
+    }
+
     /// Run the Raft loop. This is the main event loop following TiKV's pattern:
     /// tick → receive messages → propose → process ready → advance.
     pub async fn run(
@@ -336,50 +400,18 @@ impl RaftNode {
 
         loop {
             // Receive all pending messages (non-blocking).
+            let mut handled_message = false;
             loop {
                 match self.mailbox.try_recv() {
-                    Ok(RaftMessage::Raft(msg)) => {
-                        if self.raw_node.raft.state == StateRole::Leader
-                            && is_leader_quorum_response(&msg)
-                            && msg.from != self.config.node_id
-                        {
-                            let now = Instant::now();
-                            recent_peer_responses.insert(msg.from, now);
-                            if has_recent_peer_quorum(
-                                self.config.node_id,
-                                &self.config.peers,
-                                &recent_peer_responses,
-                                now,
-                                leader_serving_lease_duration,
-                            ) {
-                                (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
-                            }
+                    Ok(msg) => {
+                        handled_message = true;
+                        if self.process_mailbox_message(
+                            msg,
+                            &mut recent_peer_responses,
+                            leader_serving_lease_duration,
+                        )? {
+                            return Ok(());
                         }
-                        if let Err(e) = self.raw_node.step(msg) {
-                            tracing::warn!("Raft step error: {e}");
-                        }
-                    },
-                    Ok(RaftMessage::Propose(proposal)) => {
-                        if self.raw_node.raft.state == StateRole::Leader {
-                            let index = self.raw_node.raft.raft_log.last_index() + 1;
-                            if let Err(e) = self.raw_node.propose(vec![], proposal.data) {
-                                tracing::warn!("Raft propose error: {e}");
-                                let _ = proposal.result_tx.send(RaftProposalResult::Rejected);
-                            } else {
-                                self.pending_proposals.insert(index, proposal.result_tx);
-                            }
-                        } else {
-                            // Not leader — reject.
-                            let _ = proposal.result_tx.send(RaftProposalResult::Rejected);
-                        }
-                    },
-                    Ok(RaftMessage::MarkApplied { index, result_tx }) => {
-                        let result = self.record_applied_index(index);
-                        let _ = result_tx.send(result);
-                    },
-                    Ok(RaftMessage::Shutdown) => {
-                        tracing::info!("Raft node {} shutting down", self.config.node_id);
-                        return Ok(());
                     },
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -389,17 +421,15 @@ impl RaftNode {
                 }
             }
 
-            // Tick the election/heartbeat timer.
-            if last_tick.elapsed() >= tick_interval {
-                self.raw_node.tick();
-                if self.raw_node.raft.state == StateRole::Leader && self.config.peers.len() == 1 {
-                    (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
-                }
-                last_tick = Instant::now();
+            let should_tick = last_tick.elapsed() >= tick_interval;
+            if should_tick {
+                self.tick_election_and_heartbeat(&mut last_tick);
             }
 
-            // Process Ready state.
-            if self.raw_node.has_ready() {
+            let mut processed_ready = false;
+            while self.raw_node.has_ready() {
+                processed_ready = true;
+
                 let replication_health = {
                     let status = self.raw_node.status();
                     status.progress.map(|progress| {
@@ -615,8 +645,30 @@ impl RaftNode {
                 self.raw_node.advance_apply();
             }
 
-            // Yield to other tasks.
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            if handled_message || should_tick || processed_ready {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let next_tick = last_tick + tick_interval;
+            tokio::select! {
+                maybe_msg = self.mailbox.recv() => {
+                    let Some(msg) = maybe_msg else {
+                        tracing::info!("Raft mailbox closed, shutting down");
+                        return Ok(());
+                    };
+                    if self.process_mailbox_message(
+                        msg,
+                        &mut recent_peer_responses,
+                        leader_serving_lease_duration,
+                    )? {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_tick)) => {
+                    self.tick_election_and_heartbeat(&mut last_tick);
+                }
+            }
         }
     }
 
@@ -786,6 +838,41 @@ mod tests {
             "Proposed data should be committed. Got: {:?}",
             committed_data
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_wakes_on_mailbox_proposal() -> anyhow::Result<()> {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+
+        let engine = test_engine();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
+
+        for _ in 0..20 {
+            node.raw_node.tick();
+        }
+        node.process_ready_test();
+        assert!(node.is_leader());
+
+        let run_task = tokio::spawn(async move { node.run(|_| Ok(()), |_| Ok(())).await });
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tx.send(RaftMessage::Propose(RaftProposal {
+            data: b"mailbox proposal".to_vec(),
+            result_tx,
+        }))?;
+
+        let result = tokio::time::timeout(Duration::from_millis(50), result_rx).await??;
+        assert!(matches!(result, RaftProposalResult::Committed { .. }));
+
+        tx.send(RaftMessage::Shutdown)?;
+        run_task.await??;
+        Ok(())
     }
 
     #[tokio::test]
