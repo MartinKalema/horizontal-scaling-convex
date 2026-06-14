@@ -15,7 +15,7 @@
 
 x-backend-common: &backend-common
   image: ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest
-  pull_policy: always
+  pull_policy: ${BACKEND_PULL_POLICY:-missing}
   stop_grace_period: 10s
   stop_signal: SIGINT
   healthcheck:
@@ -123,7 +123,7 @@ services:
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
-      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
+      NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       RAFT_NODE_ID: "1"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
     depends_on:
@@ -150,7 +150,7 @@ services:
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
-      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
+      NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       RAFT_NODE_ID: "2"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
@@ -178,7 +178,7 @@ services:
       PARTITION_ID: "0"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
-      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
+      NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       RAFT_NODE_ID: "3"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
@@ -208,7 +208,7 @@ services:
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
-      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
+      NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       RAFT_NODE_ID: "1"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
     depends_on:
@@ -235,7 +235,7 @@ services:
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
-      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
+      NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       RAFT_NODE_ID: "2"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
@@ -263,7 +263,7 @@ services:
       PARTITION_ID: "1"
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
-      NODE_ADDRESSES: 0=node-p0a:50051,1=node-p1a:50051
+      NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       RAFT_NODE_ID: "3"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage

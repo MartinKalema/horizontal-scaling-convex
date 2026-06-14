@@ -17,6 +17,7 @@
 
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{
         Duration,
         SystemTime,
@@ -25,7 +26,10 @@ use std::{
 };
 
 use anyhow::Context;
-use async_nats::jetstream::kv::Store;
+use async_nats::jetstream::kv::{
+    Operation as KvOperation,
+    Store,
+};
 use async_trait::async_trait;
 use common::{
     bootstrap_model::index::database_index::IndexedFields,
@@ -71,6 +75,7 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use tokio::sync::Mutex;
 use tonic::{
     transport::Channel,
     Request,
@@ -499,6 +504,19 @@ impl NatsTwoPhaseDecisionLog {
     }
 }
 
+fn parse_nats_decision_entry(
+    transaction_id: &TwoPhaseTransactionId,
+    operation: KvOperation,
+    value: &[u8],
+) -> anyhow::Result<Option<TwoPhaseDecision>> {
+    if operation != KvOperation::Put || value.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(value)
+        .with_context(|| format!("2PC: Failed to parse decision for {transaction_id}"))
+        .map(Some)
+}
+
 #[async_trait]
 impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
     async fn write_decision(
@@ -544,9 +562,7 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
         else {
             return Ok(None);
         };
-        serde_json::from_slice(&entry.value)
-            .with_context(|| format!("2PC: Failed to parse decision for {transaction_id}"))
-            .map(Some)
+        parse_nats_decision_entry(transaction_id, entry.operation, &entry.value)
     }
 
     async fn mark_participant_resolved(
@@ -563,8 +579,11 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
             else {
                 return Ok(None);
             };
-            let mut decision: TwoPhaseDecision = serde_json::from_slice(&entry.value)
-                .with_context(|| format!("2PC: Failed to parse decision for {transaction_id}"))?;
+            let Some(mut decision) =
+                parse_nats_decision_entry(transaction_id, entry.operation, &entry.value)?
+            else {
+                return Ok(None);
+            };
             decision.mark_participant_resolved(participant);
             let payload = serde_json::to_vec(&decision).with_context(|| {
                 format!("2PC: Failed to serialize decision for {transaction_id}")
@@ -603,14 +622,18 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
 }
 
 /// Partition-to-address mapping for gRPC communication.
-/// Each entry maps a partition ID to the gRPC address of its owner node.
+/// Each entry maps a partition ID to one or more gRPC addresses for that
+/// partition's Raft peers.
 #[derive(Clone, Debug)]
 pub struct NodeAddresses {
-    addresses: BTreeMap<PartitionId, String>,
+    addresses: BTreeMap<PartitionId, Vec<String>>,
 }
 
 impl NodeAddresses {
-    /// Parse from config string: "0=host:port,1=host:port"
+    /// Parse from config string: "0=host:port|host:port,1=host:port|host:port".
+    ///
+    /// A partition can list multiple Raft peers with `|`, e.g.
+    /// "0=node-p0a:50051|node-p0b:50051,1=node-p1a:50051|node-p1b:50051".
     pub fn from_config(config: &str) -> Self {
         let mut addresses = BTreeMap::new();
         if !config.is_empty() {
@@ -618,7 +641,13 @@ impl NodeAddresses {
                 let pair = pair.trim();
                 if let Some((id, addr)) = pair.split_once('=') {
                     if let Ok(partition_id) = id.trim().parse::<u32>() {
-                        addresses.insert(PartitionId(partition_id), addr.trim().to_string());
+                        let peers = addr
+                            .split('|')
+                            .map(str::trim)
+                            .filter(|addr| !addr.is_empty())
+                            .map(str::to_string)
+                            .collect();
+                        addresses.insert(PartitionId(partition_id), peers);
                     }
                 }
             }
@@ -628,7 +657,15 @@ impl NodeAddresses {
 
     /// Get the gRPC address for a partition.
     pub fn address_for(&self, partition: PartitionId) -> Option<&str> {
-        self.addresses.get(&partition).map(|s| s.as_str())
+        self.addresses
+            .get(&partition)
+            .and_then(|addresses| addresses.first())
+            .map(|s| s.as_str())
+    }
+
+    /// Get all configured gRPC addresses for a partition.
+    pub fn addresses_for(&self, partition: PartitionId) -> Option<&[String]> {
+        self.addresses.get(&partition).map(Vec::as_slice)
     }
 
     /// Get all known partitions.
@@ -1059,6 +1096,46 @@ pub struct TwoPhaseCommitGrpcClient {
     cluster_auth: Option<ClusterGrpcAuth>,
 }
 
+fn normalize_grpc_addr(addr: &str) -> String {
+    if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
+#[derive(Clone)]
+pub struct TwoPhaseCommitGrpcClientPool {
+    cluster_auth: Option<ClusterGrpcAuth>,
+    clients: Arc<Mutex<BTreeMap<String, Arc<TwoPhaseCommitGrpcClient>>>>,
+}
+
+impl TwoPhaseCommitGrpcClientPool {
+    pub fn new(cluster_auth: Option<ClusterGrpcAuth>) -> Self {
+        Self {
+            cluster_auth,
+            clients: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub async fn client(&self, addr: &str) -> anyhow::Result<Arc<TwoPhaseCommitGrpcClient>> {
+        let normalized_addr = normalize_grpc_addr(addr);
+        if let Some(client) = self.clients.lock().await.get(&normalized_addr).cloned() {
+            return Ok(client);
+        }
+
+        let client = Arc::new(
+            TwoPhaseCommitGrpcClient::connect_inner(&normalized_addr, self.cluster_auth.clone())
+                .await?,
+        );
+        let mut clients = self.clients.lock().await;
+        Ok(clients
+            .entry(normalized_addr)
+            .or_insert_with(|| client.clone())
+            .clone())
+    }
+}
+
 impl TwoPhaseCommitGrpcClient {
     pub async fn connect(addr: &str) -> anyhow::Result<Self> {
         Self::connect_inner(addr, None).await
@@ -1075,11 +1152,7 @@ impl TwoPhaseCommitGrpcClient {
         addr: &str,
         cluster_auth: Option<ClusterGrpcAuth>,
     ) -> anyhow::Result<Self> {
-        let normalized_addr = if addr.contains("://") {
-            addr.to_string()
-        } else {
-            format!("http://{addr}")
-        };
+        let normalized_addr = normalize_grpc_addr(addr);
         let client = TonicTwoPcClient::connect(normalized_addr.clone())
             .await
             .with_context(|| format!("Failed to connect to 2PC service at {normalized_addr}"))?;
@@ -1166,7 +1239,31 @@ mod tests {
         let addrs = NodeAddresses::from_config("0=node-a:50051,1=node-b:50051");
         assert_eq!(addrs.address_for(PartitionId(0)), Some("node-a:50051"));
         assert_eq!(addrs.address_for(PartitionId(1)), Some("node-b:50051"));
+        assert_eq!(
+            addrs.addresses_for(PartitionId(0)).unwrap(),
+            &["node-a:50051".to_string()]
+        );
         assert_eq!(addrs.address_for(PartitionId(2)), None);
+    }
+
+    #[test]
+    fn test_node_addresses_parsing_multiple_peers() {
+        let addrs = NodeAddresses::from_config(
+            "0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051",
+        );
+        assert_eq!(addrs.address_for(PartitionId(0)), Some("node-p0a:50051"));
+        assert_eq!(
+            addrs.addresses_for(PartitionId(0)).unwrap(),
+            &[
+                "node-p0a:50051".to_string(),
+                "node-p0b:50051".to_string(),
+                "node-p0c:50051".to_string(),
+            ]
+        );
+        assert_eq!(
+            addrs.addresses_for(PartitionId(1)).unwrap(),
+            &["node-p1a:50051".to_string()]
+        );
     }
 
     #[test]
@@ -1200,5 +1297,30 @@ mod tests {
             },
             _ => panic!("Wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_nats_decision_entry_delete_marker_is_absent() {
+        let txn_id = TwoPhaseTransactionId::new();
+        let parsed = parse_nats_decision_entry(&txn_id, KvOperation::Delete, &[]).unwrap();
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn test_nats_decision_entry_empty_put_is_absent() {
+        let txn_id = TwoPhaseTransactionId::new();
+        let parsed = parse_nats_decision_entry(&txn_id, KvOperation::Put, &[]).unwrap();
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn test_nats_decision_entry_put_parses_decision() {
+        let txn_id = TwoPhaseTransactionId::new();
+        let decision = TwoPhaseDecision::committed(12345, vec![0, 1]);
+        let payload = serde_json::to_vec(&decision).unwrap();
+        let parsed = parse_nats_decision_entry(&txn_id, KvOperation::Put, &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, decision);
     }
 }

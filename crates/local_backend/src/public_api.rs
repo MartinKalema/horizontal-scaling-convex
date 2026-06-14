@@ -220,9 +220,12 @@ impl UdfResponse {
     }
 }
 
-fn mutation_read_after_write_token(st: &RouterState, ts: Timestamp) -> ReadAfterWriteToken {
+fn mutation_read_after_write_token(
+    source_partition: Option<PartitionId>,
+    ts: Timestamp,
+) -> ReadAfterWriteToken {
     ReadAfterWriteToken {
-        source_partition: st.partition_id.map(|partition| partition.0),
+        source_partition: source_partition.map(|partition| partition.0),
         ts: ts.into(),
     }
 }
@@ -243,16 +246,11 @@ fn read_after_write_fence(
 async fn wait_for_local_mutation_visibility(
     st: &RouterState,
     commit_ts: Timestamp,
-    require_replication_frontier: bool,
-) {
-    st.database.wait_for_write_ts(commit_ts).await;
-    if require_replication_frontier {
-        if let Some(partition_id) = st.partition_id {
-            st.database
-                .wait_for_replication_write_frontier(partition_id, commit_ts)
-                .await;
-        }
-    }
+    source_partition: Option<PartitionId>,
+) -> anyhow::Result<()> {
+    st.database
+        .wait_for_read_after_write_fence(source_partition, commit_ts)
+        .await
 }
 
 async fn maybe_forward_public_mutation(
@@ -307,14 +305,9 @@ async fn maybe_forward_public_mutation(
                 );
                 return Ok(None);
             };
-            let client_result = match st.cluster_grpc_auth.clone() {
-                Some(auth) => {
-                    MutationForwarderGrpcClient::connect_with_auth(&leader_grpc_url, auth).await
-                },
-                None => MutationForwarderGrpcClient::connect(&leader_grpc_url).await,
-            };
+            let client_result = st.mutation_forwarder_pool.client(&leader_grpc_url).await;
             match client_result {
-                Ok(client) => Some(ForwardingMode::RaftFollower(Arc::new(client))),
+                Ok(client) => Some(ForwardingMode::RaftFollower(client)),
                 Err(e) => {
                     tracing::warn!(
                         "Skipping follower mutation forwarding because leader {} at {} is not \
@@ -369,9 +362,10 @@ async fn maybe_forward_public_mutation(
 
     let response = match forwarded.result {
         Some(pb::replication::forward_mutation_response::Result::Success(success)) => {
+            let commit_ts = Timestamp::try_from(success.ts)?;
+            let source_partition = success.source_partition.map(PartitionId);
             if matches!(forwarding_mode, ForwardingMode::RaftFollower(_)) {
-                wait_for_local_mutation_visibility(st, Timestamp::try_from(success.ts)?, true)
-                    .await;
+                wait_for_local_mutation_visibility(st, commit_ts, source_partition).await?;
             }
             let packed = JsonPackedValue::from_network(success.value).context(
                 ErrorMetadata::bad_request(
@@ -382,8 +376,8 @@ async fn maybe_forward_public_mutation(
             UdfResponse::Success {
                 value: export_value(packed.unpack()?, value_format, client_version.clone())?,
                 read_after_write: Some(mutation_read_after_write_token(
-                    st,
-                    Timestamp::try_from(success.ts)?,
+                    source_partition,
+                    commit_ts,
                 )),
                 log_lines: RedactedLogLines::from_vec(success.log_lines),
             }
@@ -908,10 +902,14 @@ pub async fn public_mutation_post(
     let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
     let response = match udf_result {
         Ok(write_return) => {
-            wait_for_local_mutation_visibility(&st, write_return.ts, false).await;
+            wait_for_local_mutation_visibility(&st, write_return.ts, write_return.source_partition)
+                .await?;
             UdfResponse::Success {
                 value: export_value(write_return.value.unpack()?, value_format, client_version)?,
-                read_after_write: Some(mutation_read_after_write_token(&st, write_return.ts)),
+                read_after_write: Some(mutation_read_after_write_token(
+                    write_return.source_partition,
+                    write_return.ts,
+                )),
                 log_lines: write_return.log_lines,
             }
         },
@@ -1031,7 +1029,10 @@ mod tests {
             ResolvedHostname,
         },
         runtime::Runtime,
-        types::FunctionCaller,
+        types::{
+            FunctionCaller,
+            Timestamp,
+        },
         version::ClientVersion,
     };
     use database::{
@@ -1223,6 +1224,15 @@ mod tests {
             Ok(json!("1")),
         )
         .await
+    }
+
+    #[test]
+    fn test_mutation_read_after_write_token_uses_commit_source_partition() -> anyhow::Result<()> {
+        let token =
+            super::mutation_read_after_write_token(Some(PartitionId(7)), Timestamp::must(123));
+        assert_eq!(token.source_partition, Some(7));
+        assert_eq!(Timestamp::try_from(token.ts)?, Timestamp::must(123));
+        Ok(())
     }
 
     #[convex_macro::prod_rt_test]

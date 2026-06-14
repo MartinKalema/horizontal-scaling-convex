@@ -568,6 +568,7 @@ pub fn router(st: BackendAppState) -> Router {
         raft_state: st.raft_state.clone(),
         raft_peer_grpc_urls: st.raft_peer_grpc_urls.clone(),
         cluster_grpc_auth: st.cluster_grpc_auth.clone(),
+        mutation_forwarder_pool: st.mutation_forwarder_pool.clone(),
         replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
     };
 

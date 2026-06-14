@@ -52,6 +52,10 @@ message MutationSuccess {
 
   // The commit timestamp.
   uint64 ts = 3;
+
+  // Partition that originated the committed write, if the commit can be
+  // represented by a single origin partition.
+  optional uint32 source_partition = 4;
 }
 
 message MutationError {

@@ -20,7 +20,14 @@ use anyhow::Context;
 use async_trait::async_trait;
 use common::{
     assert_obj,
-    bootstrap_model::index::database_index::IndexedFields,
+    bootstrap_model::index::{
+        database_index::IndexedFields,
+        INDEX_TABLE,
+    },
+    document::{
+        ResolvedDocument,
+        ID_FIELD,
+    },
     interval::Interval,
     knobs::REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
     maybe_val,
@@ -85,6 +92,7 @@ use tonic::{
 };
 use value::{
     assert_val,
+    InternalId,
     PublicDocumentId,
     ResolvedDocumentId,
     TableName,
@@ -478,6 +486,22 @@ struct FailingRollbackAfterPrepareGrpcService {
     fail_next_rollback: AtomicBool,
 }
 
+struct AmbiguousPrepareAfterLocalPrepareGrpcService {
+    db: Database<TestRuntime>,
+    committer: CommitterClient,
+    local_partition: PartitionId,
+}
+
+impl AmbiguousPrepareAfterLocalPrepareGrpcService {
+    fn new(db: Database<TestRuntime>, local_partition: PartitionId) -> Self {
+        Self {
+            committer: db.committer_for_test(),
+            db,
+            local_partition,
+        }
+    }
+}
+
 impl FailingRollbackAfterPrepareGrpcService {
     fn new(db: Database<TestRuntime>, local_partition: PartitionId) -> Self {
         Self {
@@ -504,6 +528,87 @@ impl FailingCommitAfterLocalPrepareGrpcService {
             local_partition,
             fail_next_commit: AtomicBool::new(true),
         }
+    }
+}
+
+#[tonic::async_trait]
+impl TwoPhaseCommitService for AmbiguousPrepareAfterLocalPrepareGrpcService {
+    async fn prepare(
+        &self,
+        request: Request<TwoPcPrepareRequest>,
+    ) -> Result<Response<TwoPcPrepareResponse>, Status> {
+        let req = request.into_inner();
+        let txn_id = TwoPhaseTransactionId(req.transaction_id);
+        let prepare_ts: Timestamp = req
+            .prepare_ts
+            .try_into()
+            .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
+        let write_source = WriteSource::new(req.write_source);
+        let mut tx =
+            self.db.begin(Identity::system()).await.map_err(|e| {
+                Status::internal(format!("Failed to begin local prepare tx: {e:#}"))
+            })?;
+        TestFacingModel::new(&mut tx)
+            .insert(
+                &"projects"
+                    .parse()
+                    .map_err(|e| Status::internal(format!("Invalid test table name: {e:#}")))?,
+                assert_obj!("name" => "prepared-before-ambiguous-prepare-failure"),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to build local prepare tx: {e:#}")))?;
+        let final_tx = tx
+            .finalize()
+            .map_err(|e| Status::internal(format!("Failed to finalize local prepare tx: {e:#}")))?;
+        let write_indexes: Vec<_> = final_tx
+            .writes
+            .coalesced_writes()
+            .enumerate()
+            .map(|(index, _)| index)
+            .collect();
+        let partition_map = partitioned_map(self.local_partition);
+        let transaction = ParticipantTransaction::from_final_transaction(
+            &final_tx,
+            self.local_partition,
+            &write_indexes,
+            &partition_map,
+            &write_source,
+        )
+        .map_err(|e| Status::internal(format!("Failed to build local participant tx: {e:#}")))?;
+        self.committer
+            .prepare_remote(
+                txn_id,
+                transaction,
+                write_source,
+                prepare_ts,
+                req.participants.iter().copied().map(PartitionId).collect(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
+        Err(Status::unknown(
+            "transport error: connection error: stream closed because of a broken pipe",
+        ))
+    }
+
+    async fn commit_prepared(
+        &self,
+        _request: Request<TwoPcCommitRequest>,
+    ) -> Result<Response<TwoPcCommitResponse>, Status> {
+        Err(Status::failed_precondition(
+            "commit_prepared should not be called after ambiguous prepare failure",
+        ))
+    }
+
+    async fn rollback_prepared(
+        &self,
+        request: Request<TwoPcRollbackRequest>,
+    ) -> Result<Response<TwoPcRollbackResponse>, Status> {
+        let req = request.into_inner();
+        self.committer
+            .rollback_prepared(TwoPhaseTransactionId(req.transaction_id))
+            .await
+            .map_err(|e| Status::internal(format!("RollbackPrepared failed: {e:#}")))?;
+        Ok(Response::new(TwoPcRollbackResponse {}))
     }
 }
 
@@ -1366,6 +1471,142 @@ async fn test_local_commit_retries_while_prepare_is_unresolved(
 }
 
 #[convex_macro::test_runtime]
+async fn test_max_repeatable_bump_does_not_overtake_prepared_commit(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"messages".parse()?,
+            assert_obj!("text" => "prepared-after-repeatable-bump"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare = node
+        .committer_for_test()
+        .prepare(
+            txn_id.clone(),
+            final_tx,
+            WriteSource::new("prepared_repeatable_bump_test"),
+        )
+        .await?;
+
+    let bumped = node.bump_max_repeatable_ts().await?;
+    assert!(
+        bumped < prepare.prepare_ts,
+        "max repeatable bump should not advance past unresolved prepare ts: bumped={} prepare={}",
+        u64::from(bumped),
+        u64::from(prepare.prepare_ts),
+    );
+
+    let committed = node.committer_for_test().commit_prepared(txn_id).await?;
+    assert_eq!(committed, prepare.prepare_ts);
+
+    let messages = run_query(
+        node,
+        TableNamespace::root_component(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(messages.len(), 1);
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cross_partition_replica_delta_waits_behind_unresolved_prepared_transaction(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(
+        &rt,
+        log.clone(),
+        Some(partitioned_map_with_tasks(PartitionId(0))),
+    )
+    .await?;
+    let node_b = create_node(
+        &rt,
+        log.clone(),
+        Some(partitioned_map_with_tasks(PartitionId(1))),
+    )
+    .await?;
+
+    insert_doc(
+        &node_a,
+        "messages",
+        assert_obj!("text" => "remote-before-prepare"),
+    )
+    .await?;
+    let mut racing_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed message should publish a replica delta");
+    node_b
+        .committer_for_test()
+        .apply_replica_delta(racing_delta.clone())
+        .await?;
+
+    let mut tx = node_b.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"tasks".parse()?,
+            assert_obj!("title" => "prepared-local-task"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare = node_b
+        .committer_for_test()
+        .prepare(
+            txn_id.clone(),
+            final_tx,
+            WriteSource::new("prepared_replica_delta_fence_test"),
+        )
+        .await?;
+
+    racing_delta.ts = prepare.prepare_ts;
+    let err = node_b
+        .committer_for_test()
+        .apply_replica_delta(racing_delta.clone())
+        .await
+        .expect_err("cross-partition replica delta should retry behind unresolved prepare");
+    assert!(
+        format!("{err:#}").contains("would overtake unresolved 2PC prepared transaction"),
+        "unexpected error: {err:#}",
+    );
+
+    let committed = node_b.committer_for_test().commit_prepared(txn_id).await?;
+    assert_eq!(committed, prepare.prepare_ts);
+
+    node_b
+        .committer_for_test()
+        .apply_replica_delta(racing_delta)
+        .await?;
+
+    let tasks = run_query(
+        node_b.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("tasks".parse()?, Order::Asc),
+    )
+    .await?;
+    let messages = run_query(
+        node_b,
+        TableNamespace::root_component(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(messages.len(), 1);
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_prepare_retries_while_local_commit_is_pending(
     rt: TestRuntime,
     pause: PauseController,
@@ -1760,12 +2001,12 @@ async fn test_replica_delta_redelivery_is_idempotent(rt: TestRuntime) -> anyhow:
 
     let applied_frontiers = node_a_persistence
         .reader()
-        .get_persistence_global(PersistenceGlobalKey::AppliedDeltaWatermarks)
+        .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaWatermarks)
         .await?
-        .expect("replica applied frontier should be persisted");
+        .expect("replica applied data frontier should be persisted");
     let applied_frontiers = crate::snapshot_manager::partition_timestamp_map_from_json(
         applied_frontiers,
-        "applied delta watermarks",
+        "applied data delta watermarks",
     )?;
     assert_eq!(applied_frontiers.get(&PartitionId(1)), Some(&remote_ts));
 
@@ -1793,6 +2034,225 @@ async fn test_replica_delta_redelivery_is_idempotent(rt: TestRuntime) -> anyhow:
         "redelivered delta after restart must not append duplicate document log entries",
     );
 
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_frontier_heartbeat_does_not_dedupe_later_data_delta(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let target_persistence = Arc::new(TestPersistence::new());
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers.clone(),
+    )
+    .await?;
+    let target = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        target_persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_numbers,
+    )
+    .await?;
+
+    insert_doc(&source, "projects", assert_obj!("name" => "late data")).await?;
+    let data_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("project insert should publish a delta");
+    let data_ts = data_delta.ts;
+    let heartbeat_ts = data_ts.succ()?;
+
+    target
+        .committer_for_test()
+        .apply_replica_delta(CommitDelta {
+            ts: heartbeat_ts,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("heartbeat_before_data_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        })
+        .await?;
+
+    let freshness_watermarks = target_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDeltaWatermarks)
+        .await?
+        .context("heartbeat should persist the freshness watermark")?;
+    let freshness_watermarks =
+        partition_timestamp_map_from_json(freshness_watermarks, "applied delta watermarks")?;
+    assert_eq!(
+        freshness_watermarks.get(&PartitionId(1)).copied(),
+        Some(heartbeat_ts),
+        "frontier-only heartbeat advances read-after-write freshness",
+    );
+    let data_watermarks = target_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaWatermarks)
+        .await?;
+    assert!(
+        data_watermarks.is_none(),
+        "frontier-only heartbeat must not advance data-delta idempotency",
+    );
+
+    let applied_ts = target
+        .committer_for_test()
+        .apply_replica_delta(data_delta)
+        .await?;
+    assert!(
+        applied_ts > heartbeat_ts,
+        "late data should apply at a fresh local timestamp after the heartbeat",
+    );
+
+    let projects = run_query(
+        target.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        projects.len(),
+        1,
+        "non-empty data delta must not be skipped by a newer heartbeat watermark",
+    );
+
+    let persisted_data_watermarks = target_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaWatermarks)
+        .await?
+        .context("data delta should persist the data idempotency watermark")?;
+    let persisted_data_watermarks = partition_timestamp_map_from_json(
+        persisted_data_watermarks,
+        "applied data delta watermarks",
+    )?;
+    assert_eq!(
+        persisted_data_watermarks.get(&PartitionId(1)).copied(),
+        Some(data_ts),
+        "data idempotency tracks the non-empty delta, not the newer heartbeat",
+    );
+
+    let freshness_watermarks = target_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDeltaWatermarks)
+        .await?
+        .context("freshness watermark should still be persisted")?;
+    let freshness_watermarks =
+        partition_timestamp_map_from_json(freshness_watermarks, "applied delta watermarks")?;
+    assert_eq!(
+        freshness_watermarks.get(&PartitionId(1)).copied(),
+        Some(heartbeat_ts),
+        "late data must not move the freshness watermark backward",
+    );
+
+    Ok(())
+}
+
+fn rewrite_index_document_ids(mut delta: CommitDelta) -> anyhow::Result<CommitDelta> {
+    let mut rewritten = 1u8;
+    for update in &mut delta.document_updates {
+        if !delta
+            .tablet_id_to_table_name
+            .get(&update.id.tablet_id)
+            .is_some_and(|name| name == &*INDEX_TABLE)
+        {
+            continue;
+        }
+        let internal_id = InternalId([rewritten; 16]);
+        rewritten += 1;
+        let remapped_id = ResolvedDocumentId::new(
+            update.id.tablet_id,
+            PublicDocumentId::new(update.id.document_id.table(), internal_id),
+        );
+        update.id = remapped_id;
+        update.old_document = update
+            .old_document
+            .take()
+            .map(|document| {
+                let mut fields: std::collections::BTreeMap<_, _> =
+                    document.value().0.clone().into();
+                fields.remove(&common::types::FieldName::from(ID_FIELD.clone()));
+                let value = fields.try_into()?;
+                ResolvedDocument::new(remapped_id, document.creation_time(), value)
+            })
+            .transpose()?;
+        update.new_document = update
+            .new_document
+            .take()
+            .map(|document| {
+                let mut fields: std::collections::BTreeMap<_, _> =
+                    document.value().0.clone().into();
+                fields.remove(&common::types::FieldName::from(ID_FIELD.clone()));
+                let value = fields.try_into()?;
+                ResolvedDocument::new(remapped_id, document.creation_time(), value)
+            })
+            .transpose()?;
+    }
+    Ok(delta)
+}
+
+#[convex_macro::test_runtime]
+async fn test_replica_delta_skips_equivalent_index_metadata_with_new_document_ids(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a_persistence = Arc::new(TestPersistence::new());
+    let node_a = create_node_with_persistence(
+        &rt,
+        node_a_persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "catalog")).await?;
+    let delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("project insert should publish table and index metadata");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(delta.clone())
+        .await?;
+    let document_log_count = persisted_document_log_count(&node_a_persistence).await?;
+
+    let mut duplicate_index_delta = rewrite_index_document_ids(delta)?;
+    duplicate_index_delta.ts = duplicate_index_delta.ts.succ()?;
+    duplicate_index_delta.document_updates.retain(|update| {
+        duplicate_index_delta
+            .tablet_id_to_table_name
+            .get(&update.id.tablet_id)
+            .is_some_and(|name| name == &*INDEX_TABLE)
+    });
+    duplicate_index_delta.document_writes = Arc::new(Vec::new());
+    duplicate_index_delta.index_writes = Arc::new(Vec::new());
+
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(duplicate_index_delta)
+        .await?;
+
+    assert_eq!(
+        persisted_document_log_count(&node_a_persistence).await?,
+        document_log_count,
+        "equivalent duplicate _index metadata should be skipped without appending document writes",
+    );
     Ok(())
 }
 
@@ -2081,6 +2541,100 @@ async fn test_prepared_participant_recovers_from_redo_after_restart(
 }
 
 #[convex_macro::test_runtime]
+async fn test_prepared_participant_recovery_rewrites_when_restart_floor_advances(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let tp = Arc::new(TestPersistence::new());
+    let node = create_node_with_persistence(
+        &rt,
+        tp.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "recovered-from-redo-after-floor-advance"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("prepared_redo_recovery_floor_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source.clone(),
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+    node.shutdown().await?;
+
+    let restart_floor = prepare_ts.succ()?.succ()?;
+    tp.write_persistence_global(
+        PersistenceGlobalKey::MaxRepeatableTimestamp,
+        restart_floor.into(),
+    )
+    .await?;
+
+    let restarted = create_node_with_persistence(
+        &rt,
+        tp.clone(),
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let committed_ts = restarted
+        .committer_for_test()
+        .commit_prepared(txn_id)
+        .await?;
+    assert!(
+        committed_ts > prepare_ts,
+        "recovered prepare should commit at a local timestamp above the advanced restart floor",
+    );
+
+    let projects = run_query(
+        restarted.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 1);
+
+    let redo = tp
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+        .await?;
+    assert_eq!(redo, Some(serde_json::json!({})));
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_raft_prepared_redo_apply_can_commit_after_failover(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
@@ -2142,6 +2696,72 @@ async fn test_raft_prepared_redo_apply_can_commit_after_failover(
         .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
         .await?;
     assert_eq!(redo, Some(serde_json::json!({})));
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let source = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+
+    let mut tx = source.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "remote-catalog-redo"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_source = WriteSource::new("remote_catalog_owner_prepare_test");
+    let source_map = partitioned_map(PartitionId(0));
+    let participant_indexes = crate::two_phase_coordinator::participant_write_indexes(
+        &final_tx,
+        &source_map,
+        &write_source,
+    );
+    let owner_writes = participant_indexes
+        .get(&PartitionId(1))
+        .expect("projects writes and catalog metadata should route to partition 1");
+    assert_eq!(participant_indexes.len(), 1);
+    assert_eq!(
+        owner_writes.len(),
+        final_tx.writes.coalesced_writes().count()
+    );
+
+    let owner = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        owner_writes,
+        &source_map,
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = owner.committer_for_test().allocate_commit_ts().await?;
+    let redo = TwoPhaseRedoEntry::new(
+        &txn_id,
+        prepare_ts,
+        PartitionId(1),
+        participant_tx,
+        &write_source,
+    )?;
+
+    owner
+        .committer_for_test()
+        .apply_raft_prepared_redo(redo)
+        .await?;
+    let committed_ts = owner.committer_for_test().commit_prepared(txn_id).await?;
+    assert_eq!(committed_ts, prepare_ts);
+
+    let projects = run_query(
+        owner.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 1);
     Ok(())
 }
 
@@ -2262,6 +2882,581 @@ async fn test_raft_commit_delta_cleans_prepared_redo_on_follower(
     )
     .await
     .context("follower should accept local writes after Raft commit delta cleaned the prepare")?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_prepared_redo_rewrites_when_follower_floor_advanced_by_replica_delta(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_number_allocator = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let follower = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let foreign = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator,
+    )
+    .await?;
+
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "seed-before-rewrite"),
+    )
+    .await?;
+    let seed_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("seed insert should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(seed_delta)
+        .await?;
+
+    let mut tx = source.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "raft-prepare-rewrite"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("raft_prepare_rewrite_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = source.committer_for_test().allocate_commit_ts().await?;
+
+    insert_doc(
+        &foreign,
+        "messages",
+        assert_obj!("text" => "advance-follower-floor"),
+    )
+    .await?;
+    let mut foreign_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("foreign insert should publish a delta")?;
+    if foreign_delta.ts <= prepare_ts {
+        foreign_delta.ts = prepare_ts.succ()?;
+    }
+    follower
+        .committer_for_test()
+        .apply_replica_delta(foreign_delta)
+        .await?;
+
+    let redo = TwoPhaseRedoEntry::new(
+        &txn_id,
+        prepare_ts,
+        PartitionId(1),
+        participant_tx.clone(),
+        &write_source,
+    )?;
+    let prepare_result = follower
+        .committer_for_test()
+        .apply_raft_prepared_redo(redo)
+        .await?;
+    assert_eq!(prepare_result.prepare_ts, prepare_ts);
+
+    insert_doc(
+        &foreign,
+        "messages",
+        assert_obj!("text" => "advance-follower-floor-after-prepare"),
+    )
+    .await?;
+    let mut post_prepare_foreign_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("post-prepare foreign insert should publish a delta")?;
+    if post_prepare_foreign_delta.ts <= prepare_ts {
+        post_prepare_foreign_delta.ts = prepare_ts.succ()?.succ()?;
+    }
+    let err = follower
+        .committer_for_test()
+        .apply_replica_delta(post_prepare_foreign_delta.clone())
+        .await
+        .expect_err("foreign replica delta should wait behind unresolved prepared redo");
+    assert!(
+        format!("{err:#}").contains("would overtake unresolved 2PC prepared transaction"),
+        "unexpected error: {err:#}",
+    );
+
+    source
+        .committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+    source.committer_for_test().commit_prepared(txn_id).await?;
+    let delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("prepared commit should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_raft_commit_delta(delta)
+        .await?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(post_prepare_foreign_delta)
+        .await?;
+
+    let redo = follower
+        .committer_for_test()
+        .persistence_reader()
+        .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+        .await?;
+    assert_eq!(redo, Some(serde_json::json!({})));
+
+    let projects = run_query(
+        follower.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 2);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_prepared_redo_rewrites_when_pre_replay_heartbeat_advances_retention_floor(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_number_allocator = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let follower = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator,
+    )
+    .await?;
+
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "seed-before-pre-replay-heartbeat"),
+    )
+    .await?;
+    let seed_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("seed insert should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(seed_delta)
+        .await?;
+
+    let mut tx = source.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "raft-prepare-pre-replay-heartbeat-rewrite"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("raft_prepare_pre_replay_heartbeat_rewrite_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = source.committer_for_test().allocate_commit_ts().await?;
+
+    follower
+        .committer_for_test()
+        .apply_replica_delta(CommitDelta {
+            ts: prepare_ts.succ()?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("pre_replay_heartbeat_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(0)),
+        })
+        .await?;
+
+    let redo = TwoPhaseRedoEntry::new(
+        &txn_id,
+        prepare_ts,
+        PartitionId(1),
+        participant_tx.clone(),
+        &write_source,
+    )?;
+    let prepare_result = follower
+        .committer_for_test()
+        .apply_raft_prepared_redo(redo)
+        .await?;
+    assert_eq!(prepare_result.prepare_ts, prepare_ts);
+
+    source
+        .committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+    source.committer_for_test().commit_prepared(txn_id).await?;
+    let delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("prepared commit should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_raft_commit_delta(delta)
+        .await?;
+
+    let projects = run_query(
+        follower.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 2);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_prepared_redo_replay_uses_local_anchor_when_begin_ts_is_out_of_retention(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_number_allocator = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let follower = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator,
+    )
+    .await?;
+
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "seed-before-out-of-retention-begin"),
+    )
+    .await?;
+    let seed_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("seed insert should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(seed_delta)
+        .await?;
+
+    let mut tx = source.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "raft-prepare-out-of-retention-begin"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("raft_prepare_out_of_retention_begin_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = source.committer_for_test().allocate_commit_ts().await?;
+
+    follower
+        .committer_for_test()
+        .apply_replica_delta(CommitDelta {
+            ts: prepare_ts.pred()?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("pre_replay_floor_to_prepare_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(0)),
+        })
+        .await?;
+
+    let redo = TwoPhaseRedoEntry::new(
+        &txn_id,
+        prepare_ts,
+        PartitionId(1),
+        participant_tx.clone(),
+        &write_source,
+    )?;
+    let prepare_result = follower
+        .committer_for_test()
+        .apply_raft_prepared_redo(redo)
+        .await?;
+    assert_eq!(prepare_result.prepare_ts, prepare_ts);
+
+    source
+        .committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+    source.committer_for_test().commit_prepared(txn_id).await?;
+    let delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("prepared commit should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_raft_commit_delta(delta)
+        .await?;
+
+    let projects = run_query(
+        follower.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 2);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_prepared_redo_rewrites_when_heartbeat_advances_last_assigned(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_number_allocator = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let follower = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator,
+    )
+    .await?;
+
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "seed-before-heartbeat"),
+    )
+    .await?;
+    let seed_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("seed insert should publish a delta")?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(seed_delta)
+        .await?;
+
+    let mut tx = source.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "raft-prepare-heartbeat-rewrite"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("raft_prepare_heartbeat_rewrite_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = source.committer_for_test().allocate_commit_ts().await?;
+
+    let redo = TwoPhaseRedoEntry::new(
+        &txn_id,
+        prepare_ts,
+        PartitionId(1),
+        participant_tx.clone(),
+        &write_source,
+    )?;
+    let prepare_result = follower
+        .committer_for_test()
+        .apply_raft_prepared_redo(redo)
+        .await?;
+    assert_eq!(prepare_result.prepare_ts, prepare_ts);
+
+    let heartbeat_ts = prepare_ts.succ()?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(CommitDelta {
+            ts: heartbeat_ts,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::new("heartbeat_after_prepare_test"),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        })
+        .await?;
+
+    source
+        .committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+    source.committer_for_test().commit_prepared(txn_id).await?;
+    let delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .context("prepared commit should publish a delta")?;
+    let applied_ts = follower
+        .committer_for_test()
+        .apply_raft_commit_delta(delta)
+        .await?;
+    assert!(
+        applied_ts > heartbeat_ts,
+        "prepared commit should rewrite above heartbeat-advanced last_assigned",
+    );
+
+    let redo = follower
+        .committer_for_test()
+        .persistence_reader()
+        .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+        .await?;
+    assert_eq!(redo, Some(serde_json::json!({})));
+
+    let projects = run_query(
+        follower.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 2);
     Ok(())
 }
 
@@ -2425,15 +3620,15 @@ async fn test_replica_delta_timestamp_translation_records_origin_watermark(
 
     let persisted_watermarks = target_persistence
         .reader()
-        .get_persistence_global(PersistenceGlobalKey::AppliedDeltaWatermarks)
+        .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaWatermarks)
         .await?
-        .context("applied delta watermark should be persisted")?;
+        .context("applied data delta watermark should be persisted")?;
     let persisted_watermarks =
-        partition_timestamp_map_from_json(persisted_watermarks, "applied delta watermarks")?;
+        partition_timestamp_map_from_json(persisted_watermarks, "applied data delta watermarks")?;
     assert_eq!(
         persisted_watermarks.get(&PartitionId(1)).copied(),
         Some(remote_ts),
-        "origin watermark remains in the source partition timestamp domain",
+        "data idempotency watermark remains in the source partition timestamp domain",
     );
 
     let duplicate_apply_ts = target
@@ -2442,7 +3637,7 @@ async fn test_replica_delta_timestamp_translation_records_origin_watermark(
         .await?;
     assert_eq!(
         duplicate_apply_ts, remote_ts,
-        "duplicate detection uses the persisted origin timestamp watermark",
+        "duplicate detection uses the persisted data idempotency watermark",
     );
     let projects = run_query(
         target,
@@ -3103,6 +4298,82 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
     })
 }
 
+#[test]
+fn test_ambiguous_remote_prepare_failure_rolls_back_attempted_participant() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+            decision_log.clone(),
+        )
+        .await?;
+        let ambiguous_server = start_two_pc_server(
+            AmbiguousPrepareAfterLocalPrepareGrpcService::new(node_b.clone(), PartitionId(1)),
+        )
+        .await?;
+        let node_a = create_node_with_options_and_decision_log(
+            &rt,
+            log,
+            Some(partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!(
+                "1={}",
+                ambiguous_server.addr()
+            ))),
+            Some(tso),
+            decision_log.clone(),
+        )
+        .await?;
+
+        let message_id =
+            insert_doc_get_id(&node_a, "messages", assert_obj!("text" => "seed")).await?;
+        let message_id = value::PublicDocumentId::from(message_id);
+
+        let mut tx = node_a.begin(Identity::system()).await?;
+        let mut model = TestFacingModel::new(&mut tx);
+        model
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "ambiguous-prepare"),
+            )
+            .await?;
+        UserFacingModel::new(&mut tx, TableNamespace::test_user())
+            .replace(message_id, assert_obj!("text" => "prepared-local"))
+            .await?;
+
+        let err = node_a
+            .commit(tx)
+            .await
+            .expect_err("ambiguous remote prepare failure should abort the 2PC transaction");
+        assert!(
+            format!("{err:#}").contains("transport error"),
+            "expected transport-shaped prepare failure, got: {err:#}",
+        );
+        assert!(
+            decision_log.decisions().is_empty(),
+            "rollback decision should be deleted once attempted participants are resolved",
+        );
+        assert!(
+            node_b
+                .committer_for_test()
+                .two_phase_redo_records()
+                .await?
+                .is_empty(),
+            "ambiguous prepared participant should be rolled back immediately",
+        );
+
+        ambiguous_server.shutdown().await?;
+        Ok(())
+    })
+}
+
 #[convex_macro::test_runtime]
 async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
     rt: TestRuntime,
@@ -3256,11 +4527,9 @@ fn test_rollback_decision_survives_failed_rollback_rpc_for_watcher() -> anyhow::
                     !participants.contains(&2),
                     "rollback decision must not include the participant whose prepare failed",
                 );
-                assert_eq!(
-                    resolved_participants,
-                    &vec![0],
-                    "local coordinator participant should be marked resolved while failed remote \
-                     rollback remains pending",
+                assert!(
+                    !resolved_participants.contains(&1),
+                    "prepared participant should remain unresolved after its rollback RPC fails",
                 );
             },
             other => panic!("expected rollback decision, got {other:?}"),

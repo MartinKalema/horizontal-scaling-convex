@@ -34,6 +34,7 @@ use common::{
         ParseDocument,
         ParsedDocument,
         ResolvedDocument,
+        ID_FIELD,
     },
     document_index_keys::DocumentIndexKeyValue,
     errors::{
@@ -199,17 +200,24 @@ type RaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
 /// State held for a 2PC-prepared transaction awaiting commit/rollback.
 struct PreparedTransaction {
     prepared_write: PreparedWriteHandle,
+    origin_commit_ts: Timestamp,
     commit_ts: Timestamp,
     write_bytes: u64,
     document_writes: Arc<Vec<DocumentLogEntry>>,
     index_writes: Arc<Vec<PersistenceIndexEntry>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitOutcome {
+    pub ts: Timestamp,
+    pub source_partition: Option<crate::partition::PartitionId>,
+}
+
 enum PersistenceWrite {
     Commit {
         pending_write: PendingWriteHandle,
         commit_timer: StatusTimer,
-        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        result: oneshot::Sender<anyhow::Result<CommitOutcome>>,
         parent_trace: EncodedSpan,
         commit_id: usize,
         delta: CommitDelta,
@@ -218,7 +226,7 @@ enum PersistenceWrite {
     RejectedBeforePersistence {
         pending_write: PendingWriteHandle,
         commit_timer: StatusTimer,
-        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        result: oneshot::Sender<anyhow::Result<CommitOutcome>>,
         commit_id: usize,
         err: anyhow::Error,
     },
@@ -241,6 +249,7 @@ enum PersistenceWrite {
         write_bytes: u64,
         source_partition: Option<crate::partition::PartitionId>,
         applied_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
+        applied_data_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
         raft_nats_outbox_delta: Option<CommitDelta>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
@@ -257,6 +266,7 @@ enum PersistenceWrite {
         snapshot: Snapshot,
         replication_frontiers: BTreeMap<crate::partition::PartitionId, Timestamp>,
         applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+        applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -461,6 +471,42 @@ fn remap_index_metadata_update(
     })
 }
 
+fn replicated_index_update_is_already_present(
+    snapshot: &Snapshot,
+    update: &common::document::DocumentUpdate,
+) -> anyhow::Result<bool> {
+    let Some(document) = update
+        .new_document
+        .as_ref()
+        .or(update.old_document.as_ref())
+    else {
+        return Ok(false);
+    };
+    let metadata =
+        common::bootstrap_model::index::TabletIndexMetadata::from_document(document.clone())?
+            .into_value();
+    let existing = if metadata.config.is_enabled() {
+        snapshot.index_registry.get_enabled(&metadata.name)
+    } else {
+        snapshot.index_registry.get_pending(&metadata.name)
+    };
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    if existing.id() == document.id().internal_id() {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        existing.metadata().config == metadata.config,
+        "Replicated _index metadata for {} has document id {} but local index id {} already \
+         exists with different config",
+        metadata.name,
+        document.id().internal_id(),
+        existing.id(),
+    );
+    Ok(true)
+}
+
 fn downgrade_replicated_index_metadata(
     metadata: &mut common::bootstrap_model::index::TabletIndexMetadata,
 ) {
@@ -595,11 +641,14 @@ pub struct Committer<RT: Runtime> {
     // None means no Raft (existing behavior — always accept writes).
     raft_state: Option<crate::raft_partition::RaftPartitionState>,
 
-    // Durable idempotency frontier for replicated transport messages.
-    // Unlike `SnapshotManager::replication_frontiers`, this map is keyed by
-    // the origin partition's commit timestamp, not this node's local apply
-    // timestamp.
+    // Durable origin-timestamp freshness frontier for replicated transport
+    // messages. This includes data deltas and frontier-only heartbeats, so it
+    // is safe for read-after-write waits but not for data redelivery dedupe.
     applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+
+    // Durable origin-timestamp idempotency frontier for non-empty replicated
+    // data deltas only. Heartbeats must never advance this map.
+    applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -674,6 +723,7 @@ impl<RT: Runtime> Committer<RT> {
         timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
         applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+        applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
@@ -700,6 +750,7 @@ impl<RT: Runtime> Committer<RT> {
             queued_snapshots: VecDeque::new(),
             raft_state,
             applied_delta_watermarks,
+            applied_data_delta_watermarks,
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -719,7 +770,9 @@ impl<RT: Runtime> Committer<RT> {
             placement_state: client_placement_state,
             node_addresses,
             two_phase_decision_log,
-            cluster_grpc_auth,
+            two_phase_client_pool: Arc::new(crate::two_phase::TwoPhaseCommitGrpcClientPool::new(
+                cluster_grpc_auth,
+            )),
         }
     }
 
@@ -936,7 +989,10 @@ impl<RT: Runtime> Committer<RT> {
                                     u64::from(commit_ts),
                                 );
                             }
-                            let _ = result.send(Ok(commit_ts));
+                            let _ = result.send(Ok(CommitOutcome {
+                                ts: commit_ts,
+                                source_partition: published_commit.delta.source_partition,
+                            }));
 
                             // When we next get free cycles and there is no ongoing bump,
                             // bump max_repeatable_ts so followers can read this commit.
@@ -991,6 +1047,7 @@ impl<RT: Runtime> Committer<RT> {
                             write_bytes,
                             source_partition,
                             applied_delta_watermarks,
+                            applied_data_delta_watermarks,
                             raft_nats_outbox_delta,
                             result,
                             ..
@@ -1012,6 +1069,16 @@ impl<RT: Runtime> Committer<RT> {
                                         partition_timestamp_map_to_json(&frontiers),
                                     )
                                     .await?;
+                                self.applied_delta_watermarks = frontiers;
+                            }
+                            if let Some(frontiers) = applied_data_delta_watermarks {
+                                self.persistence
+                                    .write_persistence_global(
+                                        PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+                                        partition_timestamp_map_to_json(&frontiers),
+                                    )
+                                    .await?;
+                                self.applied_data_delta_watermarks = frontiers;
                             }
                             if let Some(delta) = raft_nats_outbox_delta.as_ref() {
                                 Self::add_raft_nats_outbox_delta(
@@ -1029,18 +1096,21 @@ impl<RT: Runtime> Committer<RT> {
                                         source_partition,
                                         commit_ts,
                                     )?;
+                                    let origin_watermark = self
+                                        .applied_delta_watermarks
+                                        .get(&source_partition)
+                                        .copied()
+                                        .unwrap_or(remote_ts);
                                     sm.update_applied_delta_watermark(
                                         source_partition,
-                                        remote_ts,
+                                        origin_watermark,
                                     )?;
-                                    self.applied_delta_watermarks
-                                        .insert(source_partition, remote_ts);
                                 }
                             }
                             let committed_prepared_txn = if source_partition
                                 == Some(self.local_partition_for_two_phase())
                             {
-                                self.remove_prepared_transaction_at_ts(remote_ts)?
+                                self.remove_prepared_transaction_at_origin_ts(remote_ts)?
                             } else {
                                 None
                             };
@@ -1090,6 +1160,7 @@ impl<RT: Runtime> Committer<RT> {
                             snapshot,
                             replication_frontiers,
                             applied_delta_watermarks,
+                            applied_data_delta_watermarks,
                             result,
                             ..
                         } => {
@@ -1100,6 +1171,7 @@ impl<RT: Runtime> Committer<RT> {
                             self.log.reset(snapshot_ts);
                             self.last_assigned_ts = snapshot_ts;
                             self.applied_delta_watermarks = applied_delta_watermarks.clone();
+                            self.applied_data_delta_watermarks = applied_data_delta_watermarks;
                             self.snapshot_manager.write().replace(
                                 snapshot_ts,
                                 snapshot,
@@ -1857,6 +1929,7 @@ impl<RT: Runtime> Committer<RT> {
         write_source: WriteSource,
         explicit_commit_ts: Option<Timestamp>,
         require_leader: bool,
+        allow_explicit_ts_rewrite: bool,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
         if require_leader {
             self.ensure_leader_for_writes()?;
@@ -1870,13 +1943,13 @@ impl<RT: Runtime> Committer<RT> {
         if let Some(existing) = self.prepared_transactions.get(&transaction_id) {
             if let Some(commit_ts) = explicit_commit_ts {
                 anyhow::ensure!(
-                    existing.commit_ts == commit_ts,
+                    existing.origin_commit_ts == commit_ts,
                     "2PC Prepare retried with a different commit timestamp for {}",
                     transaction_id
                 );
             }
             return Ok(crate::two_phase::PrepareResult {
-                prepare_ts: existing.commit_ts,
+                prepare_ts: existing.origin_commit_ts,
             });
         }
         if let Some(min_pending_ts) = self.pending_writes.min_ts() {
@@ -1892,22 +1965,54 @@ impl<RT: Runtime> Committer<RT> {
             )));
         }
 
-        let commit_ts = if let Some(commit_ts) = explicit_commit_ts {
-            anyhow::ensure!(
-                commit_ts >= local_commit_floor,
-                "2PC Prepare assigned ts={} but this participant requires ts>={}",
-                commit_ts,
-                local_commit_floor,
-            );
-            commit_ts
+        let (origin_commit_ts, commit_ts) = if let Some(commit_ts) = explicit_commit_ts {
+            let local_commit_ts = if commit_ts >= local_commit_floor {
+                commit_ts
+            } else if allow_explicit_ts_rewrite {
+                tracing::info!(
+                    "2PC Raft Prepare Apply: staging origin ts={} at local ts={} because the \
+                     follower snapshot floor has advanced",
+                    u64::from(commit_ts),
+                    u64::from(local_commit_floor),
+                );
+                local_commit_floor
+            } else {
+                anyhow::bail!(
+                    "2PC Prepare assigned ts={} but this participant requires ts>={}",
+                    commit_ts,
+                    local_commit_floor,
+                );
+            };
+            (commit_ts, local_commit_ts)
         } else {
-            self.next_commit_ts()?
+            let commit_ts = self.next_commit_ts()?;
+            (commit_ts, commit_ts)
         };
         if commit_ts > self.last_assigned_ts {
             self.last_assigned_ts = commit_ts;
         }
+        // Replay/recovery paths are reconstructing a prepare that was already
+        // accepted by the leader and written durably or through Raft. Do not
+        // re-scan from the original transaction begin timestamp: followers may
+        // have already compacted that range even when the origin prepare
+        // timestamp itself still does not need rewriting.
+        let conflict_begin_ts = if allow_explicit_ts_rewrite {
+            let rewritten_begin_ts = commit_ts.pred()?;
+            tracing::info!(
+                "2PC Raft Prepare Apply: validating replayed prepare with local begin ts={} \
+                 instead of origin begin ts={} to stay within the follower write-log retention \
+                 window",
+                u64::from(rewritten_begin_ts),
+                u64::from(begin_ts),
+            );
+            rewritten_begin_ts
+        } else {
+            begin_ts
+        };
         let timer = metrics::commit_is_stale_timer();
-        if let Some(conflicting_read) = self.commit_has_conflict(reads, begin_ts, commit_ts)? {
+        if let Some(conflicting_read) =
+            self.commit_has_conflict(reads, conflict_begin_ts, commit_ts)?
+        {
             anyhow::bail!(conflicting_read.into_error(table_mapping, &write_source));
         }
         timer.finish();
@@ -1961,6 +2066,7 @@ impl<RT: Runtime> Committer<RT> {
             transaction_id.clone(),
             PreparedTransaction {
                 prepared_write,
+                origin_commit_ts,
                 commit_ts,
                 write_bytes,
                 document_writes: Arc::new(doc_entries),
@@ -1975,7 +2081,7 @@ impl<RT: Runtime> Committer<RT> {
         );
 
         Ok(crate::two_phase::PrepareResult {
-            prepare_ts: commit_ts,
+            prepare_ts: origin_commit_ts,
         })
     }
 
@@ -2242,8 +2348,8 @@ impl<RT: Runtime> Committer<RT> {
         })
     }
 
-    fn fail_committed_write(
-        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+    fn fail_committed_write<T>(
+        result: oneshot::Sender<anyhow::Result<T>>,
         commit_ts: Timestamp,
         operation: &'static str,
         err: anyhow::Error,
@@ -2706,6 +2812,16 @@ impl<RT: Runtime> Committer<RT> {
                         serde_json::json!({}),
                     )
                     .await?;
+                if !checkpoint.globals.contains_key(&String::from(
+                    PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+                )) {
+                    persistence
+                        .write_persistence_global(
+                            PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+                            serde_json::json!({}),
+                        )
+                        .await?;
+                }
 
                 let replication_frontiers = checkpoint
                     .globals
@@ -2734,12 +2850,26 @@ impl<RT: Runtime> Committer<RT> {
                     })
                     .transpose()?
                     .unwrap_or_default();
+                let applied_data_delta_watermarks = checkpoint
+                    .globals
+                    .get(&String::from(
+                        PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+                    ))
+                    .map(|value| {
+                        partition_timestamp_map_from_json(
+                            value.clone(),
+                            "applied data delta watermarks",
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
 
                 Ok(PersistenceWrite::InstallSnapshot {
                     snapshot_ts: checkpoint_ts,
                     snapshot: db_snapshot.snapshot,
                     replication_frontiers,
                     applied_delta_watermarks,
+                    applied_data_delta_watermarks,
                     result,
                     commit_id,
                 })
@@ -2787,28 +2917,56 @@ impl<RT: Runtime> Committer<RT> {
         // prepare. We therefore use the remote commit timestamp as a floor and
         // only bump above it when local monotonicity requires it.
         let remote_ts = delta.ts;
-        if let Some(source_partition) = delta.source_partition
-            && self
-                .applied_delta_watermarks
-                .get(&source_partition)
-                .is_some_and(|frontier| *frontier >= remote_ts)
+        let local_prepared_commit_ts = if mode == ReplicaDeltaApplyMode::FullRaftState
+            && delta.source_partition == Some(self.local_partition_for_two_phase())
         {
-            tracing::info!(
-                "Skipping duplicate replica delta: source_partition={}, remote_ts={}",
-                source_partition.0,
-                u64::from(remote_ts),
+            self.local_prepared_commit_ts_for_origin(remote_ts)?
+        } else {
+            None
+        };
+        let latest_local_ts = *self.snapshot_manager.read().latest_ts();
+        let timestamps =
+            replica_delta_timestamps(remote_ts, latest_local_ts, self.last_assigned_ts)?;
+        let remote_ts = timestamps.origin_ts;
+        let commit_ts = if let Some(local_prepared_commit_ts) = local_prepared_commit_ts {
+            if local_prepared_commit_ts > latest_local_ts
+                && local_prepared_commit_ts > self.last_assigned_ts
+            {
+                local_prepared_commit_ts
+            } else {
+                tracing::info!(
+                    "2PC Raft Commit Apply: origin ts={} prepared locally at ts={} but local \
+                     floor is latest_snapshot={}, last_assigned={}; applying committed delta at \
+                     ts={}",
+                    u64::from(remote_ts),
+                    u64::from(local_prepared_commit_ts),
+                    u64::from(latest_local_ts),
+                    u64::from(self.last_assigned_ts),
+                    u64::from(timestamps.local_apply_ts),
+                );
+                timestamps.local_apply_ts
+            }
+        } else {
+            timestamps.local_apply_ts
+        };
+        if mode == ReplicaDeltaApplyMode::CrossPartitionReplica
+            && delta.source_partition != Some(self.local_partition_for_two_phase())
+            && let Some(min_prepared_ts) = self
+                .prepared_transactions
+                .values()
+                .map(|prepared| prepared.commit_ts)
+                .min()
+            && commit_ts >= min_prepared_ts
+        {
+            let err = anyhow::anyhow!(
+                "Replica delta at ts={} would overtake unresolved 2PC prepared transaction at \
+                 ts={}; retry after the prepared transaction commits or rolls back",
+                u64::from(commit_ts),
+                u64::from(min_prepared_ts),
             );
-            let _ = result.send(Ok(remote_ts));
+            let _ = result.send(Err(err));
             return Ok(());
         }
-        let timestamps = replica_delta_timestamps(
-            remote_ts,
-            *self.snapshot_manager.read().latest_ts(),
-            self.last_assigned_ts,
-        )?;
-        let remote_ts = timestamps.origin_ts;
-        let commit_ts = timestamps.local_apply_ts;
-        self.last_assigned_ts = commit_ts;
         tracing::info!(
             "Applying replica delta: remote_ts={}, local_ts={}, {} document updates, {} tablet \
              mappings",
@@ -2956,6 +3114,9 @@ impl<RT: Runtime> Committer<RT> {
 
         let is_frontier_only = tables_updates.is_empty() && other_updates.is_empty();
         if is_frontier_only {
+            if commit_ts > self.last_assigned_ts {
+                self.last_assigned_ts = commit_ts;
+            }
             let Some(source_partition) = delta.source_partition else {
                 tracing::debug!(
                     "Skipping no-op replica delta at ts {} with no source partition",
@@ -2976,11 +3137,22 @@ impl<RT: Runtime> Committer<RT> {
             };
             let updated_applied_delta_watermarks = {
                 let mut frontiers = self.applied_delta_watermarks.clone();
-                frontiers.insert(source_partition, remote_ts);
+                if frontiers
+                    .get(&source_partition)
+                    .is_none_or(|current| *current < remote_ts)
+                {
+                    frontiers.insert(source_partition, remote_ts);
+                }
                 frontiers
             };
-            self.applied_delta_watermarks
-                .insert(source_partition, remote_ts);
+            if self
+                .applied_delta_watermarks
+                .get(&source_partition)
+                .is_none_or(|current| *current < remote_ts)
+            {
+                self.applied_delta_watermarks
+                    .insert(source_partition, remote_ts);
+            }
             let persistence = self.persistence.clone();
             self.persistence_writes.push_back(
                 async move {
@@ -3007,6 +3179,25 @@ impl<RT: Runtime> Committer<RT> {
                 source_partition.0,
             );
             return Ok(());
+        }
+
+        if let Some(source_partition) = delta.source_partition
+            && local_prepared_commit_ts.is_none()
+            && self
+                .applied_data_delta_watermarks
+                .get(&source_partition)
+                .is_some_and(|frontier| *frontier >= remote_ts)
+        {
+            tracing::info!(
+                "Skipping duplicate non-empty replica delta: source_partition={}, remote_ts={}",
+                source_partition.0,
+                u64::from(remote_ts),
+            );
+            let _ = result.send(Ok(remote_ts));
+            return Ok(());
+        }
+        if commit_ts > self.last_assigned_ts {
+            self.last_assigned_ts = commit_ts;
         }
 
         let mut snapshot = self.base_snapshot_for_new_writes();
@@ -3142,12 +3333,24 @@ impl<RT: Runtime> Committer<RT> {
                 .get(&primary_tablet)
                 .is_some_and(|name| name == index_table_name)
             {
-                remap_index_metadata_update(
+                let remapped = remap_index_metadata_update(
                     update,
                     local_tablet,
                     &remap,
                     mode == ReplicaDeltaApplyMode::CrossPartitionReplica,
-                )?
+                )?;
+                if replicated_index_update_is_already_present(&snapshot, &remapped)? {
+                    tracing::debug!(
+                        "Skipping replicated _index metadata for existing local index: {:?}",
+                        remapped
+                            .new_document
+                            .as_ref()
+                            .or(remapped.old_document.as_ref())
+                            .map(|document| document.id()),
+                    );
+                    continue;
+                }
+                remapped
             } else {
                 DocumentUpdate {
                     id: ResolvedDocumentId {
@@ -3211,12 +3414,42 @@ impl<RT: Runtime> Committer<RT> {
         });
         let updated_applied_delta_watermarks = delta.source_partition.map(|source_partition| {
             let mut frontiers = self.applied_delta_watermarks.clone();
-            frontiers.insert(source_partition, remote_ts);
+            if frontiers
+                .get(&source_partition)
+                .is_none_or(|current| *current < remote_ts)
+            {
+                frontiers.insert(source_partition, remote_ts);
+            }
             frontiers
         });
+        let updated_applied_data_delta_watermarks =
+            delta.source_partition.map(|source_partition| {
+                let mut frontiers = self.applied_data_delta_watermarks.clone();
+                if frontiers
+                    .get(&source_partition)
+                    .is_none_or(|current| *current < remote_ts)
+                {
+                    frontiers.insert(source_partition, remote_ts);
+                }
+                frontiers
+            });
         if let Some(source_partition) = delta.source_partition {
-            self.applied_delta_watermarks
-                .insert(source_partition, remote_ts);
+            if self
+                .applied_delta_watermarks
+                .get(&source_partition)
+                .is_none_or(|current| *current < remote_ts)
+            {
+                self.applied_delta_watermarks
+                    .insert(source_partition, remote_ts);
+            }
+            if self
+                .applied_data_delta_watermarks
+                .get(&source_partition)
+                .is_none_or(|current| *current < remote_ts)
+            {
+                self.applied_data_delta_watermarks
+                    .insert(source_partition, remote_ts);
+            }
         }
         let raft_nats_outbox_delta = (mode == ReplicaDeltaApplyMode::FullRaftState
             && delta.source_partition.is_some())
@@ -3230,6 +3463,7 @@ impl<RT: Runtime> Committer<RT> {
             let idx_writes = index_writes.clone();
             let replication_frontiers = updated_replication_frontiers.clone();
             let applied_delta_watermarks = updated_applied_delta_watermarks.clone();
+            let applied_data_delta_watermarks = updated_applied_data_delta_watermarks.clone();
             let source_partition = delta.source_partition;
             async move {
                 // Write to persistence (so function runner can load modules).
@@ -3263,6 +3497,7 @@ impl<RT: Runtime> Committer<RT> {
                     write_bytes: delta.write_bytes,
                     source_partition,
                     applied_delta_watermarks,
+                    applied_data_delta_watermarks,
                     raft_nats_outbox_delta,
                     result,
                     commit_id,
@@ -3376,30 +3611,90 @@ impl<RT: Runtime> Committer<RT> {
         write_source: WriteSource,
         prepare_ts: Timestamp,
         require_leader: bool,
+        allow_explicit_ts_rewrite: bool,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        let mut table_mapping = self
+        let local_table_mapping = self
             .snapshot_manager
             .read()
             .latest_snapshot()
             .table_mapping()
             .clone();
+        let mut table_mapping = local_table_mapping.clone();
         transaction.augment_table_mapping(&mut table_mapping)?;
+        let writes = Self::remap_participant_system_table_writes(
+            transaction.writes,
+            &table_mapping,
+            &local_table_mapping,
+        )?;
         self.stage_prepared_transaction(
             transaction_id,
             *transaction.begin_timestamp,
             &transaction.reads,
-            transaction.writes,
+            writes,
             &table_mapping,
             write_source,
             Some(prepare_ts),
             require_leader,
+            allow_explicit_ts_rewrite,
         )
+    }
+
+    fn remap_participant_system_table_writes(
+        writes: Vec<DocumentUpdateWithPrevTs>,
+        source_mapping: &TableMapping,
+        local_mapping: &TableMapping,
+    ) -> anyhow::Result<Vec<DocumentUpdateWithPrevTs>> {
+        writes
+            .into_iter()
+            .map(|write| {
+                let Ok(table_name) = source_mapping.tablet_name(write.id.tablet_id) else {
+                    return Ok(write);
+                };
+                if &table_name != &*TABLES_TABLE
+                    && &table_name != &*common::bootstrap_model::index::INDEX_TABLE
+                {
+                    return Ok(write);
+                }
+                let local_table = local_mapping
+                    .namespace(value::TableNamespace::Global)
+                    .id(&table_name)?;
+                let remapped_id = ResolvedDocumentId::new(
+                    local_table.tablet_id,
+                    PublicDocumentId::new(local_table.table_number, write.id.internal_id()),
+                );
+                let old_document = match write.old_document {
+                    Some((document, ts)) => {
+                        Some((Self::remap_document_id(document, remapped_id)?, ts))
+                    },
+                    None => None,
+                };
+                let new_document = match write.new_document {
+                    Some(document) => Some(Self::remap_document_id(document, remapped_id)?),
+                    None => None,
+                };
+                Ok(DocumentUpdateWithPrevTs {
+                    id: remapped_id,
+                    old_document,
+                    new_document,
+                })
+            })
+            .collect()
+    }
+
+    fn remap_document_id(
+        document: ResolvedDocument,
+        remapped_id: ResolvedDocumentId,
+    ) -> anyhow::Result<ResolvedDocument> {
+        let mut value: BTreeMap<_, _> = document.value().0.clone().into();
+        value.remove(&common::types::FieldName::from(ID_FIELD.clone()));
+        ResolvedDocument::new(remapped_id, document.creation_time(), value.try_into()?)
     }
 
     fn stage_two_phase_redo_entry(
         &mut self,
         entry: &crate::two_phase::TwoPhaseRedoEntry,
         require_leader: bool,
+        allow_explicit_ts_rewrite: bool,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
         let transaction_id = entry.transaction_id();
         let prepare_ts = entry.prepare_ts()?;
@@ -3422,6 +3717,7 @@ impl<RT: Runtime> Committer<RT> {
             entry.write_source(),
             prepare_ts,
             require_leader,
+            allow_explicit_ts_rewrite,
         )
     }
 
@@ -3439,27 +3735,58 @@ impl<RT: Runtime> Committer<RT> {
         let Some(entry) = records.remove(&transaction_id.0) else {
             return Ok(false);
         };
-        self.stage_two_phase_redo_entry(&entry, require_leader)
+        self.stage_two_phase_redo_entry(&entry, require_leader, false)
             .with_context(|| format!("2PC: failed to stage durable redo txn={transaction_id}"))?;
         Ok(true)
     }
 
-    fn remove_prepared_transaction_at_ts(
+    fn remove_prepared_transaction_at_origin_ts(
         &mut self,
-        commit_ts: Timestamp,
+        origin_commit_ts: Timestamp,
+    ) -> anyhow::Result<Option<crate::two_phase::TwoPhaseTransactionId>> {
+        self.remove_prepared_transaction_matching_ts(origin_commit_ts, |prepared| {
+            prepared.origin_commit_ts
+        })
+    }
+
+    fn local_prepared_commit_ts_for_origin(
+        &self,
+        origin_commit_ts: Timestamp,
+    ) -> anyhow::Result<Option<Timestamp>> {
+        let matching = self
+            .prepared_transactions
+            .iter()
+            .filter_map(|(transaction_id, prepared)| {
+                (prepared.origin_commit_ts == origin_commit_ts)
+                    .then(|| (transaction_id.clone(), prepared.commit_ts))
+            })
+            .collect_vec();
+        anyhow::ensure!(
+            matching.len() <= 1,
+            "Found {} prepared transactions at origin ts={}; expected at most one",
+            matching.len(),
+            u64::from(origin_commit_ts),
+        );
+        Ok(matching.into_iter().next().map(|(_, commit_ts)| commit_ts))
+    }
+
+    fn remove_prepared_transaction_matching_ts(
+        &mut self,
+        ts: Timestamp,
+        ts_selector: impl Fn(&PreparedTransaction) -> Timestamp,
     ) -> anyhow::Result<Option<crate::two_phase::TwoPhaseTransactionId>> {
         let matching = self
             .prepared_transactions
             .iter()
             .filter_map(|(transaction_id, prepared)| {
-                (prepared.commit_ts == commit_ts).then(|| transaction_id.clone())
+                (ts_selector(prepared) == ts).then(|| transaction_id.clone())
             })
             .collect_vec();
         anyhow::ensure!(
             matching.len() <= 1,
             "Found {} prepared transactions at ts={}; expected at most one",
             matching.len(),
-            u64::from(commit_ts),
+            u64::from(ts),
         );
         let Some(transaction_id) = matching.into_iter().next() else {
             return Ok(None);
@@ -3471,7 +3798,7 @@ impl<RT: Runtime> Committer<RT> {
                 anyhow::anyhow!(
                     "2PC cleanup: prepared transaction {} disappeared while cleaning ts={}",
                     transaction_id,
-                    u64::from(commit_ts),
+                    u64::from(ts),
                 )
             })?;
         self.prepared_writes
@@ -3480,7 +3807,7 @@ impl<RT: Runtime> Committer<RT> {
                 anyhow::anyhow!(
                     "2PC cleanup: prepared intent for txn={} at ts={} was missing",
                     transaction_id,
-                    u64::from(commit_ts),
+                    u64::from(prepared.commit_ts),
                 )
             })?;
         Ok(Some(transaction_id))
@@ -3527,7 +3854,7 @@ impl<RT: Runtime> Committer<RT> {
                 continue;
             }
 
-            self.stage_two_phase_redo_entry(entry, false)
+            self.stage_two_phase_redo_entry(entry, false, true)
                 .with_context(|| {
                     format!("2PC Recovery: failed to stage prepared txn={transaction_id}")
                 })?;
@@ -3566,6 +3893,7 @@ impl<RT: Runtime> Committer<RT> {
             write_source.clone(),
             None,
             true,
+            false,
         )?;
         let redo = crate::two_phase::TwoPhaseRedoEntry::new(
             &transaction_id,
@@ -3677,6 +4005,7 @@ impl<RT: Runtime> Committer<RT> {
             write_source,
             prepare_ts,
             true,
+            false,
         )?;
         if let Err(err) = Self::persist_two_phase_redo(self.persistence.clone(), redo.clone()).await
         {
@@ -3928,7 +4257,7 @@ impl<RT: Runtime> Committer<RT> {
         );
 
         let result = self
-            .stage_two_phase_redo_entry(&redo, false)
+            .stage_two_phase_redo_entry(&redo, false, true)
             .with_context(|| {
                 format!("2PC Raft Prepare Apply: failed to stage txn={transaction_id}")
             })?;
@@ -3954,7 +4283,7 @@ impl<RT: Runtime> Committer<RT> {
     fn start_commit(
         &mut self,
         transaction: FinalTransaction,
-        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        result: oneshot::Sender<anyhow::Result<CommitOutcome>>,
         write_source: WriteSource,
         parent_trace: EncodedSpan,
         commit_id: usize,
@@ -3962,7 +4291,13 @@ impl<RT: Runtime> Committer<RT> {
     ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
         // Skip read-only transactions.
         if transaction.is_readonly() {
-            let _ = result.send(Ok(*transaction.begin_timestamp));
+            let _ = result.send(Ok(CommitOutcome {
+                ts: *transaction.begin_timestamp,
+                source_partition: self
+                    .placement_state
+                    .as_ref()
+                    .map(|placement_state| placement_state.local_partition()),
+            }));
             return None;
         }
         let commit_timer = metrics::commit_timer();
@@ -4291,7 +4626,16 @@ impl<RT: Runtime> Committer<RT> {
     }
 
     fn next_max_repeatable_ts(&mut self) -> anyhow::Result<Timestamp> {
-        if let Some(min_pending) = self.pending_writes.min_ts() {
+        if !self.prepared_transactions.is_empty() {
+            let current = *self.snapshot_manager.read().persisted_max_repeatable_ts();
+            tracing::debug!(
+                prepared_transactions = self.prepared_transactions.len(),
+                current = u64::from(current),
+                "Skipping max repeatable timestamp bump while 2PC prepared transactions are \
+                 unresolved",
+            );
+            Ok(current)
+        } else if let Some(min_pending) = self.pending_writes.min_ts() {
             // If there's a pending write, push max_repeatable_ts to be right
             // before the pending write, so followers can choose recent
             // timestamps but can't read at the timestamp of the pending write.
@@ -4324,7 +4668,7 @@ pub struct CommitterClient {
     placement_state: Option<crate::partition::PlacementState>,
     node_addresses: Option<crate::two_phase::NodeAddresses>,
     two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
-    cluster_grpc_auth: Option<ClusterGrpcAuth>,
+    two_phase_client_pool: Arc<crate::two_phase::TwoPhaseCommitGrpcClientPool>,
 }
 
 impl CommitterClient {
@@ -4470,8 +4814,11 @@ impl CommitterClient {
         self.node_addresses.as_ref()
     }
 
-    pub(crate) fn cluster_grpc_auth(&self) -> Option<ClusterGrpcAuth> {
-        self.cluster_grpc_auth.clone()
+    pub(crate) async fn two_phase_client(
+        &self,
+        addr: &str,
+    ) -> anyhow::Result<Arc<crate::two_phase::TwoPhaseCommitGrpcClient>> {
+        self.two_phase_client_pool.client(addr).await
     }
 
     pub fn placement_version(&self) -> crate::partition::PlacementVersion {
@@ -4603,15 +4950,23 @@ impl CommitterClient {
         transaction: Transaction<RT>,
         write_source: WriteSource,
     ) -> BoxFuture<'_, anyhow::Result<Timestamp>> {
-        self._commit(transaction, write_source).boxed()
+        async move { Ok(self.commit_outcome(transaction, write_source).await?.ts) }.boxed()
     }
 
-    #[fastrace::trace]
-    async fn _commit<RT: Runtime>(
+    pub fn commit_outcome<RT: Runtime>(
         &self,
         transaction: Transaction<RT>,
         write_source: WriteSource,
-    ) -> anyhow::Result<Timestamp> {
+    ) -> BoxFuture<'_, anyhow::Result<CommitOutcome>> {
+        self._commit_outcome(transaction, write_source).boxed()
+    }
+
+    #[fastrace::trace]
+    async fn _commit_outcome<RT: Runtime>(
+        &self,
+        transaction: Transaction<RT>,
+        write_source: WriteSource,
+    ) -> anyhow::Result<CommitOutcome> {
         let _timer = metrics::commit_client_timer(transaction.identity());
         self.check_generated_ids(&transaction).await?;
 
@@ -4927,7 +5282,7 @@ enum CommitterMessage {
     Commit {
         queue_timer: Timer<VMHistogram>,
         transaction: FinalTransaction,
-        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        result: oneshot::Sender<anyhow::Result<CommitOutcome>>,
         write_source: WriteSource,
         parent_trace: EncodedSpan,
     },

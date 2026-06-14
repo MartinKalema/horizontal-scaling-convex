@@ -15,6 +15,7 @@ use std::{
 };
 
 use raft::{
+    GetEntriesContext,
     SnapshotStatus,
     StateRole,
     Storage,
@@ -181,6 +182,41 @@ fn node_idx(nodes: &[RaftNode], id: u64) -> usize {
     nodes.iter().position(|n| n.node_id() == id).unwrap()
 }
 
+fn persisted_entry_data(node: &RaftNode) -> Vec<Vec<u8>> {
+    let first = node.storage.first_index().unwrap();
+    let last = node.storage.last_index().unwrap();
+    if first > last {
+        return vec![];
+    }
+    node.storage
+        .entries(first, last + 1, None, GetEntriesContext::empty(false))
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.data.to_vec())
+        .collect()
+}
+
+fn persisted_log_contains(node: &RaftNode, payload: &[u8]) -> bool {
+    persisted_entry_data(node)
+        .iter()
+        .any(|data| data.as_slice() == payload)
+}
+
+fn wait_for_committed_payload(
+    nodes: &mut [RaftNode],
+    active: &[bool],
+    payload: &[u8],
+    ticks: usize,
+) -> bool {
+    for _ in 0..ticks {
+        let committed = tick_cycle(nodes, active);
+        if committed.iter().any(|data| data.as_slice() == payload) {
+            return true;
+        }
+    }
+    false
+}
+
 // ============================================================
 // Test 1: 3-node election (already existed, rewritten with helpers)
 // ============================================================
@@ -336,6 +372,308 @@ async fn test_write_during_leader_transition() {
         post_committed.iter().any(|d| d == b"after kill"),
         "Post-kill write should be committed on new leader"
     );
+}
+
+#[tokio::test]
+async fn test_unquorumed_leader_proposal_is_truncated_after_failover() {
+    let mut nodes = create_three_node_group();
+    let old_leader_id = elect_leader(&mut nodes);
+    let old_leader_idx = node_idx(&nodes, old_leader_id);
+    let all_active = vec![true; 3];
+    let unquorumed_payload = b"old-leader-local-only";
+
+    nodes[old_leader_idx]
+        .raw_node
+        .propose(vec![], unquorumed_payload.to_vec())
+        .unwrap();
+
+    let mut committed = Vec::new();
+    for _ in 0..3 {
+        committed.extend(tick_cycle_with_message_filter(
+            &mut nodes,
+            &all_active,
+            |from, _, msg| {
+                !(from == old_leader_id
+                    && matches!(
+                        msg.get_msg_type(),
+                        raft::prelude::MessageType::MsgAppend
+                            | raft::prelude::MessageType::MsgHeartbeat
+                    ))
+            },
+        ));
+    }
+
+    assert!(
+        persisted_log_contains(&nodes[old_leader_idx], unquorumed_payload),
+        "old leader should have persisted the local proposal before losing leadership",
+    );
+    assert!(
+        !committed
+            .iter()
+            .any(|data| data.as_slice() == unquorumed_payload),
+        "proposal without quorum must not commit before failover",
+    );
+
+    let mut active = vec![true; 3];
+    active[old_leader_idx] = false;
+    let mut new_leader_id = 0;
+    for _ in 0..80 {
+        tick_cycle(&mut nodes, &active);
+        if let Some(new_leader) = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, node)| {
+                active[*i]
+                    && node.raw_node.raft.state == StateRole::Leader
+                    && node.node_id() != old_leader_id
+            })
+            .map(|(_, node)| node.node_id())
+        {
+            new_leader_id = new_leader;
+            break;
+        }
+    }
+    assert_ne!(
+        new_leader_id, 0,
+        "majority should elect a replacement leader"
+    );
+
+    let new_leader_idx = node_idx(&nodes, new_leader_id);
+    let committed_payload = b"new-leader-committed";
+    nodes[new_leader_idx]
+        .raw_node
+        .propose(vec![], committed_payload.to_vec())
+        .unwrap();
+    assert!(
+        wait_for_committed_payload(&mut nodes, &active, committed_payload, 40),
+        "new leader should commit a replacement entry with the surviving majority",
+    );
+
+    active[old_leader_idx] = true;
+    for _ in 0..120 {
+        tick_cycle(&mut nodes, &active);
+        if nodes
+            .iter()
+            .all(|node| persisted_log_contains(node, committed_payload))
+            && nodes
+                .iter()
+                .all(|node| !persisted_log_contains(node, unquorumed_payload))
+        {
+            break;
+        }
+    }
+
+    for node in &nodes {
+        assert!(
+            !persisted_log_contains(node, unquorumed_payload),
+            "uncommitted old-leader entry must be truncated on node {} after rejoin",
+            node.node_id(),
+        );
+        assert!(
+            persisted_log_contains(node, committed_payload),
+            "replacement committed entry should be present on node {}",
+            node.node_id(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_quorumed_proposal_survives_leader_death_before_all_followers_catch_up() {
+    let mut nodes = create_three_node_group();
+    let leader_id = elect_leader(&mut nodes);
+    let leader_idx = node_idx(&nodes, leader_id);
+    let lagging_follower_id = nodes
+        .iter()
+        .find(|node| node.node_id() != leader_id)
+        .expect("expected a follower")
+        .node_id();
+    let lagging_follower_idx = node_idx(&nodes, lagging_follower_id);
+    let all_active = vec![true; 3];
+    let payload = b"quorumed-before-leader-death";
+
+    nodes[leader_idx]
+        .raw_node
+        .propose(vec![], payload.to_vec())
+        .unwrap();
+
+    let mut committed = false;
+    for _ in 0..40 {
+        let cycle_committed =
+            tick_cycle_with_message_filter(&mut nodes, &all_active, |from, to, msg| {
+                !(from == leader_id
+                    && to == lagging_follower_id
+                    && matches!(
+                        msg.get_msg_type(),
+                        raft::prelude::MessageType::MsgAppend
+                            | raft::prelude::MessageType::MsgHeartbeat
+                    ))
+            });
+        if cycle_committed
+            .iter()
+            .any(|data| data.as_slice() == payload)
+        {
+            committed = true;
+            break;
+        }
+    }
+    assert!(
+        committed,
+        "leader plus one follower should commit while the other follower is lagging",
+    );
+    assert!(
+        !persisted_log_contains(&nodes[lagging_follower_idx], payload),
+        "the isolated follower should genuinely lag before leader death",
+    );
+
+    let mut active = vec![true; 3];
+    active[leader_idx] = false;
+    let survivor_with_entry = nodes
+        .iter()
+        .enumerate()
+        .find(|(i, node)| *i != leader_idx && persisted_log_contains(node, payload))
+        .map(|(_, node)| node.node_id())
+        .expect("one surviving follower should have the quorumed entry");
+
+    let mut new_leader_id = 0;
+    for _ in 0..80 {
+        tick_cycle(&mut nodes, &active);
+        if let Some(new_leader) = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, node)| active[*i] && node.raw_node.raft.state == StateRole::Leader)
+            .map(|(_, node)| node.node_id())
+        {
+            new_leader_id = new_leader;
+            break;
+        }
+    }
+    assert_eq!(
+        new_leader_id, survivor_with_entry,
+        "only the surviving voter with the committed entry should be able to lead safely",
+    );
+
+    active[leader_idx] = true;
+    for _ in 0..120 {
+        tick_cycle(&mut nodes, &active);
+        if nodes
+            .iter()
+            .all(|node| persisted_log_contains(node, payload))
+        {
+            break;
+        }
+    }
+
+    for node in &nodes {
+        assert!(
+            persisted_log_contains(node, payload),
+            "quorumed proposal should survive leader death and catch up node {}",
+            node.node_id(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_isolated_old_leader_steps_down_without_quorum() {
+    let mut nodes = create_three_node_group();
+    let old_leader_id = elect_leader(&mut nodes);
+    let old_leader_idx = node_idx(&nodes, old_leader_id);
+    let all_active = vec![true; 3];
+
+    for _ in 0..80 {
+        tick_cycle_with_message_filter(&mut nodes, &all_active, |from, to, _| {
+            from != old_leader_id && to != old_leader_id
+        });
+        if nodes[old_leader_idx].raw_node.raft.state != StateRole::Leader {
+            break;
+        }
+    }
+
+    assert_ne!(
+        nodes[old_leader_idx].raw_node.raft.state,
+        StateRole::Leader,
+        "old leader should step down after losing quorum",
+    );
+    assert_eq!(
+        nodes[old_leader_idx].raw_node.raft.leader_id, 0,
+        "isolated old leader should not believe it still has a known leader",
+    );
+}
+
+#[tokio::test]
+async fn test_majority_commits_while_old_leader_is_isolated() {
+    let mut nodes = create_three_node_group();
+    let old_leader_id = elect_leader(&mut nodes);
+    let old_leader_idx = node_idx(&nodes, old_leader_id);
+    let all_active = vec![true; 3];
+
+    for _ in 0..80 {
+        tick_cycle_with_message_filter(&mut nodes, &all_active, |from, to, _| {
+            from != old_leader_id && to != old_leader_id
+        });
+        if nodes
+            .iter()
+            .enumerate()
+            .any(|(i, node)| i != old_leader_idx && node.raw_node.raft.state == StateRole::Leader)
+        {
+            break;
+        }
+    }
+
+    let new_leader_idx = nodes
+        .iter()
+        .enumerate()
+        .find(|(i, node)| i != &old_leader_idx && node.raw_node.raft.state == StateRole::Leader)
+        .map(|(i, _)| i)
+        .expect("surviving majority should elect a new leader");
+    let majority_payload = b"majority-after-old-leader-isolated";
+    nodes[new_leader_idx]
+        .raw_node
+        .propose(vec![], majority_payload.to_vec())
+        .unwrap();
+
+    let mut committed = Vec::new();
+    for _ in 0..40 {
+        committed.extend(tick_cycle_with_message_filter(
+            &mut nodes,
+            &all_active,
+            |from, to, _| from != old_leader_id && to != old_leader_id,
+        ));
+        if committed
+            .iter()
+            .any(|data| data.as_slice() == majority_payload)
+        {
+            break;
+        }
+    }
+
+    assert!(
+        committed
+            .iter()
+            .any(|data| data.as_slice() == majority_payload),
+        "surviving majority should continue committing while old leader is isolated",
+    );
+    assert!(
+        !persisted_log_contains(&nodes[old_leader_idx], majority_payload),
+        "isolated old leader should not see majority writes before the partition heals",
+    );
+
+    for _ in 0..120 {
+        tick_cycle(&mut nodes, &all_active);
+        if nodes
+            .iter()
+            .all(|node| persisted_log_contains(node, majority_payload))
+        {
+            break;
+        }
+    }
+
+    for node in &nodes {
+        assert!(
+            persisted_log_contains(node, majority_payload),
+            "majority commit should catch up node {} after isolation heals",
+            node.node_id(),
+        );
+    }
 }
 
 // ============================================================
@@ -592,5 +930,72 @@ async fn test_lagging_follower_catches_up_via_snapshot() {
     assert!(
         nodes[lagging_idx].storage.first_index().unwrap() > 1,
         "lagging follower should have installed a snapshot instead of replaying from index 1",
+    );
+}
+
+#[tokio::test]
+async fn test_failed_snapshot_delivery_retries_and_catches_up() {
+    let mut nodes = create_three_node_group();
+    let leader_id = elect_leader(&mut nodes);
+    let leader_idx = node_idx(&nodes, leader_id);
+    let lagging_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let lagging_id = nodes[lagging_idx].node_id();
+
+    let mut active = vec![true; 3];
+    active[lagging_idx] = false;
+
+    for i in 0..12 {
+        nodes[leader_idx]
+            .raw_node
+            .propose(vec![], format!("snapshot-retry-entry-{i}").into_bytes())
+            .unwrap();
+        for _ in 0..5 {
+            tick_cycle(&mut nodes, &active);
+        }
+    }
+
+    let compact_index = nodes[leader_idx].raw_node.raft.raft_log.committed;
+    assert!(
+        compact_index > 1,
+        "expected committed work before compaction"
+    );
+    nodes[leader_idx].storage.compact(compact_index).unwrap();
+
+    active[lagging_idx] = true;
+    nodes[leader_idx]
+        .raw_node
+        .propose(vec![], b"post-failed-snapshot".to_vec())
+        .unwrap();
+
+    for _ in 0..40 {
+        tick_cycle_with_message_filter(&mut nodes, &active, |_, to, msg| {
+            !(to == lagging_id && msg.get_msg_type() == raft::prelude::MessageType::MsgSnapshot)
+        });
+    }
+
+    assert!(
+        nodes[lagging_idx].storage.last_index().unwrap()
+            < nodes[leader_idx].storage.last_index().unwrap(),
+        "lagging follower should remain behind while snapshot delivery fails",
+    );
+
+    for _ in 0..120 {
+        tick_cycle(&mut nodes, &active);
+        if nodes[lagging_idx].storage.last_index().unwrap()
+            == nodes[leader_idx].storage.last_index().unwrap()
+            && nodes[lagging_idx].storage.first_index().unwrap() > 1
+        {
+            break;
+        }
+    }
+
+    assert_eq!(
+        nodes[lagging_idx].storage.last_index().unwrap(),
+        nodes[leader_idx].storage.last_index().unwrap(),
+        "lagging follower should catch up after snapshot delivery recovers",
+    );
+    assert!(
+        nodes[lagging_idx].storage.first_index().unwrap() > 1,
+        "lagging follower should install the retried snapshot",
     );
 }

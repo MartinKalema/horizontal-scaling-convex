@@ -8,12 +8,16 @@
 #   1. Cross-Partition Data Verification (Vitess VDiff)
 #   2. Bank Invariant — Single Table (CockroachDB Jepsen bank)
 #   3. Bank Invariant — Multi-Table (TiDB bank-multitable)
-#   4. Partition Enforcement (Vitess Single mode)
+#   4. Transparent Partition Routing (topology hiding)
+#   4b. All Replica Entrypoint Routing (cluster-wide topology hiding)
+#   4c. Six-Entrypoint Read-After-Write (session/topology hiding)
 #   5. Concurrent Write Scaling (CockroachDB KV)
 #   6. Monotonic Reads (TiDB monotonic)
 #   7. Node Restart Recovery (TiDB kill -9 / CockroachDB nemesis)
 #   8. Idempotent Re-Run (CockroachDB workload check)
 #   9. Two-Phase Commit Cross-Partition (Vitess 2PC)
+#   9f. 2PC Atomicity During NATS Outage
+#   9g. 2PC Atomicity During Participant Restart
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -25,6 +29,9 @@
 #  18. Interleaved Cross-Partition Reads (read skew detection)
 #  19. Large Batch Write Atomicity
 #  20. Kill Both Nodes Sequentially (full cluster restart)
+#  20b. Writes Through Followers During Raft Leader Outage
+#  20c. Lagging Follower Catch-Up After Cross-Partition Writes
+#  20d. Cross-Partition 2PC During Participant Leader Outage
 #  21. Sustained Writes 30s (long-running replication)
 #  22. Duplicate Insert Idempotency
 #  23. Final Exhaustive Invariant Check
@@ -42,6 +49,7 @@
 #  35. Single Document Read-Modify-Write (register)
 #  36. Write Skew Detection (G2 anomaly)
 #  37. Ultimate Final Invariant Check
+#  38. Sync Route Authority Guard
 #
 # Prerequisites:
 #   docker compose --profile cluster up
@@ -54,8 +62,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-NODE_A_URL="http://127.0.0.1:3210"
-NODE_B_URL="http://127.0.0.1:3310"
+NODE_P0A_URL="http://127.0.0.1:3210"
+NODE_P0B_URL="http://127.0.0.1:3220"
+NODE_P0C_URL="http://127.0.0.1:3230"
+NODE_P1A_URL="http://127.0.0.1:3310"
+NODE_P1B_URL="http://127.0.0.1:3320"
+NODE_P1C_URL="http://127.0.0.1:3330"
+NODE_A_URL="$NODE_P0A_URL"
+NODE_B_URL="$NODE_P1A_URL"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -82,7 +96,7 @@ fail() {
 echo ""
 echo -e "${BOLD}Preflight checks${NC}"
 
-for name in docker-node-p0a-1 docker-node-p1a-1; do
+for name in docker-node-p0a-1 docker-node-p0b-1 docker-node-p0c-1 docker-node-p1a-1 docker-node-p1b-1 docker-node-p1c-1; do
     if ! docker inspect "$name" > /dev/null 2>&1; then
         echo -e "${RED}Container $name not running. Start the deployment first:${NC}"
         echo "  docker compose --profile cluster up"
@@ -91,8 +105,14 @@ for name in docker-node-p0a-1 docker-node-p1a-1; do
 done
 echo "  Containers running."
 
-NODE_A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
-NODE_B_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P0B_KEY=$(docker exec docker-node-p0b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P0C_KEY=$(docker exec docker-node-p0c-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P1B_KEY=$(docker exec docker-node-p1b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P1C_KEY=$(docker exec docker-node-p1c-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY="$NODE_P0A_KEY"
+NODE_B_KEY="$NODE_P1A_KEY"
 echo "  Admin keys generated."
 
 # --- Deploy test functions ---
@@ -234,6 +254,22 @@ export const readOrdered = query({
   },
 });
 
+export const countMessagesByAuthorChannel = query({
+  args: { author: v.string(), channel: v.string() },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db.query("messages").collect();
+    return rows.filter((r: any) => r.author === args.author && r.channel === args.channel).length;
+  },
+});
+
+export const countTasksByTitle = query({
+  args: { title: v.string() },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db.query("tasks").collect();
+    return rows.filter((r: any) => r.title === args.title).length;
+  },
+});
+
 // Concurrent counter: multiple increments, verify total.
 export const incrementCounter = mutation({
   args: { name: v.string() },
@@ -344,11 +380,25 @@ mutate() {
         -d "{\"path\":\"$3\",\"args\":$4}"
 }
 
+mutation_response() {
+    curl -s "$1/api/mutation" \
+        -H "Authorization: Convex $2" \
+        -H "Content-Type: application/json" \
+        -d "{\"path\":\"$3\",\"args\":$4}"
+}
+
 query_api() {
     curl -sf "$1/api/query" \
         -H "Authorization: Convex $2" \
         -H "Content-Type: application/json" \
         -d "{\"path\":\"$3\",\"args\":{}}"
+}
+
+query_with_args() {
+    curl -sf "$1/api/query" \
+        -H "Authorization: Convex $2" \
+        -H "Content-Type: application/json" \
+        -d "{\"path\":\"$3\",\"args\":$4}"
 }
 
 jval() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']['$1']))" <<< "$2"; }
@@ -461,46 +511,167 @@ EXPECTED_COMP=$((BASE_COMP + EXPECTED_DELTA + SALARY_DELTA))
     && pass "Cross-node multi-table invariant: both agree on \$$CA_TOTAL" \
     || fail "Cross-node multi-table invariant violated" "A=\$$CA_TOTAL vs B=\$$CB_TOTAL"
 
+# Test 3 adds two salary-bearing user documents. Keep the running table-count
+# baseline aligned so later topology-hiding checks assert the exact deltas they
+# introduce, not stale pre-compensation counts.
+AU=$((AU + 2))
+
 # ============================================================
 echo ""
-echo -e "${BOLD}Test 4: Partition Enforcement (Vitess Single Mode)${NC}"
+echo -e "${BOLD}Test 4: Transparent Partition Routing (Topology Hiding)${NC}"
 # ============================================================
 
-# Node A → projects (partition 1): must fail
+# Node A → projects (partition 1): should route/coordinate transparently.
 R=$(curl -s "$NODE_A_URL/api/mutation" -H "Authorization: Convex $NODE_A_KEY" -H "Content-Type: application/json" \
     -d '{"path":"messages:createProject","args":{"name":"X","status":"x","budget":0}}')
-echo "$R" | grep -q "InternalServerError" \
-    && pass "Node A rejected write to 'projects' (partition 1)" \
-    || fail "Node A should reject projects write" "$R"
+echo "$R" | grep -q '"status":"success"' \
+    && pass "Node A transparently routed write to 'projects' (partition 1)" \
+    || fail "Node A should route projects write" "$R"
 
-# Node B → messages (partition 0): must fail
+# Node B → messages (partition 0): should route/coordinate transparently.
 R=$(curl -s "$NODE_B_URL/api/mutation" -H "Authorization: Convex $NODE_B_KEY" -H "Content-Type: application/json" \
     -d '{"path":"messages:send","args":{"text":"x","author":"x","channel":"x"}}')
-echo "$R" | grep -q "InternalServerError" \
-    && pass "Node B rejected write to 'messages' (partition 0)" \
-    || fail "Node B should reject messages write" "$R"
+echo "$R" | grep -q '"status":"success"' \
+    && pass "Node B transparently routed write to 'messages' (partition 0)" \
+    || fail "Node B should route messages write" "$R"
 
-# Node A → tasks (partition 1): must fail
+# Node A → tasks (partition 1): should route/coordinate transparently.
 R=$(curl -s "$NODE_A_URL/api/mutation" -H "Authorization: Convex $NODE_A_KEY" -H "Content-Type: application/json" \
     -d '{"path":"messages:createTask","args":{"title":"x","assignee":"x","project":"x","status":"x"}}')
-echo "$R" | grep -q "InternalServerError" \
-    && pass "Node A rejected write to 'tasks' (partition 1)" \
-    || fail "Node A should reject tasks write" "$R"
+echo "$R" | grep -q '"status":"success"' \
+    && pass "Node A transparently routed write to 'tasks' (partition 1)" \
+    || fail "Node A should route tasks write" "$R"
 
-# Node B → users (partition 0): must fail
+# Node B → users (partition 0): should route/coordinate transparently.
 R=$(curl -s "$NODE_B_URL/api/mutation" -H "Authorization: Convex $NODE_B_KEY" -H "Content-Type: application/json" \
     -d '{"path":"messages:createUser","args":{"name":"x","role":"x"}}')
-echo "$R" | grep -q "InternalServerError" \
-    && pass "Node B rejected write to 'users' (partition 0)" \
-    || fail "Node B should reject users write" "$R"
+echo "$R" | grep -q '"status":"success"' \
+    && pass "Node B transparently routed write to 'users' (partition 0)" \
+    || fail "Node B should route users write" "$R"
 
-# Verify no phantom data — counts should match post-test1 values
+# Verify the transparently routed writes converged on both nodes.
 sleep 1
 DC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
-CP=$(jval projects "$DC"); CM=$(jval messages "$DC")
-[ "$CP" -eq "$AP" ] && [ "$CM" -eq "$AM" ] \
-    && pass "No phantom data from rejected writes (proj=$CP msgs=$CM unchanged)" \
-    || fail "Phantom data detected" "proj=$CP (expected $AP) msgs=$CM (expected $AM)"
+DD=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+CM=$(jval messages "$DC"); CU=$(jval users "$DC"); CP=$(jval projects "$DC"); CT=$(jval tasks "$DC")
+DM_B=$(jval messages "$DD"); DU_B=$(jval users "$DD"); DP_B=$(jval projects "$DD"); DT_B=$(jval tasks "$DD")
+EXPECTED_M=$((AM + 1)); EXPECTED_U=$((AU + 1)); EXPECTED_P=$((AP + 1)); EXPECTED_T=$((AT + 1))
+[ "$CM" -eq "$EXPECTED_M" ] && [ "$CU" -eq "$EXPECTED_U" ] && [ "$CP" -eq "$EXPECTED_P" ] && [ "$CT" -eq "$EXPECTED_T" ] \
+    && [ "$CM" -eq "$DM_B" ] && [ "$CU" -eq "$DU_B" ] && [ "$CP" -eq "$DP_B" ] && [ "$CT" -eq "$DT_B" ] \
+    && pass "Transparent routing converged (msgs=$CM users=$CU proj=$CP tasks=$CT)" \
+    || fail "Transparent routing did not converge" "A: $CM,$CU,$CP,$CT expected $EXPECTED_M,$EXPECTED_U,$EXPECTED_P,$EXPECTED_T; B: $DM_B,$DU_B,$DP_B,$DT_B"
+
+AM=$CM; AU=$CU; AP=$CP; AT=$CT
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 4b: All Replica Entrypoint Routing (Cluster-Wide Topology Hiding)${NC}"
+# ============================================================
+
+# Public traffic should not need to know either the table owner or the current
+# Raft leader. Exercise non-leader entrypoints in both partitions and require
+# the system to forward/coordinate the write internally.
+R=$(mutate "$NODE_P0B_URL" "$NODE_P0B_KEY" "messages:createProject" '{"name":"follower-p0b-project","status":"x","budget":0}')
+echo "$R" | grep -q '"status":"success"' \
+    && pass "p0 follower B routed write to 'projects' (partition 1)" \
+    || fail "p0 follower B should route projects write" "$R"
+
+R=$(mutate "$NODE_P0C_URL" "$NODE_P0C_KEY" "messages:createUser" '{"name":"follower-p0c-user","role":"x"}')
+echo "$R" | grep -q '"status":"success"' \
+    && pass "p0 follower C routed write to 'users' (partition 0)" \
+    || fail "p0 follower C should route users write" "$R"
+
+R=$(mutate "$NODE_P1B_URL" "$NODE_P1B_KEY" "messages:send" '{"text":"follower-p1b-message","author":"x","channel":"x"}')
+echo "$R" | grep -q '"status":"success"' \
+    && pass "p1 follower B routed write to 'messages' (partition 0)" \
+    || fail "p1 follower B should route messages write" "$R"
+
+R=$(mutate "$NODE_P1C_URL" "$NODE_P1C_KEY" "messages:createTask" '{"title":"follower-p1c-task","assignee":"x","project":"x","status":"x"}')
+echo "$R" | grep -q '"status":"success"' \
+    && pass "p1 follower C routed write to 'tasks' (partition 1)" \
+    || fail "p1 follower C should route tasks write" "$R"
+
+sleep 2
+EXPECTED_M=$((AM + 1)); EXPECTED_U=$((AU + 1)); EXPECTED_P=$((AP + 1)); EXPECTED_T=$((AT + 1))
+ALL_NODE_COUNTS=()
+ALL_NODE_COUNTS+=("p0a=$(query_api "$NODE_P0A_URL" "$NODE_P0A_KEY" "messages:dashboard")")
+ALL_NODE_COUNTS+=("p0b=$(query_api "$NODE_P0B_URL" "$NODE_P0B_KEY" "messages:dashboard")")
+ALL_NODE_COUNTS+=("p0c=$(query_api "$NODE_P0C_URL" "$NODE_P0C_KEY" "messages:dashboard")")
+ALL_NODE_COUNTS+=("p1a=$(query_api "$NODE_P1A_URL" "$NODE_P1A_KEY" "messages:dashboard")")
+ALL_NODE_COUNTS+=("p1b=$(query_api "$NODE_P1B_URL" "$NODE_P1B_KEY" "messages:dashboard")")
+ALL_NODE_COUNTS+=("p1c=$(query_api "$NODE_P1C_URL" "$NODE_P1C_KEY" "messages:dashboard")")
+
+ALL_NODES_OK=true
+DETAILS=""
+for entry in "${ALL_NODE_COUNTS[@]}"; do
+    node="${entry%%=*}"
+    payload="${entry#*=}"
+    NM=$(jval messages "$payload"); NU=$(jval users "$payload"); NP=$(jval projects "$payload"); NT=$(jval tasks "$payload")
+    DETAILS="$DETAILS $node:$NM,$NU,$NP,$NT"
+    if [ "$NM" -ne "$EXPECTED_M" ] || [ "$NU" -ne "$EXPECTED_U" ] || [ "$NP" -ne "$EXPECTED_P" ] || [ "$NT" -ne "$EXPECTED_T" ]; then
+        ALL_NODES_OK=false
+    fi
+done
+
+$ALL_NODES_OK \
+    && pass "All six node entrypoints converged (msgs=$EXPECTED_M users=$EXPECTED_U proj=$EXPECTED_P tasks=$EXPECTED_T)" \
+    || fail "All six node entrypoints did not converge" "$DETAILS expected $EXPECTED_M,$EXPECTED_U,$EXPECTED_P,$EXPECTED_T"
+
+AM=$EXPECTED_M; AU=$EXPECTED_U; AP=$EXPECTED_P; AT=$EXPECTED_T
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 4c: Six-Entrypoint Read-After-Write (Session/Topology Hiding)${NC}"
+# ============================================================
+
+# Each public node should be usable as an entrypoint. Write one unique message
+# through every node, then require every node to read every unique message back.
+ENTRYPOINT_LABELS=(p0a p0b p0c p1a p1b p1c)
+ENTRYPOINT_URLS=("$NODE_P0A_URL" "$NODE_P0B_URL" "$NODE_P0C_URL" "$NODE_P1A_URL" "$NODE_P1B_URL" "$NODE_P1C_URL")
+ENTRYPOINT_KEYS=("$NODE_P0A_KEY" "$NODE_P0B_KEY" "$NODE_P0C_KEY" "$NODE_P1A_KEY" "$NODE_P1B_KEY" "$NODE_P1C_KEY")
+SIX_RAR_AUTHORS=()
+SIX_RAR_ACCEPTED=0
+SIX_RAR_RUN="six-rar-$(date +%s)"
+
+for i in "${!ENTRYPOINT_LABELS[@]}"; do
+    label="${ENTRYPOINT_LABELS[$i]}"
+    author="$SIX_RAR_RUN-$label"
+    SIX_RAR_AUTHORS+=("$author")
+    R=$(mutation_response "${ENTRYPOINT_URLS[$i]}" "${ENTRYPOINT_KEYS[$i]}" "messages:send" \
+        "{\"text\":\"$author\",\"author\":\"$author\",\"channel\":\"six-entrypoint-rar\"}")
+    if echo "$R" | grep -q '"status":"success"'; then
+        SIX_RAR_ACCEPTED=$((SIX_RAR_ACCEPTED + 1))
+        pass "$label accepted routed read-after-write seed"
+    else
+        fail "$label rejected routed read-after-write seed" "$R"
+    fi
+done
+
+sleep 4
+SIX_RAR_OK=true
+SIX_RAR_DETAILS=""
+for read_i in "${!ENTRYPOINT_LABELS[@]}"; do
+    read_label="${ENTRYPOINT_LABELS[$read_i]}"
+    read_url="${ENTRYPOINT_URLS[$read_i]}"
+    read_key="${ENTRYPOINT_KEYS[$read_i]}"
+    for author in "${SIX_RAR_AUTHORS[@]}"; do
+        PAYLOAD=$(query_with_args "$read_url" "$read_key" "messages:countMessagesByAuthorChannel" \
+            "{\"author\":\"$author\",\"channel\":\"six-entrypoint-rar\"}" 2>/dev/null || echo '{"value":-1}')
+        COUNT=$(python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" <<< "$PAYLOAD" 2>/dev/null || echo -1)
+        if [ "$COUNT" -ne 1 ]; then
+            SIX_RAR_OK=false
+            SIX_RAR_DETAILS="$SIX_RAR_DETAILS $read_label:$author=$COUNT"
+        fi
+    done
+done
+
+$SIX_RAR_OK \
+    && pass "All six nodes read all six routed writes" \
+    || fail "Six-entrypoint read-after-write failed" "$SIX_RAR_DETAILS"
+
+POST_SIX_RAR=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+AM=$(jval messages "$POST_SIX_RAR"); AU=$(jval users "$POST_SIX_RAR")
+AP=$(jval projects "$POST_SIX_RAR"); AT=$(jval tasks "$POST_SIX_RAR")
 
 # ============================================================
 echo ""
@@ -591,14 +762,6 @@ if $MONO_OK; then
     pass "Monotonic reads: values never went backward (last=$LAST_SEEN)"
 fi
 
-# Override readLatestSeq to pass key arg
-query_with_args() {
-    curl -sf "$1/api/query" \
-        -H "Authorization: Convex $2" \
-        -H "Content-Type: application/json" \
-        -d "{\"path\":\"$3\",\"args\":$4}"
-}
-
 # ============================================================
 echo ""
 echo -e "${BOLD}Test 7: Node Restart Recovery (TiDB kill -9 / CockroachDB nemesis)${NC}"
@@ -626,7 +789,8 @@ for attempt in $(seq 1 30); do
 done
 
 # Re-generate Node B key (may have changed on restart)
-NODE_B_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
 
 # Re-deploy functions to Node B (modules are in-memory)
 echo "  Re-deploying functions to Node B..."
@@ -694,17 +858,22 @@ PRE_2PC_T=$(jval tasks "$PRE_2PC")
 # 9a: Atomic cross-partition write (Vitess atomic commit pattern).
 # A single mutation writes to messages (partition 0) AND tasks (partition 1).
 # With 2PC, both should be committed atomically.
-R=$(mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
-    '{"text":"2pc-msg-1","taskTitle":"2pc-task-1"}' 2>&1)
-if echo "$R" | grep -q "success"; then
+R=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+    '{"text":"2pc-msg-1","taskTitle":"2pc-task-1"}')
+if echo "$R" | grep -q '"status":"success"'; then
     pass "Cross-partition mutation accepted (2PC coordinator)"
 else
     fail "Cross-partition mutation rejected" "$R"
 fi
 
 # 9b: Write a second cross-partition mutation.
-mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
-    '{"text":"2pc-msg-2","taskTitle":"2pc-task-2"}' > /dev/null 2>&1
+R=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+    '{"text":"2pc-msg-2","taskTitle":"2pc-task-2"}')
+if echo "$R" | grep -q '"status":"success"'; then
+    pass "Second cross-partition mutation accepted (2PC coordinator)"
+else
+    fail "Second cross-partition mutation rejected" "$R"
+fi
 
 sleep 4
 
@@ -733,6 +902,101 @@ DELTA_T=$((POST_T_A - PRE_2PC_T))
 [ "$DELTA_M" -eq "$DELTA_T" ] \
     && pass "2PC invariant: msgs and tasks incremented equally (+$DELTA_M)" \
     || fail "2PC invariant violated" "msgs +$DELTA_M vs tasks +$DELTA_T"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 9f: 2PC Atomicity During NATS Outage${NC}"
+# ============================================================
+# NATS backs the TSO and 2PC decision log, so an outage may make the mutation
+# fail safely. What must never happen is a torn 2PC write.
+
+PRE_NATS_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_NATS_2PC_M=$(jval messages "$PRE_NATS_2PC")
+PRE_NATS_2PC_T=$(jval tasks "$PRE_NATS_2PC")
+
+echo "  Pausing NATS and attempting one cross-partition mutation..."
+docker pause docker-nats-1 > /dev/null 2>&1
+NATS_2PC_RESPONSE=$(curl --max-time 10 -s "$NODE_A_URL/api/mutation" \
+    -H "Authorization: Convex $NODE_A_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"path":"messages:crossPartitionWrite","args":{"text":"2pc-nats-outage","taskTitle":"2pc-nats-outage-task"}}' \
+    || echo '{"status":"transport_error"}')
+sleep 2
+docker unpause docker-nats-1 > /dev/null 2>&1
+echo "  NATS resumed."
+
+sleep 6
+POST_NATS_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_NATS_2PC_M=$(jval messages "$POST_NATS_2PC")
+POST_NATS_2PC_T=$(jval tasks "$POST_NATS_2PC")
+NATS_2PC_DM=$((POST_NATS_2PC_M - PRE_NATS_2PC_M))
+NATS_2PC_DT=$((POST_NATS_2PC_T - PRE_NATS_2PC_T))
+
+if [ "$NATS_2PC_DM" -eq "$NATS_2PC_DT" ] && { [ "$NATS_2PC_DM" -eq 0 ] || [ "$NATS_2PC_DM" -eq 1 ]; }; then
+    pass "2PC under NATS outage was atomic/fail-closed (msgs +$NATS_2PC_DM tasks +$NATS_2PC_DT)"
+else
+    fail "2PC under NATS outage produced torn/non-idempotent result" "response=$NATS_2PC_RESPONSE msgs +$NATS_2PC_DM tasks +$NATS_2PC_DT"
+fi
+
+POST_NATS_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_NATS_2PC_BM=$(jval messages "$POST_NATS_2PC_B")
+POST_NATS_2PC_BT=$(jval tasks "$POST_NATS_2PC_B")
+[ "$POST_NATS_2PC_M" -eq "$POST_NATS_2PC_BM" ] && [ "$POST_NATS_2PC_T" -eq "$POST_NATS_2PC_BT" ] \
+    && pass "Nodes converged after NATS 2PC disruption" \
+    || fail "Nodes diverged after NATS 2PC disruption" "A: $POST_NATS_2PC_M,$POST_NATS_2PC_T vs B: $POST_NATS_2PC_BM,$POST_NATS_2PC_BT"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 9g: 2PC Atomicity During Participant Restart${NC}"
+# ============================================================
+# Race a cross-partition mutation with a partition-1 participant restart. The
+# client result may be ambiguous, but the persisted result must not be torn.
+
+PRE_RESTART_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_RESTART_2PC_M=$(jval messages "$PRE_RESTART_2PC")
+PRE_RESTART_2PC_T=$(jval tasks "$PRE_RESTART_2PC")
+RESTART_2PC_RESPONSE_FILE=$(mktemp)
+
+(curl --max-time 20 -s "$NODE_A_URL/api/mutation" \
+    -H "Authorization: Convex $NODE_A_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"path":"messages:crossPartitionWrite","args":{"text":"2pc-participant-restart","taskTitle":"2pc-participant-restart-task"}}' \
+    > "$RESTART_2PC_RESPONSE_FILE" || echo '{"status":"transport_error"}' > "$RESTART_2PC_RESPONSE_FILE") &
+RESTART_2PC_PID=$!
+sleep 0.05
+docker restart docker-node-p1a-1 > /dev/null 2>&1
+wait "$RESTART_2PC_PID" || true
+
+echo "  Waiting for participant node p1a to recover..."
+for attempt in $(seq 1 60); do
+    curl -sf "$NODE_B_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
+
+sleep 8
+POST_RESTART_2PC_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_RESTART_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_RESTART_2PC_M=$(jval messages "$POST_RESTART_2PC_A")
+POST_RESTART_2PC_T=$(jval tasks "$POST_RESTART_2PC_A")
+POST_RESTART_2PC_BM=$(jval messages "$POST_RESTART_2PC_B")
+POST_RESTART_2PC_BT=$(jval tasks "$POST_RESTART_2PC_B")
+RESTART_2PC_DM=$((POST_RESTART_2PC_M - PRE_RESTART_2PC_M))
+RESTART_2PC_DT=$((POST_RESTART_2PC_T - PRE_RESTART_2PC_T))
+RESTART_2PC_RESPONSE=$(cat "$RESTART_2PC_RESPONSE_FILE")
+rm -f "$RESTART_2PC_RESPONSE_FILE"
+
+if [ "$RESTART_2PC_DM" -eq "$RESTART_2PC_DT" ] && { [ "$RESTART_2PC_DM" -eq 0 ] || [ "$RESTART_2PC_DM" -eq 1 ]; }; then
+    pass "2PC during participant restart was atomic (msgs +$RESTART_2PC_DM tasks +$RESTART_2PC_DT)"
+else
+    fail "2PC during participant restart produced torn/non-idempotent result" "response=$RESTART_2PC_RESPONSE msgs +$RESTART_2PC_DM tasks +$RESTART_2PC_DT"
+fi
+
+[ "$POST_RESTART_2PC_M" -eq "$POST_RESTART_2PC_BM" ] && [ "$POST_RESTART_2PC_T" -eq "$POST_RESTART_2PC_BT" ] \
+    && pass "Nodes converged after participant restart 2PC race" \
+    || fail "Nodes diverged after participant restart 2PC race" "A: $POST_RESTART_2PC_M,$POST_RESTART_2PC_T vs B: $POST_RESTART_2PC_BM,$POST_RESTART_2PC_BT"
 
 # ============================================================
 echo ""
@@ -854,7 +1118,8 @@ for attempt in $(seq 1 30); do
     sleep 1
 done
 
-NODE_B_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
 
 sleep 4
@@ -1133,8 +1398,10 @@ for attempt in $(seq 1 60); do
     sleep 1
 done
 
-NODE_A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
-NODE_B_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY="$NODE_P0A_KEY"
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
 
@@ -1152,6 +1419,217 @@ POST_KILL_BM=$(jval messages "$POST_KILL_B")
 [ "$POST_KILL_AM" -eq "$POST_KILL_BM" ] \
     && pass "Both nodes converged after full restart" \
     || fail "Nodes diverged after restart" "A=$POST_KILL_AM vs B=$POST_KILL_BM"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 20b: Writes Through Followers During Raft Leader Outage${NC}"
+# ============================================================
+# Stop p0a and require every surviving public entrypoint to route a p0-owned
+# write through the new Raft leader. This catches stale leader/follower routing.
+
+PRE_P0_OUTAGE=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+PRE_P0_OUTAGE_M=$(jval messages "$PRE_P0_OUTAGE")
+PRE_P0_OUTAGE_T=$(jval tasks "$PRE_P0_OUTAGE")
+
+echo "  Stopping p0a to force/hold a partition-0 leader change..."
+docker stop docker-node-p0a-1 > /dev/null 2>&1
+sleep 6
+
+OUTAGE_LABELS=(p0b p0c p1a p1b p1c)
+OUTAGE_URLS=("$NODE_P0B_URL" "$NODE_P0C_URL" "$NODE_P1A_URL" "$NODE_P1B_URL" "$NODE_P1C_URL")
+OUTAGE_KEYS=("$NODE_P0B_KEY" "$NODE_P0C_KEY" "$NODE_P1A_KEY" "$NODE_P1B_KEY" "$NODE_P1C_KEY")
+P0_OUTAGE_ACCEPTED=0
+P0_OUTAGE_RUN="p0-outage-$(date +%s)"
+
+for i in "${!OUTAGE_LABELS[@]}"; do
+    label="${OUTAGE_LABELS[$i]}"
+    R=$(mutation_response "${OUTAGE_URLS[$i]}" "${OUTAGE_KEYS[$i]}" "messages:send" \
+        "{\"text\":\"$P0_OUTAGE_RUN-$label\",\"author\":\"$P0_OUTAGE_RUN\",\"channel\":\"raft-outage\"}")
+    if echo "$R" | grep -q '"status":"success"'; then
+        P0_OUTAGE_ACCEPTED=$((P0_OUTAGE_ACCEPTED + 1))
+    else
+        fail "$label could not route write while p0a was down" "$R"
+    fi
+done
+
+[ "$P0_OUTAGE_ACCEPTED" -eq 5 ] \
+    && pass "All five surviving entrypoints accepted writes while p0a was down" \
+    || fail "Some entrypoints failed during p0a outage" "accepted=$P0_OUTAGE_ACCEPTED expected=5"
+
+P0_OUTAGE_2PC_LABELS=(p1a p1b p1c)
+P0_OUTAGE_2PC_URLS=("$NODE_P1A_URL" "$NODE_P1B_URL" "$NODE_P1C_URL")
+P0_OUTAGE_2PC_KEYS=("$NODE_P1A_KEY" "$NODE_P1B_KEY" "$NODE_P1C_KEY")
+P0_OUTAGE_2PC_ACCEPTED=0
+
+for i in "${!P0_OUTAGE_2PC_LABELS[@]}"; do
+    label="${P0_OUTAGE_2PC_LABELS[$i]}"
+    R=$(mutation_response "${P0_OUTAGE_2PC_URLS[$i]}" "${P0_OUTAGE_2PC_KEYS[$i]}" "messages:crossPartitionWrite" \
+        "{\"text\":\"$P0_OUTAGE_RUN-2pc-$label\",\"taskTitle\":\"$P0_OUTAGE_RUN-2pc-task-$label\"}")
+    if echo "$R" | grep -q '"status":"success"'; then
+        P0_OUTAGE_2PC_ACCEPTED=$((P0_OUTAGE_2PC_ACCEPTED + 1))
+    else
+        fail "$label could not route 2PC write while p0a was down" "$R"
+    fi
+done
+
+[ "$P0_OUTAGE_2PC_ACCEPTED" -eq 3 ] \
+    && pass "Surviving p1 entrypoints accepted 2PC writes while p0a was down" \
+    || fail "Some 2PC writes failed during p0a outage" "accepted=$P0_OUTAGE_2PC_ACCEPTED expected=3"
+
+echo "  Restarting p0a..."
+docker start docker-node-p0a-1 > /dev/null 2>&1
+for attempt in $(seq 1 60); do
+    curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY="$NODE_P0A_KEY"
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
+
+sleep 6
+POST_P0_OUTAGE_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_P0_OUTAGE_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_P0_OUTAGE_AM=$(jval messages "$POST_P0_OUTAGE_A")
+POST_P0_OUTAGE_BM=$(jval messages "$POST_P0_OUTAGE_B")
+POST_P0_OUTAGE_AT=$(jval tasks "$POST_P0_OUTAGE_A")
+POST_P0_OUTAGE_BT=$(jval tasks "$POST_P0_OUTAGE_B")
+P0_OUTAGE_DELTA=$((POST_P0_OUTAGE_AM - PRE_P0_OUTAGE_M))
+P0_OUTAGE_TASK_DELTA=$((POST_P0_OUTAGE_AT - PRE_P0_OUTAGE_T))
+P0_OUTAGE_EXPECTED_M=$((P0_OUTAGE_ACCEPTED + P0_OUTAGE_2PC_ACCEPTED))
+
+[ "$P0_OUTAGE_DELTA" -eq "$P0_OUTAGE_EXPECTED_M" ] \
+    && pass "All outage-window writes survived Raft leader outage (+$P0_OUTAGE_DELTA)" \
+    || fail "Lost/extra writes during Raft leader outage" "+$P0_OUTAGE_DELTA expected +$P0_OUTAGE_EXPECTED_M"
+
+[ "$P0_OUTAGE_TASK_DELTA" -eq "$P0_OUTAGE_2PC_ACCEPTED" ] \
+    && pass "2PC outage-window task halves survived Raft leader outage (+$P0_OUTAGE_TASK_DELTA)" \
+    || fail "Lost/extra 2PC task halves during Raft leader outage" "+$P0_OUTAGE_TASK_DELTA expected +$P0_OUTAGE_2PC_ACCEPTED"
+
+[ "$POST_P0_OUTAGE_AM" -eq "$POST_P0_OUTAGE_BM" ] && [ "$POST_P0_OUTAGE_AT" -eq "$POST_P0_OUTAGE_BT" ] \
+    && pass "Nodes converged after p0a leader outage" \
+    || fail "Nodes diverged after p0a leader outage" "p0a=$POST_P0_OUTAGE_AM,$POST_P0_OUTAGE_AT p1a=$POST_P0_OUTAGE_BM,$POST_P0_OUTAGE_BT"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 20c: Lagging Follower Catch-Up After Cross-Partition Writes${NC}"
+# ============================================================
+# Keep p1c offline while cross-partition writes commit, then require it to
+# catch up through Raft/NATS before serving a consistent dashboard.
+
+PRE_LAGGING=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_LAGGING_M=$(jval messages "$PRE_LAGGING")
+PRE_LAGGING_T=$(jval tasks "$PRE_LAGGING")
+LAGGING_2PC_COUNT=4
+
+echo "  Stopping p1c before heavy cross-partition writes..."
+docker stop docker-node-p1c-1 > /dev/null 2>&1
+sleep 5
+
+LAGGING_ACCEPTED=0
+for i in $(seq 1 "$LAGGING_2PC_COUNT"); do
+    R=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+        "{\"text\":\"lagging-2pc-$i\",\"taskTitle\":\"lagging-2pc-task-$i\"}")
+    if echo "$R" | grep -q '"status":"success"'; then
+        LAGGING_ACCEPTED=$((LAGGING_ACCEPTED + 1))
+    else
+        fail "Cross-partition write $i failed while p1c was offline" "$R"
+    fi
+done
+
+[ "$LAGGING_ACCEPTED" -eq "$LAGGING_2PC_COUNT" ] \
+    && pass "Cross-partition writes committed while p1c was offline ($LAGGING_ACCEPTED/$LAGGING_2PC_COUNT)" \
+    || fail "Some cross-partition writes failed while p1c was offline" "accepted=$LAGGING_ACCEPTED expected=$LAGGING_2PC_COUNT"
+
+echo "  Restarting p1c and waiting for catch-up..."
+docker start docker-node-p1c-1 > /dev/null 2>&1
+for attempt in $(seq 1 60); do
+    curl -sf "$NODE_P1C_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P1C_KEY=$(docker exec docker-node-p1c-1 ./generate_admin_key.sh 2>&1 | tail -1)
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_P1C_KEY" --url "$NODE_P1C_URL" > /dev/null 2>&1)
+
+sleep 10
+POST_LAGGING_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_LAGGING_C=$(query_api "$NODE_P1C_URL" "$NODE_P1C_KEY" "messages:dashboard")
+POST_LAGGING_AM=$(jval messages "$POST_LAGGING_A")
+POST_LAGGING_AT=$(jval tasks "$POST_LAGGING_A")
+POST_LAGGING_CM=$(jval messages "$POST_LAGGING_C")
+POST_LAGGING_CT=$(jval tasks "$POST_LAGGING_C")
+LAGGING_DM=$((POST_LAGGING_AM - PRE_LAGGING_M))
+LAGGING_DT=$((POST_LAGGING_AT - PRE_LAGGING_T))
+
+[ "$LAGGING_DM" -eq "$LAGGING_ACCEPTED" ] && [ "$LAGGING_DT" -eq "$LAGGING_ACCEPTED" ] \
+    && pass "Heavy cross-partition writes remained atomic while follower lagged (+$LAGGING_ACCEPTED/+${LAGGING_ACCEPTED})" \
+    || fail "Unexpected heavy 2PC deltas while follower lagged" "msgs +$LAGGING_DM tasks +$LAGGING_DT expected +$LAGGING_ACCEPTED"
+
+[ "$POST_LAGGING_AM" -eq "$POST_LAGGING_CM" ] && [ "$POST_LAGGING_AT" -eq "$POST_LAGGING_CT" ] \
+    && pass "Lagging p1c caught up after cross-partition writes" \
+    || fail "Lagging p1c did not catch up" "p0a: $POST_LAGGING_AM,$POST_LAGGING_AT vs p1c: $POST_LAGGING_CM,$POST_LAGGING_CT"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 20d: Cross-Partition 2PC During Participant Leader Outage${NC}"
+# ============================================================
+# Stop the partition-1 leader and require every surviving public entrypoint to
+# coordinate cross-partition writes through the new partition-1 Raft leader.
+
+PRE_P1_OUTAGE=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_P1_OUTAGE_M=$(jval messages "$PRE_P1_OUTAGE")
+PRE_P1_OUTAGE_T=$(jval tasks "$PRE_P1_OUTAGE")
+
+echo "  Stopping p1a to force/hold a partition-1 leader change..."
+docker stop docker-node-p1a-1 > /dev/null 2>&1
+sleep 6
+
+P1_OUTAGE_LABELS=(p0a p0b p0c p1b p1c)
+P1_OUTAGE_URLS=("$NODE_P0A_URL" "$NODE_P0B_URL" "$NODE_P0C_URL" "$NODE_P1B_URL" "$NODE_P1C_URL")
+P1_OUTAGE_KEYS=("$NODE_P0A_KEY" "$NODE_P0B_KEY" "$NODE_P0C_KEY" "$NODE_P1B_KEY" "$NODE_P1C_KEY")
+P1_OUTAGE_ACCEPTED=0
+P1_OUTAGE_RUN="p1-outage-$(date +%s)"
+
+for i in "${!P1_OUTAGE_LABELS[@]}"; do
+    label="${P1_OUTAGE_LABELS[$i]}"
+    R=$(mutation_response "${P1_OUTAGE_URLS[$i]}" "${P1_OUTAGE_KEYS[$i]}" "messages:crossPartitionWrite" \
+        "{\"text\":\"$P1_OUTAGE_RUN-$label\",\"taskTitle\":\"$P1_OUTAGE_RUN-task-$label\"}")
+    if echo "$R" | grep -q '"status":"success"'; then
+        P1_OUTAGE_ACCEPTED=$((P1_OUTAGE_ACCEPTED + 1))
+    else
+        fail "$label could not route 2PC write while p1a was down" "$R"
+    fi
+done
+
+[ "$P1_OUTAGE_ACCEPTED" -eq 5 ] \
+    && pass "All five surviving entrypoints accepted 2PC writes while p1a was down" \
+    || fail "Some 2PC writes failed during p1a outage" "accepted=$P1_OUTAGE_ACCEPTED expected=5"
+
+echo "  Restarting p1a..."
+docker start docker-node-p1a-1 > /dev/null 2>&1
+for attempt in $(seq 1 60); do
+    curl -sf "$NODE_B_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
+
+sleep 8
+POST_P1_OUTAGE_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_P1_OUTAGE_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_P1_OUTAGE_AM=$(jval messages "$POST_P1_OUTAGE_A")
+POST_P1_OUTAGE_AT=$(jval tasks "$POST_P1_OUTAGE_A")
+POST_P1_OUTAGE_BM=$(jval messages "$POST_P1_OUTAGE_B")
+POST_P1_OUTAGE_BT=$(jval tasks "$POST_P1_OUTAGE_B")
+P1_OUTAGE_DM=$((POST_P1_OUTAGE_AM - PRE_P1_OUTAGE_M))
+P1_OUTAGE_DT=$((POST_P1_OUTAGE_AT - PRE_P1_OUTAGE_T))
+
+[ "$P1_OUTAGE_DM" -eq "$P1_OUTAGE_ACCEPTED" ] && [ "$P1_OUTAGE_DT" -eq "$P1_OUTAGE_ACCEPTED" ] \
+    && pass "2PC writes survived participant leader outage (+$P1_OUTAGE_ACCEPTED/+${P1_OUTAGE_ACCEPTED})" \
+    || fail "Lost/extra 2PC writes during participant leader outage" "msgs +$P1_OUTAGE_DM tasks +$P1_OUTAGE_DT expected +$P1_OUTAGE_ACCEPTED"
+
+[ "$POST_P1_OUTAGE_AM" -eq "$POST_P1_OUTAGE_BM" ] && [ "$POST_P1_OUTAGE_AT" -eq "$POST_P1_OUTAGE_BT" ] \
+    && pass "Nodes converged after p1a participant leader outage" \
+    || fail "Nodes diverged after p1a participant leader outage" "p0a=$POST_P1_OUTAGE_AM,$POST_P1_OUTAGE_AT p1a=$POST_P1_OUTAGE_BM,$POST_P1_OUTAGE_BT"
 
 # ============================================================
 echo ""
@@ -1338,15 +1816,18 @@ DJ_BT=$(jval tasks "$DJ_CHECK_B")
 echo ""
 echo -e "${BOLD}Test 26: NATS Partition Simulation${NC}"
 # ============================================================
-# Pause NATS briefly, write to Node A, unpause, verify Node B catches up.
+# Pause NATS briefly, write to Node A, unpause, verify accepted writes are
+# eventually visible on both partitions.
 
 echo "  Pausing NATS for 3 seconds..."
 docker pause docker-nats-1 > /dev/null 2>&1
 
-# Write during NATS outage (should succeed locally, publish will retry).
+# Write during NATS outage. It may fail closed if the TSO/decision path cannot
+# make progress, but if it is accepted then the Raft/NATS outbox must replay it
+# after recovery.
 NATS_KEY="nats-pause-$(date +%s)"
-mutate "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
-    "{\"text\":\"$NATS_KEY\",\"author\":\"nats-test\",\"channel\":\"test\"}" > /dev/null 2>&1 || true
+NATS_RESPONSE=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:send" \
+    "{\"text\":\"$NATS_KEY\",\"author\":\"$NATS_KEY\",\"channel\":\"nats-outage\"}" 2>&1 || echo '{"status":"transport_error"}')
 
 sleep 3
 docker unpause docker-nats-1 > /dev/null 2>&1
@@ -1361,6 +1842,28 @@ curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 \
 curl -sf "$NODE_B_URL/version" > /dev/null 2>&1 \
     && pass "Node B survived NATS partition" \
     || fail "Node B crashed during NATS partition"
+
+NATS_ACCEPTED=0
+if echo "$NATS_RESPONSE" | grep -q '"status":"success"'; then
+    NATS_ACCEPTED=1
+fi
+
+NATS_A_COUNT=$(query_with_args "$NODE_A_URL" "$NODE_A_KEY" "messages:countMessagesByAuthorChannel" \
+    "{\"author\":\"$NATS_KEY\",\"channel\":\"nats-outage\"}" \
+    | python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" 2>/dev/null || echo -1)
+NATS_B_COUNT=$(query_with_args "$NODE_B_URL" "$NODE_B_KEY" "messages:countMessagesByAuthorChannel" \
+    "{\"author\":\"$NATS_KEY\",\"channel\":\"nats-outage\"}" \
+    | python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" 2>/dev/null || echo -1)
+
+if [ "$NATS_ACCEPTED" -eq 1 ]; then
+    [ "$NATS_A_COUNT" -eq 1 ] && [ "$NATS_B_COUNT" -eq 1 ] \
+        && pass "Accepted write during NATS outage replayed to both partitions" \
+        || fail "Accepted write during NATS outage did not replay" "response=$NATS_RESPONSE p0a=$NATS_A_COUNT p1a=$NATS_B_COUNT"
+else
+    [ "$NATS_A_COUNT" -eq 0 ] && [ "$NATS_B_COUNT" -eq 0 ] \
+        && pass "Write during NATS outage failed closed without partial visibility" \
+        || fail "Failed NATS-outage write left partial visibility" "response=$NATS_RESPONSE p0a=$NATS_A_COUNT p1a=$NATS_B_COUNT"
+fi
 
 # ============================================================
 echo ""
@@ -1563,7 +2066,8 @@ for attempt in $(seq 1 30); do
     sleep 1
 done
 
-NODE_A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY="$NODE_P0A_KEY"
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
 
 # Write after restart — TSO must give a valid timestamp.
@@ -1653,7 +2157,7 @@ WS_RESULT=$(curl -sf "$NODE_A_URL/api/query" \
 echo ""
 echo -e "${BOLD}Test 37: Ultimate Final Invariant Check${NC}"
 # ============================================================
-# After ALL 36 tests including NATS partition, node restarts, deploys,
+# After ALL previous tests including NATS partition, node restarts, deploys,
 # 200-doc batches, and sustained writes — every invariant must hold.
 
 sleep 5
@@ -1680,6 +2184,38 @@ ULT_BB=$(jtotal "$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:totalBudget")
 
 echo ""
 echo "  FINAL DATA: msgs=$ULT_AM users=$ULT_AU projects=$ULT_AP tasks=$ULT_AT budget=\$$ULT_BA"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 38: Sync Route Authority Guard${NC}"
+# ============================================================
+# Sync/subscription setup is coordinator-owner only. Non-coordinator partition
+# nodes must fail closed before WebSocket upgrade instead of hosting orphaned
+# subscription state.
+
+SYNC_OK=true
+SYNC_DETAILS=""
+for entry in "p1a|$NODE_P1A_URL" "p1b|$NODE_P1B_URL" "p1c|$NODE_P1C_URL"; do
+    label="${entry%%|*}"
+    url="${entry#*|}"
+    for path in "/api/sync" "/api/1.0.0/sync"; do
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Connection: Upgrade" \
+            -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Version: 13" \
+            "$url$path" 2>/dev/null || echo "000")
+        STATUS="${STATUS: -3}"
+        if [ "$STATUS" -lt 400 ] || [ "$STATUS" -eq 101 ]; then
+            SYNC_OK=false
+            SYNC_DETAILS="$SYNC_DETAILS $label$path=$STATUS"
+        fi
+    done
+done
+
+$SYNC_OK \
+    && pass "Non-coordinator partition nodes reject sync/WebSocket routes" \
+    || fail "Sync route did not fail closed on non-coordinator nodes" "$SYNC_DETAILS"
 
 # ============================================================
 echo ""
