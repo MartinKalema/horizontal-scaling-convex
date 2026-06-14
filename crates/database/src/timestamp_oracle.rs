@@ -159,6 +159,14 @@ fn batch_lower_bound(counter_value: u64, min_next: u64) -> u64 {
     std::cmp::max(counter_value, min_next)
 }
 
+fn should_read_committed_floor_before_assignment(
+    current: u64,
+    upper_bound: u64,
+    local_min_next: u64,
+) -> bool {
+    next_ts_from_reserved_batch(current, upper_bound, local_min_next).is_some()
+}
+
 impl BatchTimestampOracle {
     /// Connect to NATS and initialize the KV bucket for timestamp allocation.
     pub async fn connect(nats_url: &str, batch_size: Option<u64>) -> anyhow::Result<Self> {
@@ -263,6 +271,22 @@ impl BatchTimestampOracle {
 
         anyhow::bail!("TSO: Failed to reserve batch after 10 attempts")
     }
+
+    fn assign_from_reserved_batch(
+        &self,
+        lower: u64,
+        upper: u64,
+        min_next: u64,
+    ) -> anyhow::Result<Timestamp> {
+        let mut state = self.state.lock();
+        state.current = lower;
+        state.upper_bound = upper;
+        let (ts, next_current) =
+            next_ts_from_reserved_batch(state.current, state.upper_bound, min_next)
+                .context("TSO: Reserved batch cannot satisfy requested floor")?;
+        state.current = next_current;
+        Timestamp::try_from(ts)
+    }
 }
 
 #[async_trait]
@@ -270,17 +294,35 @@ impl TimestampOracle for BatchTimestampOracle {
     async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp> {
         let timer = metrics::tso_operation_timer("next_ts_at_or_after");
         let result = async {
-            let committed_floor = self.max_committed_ts().await?;
-            let min_next_ts = std::cmp::max(min_ts, committed_floor.succ()?);
-            let min_next = u64::from(min_next_ts);
-
             loop {
+                let local_min_next = {
+                    let state = self.state.lock();
+                    u64::from(std::cmp::max(min_ts, state.max_committed.succ()?))
+                };
+
+                let reserved_batch_can_satisfy_local_floor = {
+                    let state = self.state.lock();
+                    should_read_committed_floor_before_assignment(
+                        state.current,
+                        state.upper_bound,
+                        local_min_next,
+                    )
+                };
+
+                if !reserved_batch_can_satisfy_local_floor {
+                    let (lower, upper) = self.reserve_batch_at_or_above(local_min_next).await?;
+                    return self.assign_from_reserved_batch(lower, upper, local_min_next);
+                }
+
+                let committed_floor = self.max_committed_ts().await?;
+                let min_next_ts = std::cmp::max(min_ts, committed_floor.succ()?);
+                let min_next = u64::from(min_next_ts);
+
                 let candidate = {
                     let mut state = self.state.lock();
                     if committed_floor > state.max_committed {
                         state.max_committed = committed_floor;
                     }
-
                     if let Some((ts, next_current)) =
                         next_ts_from_reserved_batch(state.current, state.upper_bound, min_next)
                     {
@@ -296,9 +338,7 @@ impl TimestampOracle for BatchTimestampOracle {
                 }
 
                 let (lower, upper) = self.reserve_batch_at_or_above(min_next).await?;
-                let mut state = self.state.lock();
-                state.current = lower;
-                state.upper_bound = upper;
+                return self.assign_from_reserved_batch(lower, upper, min_next);
             }
         }
         .await;
@@ -458,6 +498,7 @@ mod tests {
     use super::{
         batch_lower_bound,
         next_ts_from_reserved_batch,
+        should_read_committed_floor_before_assignment,
     };
 
     #[test]
@@ -487,5 +528,21 @@ mod tests {
         assert_eq!(batch_lower_bound(1000, 1001), 1001);
         assert_eq!(batch_lower_bound(1000, 1500), 1500);
         assert_eq!(batch_lower_bound(2000, 1500), 2000);
+    }
+
+    #[test]
+    fn committed_floor_read_is_needed_before_using_existing_batch() {
+        assert!(should_read_committed_floor_before_assignment(100, 200, 150));
+    }
+
+    #[test]
+    fn committed_floor_read_is_not_needed_before_reserving_new_batch() {
+        assert!(!should_read_committed_floor_before_assignment(0, 0, 1));
+        assert!(!should_read_committed_floor_before_assignment(
+            100, 200, 200
+        ));
+        assert!(!should_read_committed_floor_before_assignment(
+            100, 200, 250
+        ));
     }
 }
