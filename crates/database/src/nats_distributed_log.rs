@@ -6,7 +6,10 @@
 //! Reference: https://natsbyexample.com/examples/jetstream/limits-stream/rust
 //! Reference: https://natsbyexample.com/examples/jetstream/pull-consumer/rust
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use async_nats::jetstream::{
@@ -430,6 +433,13 @@ impl ReplicationAck for NatsReplicationAck {
             .ack_with(AckKind::Nak(None))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to NAK NATS replication message: {e}"))
+    }
+
+    async fn nak_with_delay(self: Box<Self>, delay: Duration) -> anyhow::Result<()> {
+        self.msg
+            .ack_with(AckKind::Nak(Some(delay)))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to delayed-NAK NATS replication message: {e}"))
     }
 
     async fn term(self: Box<Self>) -> anyhow::Result<()> {

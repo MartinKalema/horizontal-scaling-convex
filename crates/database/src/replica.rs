@@ -25,17 +25,21 @@ use crate::{
         CommitDelta,
         DistributedLog,
         ReplicationMessage,
+        RetryableReplicaApplyError,
     },
     committer::CommitterClient,
 };
+
+const RETRYABLE_REPLICA_APPLY_NAK_DELAY: Duration = Duration::from_millis(100);
 
 pub async fn apply_replication_message(
     committer: &CommitterClient,
     message: ReplicationMessage,
 ) -> anyhow::Result<(common::types::Timestamp, usize)> {
     let committer = committer.clone();
-    apply_replication_message_with(message, move |delta| async move {
-        committer.apply_replica_delta(delta).await
+    apply_replication_message_with(message, move |delta| {
+        let committer = committer.clone();
+        async move { committer.apply_replica_delta(delta).await }
     })
     .await
 }
@@ -86,42 +90,54 @@ where
 
 async fn apply_replication_message_with<F, Fut>(
     message: ReplicationMessage,
-    apply: F,
+    mut apply: F,
 ) -> anyhow::Result<(common::types::Timestamp, usize)>
 where
-    F: FnOnce(CommitDelta) -> Fut,
+    F: FnMut(CommitDelta) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<common::types::Timestamp>>,
 {
     let (delta, ack) = message.into_parts();
     let ts = delta.ts;
     let num_updates = delta.document_updates.len();
 
-    match apply(delta).await {
-        Ok(applied_ts) => {
-            ack.ack().await.with_context(|| {
-                format!(
-                    "Failed to ack applied replica delta at ts={}",
-                    u64::from(applied_ts),
-                )
-            })?;
-            Ok((applied_ts, num_updates))
-        },
-        Err(e) => {
-            tracing::error!(
-                "Failed to apply replica delta at ts={}: {e:#}",
-                u64::from(ts),
-            );
-            if let Err(ack_err) = ack.nak().await {
-                tracing::warn!(
-                    "Failed to NAK unapplied replica delta at ts={}: {ack_err:#}",
+    loop {
+        match apply(delta.clone()).await {
+            Ok(applied_ts) => {
+                ack.ack().await.with_context(|| {
+                    format!(
+                        "Failed to ack applied replica delta at ts={}",
+                        u64::from(applied_ts),
+                    )
+                })?;
+                return Ok((applied_ts, num_updates));
+            },
+            Err(e) => {
+                if e.downcast_ref::<RetryableReplicaApplyError>().is_some() {
+                    tracing::info!(
+                        "Replica delta at ts={} is temporarily blocked; retrying in place after \
+                         {:?}: {e:#}",
+                        u64::from(ts),
+                        RETRYABLE_REPLICA_APPLY_NAK_DELAY,
+                    );
+                    tokio::time::sleep(RETRYABLE_REPLICA_APPLY_NAK_DELAY).await;
+                    continue;
+                }
+                tracing::error!(
+                    "Failed to apply replica delta at ts={}: {e:#}",
                     u64::from(ts),
                 );
-            }
-            anyhow::bail!(
-                "Failed to apply replica delta at ts={}: {e:#}",
-                u64::from(ts)
-            );
-        },
+                if let Err(ack_err) = ack.nak().await {
+                    tracing::warn!(
+                        "Failed to NAK unapplied replica delta at ts={}: {ack_err:#}",
+                        u64::from(ts),
+                    );
+                }
+                anyhow::bail!(
+                    "Failed to apply replica delta at ts={}: {e:#}",
+                    u64::from(ts)
+                );
+            },
+        }
     }
 }
 
@@ -213,6 +229,7 @@ mod tests {
             },
             Arc,
         },
+        time::Duration,
     };
 
     use async_trait::async_trait;
@@ -227,6 +244,7 @@ mod tests {
             CommitDelta,
             ReplicationAck,
             ReplicationMessage,
+            RetryableReplicaApplyError,
         },
         write_log::WriteSource,
     };
@@ -235,6 +253,7 @@ mod tests {
     struct AckCounts {
         ack: AtomicUsize,
         nak: AtomicUsize,
+        delayed_nak: AtomicUsize,
         term: AtomicUsize,
     }
 
@@ -251,6 +270,11 @@ mod tests {
 
         async fn nak(self: Box<Self>) -> anyhow::Result<()> {
             self.counts.nak.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn nak_with_delay(self: Box<Self>, _delay: Duration) -> anyhow::Result<()> {
+            self.counts.delayed_nak.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -290,6 +314,7 @@ mod tests {
         assert_eq!(num_updates, 0);
         assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
         assert_eq!(counts.term.load(Ordering::SeqCst), 0);
         Ok(())
     }
@@ -313,6 +338,41 @@ mod tests {
         assert!(message.contains("forced apply failure"), "{message}");
         assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.term.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retryable_apply_failure_retries_in_place() -> anyhow::Result<()> {
+        let counts = Arc::new(AckCounts::default());
+        let ts = Timestamp::try_from(42u64)?;
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let (applied_ts, num_updates) =
+            apply_replication_message_with(test_message(ts, counts.clone()), {
+                let attempts = attempts.clone();
+                move |delta| {
+                    let attempts = attempts.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(anyhow::Error::new(RetryableReplicaApplyError::new(
+                                "prepared transaction still unresolved",
+                            )))
+                        } else {
+                            Ok(delta.ts)
+                        }
+                    }
+                }
+            })
+            .await?;
+
+        assert_eq!(applied_ts, ts);
+        assert_eq!(num_updates, 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
         assert_eq!(counts.term.load(Ordering::SeqCst), 0);
         Ok(())
     }
@@ -339,6 +399,7 @@ mod tests {
         assert_eq!(applied_ts, ts);
         assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
         assert_eq!(counts.term.load(Ordering::SeqCst), 0);
         Ok(())
     }
@@ -361,11 +422,14 @@ mod tests {
             move |message| {
                 let attempts = attempts.clone();
                 async move {
-                    apply_replication_message_with(message, |delta| async move {
-                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                            anyhow::bail!("transient apply failure");
+                    apply_replication_message_with(message, |delta| {
+                        let attempts = attempts.clone();
+                        async move {
+                            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                anyhow::bail!("transient apply failure");
+                            }
+                            Ok(delta.ts)
                         }
-                        Ok(delta.ts)
                     })
                     .await
                 }
@@ -383,6 +447,7 @@ mod tests {
         );
         assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
         assert_eq!(successes.load(Ordering::SeqCst), 1);
         Ok(())
     }

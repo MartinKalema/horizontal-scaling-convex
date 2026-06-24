@@ -10,7 +10,10 @@ use std::{
         BTreeMap,
         BTreeSet,
     },
+    error::Error,
+    fmt,
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -86,8 +89,31 @@ pub trait ReplicationAck: Send + 'static {
 
     async fn nak(self: Box<Self>) -> anyhow::Result<()>;
 
+    async fn nak_with_delay(self: Box<Self>, delay: Duration) -> anyhow::Result<()>;
+
     async fn term(self: Box<Self>) -> anyhow::Result<()>;
 }
+
+#[derive(Debug)]
+pub struct RetryableReplicaApplyError {
+    message: String,
+}
+
+impl RetryableReplicaApplyError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for RetryableReplicaApplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for RetryableReplicaApplyError {}
 
 pub struct ReplicationMessage {
     pub delta: CommitDelta,
@@ -120,6 +146,10 @@ impl ReplicationAck for NoopReplicationAck {
     }
 
     async fn nak(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn nak_with_delay(self: Box<Self>, _delay: Duration) -> anyhow::Result<()> {
         Ok(())
     }
 
