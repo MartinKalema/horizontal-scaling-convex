@@ -142,6 +142,7 @@ use crate::{
     commit_delta::{
         CommitDelta,
         DistributedLog,
+        RetryableReplicaApplyError,
     },
     database::{
         ConflictingReadWithWriteSource,
@@ -230,6 +231,17 @@ enum PersistenceWrite {
         commit_id: usize,
         err: anyhow::Error,
     },
+    PreparedCommit {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        commit_id: usize,
+        delta: CommitDelta,
+        raft_applied_index: Option<u64>,
+    },
+    PreparedRejectedBeforePersistence {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        commit_id: usize,
+        err: anyhow::Error,
+    },
     MaxRepeatableTimestamp {
         new_max_repeatable: Timestamp,
         timer: Timer<VMHistogram>,
@@ -277,6 +289,8 @@ impl PersistenceWrite {
         match self {
             Self::Commit { commit_id, .. } => *commit_id,
             Self::RejectedBeforePersistence { commit_id, .. } => *commit_id,
+            Self::PreparedCommit { commit_id, .. } => *commit_id,
+            Self::PreparedRejectedBeforePersistence { commit_id, .. } => *commit_id,
             Self::MaxRepeatableTimestamp { commit_id, .. } => *commit_id,
             Self::ReplicaDelta { commit_id, .. } => *commit_id,
             Self::RemoteReadFrontierHeartbeat { commit_id, .. } => *commit_id,
@@ -582,7 +596,6 @@ fn replica_delta_timestamps(
 type RaftCommitWaiter = Option<oneshot::Receiver<RaftProposalResult>>;
 
 struct PublishedCommit {
-    commit_ts: Timestamp,
     delta: CommitDelta,
     raft_applied_index: Option<u64>,
 }
@@ -630,6 +643,15 @@ pub struct Committer<RT: Runtime> {
     prepared_transactions:
         std::collections::HashMap<crate::two_phase::TwoPhaseTransactionId, PreparedTransaction>,
 
+    // 2PC CommitPrepared requests that are already past the decision point and
+    // waiting on the async Raft+persistence path. Duplicate CommitPrepared
+    // messages must join the same in-flight commit instead of writing the same
+    // prepared delta twice.
+    prepared_commit_waiters: std::collections::HashMap<
+        crate::two_phase::TwoPhaseTransactionId,
+        Vec<oneshot::Sender<anyhow::Result<Timestamp>>>,
+    >,
+
     // Snapshots for queued-but-not-yet-published state machine writes.
     // Local commits and replica deltas must both build on the latest queued
     // snapshot, not just the latest published one, or a later publish can
@@ -649,6 +671,10 @@ pub struct Committer<RT: Runtime> {
     // Durable origin-timestamp idempotency frontier for non-empty replicated
     // data deltas only. Heartbeats must never advance this map.
     applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+
+    // Sender for requeueing internal work that must wait for earlier state
+    // machine timestamps to become visible without blocking the committer loop.
+    sender: mpsc::Sender<CommitterMessage>,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -747,10 +773,12 @@ impl<RT: Runtime> Committer<RT> {
             placement_state,
             timestamp_oracle,
             prepared_transactions: std::collections::HashMap::new(),
+            prepared_commit_waiters: std::collections::HashMap::new(),
             queued_snapshots: VecDeque::new(),
             raft_state,
             applied_delta_watermarks,
             applied_data_delta_watermarks,
+            sender: tx.clone(),
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -1028,6 +1056,136 @@ impl<RT: Runtime> Committer<RT> {
                             let _ = result.send(Err(err));
                             commit_timer.finish();
                         },
+                        PersistenceWrite::PreparedCommit {
+                            transaction_id,
+                            delta,
+                            raft_applied_index,
+                            ..
+                        } => {
+                            let commit_ts = delta.ts;
+                            let published_commit = match self.publish_prepared_commit(
+                                transaction_id.clone(),
+                                delta,
+                                raft_applied_index,
+                            ) {
+                                Ok(published_commit) => published_commit,
+                                Err(err) => {
+                                    return self.fail_prepared_committed_write(
+                                        &transaction_id,
+                                        commit_ts,
+                                        "publish prepared committed write",
+                                        err,
+                                    );
+                                },
+                            };
+                            if let Some(raft_applied_index) = published_commit.raft_applied_index {
+                                let raft_mark_timer = metrics::commit_hot_path_stage_timer(
+                                    "2pc_participant",
+                                    "raft_mark_applied",
+                                );
+                                let Some(raft_state) = self.raft_state.as_ref() else {
+                                    return self.fail_prepared_committed_write(
+                                        &transaction_id,
+                                        commit_ts,
+                                        "mark Raft applied index",
+                                        anyhow::anyhow!(
+                                            "2PC CommitPrepared txn={} returned Raft applied index \
+                                             {} without Raft state",
+                                            transaction_id,
+                                            raft_applied_index,
+                                        ),
+                                    );
+                                };
+                                if let Err(err) =
+                                    raft_state.mark_applied(raft_applied_index).await
+                                {
+                                    return self.fail_prepared_committed_write(
+                                        &transaction_id,
+                                        commit_ts,
+                                        "mark Raft applied index",
+                                        err,
+                                    );
+                                }
+                                raft_mark_timer.finish();
+                            }
+                            let use_raft_nats_outbox =
+                                Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
+                            if use_raft_nats_outbox
+                                && let Err(err) = Self::record_raft_nats_outbox_delta(
+                                    self.persistence.clone(),
+                                    &published_commit.delta,
+                                    "2pc_participant",
+                                )
+                                .await
+                            {
+                                return self.fail_prepared_committed_write(
+                                    &transaction_id,
+                                    commit_ts,
+                                    "record prepared committed write in Raft->NATS outbox",
+                                    err,
+                                );
+                            }
+                            if let Err(err) = Self::publish_commit_delta(
+                                self.distributed_log.clone(),
+                                published_commit.delta.clone(),
+                                "2pc_participant",
+                            )
+                            .await
+                            {
+                                if use_raft_nats_outbox {
+                                    tracing::error!(
+                                        "Failed to publish prepared committed write at ts={} to \
+                                         replication log; leaving Raft->NATS outbox entry for \
+                                         replay: {err:#}",
+                                        u64::from(commit_ts),
+                                    );
+                                } else {
+                                    return self.fail_prepared_committed_write(
+                                        &transaction_id,
+                                        commit_ts,
+                                        "publish prepared committed write to replication log",
+                                        err,
+                                    );
+                                }
+                            } else if use_raft_nats_outbox
+                                && let Err(err) = Self::clear_raft_nats_outbox_delta(
+                                    self.persistence.clone(),
+                                    commit_ts,
+                                    "2pc_participant",
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Published prepared committed write at ts={} to replication log \
+                                     but failed to clear Raft->NATS outbox entry: {err:#}",
+                                    u64::from(commit_ts),
+                                );
+                            }
+                            if let Err(err) = Self::delete_two_phase_redo(
+                                self.persistence.clone(),
+                                &transaction_id,
+                            )
+                            .await
+                            {
+                                return self.fail_prepared_committed_write(
+                                    &transaction_id,
+                                    commit_ts,
+                                    "delete prepared committed write redo",
+                                    err,
+                                );
+                            }
+                            self.send_prepared_commit_waiters(&transaction_id, Ok(commit_ts));
+                            if next_bump_wait.is_some() {
+                                next_bump_wait = Some(*MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY);
+                            }
+                        },
+                        PersistenceWrite::PreparedRejectedBeforePersistence {
+                            transaction_id,
+                            err,
+                            ..
+                        } => {
+                            self.send_prepared_commit_waiters(&transaction_id, Err(err));
+                        },
                         PersistenceWrite::MaxRepeatableTimestamp {
                             new_max_repeatable,
                             timer,
@@ -1036,6 +1194,26 @@ impl<RT: Runtime> Committer<RT> {
                         } => {
                             let span = committer_span.as_ref().map(|root| Span::enter_with_parent("publish_max_repeatable_ts", root)).unwrap_or_else(Span::noop);
                             span.set_local_parent();
+                            if let Some(min_prepared_ts) = self.prepared_writes.min_ts()
+                                && min_prepared_ts <= new_max_repeatable
+                            {
+                                tracing::debug!(
+                                    "Skipping max repeatable timestamp publish at ts={} behind \
+                                     unresolved 2PC prepared ts={}",
+                                    u64::from(new_max_repeatable),
+                                    u64::from(min_prepared_ts),
+                                );
+                                let current = *self.snapshot_manager
+                                    .read()
+                                    .persisted_max_repeatable_ts();
+                                let base_period = *MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY;
+                                next_bump_wait = Some(
+                                    self.runtime.rng().random_range(base_period..base_period * 2),
+                                );
+                                let _ = result.send(current);
+                                drop(timer);
+                                continue;
+                            }
                             self.publish_max_repeatable_ts(new_max_repeatable)?;
                             let base_period = *MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY;
                             next_bump_wait = Some(
@@ -1344,109 +1522,12 @@ impl<RT: Runtime> Committer<RT> {
                             transaction_id,
                             result,
                         }) => {
-                            let redo_transaction_id = transaction_id.clone();
-                            let published_commit = match self.handle_commit_prepared(transaction_id)
+                            if let Some(persistence_write_future) =
+                                self.start_commit_prepared(transaction_id, result, commit_id)
                             {
-                                Ok(published_commit) => published_commit,
-                                Err(err) => {
-                                    let _ = result.send(Err(err));
-                                    continue;
-                                },
-                            };
-                            let commit_ts = published_commit.commit_ts;
-                            if let Some(raft_applied_index) = published_commit.raft_applied_index {
-                                let raft_mark_timer = metrics::commit_hot_path_stage_timer(
-                                    "2pc_participant",
-                                    "raft_mark_applied",
-                                );
-                                let Some(raft_state) = self.raft_state.as_ref() else {
-                                    return Self::fail_committed_write(
-                                        result,
-                                        commit_ts,
-                                        "mark Raft applied index for prepared write",
-                                        anyhow::anyhow!(
-                                            "prepared commit returned Raft applied index {} without Raft state",
-                                            raft_applied_index,
-                                        ),
-                                    );
-                                };
-                                if let Err(err) =
-                                    raft_state.mark_applied(raft_applied_index).await
-                                {
-                                    return Self::fail_committed_write(
-                                        result,
-                                        commit_ts,
-                                        "mark Raft applied index for prepared write",
-                                        err,
-                                    );
-                                }
-                                raft_mark_timer.finish();
+                                self.persistence_writes.push_back(persistence_write_future);
+                                commit_id += 1;
                             }
-                            let use_raft_nats_outbox =
-                                Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
-                            if use_raft_nats_outbox
-                                && let Err(err) = Self::record_raft_nats_outbox_delta(
-                                    self.persistence.clone(),
-                                    &published_commit.delta,
-                                    "2pc_participant",
-                                )
-                                .await
-                            {
-                                return Self::fail_committed_write(
-                                    result,
-                                    commit_ts,
-                                    "record prepared write in Raft->NATS outbox",
-                                    err,
-                                );
-                            }
-                            if let Err(err) = Self::publish_commit_delta(
-                                self.distributed_log.clone(),
-                                published_commit.delta.clone(),
-                                "2pc_participant",
-                            )
-                            .await
-                            {
-                                if use_raft_nats_outbox {
-                                    tracing::error!(
-                                        "Failed to publish prepared write at ts={} to replication \
-                                         log; leaving Raft->NATS outbox entry for replay: {err:#}",
-                                        u64::from(commit_ts),
-                                    );
-                                } else {
-                                    return Self::fail_committed_write(
-                                        result,
-                                        commit_ts,
-                                        "publish prepared write to replication log",
-                                        err,
-                                    );
-                                }
-                            } else if use_raft_nats_outbox
-                                && let Err(err) = Self::clear_raft_nats_outbox_delta(
-                                    self.persistence.clone(),
-                                    commit_ts,
-                                    "2pc_participant",
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Published prepared write at ts={} to replication log but \
-                                     failed to clear Raft->NATS outbox entry: {err:#}",
-                                    u64::from(commit_ts),
-                                );
-                            }
-                            if let Err(err) = Self::delete_two_phase_redo(
-                                self.persistence.clone(),
-                                &redo_transaction_id,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "2PC CommitPrepared: committed txn={} but failed to delete \
-                                     redo: {err:#}",
-                                    redo_transaction_id,
-                                );
-                            }
-                            let _ = result.send(Ok(commit_ts));
                         },
                         Some(CommitterMessage::RollbackPrepared {
                             transaction_id,
@@ -1951,8 +2032,11 @@ impl<RT: Runtime> Committer<RT> {
         self.ensure_prepare_ownership(&writes, table_mapping, &write_source)?;
         self.validate_remote_read_frontiers(begin_ts, reads, table_mapping, &write_source)?;
 
-        let local_commit_floor =
-            cmp::max(self.log.max_ts(), *self.snapshot_manager.read().latest_ts()).succ()?;
+        let local_commit_floor = if allow_explicit_ts_rewrite {
+            self.replayed_prepare_commit_floor()?
+        } else {
+            cmp::max(self.log.max_ts(), *self.snapshot_manager.read().latest_ts()).succ()?
+        };
 
         if let Some(existing) = self.prepared_transactions.get(&transaction_id) {
             if let Some(commit_ts) = explicit_commit_ts {
@@ -2043,15 +2127,20 @@ impl<RT: Runtime> Committer<RT> {
         let (document_writes, index_writes, snapshot) =
             self.compute_writes(commit_ts, &ordered_update_refs)?;
 
-        let prepared_write = self.prepared_writes.insert(
-            commit_ts,
-            writes
-                .into_iter()
-                .map(|update| (update.id, PackedDocumentUpdate::pack(&update)))
-                .collect(),
-            write_source.clone(),
-            snapshot,
-        );
+        let prepared_write = self
+            .prepared_writes
+            .insert(
+                commit_ts,
+                writes
+                    .into_iter()
+                    .map(|update| (update.id, PackedDocumentUpdate::pack(&update)))
+                    .collect(),
+                write_source.clone(),
+                snapshot,
+            )
+            .with_context(|| {
+                format!("2PC Prepare failed to stage prepared intent for txn={transaction_id}")
+            })?;
 
         let mut write_bytes: u64 = 0;
         let doc_entries: Vec<DocumentLogEntry> = document_writes
@@ -2378,6 +2467,44 @@ impl<RT: Runtime> Committer<RT> {
             u64::from(commit_ts),
         );
         let _ = result.send(Err(anyhow::anyhow!(message.clone())));
+        anyhow::bail!(message)
+    }
+
+    fn send_prepared_commit_waiters(
+        &mut self,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+        result: anyhow::Result<Timestamp>,
+    ) {
+        let Some(waiters) = self.prepared_commit_waiters.remove(transaction_id) else {
+            return;
+        };
+        match result {
+            Ok(commit_ts) => {
+                for waiter in waiters {
+                    let _ = waiter.send(Ok(commit_ts));
+                }
+            },
+            Err(err) => {
+                let message = format!("{err:#}");
+                for waiter in waiters {
+                    let _ = waiter.send(Err(anyhow::anyhow!(message.clone())));
+                }
+            },
+        }
+    }
+
+    fn fail_prepared_committed_write(
+        &mut self,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+        commit_ts: Timestamp,
+        operation: &'static str,
+        err: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let message = format!(
+            "Failed to {operation} after prepared persistence commit at ts={}: {err:#}",
+            u64::from(commit_ts),
+        );
+        self.send_prepared_commit_waiters(transaction_id, Err(anyhow::anyhow!(message.clone())));
         anyhow::bail!(message)
     }
 
@@ -2768,7 +2895,6 @@ impl<RT: Runtime> Committer<RT> {
         apply_timer.finish();
         hot_path_apply_timer.finish();
         Ok(PublishedCommit {
-            commit_ts,
             delta,
             raft_applied_index: None,
         })
@@ -3025,12 +3151,12 @@ impl<RT: Runtime> Committer<RT> {
                 .min()
             && commit_ts >= min_prepared_ts
         {
-            let err = anyhow::anyhow!(
+            let err = anyhow::Error::new(RetryableReplicaApplyError::new(format!(
                 "Replica delta at ts={} would overtake unresolved 2PC prepared transaction at \
                  ts={}; retry after the prepared transaction commits or rolls back",
                 u64::from(commit_ts),
                 u64::from(min_prepared_ts),
-            );
+            )));
             let _ = result.send(Err(err));
             return Ok(());
         }
@@ -4148,26 +4274,86 @@ impl<RT: Runtime> Committer<RT> {
         Ok(result)
     }
 
-    /// Commit a previously prepared transaction: write to persistence,
-    /// publish to snapshot manager and write log, publish delta to NATS.
-    fn handle_commit_prepared(
+    /// Start committing a previously prepared transaction without blocking the
+    /// committer loop on Raft quorum or persistence I/O.
+    fn start_commit_prepared(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
-    ) -> anyhow::Result<PublishedCommit> {
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        commit_id: usize,
+    ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
+        if let Some(waiters) = self.prepared_commit_waiters.get_mut(&transaction_id) {
+            tracing::debug!(
+                "2PC CommitPrepared: txn={} already committing; attaching duplicate waiter",
+                transaction_id,
+            );
+            waiters.push(result);
+            return None;
+        }
+
         let redo_stage_timer =
             metrics::commit_hot_path_stage_timer("2pc_participant", "two_phase_redo");
-        self.stage_durable_two_phase_redo(&transaction_id, true)?;
+        if let Err(err) = self.stage_durable_two_phase_redo(&transaction_id, true) {
+            let _ = result.send(Err(err));
+            return None;
+        }
         redo_stage_timer.finish();
         let prepared = self
             .prepared_transactions
             .get(&transaction_id)
             .ok_or_else(|| {
                 anyhow::anyhow!("2PC CommitPrepared: unknown transaction {}", transaction_id)
-            })?;
+            });
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                let _ = result.send(Err(err));
+                return None;
+            },
+        };
         let commit_ts = prepared.commit_ts;
         let write_bytes = prepared.write_bytes;
-        let document_writes = prepared.document_writes.clone();
-        let index_writes = prepared.index_writes.clone();
+        if let Some(min_prepared_ts) = self.prepared_writes.min_ts()
+            && min_prepared_ts < commit_ts
+        {
+            tracing::debug!(
+                "2PC CommitPrepared: deferring txn={} at ts={} behind unresolved prepared ts={}",
+                transaction_id,
+                u64::from(commit_ts),
+                u64::from(min_prepared_ts),
+            );
+            let sender = self.sender.clone();
+            let rt = self.runtime.clone();
+            tokio_spawn(
+                "defer_commit_prepared_until_prior_intent_resolves",
+                async move {
+                    rt.wait(Duration::from_millis(5)).await;
+                    let message = CommitterMessage::CommitPrepared {
+                        transaction_id,
+                        result,
+                    };
+                    if let Err(err) = sender.try_send(message) {
+                        match err {
+                            TrySendError::Full(CommitterMessage::CommitPrepared {
+                                result, ..
+                            }) => {
+                                let _ = result.send(Err(metrics::committer_full_error().into()));
+                            },
+                            TrySendError::Closed(CommitterMessage::CommitPrepared {
+                                result,
+                                ..
+                            }) => {
+                                let _ = result.send(Err(metrics::shutdown_error()));
+                            },
+                            _ => {
+                                unreachable!("deferred CommitPrepared requeued a different message")
+                            },
+                        }
+                    }
+                },
+            );
+            return None;
+        }
 
         tracing::info!(
             "2PC CommitPrepared: txn={}, ts={}",
@@ -4175,14 +4361,17 @@ impl<RT: Runtime> Committer<RT> {
             u64::from(commit_ts),
         );
 
-        let (ordered_updates, write_source, snapshot) =
-            self.prepared_writes.get(commit_ts).ok_or_else(|| {
-                anyhow::anyhow!(
+        let (ordered_updates, write_source, snapshot) = match self.prepared_writes.get(commit_ts) {
+            Some(write) => write,
+            None => {
+                let _ = result.send(Err(anyhow::anyhow!(
                     "2PC CommitPrepared: prepared intent for txn={} at ts={} was missing",
                     transaction_id,
                     u64::from(commit_ts),
-                )
-            })?;
+                )));
+                return None;
+            },
+        };
         let source_partition = self
             .placement_state
             .as_ref()
@@ -4193,43 +4382,96 @@ impl<RT: Runtime> Committer<RT> {
             write_source.clone(),
             &snapshot,
             write_bytes,
-            document_writes.clone(),
-            index_writes.clone(),
+            prepared.document_writes.clone(),
+            prepared.index_writes.clone(),
             source_partition,
         );
-        let raft_commit_waiter = self.propose_commit_to_raft(&delta)?;
-        let raft_applied_index = block_in_place(|| {
-            let wait_future =
-                Self::wait_for_raft_commit(raft_commit_waiter, commit_ts, "2pc_participant");
-            let rt = tokio::runtime::Handle::current();
-            if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                futures::executor::block_on(wait_future)
-            } else {
-                rt.block_on(wait_future)
-            }
-        })?;
+        let raft_commit_waiter = match self.propose_commit_to_raft(&delta) {
+            Ok(waiter) => waiter,
+            Err(err) => {
+                let _ = result.send(Err(err));
+                return None;
+            },
+        };
 
-        // Write to persistence (same as normal commit path).
-        let persistence_stage_timer =
-            metrics::commit_hot_path_stage_timer("2pc_participant", "persistence_write");
-        let persistence_result = block_in_place(|| {
-            let write_future = async {
-                self.persistence
-                    .write(&document_writes, &index_writes, ConflictStrategy::Error)
-                    .await
-            };
-            let rt = tokio::runtime::Handle::current();
-            if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                futures::executor::block_on(write_future)
-            } else {
-                rt.block_on(write_future)
-            }
-        });
-        if persistence_result.is_ok() {
-            persistence_stage_timer.finish();
-        }
-        persistence_result?;
+        self.prepared_commit_waiters
+            .insert(transaction_id.clone(), vec![result]);
 
+        let persistence = self.persistence.clone();
+        let pause_client = self.runtime.pause_client();
+        let rt = self.runtime.clone();
+        Some(
+            async move {
+                let raft_applied_index = match Self::wait_for_raft_commit(
+                    raft_commit_waiter,
+                    commit_ts,
+                    "2pc_participant",
+                )
+                .await
+                {
+                    Ok(index) => index,
+                    Err(err) => {
+                        return Ok(PersistenceWrite::PreparedRejectedBeforePersistence {
+                            transaction_id,
+                            commit_id,
+                            err,
+                        });
+                    },
+                };
+                let persistence_stage_timer =
+                    metrics::commit_hot_path_stage_timer("2pc_participant", "persistence_write");
+                let mut backoff = Backoff::new(
+                    INITIAL_PERSISTENCE_WRITES_BACKOFF,
+                    MAX_PERSISTENCE_WRITES_BACKOFF,
+                );
+                loop {
+                    let name = "CommitPrepared::write_to_persistence";
+                    let handle = AbortOnDropHandle::new(tokio_spawn(
+                        name,
+                        Self::write_to_persistence(
+                            persistence.clone(),
+                            delta.index_writes.clone(),
+                            delta.document_writes.clone(),
+                            delta.write_source.clone(),
+                        )
+                        .in_span(Span::enter_with_local_parent(name)),
+                    ));
+                    if let Err(mut e) = handle.await? {
+                        if e.is::<DatabaseTimeoutError>() || e.is::<DatabaseOperationalError>() {
+                            let delay = backoff.fail(&mut rt.rng());
+                            tracing::error!(
+                                "Failed to commit prepared transaction because database timed out"
+                            );
+                            report_error(&mut e).await;
+                            rt.wait(delay).await;
+                        } else {
+                            return Err(e);
+                        }
+                    } else {
+                        pause_client.wait(AFTER_PENDING_WRITE_SNAPSHOT).await;
+                        persistence_stage_timer.finish();
+                        return Ok(PersistenceWrite::PreparedCommit {
+                            transaction_id,
+                            commit_id,
+                            delta,
+                            raft_applied_index,
+                        });
+                    }
+                }
+            }
+            .boxed(),
+        )
+    }
+
+    /// Publish a prepared transaction after Raft quorum and persistence have
+    /// already succeeded.
+    fn publish_prepared_commit(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        delta: CommitDelta,
+        raft_applied_index: Option<u64>,
+    ) -> anyhow::Result<PublishedCommit> {
+        let commit_ts = delta.ts;
         let prepared = self
             .prepared_transactions
             .remove(&transaction_id)
@@ -4254,6 +4496,14 @@ impl<RT: Runtime> Committer<RT> {
             intent_ts,
             prepared.commit_ts,
         );
+        anyhow::ensure!(
+            commit_ts == prepared.commit_ts,
+            "2PC CommitPrepared: persisted delta for txn={} had ts={} but transaction expected \
+             ts={}",
+            transaction_id,
+            commit_ts,
+            prepared.commit_ts,
+        );
 
         // Publish commit — makes writes visible to reads.
         let mut published_commit = self.publish_commit_from_updates(
@@ -4273,6 +4523,12 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.prepared_commit_waiters.contains_key(&transaction_id),
+            "2PC RollbackPrepared: transaction {} is already committing",
+            transaction_id,
+        );
+
         if !self.prepared_transactions.contains_key(&transaction_id)
             && Self::block_on_current_runtime(Self::load_two_phase_redo_records(
                 self.persistence.clone(),
@@ -4720,6 +4976,12 @@ impl<RT: Runtime> Committer<RT> {
         ))
     }
 
+    fn replayed_prepare_commit_floor(&self) -> anyhow::Result<Timestamp> {
+        let log_floor = self.log.max_ts().succ()?;
+        let latest_ts = self.snapshot_manager.read().latest_ts();
+        Ok(cmp::max(log_floor, latest_ts.succ()?))
+    }
+
     fn next_max_repeatable_ts(&mut self) -> anyhow::Result<Timestamp> {
         if !self.prepared_transactions.is_empty() {
             let current = *self.snapshot_manager.read().persisted_max_repeatable_ts();
@@ -5079,13 +5341,6 @@ impl CommitterClient {
             )
         });
 
-        self.wait_for_remote_read_frontiers(
-            *transaction.begin_timestamp,
-            transaction.reads.read_set(),
-            &write_source,
-        )
-        .await?;
-
         // Note that we do a best effort validation for memory index sizes. We
         // use the latest snapshot instead of the transaction base snapshot. This
         // is both more accurate and also avoids pedant hitting transient errors.
@@ -5098,7 +5353,14 @@ impl CommitterClient {
             match transaction_classification
                 .expect("partitioned commit should always classify the finalized transaction")
             {
-                crate::two_phase_coordinator::TransactionClassification::SinglePartition => {},
+                crate::two_phase_coordinator::TransactionClassification::SinglePartition => {
+                    self.wait_for_remote_read_frontiers(
+                        *transaction.begin_timestamp,
+                        transaction.reads.read_set(),
+                        &write_source,
+                    )
+                    .await?;
+                },
                 crate::two_phase_coordinator::TransactionClassification::RemoteSinglePartition {
                     owner,
                 } => {

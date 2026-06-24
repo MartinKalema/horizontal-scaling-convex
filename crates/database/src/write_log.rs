@@ -795,14 +795,13 @@ impl PreparedWrites {
         writes: OrderedDocumentWrites,
         write_source: WriteSource,
         snapshot: Snapshot,
-    ) -> PreparedWriteHandle {
-        assert!(
-            self.by_ts
-                .insert(ts, (writes, write_source, snapshot))
-                .is_none(),
+    ) -> anyhow::Result<PreparedWriteHandle> {
+        anyhow::ensure!(
+            !self.by_ts.contains_key(&ts),
             "prepared write already staged at {ts}",
         );
-        PreparedWriteHandle(Some(ts))
+        self.by_ts.insert(ts, (writes, write_source, snapshot));
+        Ok(PreparedWriteHandle(Some(ts)))
     }
 
     pub fn iter(
@@ -844,6 +843,10 @@ impl PreparedWrites {
         self.by_ts.get(&ts).map(|(writes, write_source, snapshot)| {
             (writes.clone(), write_source.clone(), snapshot.clone())
         })
+    }
+
+    pub fn min_ts(&self) -> Option<Timestamp> {
+        self.by_ts.keys().next().copied()
     }
 
     pub fn len(&self) -> usize {

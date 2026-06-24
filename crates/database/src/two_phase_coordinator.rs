@@ -206,7 +206,7 @@ async fn prepare_participant(
         let node_addresses = node_addresses.with_context(|| {
             format!(
                 "NODE_ADDRESSES is required to route this transaction to the authoritative owner \
-                 {participant}"
+                 {participant}. Route this mutation to the correct partition owner."
             )
         })?;
         let addresses = node_addresses
