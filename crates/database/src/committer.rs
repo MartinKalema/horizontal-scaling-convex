@@ -5007,9 +5007,14 @@ impl<RT: Runtime> Committer<RT> {
     fn explicit_prepare_commit_floor(&self) -> anyhow::Result<Timestamp> {
         let log_floor = self.log.max_ts().succ()?;
         let latest_ts = self.snapshot_manager.read().latest_ts();
+        let queued_floor = self
+            .latest_queued_snapshot()
+            .map(|(ts, _)| ts.succ())
+            .transpose()?
+            .unwrap_or(Timestamp::MIN);
         Ok(cmp::max(
             log_floor,
-            cmp::max(latest_ts.succ()?, self.last_assigned_ts),
+            cmp::max(latest_ts.succ()?, queued_floor),
         ))
     }
 

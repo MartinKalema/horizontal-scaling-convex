@@ -3198,7 +3198,7 @@ async fn test_raft_prepared_redo_rewrite_allocates_unique_local_prepare_timestam
 }
 
 #[convex_macro::test_runtime]
-async fn test_live_prepare_rejects_timestamp_below_last_assigned(
+async fn test_live_prepare_rejects_timestamp_below_local_write_floor(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
@@ -3267,19 +3267,12 @@ async fn test_live_prepare_rejects_timestamp_below_last_assigned(
     let txn_id = TwoPhaseTransactionId::new();
     let prepare_ts = source.committer_for_test().allocate_commit_ts().await?;
 
-    participant
-        .committer_for_test()
-        .apply_replica_delta(CommitDelta {
-            ts: prepare_ts.succ()?,
-            document_writes: Arc::new(Vec::new()),
-            document_updates: Vec::new(),
-            index_writes: Arc::new(Vec::new()),
-            write_source: WriteSource::new("live_prepare_floor_heartbeat_test"),
-            write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
-            source_partition: Some(PartitionId(0)),
-        })
-        .await?;
+    insert_doc(
+        &participant,
+        "projects",
+        assert_obj!("name" => "live-prepare-local-floor-advancer"),
+    )
+    .await?;
 
     let err = participant
         .committer_for_test()
@@ -3291,11 +3284,83 @@ async fn test_live_prepare_rejects_timestamp_below_last_assigned(
             vec![PartitionId(1)],
         )
         .await
-        .expect_err("live prepare should reject a timestamp below the local assigned floor");
+        .expect_err("live prepare should reject a timestamp below the local write floor");
     assert!(
         format!("{err:#}").contains("2PC Prepare assigned ts="),
         "unexpected error: {err:#}",
     );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_live_prepare_allows_timestamp_below_uncommitted_reservation(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let table_number_allocator = Arc::new(InMemoryTableNumberAllocator::default());
+    let node = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_number_allocator,
+    )
+    .await?;
+
+    insert_doc(
+        &node,
+        "projects",
+        assert_obj!("name" => "seed-before-concurrent-prepare-floor"),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "live-prepare-below-reserved-timestamp"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("live_prepare_below_reserved_timestamp_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    let later_reserved_ts = node.committer_for_test().allocate_commit_ts().await?;
+    assert!(
+        later_reserved_ts > prepare_ts,
+        "test setup expected a later reserved timestamp",
+    );
+
+    let result = node
+        .committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+    assert_eq!(result.prepare_ts, prepare_ts);
+
+    node.committer_for_test().rollback_prepared(txn_id).await?;
 
     Ok(())
 }
