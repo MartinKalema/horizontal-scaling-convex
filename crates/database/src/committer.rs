@@ -2063,7 +2063,7 @@ impl<RT: Runtime> Committer<RT> {
         let local_commit_floor = if allow_explicit_ts_rewrite {
             self.replayed_prepare_commit_floor()?
         } else {
-            cmp::max(self.log.max_ts(), *self.snapshot_manager.read().latest_ts()).succ()?
+            self.explicit_prepare_commit_floor()?
         };
 
         if let Some(existing) = self.prepared_transactions.get(&transaction_id) {
@@ -5001,6 +5001,15 @@ impl<RT: Runtime> Committer<RT> {
         Ok(cmp::max(
             log_floor,
             cmp::max(latest_ts.succ()?, self.last_assigned_ts.succ()?),
+        ))
+    }
+
+    fn explicit_prepare_commit_floor(&self) -> anyhow::Result<Timestamp> {
+        let log_floor = self.log.max_ts().succ()?;
+        let latest_ts = self.snapshot_manager.read().latest_ts();
+        Ok(cmp::max(
+            log_floor,
+            cmp::max(latest_ts.succ()?, self.last_assigned_ts),
         ))
     }
 
