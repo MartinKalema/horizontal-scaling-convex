@@ -849,6 +849,10 @@ impl PreparedWrites {
         self.by_ts.keys().next().copied()
     }
 
+    pub fn max_ts(&self) -> Option<Timestamp> {
+        self.by_ts.keys().next_back().copied()
+    }
+
     pub fn len(&self) -> usize {
         self.by_ts.len()
     }
