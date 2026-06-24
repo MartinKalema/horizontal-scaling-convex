@@ -349,6 +349,22 @@ fn stale_replica_frontiers(
         .collect()
 }
 
+fn merge_partition_timestamp_max(
+    current: &BTreeMap<crate::partition::PartitionId, Timestamp>,
+    proposed: BTreeMap<crate::partition::PartitionId, Timestamp>,
+) -> BTreeMap<crate::partition::PartitionId, Timestamp> {
+    let mut merged = current.clone();
+    for (partition, ts) in proposed {
+        if merged
+            .get(&partition)
+            .is_none_or(|current_ts| *current_ts < ts)
+        {
+            merged.insert(partition, ts);
+        }
+    }
+    merged
+}
+
 fn compact_checkpoint_documents(checkpoint: &CheckpointData) -> Vec<DocumentLogEntry> {
     let mut latest_documents = BTreeMap::new();
     for entry in &checkpoint.documents {
@@ -1247,6 +1263,10 @@ impl<RT: Runtime> Committer<RT> {
                                 self.log.append(commit_ts, writes, write_source);
                             }
                             if let Some(frontiers) = applied_delta_watermarks {
+                                let frontiers = merge_partition_timestamp_max(
+                                    &self.applied_delta_watermarks,
+                                    frontiers,
+                                );
                                 self.persistence
                                     .write_persistence_global(
                                         PersistenceGlobalKey::AppliedDeltaWatermarks,
@@ -1256,6 +1276,10 @@ impl<RT: Runtime> Committer<RT> {
                                 self.applied_delta_watermarks = frontiers;
                             }
                             if let Some(frontiers) = applied_data_delta_watermarks {
+                                let frontiers = merge_partition_timestamp_max(
+                                    &self.applied_data_delta_watermarks,
+                                    frontiers,
+                                );
                                 self.persistence
                                     .write_persistence_global(
                                         PersistenceGlobalKey::AppliedDataDeltaWatermarks,
@@ -1321,6 +1345,10 @@ impl<RT: Runtime> Committer<RT> {
                             result,
                             ..
                         } => {
+                            let applied_delta_watermarks = merge_partition_timestamp_max(
+                                &self.applied_delta_watermarks,
+                                applied_delta_watermarks,
+                            );
                             self.persistence
                                 .write_persistence_global(
                                     PersistenceGlobalKey::AppliedDeltaWatermarks,
