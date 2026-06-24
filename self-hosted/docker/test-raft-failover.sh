@@ -161,16 +161,26 @@ write_to_either_survivor() {
     local prefix="$1"
     local text="$2"
     shift 2
-    while [ "$#" -gt 0 ]; do
-        local url="$1"
-        local key="$2"
-        shift 2
-        local response
-        response=$(mutate "$url" "$key" "$prefix-$text" 2>&1 || echo "FAIL")
-        if echo "$response" | grep -q "success"; then
-            return 0
-        fi
+    local endpoints=("$@")
+    local last_response=""
+    # Leader changes can leave a short no-leader window. Treat availability as
+    # bounded retry success instead of a single unlucky sample during election.
+    for _ in $(seq 1 30); do
+        set -- "${endpoints[@]}"
+        while [ "$#" -gt 0 ]; do
+            local url="$1"
+            local key="$2"
+            shift 2
+            local response
+            response=$(mutate "$url" "$key" "$prefix-$text" 2>&1 || echo "FAIL")
+            if echo "$response" | grep -q "success"; then
+                return 0
+            fi
+            last_response="$response"
+        done
+        sleep 1
     done
+    [ -n "$last_response" ] && echo "$last_response" >&2
     return 1
 }
 
