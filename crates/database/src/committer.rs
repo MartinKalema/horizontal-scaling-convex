@@ -4979,7 +4979,16 @@ impl<RT: Runtime> Committer<RT> {
     fn replayed_prepare_commit_floor(&self) -> anyhow::Result<Timestamp> {
         let log_floor = self.log.max_ts().succ()?;
         let latest_ts = self.snapshot_manager.read().latest_ts();
-        Ok(cmp::max(log_floor, latest_ts.succ()?))
+        let prepared_floor = self
+            .prepared_writes
+            .max_ts()
+            .map(|ts| ts.succ())
+            .transpose()?
+            .unwrap_or(Timestamp::MIN);
+        Ok(cmp::max(
+            prepared_floor,
+            cmp::max(log_floor, latest_ts.succ()?),
+        ))
     }
 
     fn next_max_repeatable_ts(&mut self) -> anyhow::Result<Timestamp> {
