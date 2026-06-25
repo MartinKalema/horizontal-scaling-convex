@@ -2176,6 +2176,49 @@ async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
 }
 
 #[convex_macro::test_runtime]
+async fn test_partitioned_commit_records_nats_outbox_when_publish_unavailable(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let replay_log = Arc::new(SwitchableDistributedLog::failing());
+    let persistence = Arc::new(TestPersistence::new());
+    let db = create_node_with_custom_distributed_log(
+        &rt,
+        persistence.clone(),
+        replay_log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        Arc::new(InMemoryTableNumberAllocator::default()),
+    )
+    .await?;
+
+    let commit_ts = insert_doc(
+        &db,
+        "messages",
+        assert_obj!("body" => "accepted while nats is unavailable"),
+    )
+    .await?;
+
+    let outbox = persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+        .await?
+        .context("partitioned local commit should record a Raft->NATS outbox entry")?;
+    let records: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_value(outbox)?;
+    assert_eq!(
+        records.len(),
+        1,
+        "failed NATS publish should leave the accepted local commit in the outbox",
+    );
+    assert!(records.contains_key(&u64::from(commit_ts).to_string()));
+    assert!(
+        replay_log.published().is_empty(),
+        "the failing log must not observe a successful publish",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_frontier_heartbeat_does_not_dedupe_later_data_delta(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
