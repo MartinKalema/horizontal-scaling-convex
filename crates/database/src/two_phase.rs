@@ -137,6 +137,8 @@ pub enum TwoPhaseDecision {
         participant_intents: Vec<TwoPhaseParticipantIntent>,
         transaction_digest: TwoPhaseTransactionDigest,
         #[serde(default)]
+        staged_at_unix_millis: Option<u64>,
+        #[serde(default)]
         resolved_participants: Vec<u32>,
     },
     /// All participants prepared successfully. Commit.
@@ -218,6 +220,7 @@ impl TwoPhaseDecision {
             participants,
             participant_intents,
             transaction_digest,
+            staged_at_unix_millis: Some(now_unix_millis()),
             resolved_participants: Vec::new(),
         }
     }
@@ -308,6 +311,34 @@ impl TwoPhaseDecision {
         }
     }
 
+    pub fn committed_from_staging(&self) -> Option<Self> {
+        match self {
+            Self::Staging {
+                commit_ts,
+                participants,
+                resolved_participants,
+                ..
+            } if self.all_participants_staged() => Some(Self::Committed {
+                commit_ts: *commit_ts,
+                participants: participants.clone(),
+                resolved_participants: resolved_participants.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn staged_age(&self) -> Option<Duration> {
+        let Self::Staging {
+            staged_at_unix_millis: Some(staged_at),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let now = now_unix_millis();
+        Some(Duration::from_millis(now.saturating_sub(*staged_at)))
+    }
+
     pub fn mark_participant_staged(&mut self, intent: TwoPhaseParticipantIntent) {
         let Self::Staging {
             participants,
@@ -356,6 +387,14 @@ impl TwoPhaseDecision {
             .iter()
             .all(|participant| self.resolved_participants().contains(participant))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StagingRecoveryResult {
+    Missing,
+    Pending(TwoPhaseDecision),
+    Committed(TwoPhaseDecision),
+    AlreadyFinal(TwoPhaseDecision),
 }
 
 /// Result from a successful Prepare on a participant.
@@ -567,6 +606,24 @@ pub mod testing {
             Ok(Some(decision.clone()))
         }
 
+        async fn recover_staging_decision(
+            &self,
+            transaction_id: &TwoPhaseTransactionId,
+        ) -> anyhow::Result<StagingRecoveryResult> {
+            let mut decisions = self.decisions.lock();
+            let Some(decision) = decisions.get_mut(&transaction_id.0) else {
+                return Ok(StagingRecoveryResult::Missing);
+            };
+            if !decision.is_staging() {
+                return Ok(StagingRecoveryResult::AlreadyFinal(decision.clone()));
+            }
+            let Some(committed) = decision.committed_from_staging() else {
+                return Ok(StagingRecoveryResult::Pending(decision.clone()));
+            };
+            *decision = committed.clone();
+            Ok(StagingRecoveryResult::Committed(committed))
+        }
+
         async fn delete_decision(
             &self,
             transaction_id: &TwoPhaseTransactionId,
@@ -626,6 +683,11 @@ pub trait TwoPhaseDecisionLog: Send + Sync + 'static {
         intent: TwoPhaseParticipantIntent,
     ) -> anyhow::Result<Option<TwoPhaseDecision>>;
 
+    async fn recover_staging_decision(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+    ) -> anyhow::Result<StagingRecoveryResult>;
+
     async fn delete_decision(&self, transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()>;
 }
 
@@ -663,6 +725,13 @@ impl TwoPhaseDecisionLog for NoopTwoPhaseDecisionLog {
         _intent: TwoPhaseParticipantIntent,
     ) -> anyhow::Result<Option<TwoPhaseDecision>> {
         Ok(None)
+    }
+
+    async fn recover_staging_decision(
+        &self,
+        _transaction_id: &TwoPhaseTransactionId,
+    ) -> anyhow::Result<StagingRecoveryResult> {
+        Ok(StagingRecoveryResult::Missing)
     }
 
     async fn delete_decision(&self, _transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()> {
@@ -848,6 +917,57 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
         anyhow::bail!(
             "2PC: Failed to mark participant {} staged for {transaction_id} after CAS retries",
             intent.partition_id,
+        )
+    }
+
+    async fn recover_staging_decision(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+    ) -> anyhow::Result<StagingRecoveryResult> {
+        let key = two_phase_decision_key(transaction_id);
+        for _ in 0..10 {
+            let Some(entry) =
+                self.kv.entry(key.clone()).await.with_context(|| {
+                    format!("2PC: Failed to read decision for {transaction_id}")
+                })?
+            else {
+                return Ok(StagingRecoveryResult::Missing);
+            };
+            let Some(decision) =
+                parse_nats_decision_entry(transaction_id, entry.operation, &entry.value)?
+            else {
+                return Ok(StagingRecoveryResult::Missing);
+            };
+            if !decision.is_staging() {
+                return Ok(StagingRecoveryResult::AlreadyFinal(decision));
+            }
+            let Some(committed) = decision.committed_from_staging() else {
+                return Ok(StagingRecoveryResult::Pending(decision));
+            };
+            let payload = serde_json::to_vec(&committed).with_context(|| {
+                format!("2PC: Failed to serialize recovered decision for {transaction_id}")
+            })?;
+            match self
+                .kv
+                .update(key.clone(), payload.into(), entry.revision)
+                .await
+            {
+                Ok(_) => return Ok(StagingRecoveryResult::Committed(committed)),
+                Err(err)
+                    if err.kind()
+                        == async_nats::jetstream::kv::UpdateErrorKind::WrongLastRevision =>
+                {
+                    continue;
+                },
+                Err(err) => {
+                    anyhow::bail!(
+                        "2PC: Failed to recover staging decision for {transaction_id}: {err:#}"
+                    );
+                },
+            }
+        }
+        anyhow::bail!(
+            "2PC: Failed to recover staging decision for {transaction_id} after CAS retries"
         )
     }
 
@@ -1568,6 +1688,7 @@ mod tests {
                 participants,
                 participant_intents,
                 transaction_digest,
+                staged_at_unix_millis,
                 resolved_participants,
             } => {
                 assert_eq!(commit_ts, 12345);
@@ -1580,6 +1701,7 @@ mod tests {
                     ]
                 );
                 assert_eq!(Some(&transaction_digest), decision.transaction_digest(),);
+                assert!(staged_at_unix_millis.is_some());
                 assert!(resolved_participants.is_empty());
             },
             _ => panic!("Wrong variant"),
@@ -1734,6 +1856,82 @@ mod tests {
                     participant_intent(0, 12345, "participant-zero"),
                     participant_intent(1, 12345, "participant-one"),
                 ],
+            );
+        });
+    }
+
+    #[test]
+    fn test_in_memory_decision_log_recovers_complete_staging_to_committed() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("staging-recovery".to_string());
+            let staging = TwoPhaseDecision::staging(
+                12345,
+                vec![0, 1],
+                vec![
+                    participant_intent(0, 12345, "participant-zero"),
+                    participant_intent(1, 12345, "participant-one"),
+                ],
+            );
+            log.write_decision(&txn_id, &staging).await.unwrap();
+
+            let result = log.recover_staging_decision(&txn_id).await.unwrap();
+            let StagingRecoveryResult::Committed(TwoPhaseDecision::Committed {
+                commit_ts,
+                participants,
+                resolved_participants,
+            }) = result
+            else {
+                panic!("expected committed recovery");
+            };
+            assert_eq!(commit_ts, 12345);
+            assert_eq!(participants, vec![0, 1]);
+            assert!(resolved_participants.is_empty());
+            assert_eq!(
+                log.get_decision(&txn_id).await.unwrap(),
+                Some(TwoPhaseDecision::committed(12345, vec![0, 1])),
+            );
+        });
+    }
+
+    #[test]
+    fn test_in_memory_decision_log_leaves_incomplete_staging_pending() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("staging-pending".to_string());
+            let staging = TwoPhaseDecision::staging(
+                12345,
+                vec![0, 1],
+                vec![participant_intent(0, 12345, "participant-zero")],
+            );
+            log.write_decision(&txn_id, &staging).await.unwrap();
+
+            let result = log.recover_staging_decision(&txn_id).await.unwrap();
+            assert_eq!(result, StagingRecoveryResult::Pending(staging.clone()));
+            assert_eq!(log.get_decision(&txn_id).await.unwrap(), Some(staging));
+        });
+    }
+
+    #[test]
+    fn test_in_memory_decision_log_recovery_is_idempotent_after_final_decision() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("staging-idempotent-recovery".to_string());
+            let staging = TwoPhaseDecision::staging(
+                12345,
+                vec![0],
+                vec![participant_intent(0, 12345, "participant-zero")],
+            );
+            log.write_decision(&txn_id, &staging).await.unwrap();
+            assert!(matches!(
+                log.recover_staging_decision(&txn_id).await.unwrap(),
+                StagingRecoveryResult::Committed(_),
+            ));
+
+            let result = log.recover_staging_decision(&txn_id).await.unwrap();
+            assert_eq!(
+                result,
+                StagingRecoveryResult::AlreadyFinal(TwoPhaseDecision::committed(12345, vec![0])),
             );
         });
     }

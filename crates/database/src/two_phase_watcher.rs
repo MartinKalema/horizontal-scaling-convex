@@ -17,8 +17,10 @@ use common::runtime::Runtime;
 
 use crate::{
     committer::CommitterClient,
+    metrics,
     partition::PartitionId,
     two_phase::{
+        StagingRecoveryResult,
         TwoPhaseDecision,
         TwoPhaseTransactionId,
         PREPARE_TIMEOUT_SECS,
@@ -27,24 +29,14 @@ use crate::{
     },
 };
 
-/// Apply an existing durable 2PC decision to this local participant.
-pub async fn resolve_decision_for_local_partition(
+async fn apply_final_decision_for_local_partition(
     committer: &CommitterClient,
     local_partition: PartitionId,
-    txn_id: TwoPhaseTransactionId,
+    txn_id: &TwoPhaseTransactionId,
     decision: TwoPhaseDecision,
 ) -> anyhow::Result<bool> {
-    let resolved = match decision {
-        TwoPhaseDecision::Staging { .. } => {
-            // True parallel-commit status recovery is added in a follow-up
-            // issue. Until then, Staging is metadata-only and must not be
-            // interpreted as either commit or rollback by the legacy watcher.
-            tracing::debug!(
-                "2PC Watcher: staging txn={} needs transaction status recovery",
-                txn_id,
-            );
-            false
-        },
+    match decision {
+        TwoPhaseDecision::Staging { .. } => Ok(false),
         TwoPhaseDecision::Committed { participants, .. } => {
             if !participants.contains(&local_partition.0) {
                 return Ok(false);
@@ -59,7 +51,7 @@ pub async fn resolve_decision_for_local_partition(
                         txn_id,
                         u64::from(ts),
                     );
-                    true
+                    Ok(true)
                 },
                 Err(e) => {
                     // "unknown transaction" means it was already committed or
@@ -69,12 +61,12 @@ pub async fn resolve_decision_for_local_partition(
                             "2PC Watcher: committed txn={} already resolved locally",
                             txn_id,
                         );
-                        true
+                        Ok(true)
                     } else {
                         tracing::debug!(
                             "2PC Watcher: CommitPrepared for {txn_id} not ready: {e:#}"
                         );
-                        false
+                        Ok(false)
                     }
                 },
             }
@@ -90,20 +82,80 @@ pub async fn resolve_decision_for_local_partition(
                         "2PC Watcher: rolled back txn={} locally or it was already gone",
                         txn_id,
                     );
-                    true
+                    Ok(true)
                 },
                 Err(e) if e.to_string().contains("unknown transaction") => {
                     tracing::debug!(
                         "2PC Watcher: rollback txn={} already resolved locally",
                         txn_id,
                     );
-                    true
+                    Ok(true)
                 },
                 Err(e) => {
                     tracing::debug!("2PC Watcher: RollbackPrepared for {txn_id} not ready: {e:#}");
+                    Ok(false)
+                },
+            }
+        },
+    }
+}
+
+/// Apply an existing durable 2PC decision to this local participant.
+pub async fn resolve_decision_for_local_partition(
+    committer: &CommitterClient,
+    local_partition: PartitionId,
+    txn_id: TwoPhaseTransactionId,
+    decision: TwoPhaseDecision,
+) -> anyhow::Result<bool> {
+    let resolved = match decision {
+        TwoPhaseDecision::Staging { .. } => {
+            let decision_log = committer.two_phase_decision_log();
+            match decision_log.recover_staging_decision(&txn_id).await? {
+                StagingRecoveryResult::Committed(recovered) => {
+                    metrics::log_two_phase_staging_recovery("committed");
+                    apply_final_decision_for_local_partition(
+                        committer,
+                        local_partition,
+                        &txn_id,
+                        recovered,
+                    )
+                    .await?
+                },
+                StagingRecoveryResult::AlreadyFinal(recovered) => {
+                    metrics::log_two_phase_staging_recovery("already_final");
+                    apply_final_decision_for_local_partition(
+                        committer,
+                        local_partition,
+                        &txn_id,
+                        recovered,
+                    )
+                    .await?
+                },
+                StagingRecoveryResult::Pending(pending) => {
+                    metrics::log_two_phase_staging_recovery("pending");
+                    if let Some(age) = pending.staged_age() {
+                        metrics::log_two_phase_staging_age(age);
+                    }
+                    tracing::debug!(
+                        "2PC Watcher: staging txn={} still missing participant proofs",
+                        txn_id,
+                    );
+                    false
+                },
+                StagingRecoveryResult::Missing => {
+                    metrics::log_two_phase_staging_recovery("missing");
                     false
                 },
             }
+        },
+        final_decision => {
+            apply_final_decision_for_local_partition(
+                committer,
+                local_partition,
+                &txn_id,
+                final_decision,
+            )
+            .await?
         },
     };
 
