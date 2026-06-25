@@ -62,7 +62,10 @@ use common::{
         Timestamp,
     },
 };
-use futures::TryStreamExt;
+use futures::{
+    stream::BoxStream,
+    TryStreamExt,
+};
 use keybroker::Identity;
 use parking_lot::Mutex;
 use pb::replication::{
@@ -104,6 +107,8 @@ use crate::{
     commit_delta::{
         testing::InMemoryDistributedLog,
         CommitDelta,
+        DistributedLog,
+        ReplicationMessage,
     },
     committer::{
         CommitterClient,
@@ -270,6 +275,78 @@ async fn create_node_with_persistence_and_table_number_allocator(
     let handle = db.start_search_and_vector_bootstrap();
     handle.join().await?;
     Ok(db)
+}
+
+async fn create_node_with_custom_distributed_log(
+    rt: &TestRuntime,
+    tp: Arc<TestPersistence>,
+    distributed_log: Arc<dyn DistributedLog>,
+    partition_map: Option<PartitionMap>,
+    table_number_allocator: Arc<dyn TableNumberAllocator>,
+) -> anyhow::Result<Database<TestRuntime>> {
+    let searcher: Arc<dyn search::Searcher> = Arc::new(SearcherStub {});
+    let (deleted_tablet_sender, _) = tokio::sync::mpsc::channel(100);
+    let db = Database::load(
+        tp,
+        rt.clone(),
+        searcher,
+        ShutdownSignal::panic(),
+        Default::default(),
+        None,
+        Arc::new(new_unlimited_rate_limiter(rt.clone())),
+        deleted_tablet_sender,
+        distributed_log,
+        false,
+        partition_map,
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        None,
+        table_number_allocator,
+        None,
+    )
+    .await?;
+    db.set_search_storage(Arc::new(LocalDirStorage::new(rt.clone())?));
+    let handle = db.start_search_and_vector_bootstrap();
+    handle.join().await?;
+    Ok(db)
+}
+
+#[derive(Default)]
+struct SwitchableDistributedLog {
+    fail_publishes: AtomicBool,
+    published: Mutex<Vec<Timestamp>>,
+}
+
+impl SwitchableDistributedLog {
+    fn failing() -> Self {
+        Self {
+            fail_publishes: AtomicBool::new(true),
+            published: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn published(&self) -> Vec<Timestamp> {
+        self.published.lock().clone()
+    }
+}
+
+#[async_trait]
+impl DistributedLog for SwitchableDistributedLog {
+    async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+        if self.fail_publishes.load(Ordering::SeqCst) {
+            anyhow::bail!("injected replication publish failure");
+        }
+        self.published.lock().push(delta.ts);
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        _from_ts: Timestamp,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+        Ok(Box::pin(futures::stream::pending()))
+    }
 }
 
 fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
@@ -2033,6 +2110,66 @@ async fn test_replica_delta_redelivery_is_idempotent(rt: TestRuntime) -> anyhow:
         persisted_document_log_count(&node_a_persistence).await?,
         docs_after_first_apply,
         "redelivered delta after restart must not append duplicate document log entries",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let source_log = Arc::new(InMemoryDistributedLog::new());
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_table_number_allocator(
+        &rt,
+        source_log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers.clone(),
+    )
+    .await?;
+
+    insert_doc(&source, "projects", assert_obj!("name" => "raft-outbox")).await?;
+    let delta = source_log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("source partition insert should publish a delta");
+    assert_eq!(delta.source_partition, Some(PartitionId(1)));
+    let delta_ts = delta.ts;
+
+    let replay_log = Arc::new(SwitchableDistributedLog::failing());
+    let follower_persistence = Arc::new(TestPersistence::new());
+    let follower = create_node_with_custom_distributed_log(
+        &rt,
+        follower_persistence.clone(),
+        replay_log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers,
+    )
+    .await?;
+
+    follower
+        .committer_for_test()
+        .apply_raft_commit_delta(delta)
+        .await?;
+
+    let outbox = follower_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+        .await?
+        .context("Raft follower apply should record the delta before NATS publish")?;
+    let records: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_value(outbox)?;
+    assert_eq!(
+        records.len(),
+        1,
+        "failed NATS publish should leave the Raft-applied delta in the outbox",
+    );
+    assert!(records.contains_key(&u64::from(delta_ts).to_string()));
+    assert!(
+        replay_log.published().is_empty(),
+        "the failing log must not observe a successful publish before recovery",
     );
 
     Ok(())
