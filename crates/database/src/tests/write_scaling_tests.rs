@@ -5042,6 +5042,171 @@ async fn test_watcher_recovers_complete_staging_decision_and_commits_prepared_wr
     Ok(())
 }
 
+#[convex_macro::test_runtime]
+async fn test_watcher_leaves_partial_staging_hidden_until_all_participants_stage(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "partial-staging-hidden"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("partial_staging_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(0), PartitionId(1)],
+        )
+        .await?;
+
+    let redo_records = node.committer_for_test().two_phase_redo_records().await?;
+    let redo_entry = redo_records
+        .values()
+        .next()
+        .context("prepare should persist a redo entry")?;
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![0, 1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(redo_entry)],
+    );
+    assert!(
+        !staging.all_participants_staged(),
+        "test setup should represent an incomplete parallel-commit staging record",
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id.clone(),
+        staging.clone(),
+    )
+    .await?;
+    assert!(
+        !resolved,
+        "watcher must not resolve or expose a transaction before all participants stage",
+    );
+
+    let projects_before_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        !projects_before_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("partial-staging-hidden"))
+        }),
+        "partial staged writes must stay hidden while the staging decision is pending",
+    );
+    assert!(
+        !decision_log
+            .get_decision(&txn_id)
+            .await?
+            .context("pending staging decision should remain durable")?
+            .all_participants_staged(),
+        "missing participant proof should keep the decision in staging",
+    );
+    assert_eq!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .len(),
+        1,
+        "pending staging should keep the local prepared redo for later recovery",
+    );
+
+    decision_log
+        .mark_participant_staged(
+            &txn_id,
+            TwoPhaseParticipantIntent {
+                partition_id: 0,
+                prepare_ts: u64::from(prepare_ts),
+                participant_transaction_digest: "remote-participant-digest".to_string(),
+            },
+        )
+        .await?;
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id.clone(),
+        staging,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "watcher may recover the local participant once every participant proof exists",
+    );
+
+    let projects_after_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        projects_after_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("partial-staging-hidden"))
+        }),
+        "complete staged decision should make the recovered local write visible",
+    );
+    assert!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "local recovery should clean up the participant redo after commit",
+    );
+    let Some(TwoPhaseDecision::Committed {
+        resolved_participants,
+        ..
+    }) = decision_log.get_decision(&txn_id).await?
+    else {
+        anyhow::bail!("complete staging recovery should promote the decision to committed");
+    };
+    assert_eq!(
+        resolved_participants,
+        vec![1],
+        "local watcher should mark only this participant resolved and leave the decision for \
+         other participants",
+    );
+    Ok(())
+}
+
 #[test]
 fn test_rollback_decision_survives_failed_rollback_rpc_for_watcher() -> anyhow::Result<()> {
     let td = TestDriver::new_with_io();
