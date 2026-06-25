@@ -135,6 +135,7 @@ use crate::{
         TwoPhaseCommitGrpcClient,
         TwoPhaseDecision,
         TwoPhaseDecisionLog,
+        TwoPhaseParticipantIntent,
         TwoPhaseRedoEntry,
         TwoPhaseTransactionId,
     },
@@ -4745,6 +4746,119 @@ async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
     )
     .await
     .context("timed-out prepare should no longer block conflicting writes")?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_watcher_recovers_complete_staging_decision_and_commits_prepared_write(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "staged-before-coordinator-crash"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("complete_staging_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+
+    let projects_before_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        !projects_before_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("staged-before-coordinator-crash"))
+        }),
+        "abortable staged writes must stay hidden before status recovery",
+    );
+
+    let redo_records = node.committer_for_test().two_phase_redo_records().await?;
+    let redo_entry = redo_records
+        .values()
+        .next()
+        .context("prepare should persist a redo entry")?;
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(redo_entry)],
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id,
+        staging,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "complete staged decision should recover to a committed decision",
+    );
+
+    let projects_after_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        projects_after_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("staged-before-coordinator-crash"))
+        }),
+        "watcher recovery should make the recovered committed write visible",
+    );
+    assert!(
+        decision_log.decisions().is_empty(),
+        "single-participant recovered staging decision should be deleted after cleanup",
+    );
+    assert!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "committing the recovered staged transaction should delete the participant redo record",
+    );
     Ok(())
 }
 

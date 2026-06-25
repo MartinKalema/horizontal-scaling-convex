@@ -339,7 +339,10 @@ impl TwoPhaseDecision {
         Some(Duration::from_millis(now.saturating_sub(*staged_at)))
     }
 
-    pub fn mark_participant_staged(&mut self, intent: TwoPhaseParticipantIntent) {
+    pub fn mark_participant_staged(
+        &mut self,
+        intent: TwoPhaseParticipantIntent,
+    ) -> anyhow::Result<()> {
         let Self::Staging {
             participants,
             participant_intents,
@@ -347,7 +350,7 @@ impl TwoPhaseDecision {
             ..
         } = self
         else {
-            return;
+            return Ok(());
         };
         if !participants.contains(&intent.partition_id) {
             participants.push(intent.partition_id);
@@ -358,13 +361,19 @@ impl TwoPhaseDecision {
             .iter_mut()
             .find(|existing| existing.partition_id == intent.partition_id)
         {
-            *existing = intent;
+            anyhow::ensure!(
+                *existing == intent,
+                "2PC staging proof for participant {} conflicts with the existing staged intent",
+                intent.partition_id,
+            );
+            return Ok(());
         } else {
             participant_intents.push(intent);
         }
         participant_intents.sort_by_key(|intent| intent.partition_id);
         *transaction_digest =
             TwoPhaseTransactionDigest::from_staging_record(participants, participant_intents);
+        Ok(())
     }
 
     pub fn all_participants_staged(&self) -> bool {
@@ -671,7 +680,7 @@ pub mod testing {
             let Some(decision) = decisions.get_mut(&transaction_id.0) else {
                 return Ok(None);
             };
-            decision.mark_participant_staged(intent);
+            decision.mark_participant_staged(intent)?;
             Ok(Some(decision.clone()))
         }
 
@@ -959,7 +968,7 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
             else {
                 return Ok(None);
             };
-            decision.mark_participant_staged(intent.clone());
+            decision.mark_participant_staged(intent.clone())?;
             let payload = serde_json::to_vec(&decision).with_context(|| {
                 format!("2PC: Failed to serialize decision for {transaction_id}")
             })?;
@@ -1810,7 +1819,9 @@ mod tests {
         assert!(!decision.all_participants_staged());
 
         let digest_before = decision.transaction_digest().cloned();
-        decision.mark_participant_staged(participant_intent(1, 12345, "participant-one"));
+        decision
+            .mark_participant_staged(participant_intent(1, 12345, "participant-one"))
+            .unwrap();
         assert!(decision.all_participants_staged());
         assert_ne!(digest_before.as_ref(), decision.transaction_digest());
         assert_eq!(
@@ -1826,11 +1837,34 @@ mod tests {
     fn test_staging_mark_participant_staged_is_idempotent() {
         let mut decision = TwoPhaseDecision::staging(12345, vec![0], vec![]);
         let intent = participant_intent(0, 12345, "participant-zero");
-        decision.mark_participant_staged(intent.clone());
+        decision.mark_participant_staged(intent.clone()).unwrap();
         let digest_after_first = decision.transaction_digest().cloned();
-        decision.mark_participant_staged(intent);
+        decision.mark_participant_staged(intent).unwrap();
         assert_eq!(decision.transaction_digest(), digest_after_first.as_ref());
         assert_eq!(decision.participant_intents().len(), 1);
+    }
+
+    #[test]
+    fn test_staging_rejects_conflicting_duplicate_participant_intent() {
+        let mut decision = TwoPhaseDecision::staging(
+            12345,
+            vec![0],
+            vec![participant_intent(0, 12345, "participant-zero")],
+        );
+        let digest_before = decision.transaction_digest().cloned();
+        let err = decision
+            .mark_participant_staged(participant_intent(0, 12345, "different-transaction"))
+            .expect_err("conflicting duplicate stage proof should fail closed");
+
+        assert!(
+            format!("{err:#}").contains("conflicts with the existing staged intent"),
+            "unexpected error: {err:#}",
+        );
+        assert_eq!(decision.transaction_digest(), digest_before.as_ref());
+        assert_eq!(
+            decision.participant_intents(),
+            &[participant_intent(0, 12345, "participant-zero")],
+        );
     }
 
     #[test]
@@ -2005,6 +2039,33 @@ mod tests {
                     participant_intent(1, 12345, "participant-one"),
                 ],
             );
+        });
+    }
+
+    #[test]
+    fn test_in_memory_decision_log_rejects_conflicting_duplicate_stage_proof() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("staging-conflict".to_string());
+            let staging = TwoPhaseDecision::staging(
+                12345,
+                vec![0],
+                vec![participant_intent(0, 12345, "participant-zero")],
+            );
+            log.write_decision(&txn_id, &staging).await.unwrap();
+
+            let err = log
+                .mark_participant_staged(
+                    &txn_id,
+                    participant_intent(0, 12345, "different-transaction"),
+                )
+                .await
+                .expect_err("conflicting duplicate stage proof should fail closed");
+            assert!(
+                format!("{err:#}").contains("conflicts with the existing staged intent"),
+                "unexpected error: {err:#}",
+            );
+            assert_eq!(log.get_decision(&txn_id).await.unwrap(), Some(staging));
         });
     }
 
