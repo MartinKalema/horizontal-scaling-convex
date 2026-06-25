@@ -24,9 +24,11 @@ When a transaction touches only one region, skip 2PC entirely — just commit di
 
 Source: [TiDB 1PC](https://pingcap.github.io/tidb-dev-guide/understand-tidb/1pc.html)
 
-### CockroachDB (more complex than needed)
+### CockroachDB (parallel-commit target, not current safety baseline)
 
-Parallel Commits protocol with write intents as provisional values + transaction records. Can respond to client before all intents are resolved. We don't need this complexity because our partitions are coarser (table-level, not range-level).
+Parallel Commits protocol with write intents as provisional values + transaction records. Can respond to client before all intents are resolved, but only because the transaction record plus every listed intent forms a durable commit proof and because transaction status recovery can finish or abort ambiguous transactions.
+
+Our current 2PC path does not claim that protocol. It uses the simpler durable-decision model below. The Convex-safe design for true parallel commits is tracked separately in `docs/parallel-commits-design.md` because it must also preserve Convex subscriptions, read-after-write behavior, consistent snapshots, and exact reactive invalidation.
 
 Source: [CockroachDB Parallel Commits](https://www.cockroachlabs.com/blog/parallel-commits/)
 
