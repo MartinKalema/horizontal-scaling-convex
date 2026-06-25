@@ -37,6 +37,7 @@ use common::{
     grpc::ClusterGrpcAuth,
     interval::IntervalSet,
     query::FilterValue,
+    sha256::Sha256,
     types::{
         IndexDescriptor,
         RepeatableTimestamp,
@@ -124,6 +125,20 @@ impl std::fmt::Display for TwoPhaseTransactionId {
 /// Follows Vitess's Metadata Manager (MM) pattern.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TwoPhaseDecision {
+    /// A true parallel-commit attempt whose final status can be recovered by
+    /// checking that every listed participant intent was durably staged.
+    ///
+    /// This variant is intentionally metadata-only for now: the live commit
+    /// path still uses the conservative Committed/RolledBack decisions until
+    /// staged-write reads and transaction status recovery are implemented.
+    Staging {
+        commit_ts: u64,
+        participants: Vec<u32>,
+        participant_intents: Vec<TwoPhaseParticipantIntent>,
+        transaction_digest: TwoPhaseTransactionDigest,
+        #[serde(default)]
+        resolved_participants: Vec<u32>,
+    },
     /// All participants prepared successfully. Commit.
     Committed {
         commit_ts: u64,
@@ -140,7 +155,73 @@ pub enum TwoPhaseDecision {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoPhaseTransactionDigest(pub String);
+
+impl TwoPhaseTransactionDigest {
+    pub fn from_staging_record(
+        participants: &[u32],
+        intents: &[TwoPhaseParticipantIntent],
+    ) -> Self {
+        let mut canonical_participants = participants.to_vec();
+        canonical_participants.sort_unstable();
+        canonical_participants.dedup();
+        let mut canonical_intents = intents.to_vec();
+        canonical_intents.sort_by_key(|intent| intent.partition_id);
+        let mut bytes = Vec::new();
+        for participant in canonical_participants {
+            bytes.extend_from_slice(&participant.to_be_bytes());
+        }
+        bytes.push(0xff);
+        for intent in canonical_intents {
+            bytes.extend_from_slice(&intent.partition_id.to_be_bytes());
+            bytes.extend_from_slice(&intent.prepare_ts.to_be_bytes());
+            bytes.extend_from_slice(intent.participant_transaction_digest.as_bytes());
+        }
+        Self(hex::encode(Sha256::hash(&bytes)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoPhaseParticipantIntent {
+    pub partition_id: u32,
+    pub prepare_ts: u64,
+    pub participant_transaction_digest: String,
+}
+
+impl TwoPhaseParticipantIntent {
+    pub fn from_redo_entry(entry: &TwoPhaseRedoEntry) -> Self {
+        Self {
+            partition_id: entry.partition_id,
+            prepare_ts: entry.prepare_ts,
+            participant_transaction_digest: entry.participant_transaction_digest(),
+        }
+    }
+}
+
 impl TwoPhaseDecision {
+    pub fn staging(
+        commit_ts: u64,
+        participants: Vec<u32>,
+        participant_intents: Vec<TwoPhaseParticipantIntent>,
+    ) -> Self {
+        let mut participants = participants;
+        participants.extend(participant_intents.iter().map(|intent| intent.partition_id));
+        participants.sort_unstable();
+        participants.dedup();
+        let mut participant_intents = participant_intents;
+        participant_intents.sort_by_key(|intent| intent.partition_id);
+        let transaction_digest =
+            TwoPhaseTransactionDigest::from_staging_record(&participants, &participant_intents);
+        Self::Staging {
+            commit_ts,
+            participants,
+            participant_intents,
+            transaction_digest,
+            resolved_participants: Vec::new(),
+        }
+    }
+
     pub fn committed(commit_ts: u64, participants: Vec<u32>) -> Self {
         Self::Committed {
             commit_ts,
@@ -159,15 +240,19 @@ impl TwoPhaseDecision {
 
     pub fn participants(&self) -> &[u32] {
         match self {
-            Self::Committed { participants, .. } | Self::RolledBack { participants, .. } => {
-                participants
-            },
+            Self::Staging { participants, .. }
+            | Self::Committed { participants, .. }
+            | Self::RolledBack { participants, .. } => participants,
         }
     }
 
     pub fn resolved_participants(&self) -> &[u32] {
         match self {
-            Self::Committed {
+            Self::Staging {
+                resolved_participants,
+                ..
+            }
+            | Self::Committed {
                 resolved_participants,
                 ..
             }
@@ -178,9 +263,36 @@ impl TwoPhaseDecision {
         }
     }
 
+    pub fn is_staging(&self) -> bool {
+        matches!(self, Self::Staging { .. })
+    }
+
+    pub fn participant_intents(&self) -> &[TwoPhaseParticipantIntent] {
+        match self {
+            Self::Staging {
+                participant_intents,
+                ..
+            } => participant_intents,
+            Self::Committed { .. } | Self::RolledBack { .. } => &[],
+        }
+    }
+
+    pub fn transaction_digest(&self) -> Option<&TwoPhaseTransactionDigest> {
+        match self {
+            Self::Staging {
+                transaction_digest, ..
+            } => Some(transaction_digest),
+            Self::Committed { .. } | Self::RolledBack { .. } => None,
+        }
+    }
+
     pub fn mark_participant_resolved(&mut self, participant: PartitionId) {
         let resolved = match self {
-            Self::Committed {
+            Self::Staging {
+                resolved_participants,
+                ..
+            }
+            | Self::Committed {
                 resolved_participants,
                 ..
             }
@@ -193,6 +305,49 @@ impl TwoPhaseDecision {
             resolved.push(participant.0);
             resolved.sort_unstable();
             resolved.dedup();
+        }
+    }
+
+    pub fn mark_participant_staged(&mut self, intent: TwoPhaseParticipantIntent) {
+        let Self::Staging {
+            participants,
+            participant_intents,
+            transaction_digest,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if !participants.contains(&intent.partition_id) {
+            participants.push(intent.partition_id);
+            participants.sort_unstable();
+            participants.dedup();
+        }
+        if let Some(existing) = participant_intents
+            .iter_mut()
+            .find(|existing| existing.partition_id == intent.partition_id)
+        {
+            *existing = intent;
+        } else {
+            participant_intents.push(intent);
+        }
+        participant_intents.sort_by_key(|intent| intent.partition_id);
+        *transaction_digest =
+            TwoPhaseTransactionDigest::from_staging_record(participants, participant_intents);
+    }
+
+    pub fn all_participants_staged(&self) -> bool {
+        match self {
+            Self::Staging {
+                participants,
+                participant_intents,
+                ..
+            } => participants.iter().all(|participant| {
+                participant_intents
+                    .iter()
+                    .any(|intent| intent.partition_id == *participant)
+            }),
+            Self::Committed { .. } | Self::RolledBack { .. } => true,
         }
     }
 
@@ -310,6 +465,14 @@ impl TwoPhaseRedoEntry {
             .context("2PC: Failed to parse participant transaction redo")?;
         ParticipantTransaction::try_from(proto)
     }
+
+    pub fn participant_transaction_digest(&self) -> String {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.partition_id.to_be_bytes());
+        bytes.extend_from_slice(&self.prepare_ts.to_be_bytes());
+        bytes.extend_from_slice(self.participant_transaction_hex.as_bytes());
+        hex::encode(Sha256::hash(&bytes))
+    }
 }
 
 fn now_unix_millis() -> u64 {
@@ -391,6 +554,19 @@ pub mod testing {
             Ok(Some(decision.clone()))
         }
 
+        async fn mark_participant_staged(
+            &self,
+            transaction_id: &TwoPhaseTransactionId,
+            intent: TwoPhaseParticipantIntent,
+        ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+            let mut decisions = self.decisions.lock();
+            let Some(decision) = decisions.get_mut(&transaction_id.0) else {
+                return Ok(None);
+            };
+            decision.mark_participant_staged(intent);
+            Ok(Some(decision.clone()))
+        }
+
         async fn delete_decision(
             &self,
             transaction_id: &TwoPhaseTransactionId,
@@ -444,6 +620,12 @@ pub trait TwoPhaseDecisionLog: Send + Sync + 'static {
         participant: PartitionId,
     ) -> anyhow::Result<Option<TwoPhaseDecision>>;
 
+    async fn mark_participant_staged(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        intent: TwoPhaseParticipantIntent,
+    ) -> anyhow::Result<Option<TwoPhaseDecision>>;
+
     async fn delete_decision(&self, transaction_id: &TwoPhaseTransactionId) -> anyhow::Result<()>;
 }
 
@@ -471,6 +653,14 @@ impl TwoPhaseDecisionLog for NoopTwoPhaseDecisionLog {
         &self,
         _transaction_id: &TwoPhaseTransactionId,
         _participant: PartitionId,
+    ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+        Ok(None)
+    }
+
+    async fn mark_participant_staged(
+        &self,
+        _transaction_id: &TwoPhaseTransactionId,
+        _intent: TwoPhaseParticipantIntent,
     ) -> anyhow::Result<Option<TwoPhaseDecision>> {
         Ok(None)
     }
@@ -609,6 +799,55 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
         }
         anyhow::bail!(
             "2PC: Failed to mark {participant} resolved for {transaction_id} after CAS retries"
+        )
+    }
+
+    async fn mark_participant_staged(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        intent: TwoPhaseParticipantIntent,
+    ) -> anyhow::Result<Option<TwoPhaseDecision>> {
+        let key = two_phase_decision_key(transaction_id);
+        for _ in 0..10 {
+            let Some(entry) =
+                self.kv.entry(key.clone()).await.with_context(|| {
+                    format!("2PC: Failed to read decision for {transaction_id}")
+                })?
+            else {
+                return Ok(None);
+            };
+            let Some(mut decision) =
+                parse_nats_decision_entry(transaction_id, entry.operation, &entry.value)?
+            else {
+                return Ok(None);
+            };
+            decision.mark_participant_staged(intent.clone());
+            let payload = serde_json::to_vec(&decision).with_context(|| {
+                format!("2PC: Failed to serialize decision for {transaction_id}")
+            })?;
+            match self
+                .kv
+                .update(key.clone(), payload.into(), entry.revision)
+                .await
+            {
+                Ok(_) => return Ok(Some(decision)),
+                Err(err)
+                    if err.kind()
+                        == async_nats::jetstream::kv::UpdateErrorKind::WrongLastRevision =>
+                {
+                    continue;
+                },
+                Err(err) => {
+                    anyhow::bail!(
+                        "2PC: Failed to mark participant {} staged for {transaction_id}: {err:#}",
+                        intent.partition_id,
+                    );
+                },
+            }
+        }
+        anyhow::bail!(
+            "2PC: Failed to mark participant {} staged for {transaction_id} after CAS retries",
+            intent.partition_id,
         )
     }
 
@@ -1299,6 +1538,129 @@ mod tests {
         }
     }
 
+    fn participant_intent(
+        partition_id: u32,
+        prepare_ts: u64,
+        digest: &str,
+    ) -> TwoPhaseParticipantIntent {
+        TwoPhaseParticipantIntent {
+            partition_id,
+            prepare_ts,
+            participant_transaction_digest: digest.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_staging_decision_serialization() {
+        let decision = TwoPhaseDecision::staging(
+            12345,
+            vec![1, 0],
+            vec![
+                participant_intent(1, 12345, "participant-one"),
+                participant_intent(0, 12345, "participant-zero"),
+            ],
+        );
+        let json = serde_json::to_string(&decision).unwrap();
+        let back: TwoPhaseDecision = serde_json::from_str(&json).unwrap();
+        match back {
+            TwoPhaseDecision::Staging {
+                commit_ts,
+                participants,
+                participant_intents,
+                transaction_digest,
+                resolved_participants,
+            } => {
+                assert_eq!(commit_ts, 12345);
+                assert_eq!(participants, vec![0, 1]);
+                assert_eq!(
+                    participant_intents,
+                    vec![
+                        participant_intent(0, 12345, "participant-zero"),
+                        participant_intent(1, 12345, "participant-one"),
+                    ]
+                );
+                assert_eq!(Some(&transaction_digest), decision.transaction_digest(),);
+                assert!(resolved_participants.is_empty());
+            },
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_staging_digest_is_order_independent() {
+        let first = TwoPhaseDecision::staging(
+            12345,
+            vec![0, 1],
+            vec![
+                participant_intent(0, 12345, "participant-zero"),
+                participant_intent(1, 12345, "participant-one"),
+            ],
+        );
+        let second = TwoPhaseDecision::staging(
+            12345,
+            vec![1, 0],
+            vec![
+                participant_intent(1, 12345, "participant-one"),
+                participant_intent(0, 12345, "participant-zero"),
+            ],
+        );
+        assert_eq!(first.transaction_digest(), second.transaction_digest());
+    }
+
+    #[test]
+    fn test_staging_tracks_missing_participant_intents() {
+        let mut decision = TwoPhaseDecision::staging(
+            12345,
+            vec![0, 1],
+            vec![participant_intent(0, 12345, "participant-zero")],
+        );
+        assert!(decision.is_staging());
+        assert_eq!(decision.participants(), &[0, 1]);
+        assert!(!decision.all_participants_staged());
+
+        let digest_before = decision.transaction_digest().cloned();
+        decision.mark_participant_staged(participant_intent(1, 12345, "participant-one"));
+        assert!(decision.all_participants_staged());
+        assert_ne!(digest_before.as_ref(), decision.transaction_digest());
+        assert_eq!(
+            decision.participant_intents(),
+            &[
+                participant_intent(0, 12345, "participant-zero"),
+                participant_intent(1, 12345, "participant-one"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_staging_mark_participant_staged_is_idempotent() {
+        let mut decision = TwoPhaseDecision::staging(12345, vec![0], vec![]);
+        let intent = participant_intent(0, 12345, "participant-zero");
+        decision.mark_participant_staged(intent.clone());
+        let digest_after_first = decision.transaction_digest().cloned();
+        decision.mark_participant_staged(intent);
+        assert_eq!(decision.transaction_digest(), digest_after_first.as_ref());
+        assert_eq!(decision.participant_intents().len(), 1);
+    }
+
+    #[test]
+    fn test_staging_decision_is_not_cleanup_resolved_by_stage_proof() {
+        let mut decision = TwoPhaseDecision::staging(
+            12345,
+            vec![0, 1],
+            vec![
+                participant_intent(0, 12345, "participant-zero"),
+                participant_intent(1, 12345, "participant-one"),
+            ],
+        );
+        assert!(decision.all_participants_staged());
+        assert!(!decision.all_participants_resolved());
+
+        decision.mark_participant_resolved(PartitionId(0));
+        assert!(!decision.all_participants_resolved());
+        decision.mark_participant_resolved(PartitionId(1));
+        assert!(decision.all_participants_resolved());
+    }
+
     #[test]
     fn test_nats_decision_entry_delete_marker_is_absent() {
         let txn_id = TwoPhaseTransactionId::new();
@@ -1322,5 +1684,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(parsed, decision);
+    }
+
+    #[test]
+    fn test_in_memory_decision_log_write_staging_if_absent_is_idempotent() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("staging-idempotent".to_string());
+            let staging = TwoPhaseDecision::staging(
+                12345,
+                vec![0, 1],
+                vec![participant_intent(0, 12345, "participant-zero")],
+            );
+            let committed = TwoPhaseDecision::committed(12345, vec![0, 1]);
+
+            assert!(log
+                .write_decision_if_absent(&txn_id, &staging)
+                .await
+                .unwrap());
+            assert!(!log
+                .write_decision_if_absent(&txn_id, &committed)
+                .await
+                .unwrap());
+            assert_eq!(log.get_decision(&txn_id).await.unwrap(), Some(staging));
+        });
+    }
+
+    #[test]
+    fn test_in_memory_decision_log_marks_participant_staged() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("staging-progress".to_string());
+            let staging = TwoPhaseDecision::staging(
+                12345,
+                vec![0, 1],
+                vec![participant_intent(0, 12345, "participant-zero")],
+            );
+            log.write_decision(&txn_id, &staging).await.unwrap();
+
+            let updated = log
+                .mark_participant_staged(&txn_id, participant_intent(1, 12345, "participant-one"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(updated.all_participants_staged());
+            assert_eq!(
+                updated.participant_intents(),
+                &[
+                    participant_intent(0, 12345, "participant-zero"),
+                    participant_intent(1, 12345, "participant-one"),
+                ],
+            );
+        });
     }
 }
