@@ -387,6 +387,75 @@ impl TwoPhaseDecision {
             .iter()
             .all(|participant| self.resolved_participants().contains(participant))
     }
+
+    pub fn staged_read_policy(&self) -> StagedTransactionReadPolicy {
+        match self {
+            Self::Staging { .. } if self.all_participants_staged() => {
+                StagedTransactionReadPolicy::RecoverStatusBeforeRead
+            },
+            Self::Staging { .. } => StagedTransactionReadPolicy::HidePendingParticipantProofs,
+            Self::Committed { .. } => StagedTransactionReadPolicy::VisibleCommittedDecision,
+            Self::RolledBack { .. } => StagedTransactionReadPolicy::HiddenRolledBackDecision,
+        }
+    }
+
+    pub fn staged_subscription_policy(&self) -> StagedTransactionSubscriptionPolicy {
+        match self {
+            Self::Staging { .. } => StagedTransactionSubscriptionPolicy::SuppressUntilFinalDecision,
+            Self::Committed { .. } => StagedTransactionSubscriptionPolicy::EmitCommittedDelta,
+            Self::RolledBack { .. } => StagedTransactionSubscriptionPolicy::SuppressRolledBack,
+        }
+    }
+
+    pub fn requires_status_recovery_before_read(&self) -> bool {
+        matches!(
+            self.staged_read_policy(),
+            StagedTransactionReadPolicy::RecoverStatusBeforeRead
+        )
+    }
+
+    pub fn staged_writes_visible_to_readers(&self) -> bool {
+        matches!(
+            self.staged_read_policy(),
+            StagedTransactionReadPolicy::VisibleCommittedDecision
+        )
+    }
+
+    pub fn should_emit_subscription_invalidation(&self) -> bool {
+        matches!(
+            self.staged_subscription_policy(),
+            StagedTransactionSubscriptionPolicy::EmitCommittedDelta
+        )
+    }
+}
+
+/// Read behavior for writes represented by a staged parallel-commit decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagedTransactionReadPolicy {
+    /// The transaction is not yet recoverably committed. Reads must not expose
+    /// its writes or use them for timestamped snapshots.
+    HidePendingParticipantProofs,
+    /// Every participant has staged its intent, but the final decision has not
+    /// been recovered yet. A read at/after the transaction timestamp must first
+    /// drive transaction-status recovery instead of showing tentative writes.
+    RecoverStatusBeforeRead,
+    /// A final committed decision exists, so normal committed-delta visibility
+    /// and OCC behavior may apply.
+    VisibleCommittedDecision,
+    /// A final rollback decision exists. The staged writes are never visible.
+    HiddenRolledBackDecision,
+}
+
+/// Subscription invalidation behavior for staged parallel-commit decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagedTransactionSubscriptionPolicy {
+    /// No user-visible invalidation may be emitted while the transaction can
+    /// still resolve to rollback.
+    SuppressUntilFinalDecision,
+    /// Emit the same invalidation path as an ordinary committed write.
+    EmitCommittedDelta,
+    /// Rollback cleanup does not represent a visible document change.
+    SuppressRolledBack,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1781,6 +1850,85 @@ mod tests {
         assert!(!decision.all_participants_resolved());
         decision.mark_participant_resolved(PartitionId(1));
         assert!(decision.all_participants_resolved());
+    }
+
+    #[test]
+    fn test_incomplete_staging_is_hidden_from_reads_and_subscriptions() {
+        let decision = TwoPhaseDecision::staging(
+            12345,
+            vec![0, 1],
+            vec![participant_intent(0, 12345, "participant-zero")],
+        );
+
+        assert_eq!(
+            decision.staged_read_policy(),
+            StagedTransactionReadPolicy::HidePendingParticipantProofs,
+        );
+        assert_eq!(
+            decision.staged_subscription_policy(),
+            StagedTransactionSubscriptionPolicy::SuppressUntilFinalDecision,
+        );
+        assert!(!decision.requires_status_recovery_before_read());
+        assert!(!decision.staged_writes_visible_to_readers());
+        assert!(!decision.should_emit_subscription_invalidation());
+    }
+
+    #[test]
+    fn test_complete_staging_requires_recovery_before_read() {
+        let decision = TwoPhaseDecision::staging(
+            12345,
+            vec![0, 1],
+            vec![
+                participant_intent(0, 12345, "participant-zero"),
+                participant_intent(1, 12345, "participant-one"),
+            ],
+        );
+
+        assert_eq!(
+            decision.staged_read_policy(),
+            StagedTransactionReadPolicy::RecoverStatusBeforeRead,
+        );
+        assert_eq!(
+            decision.staged_subscription_policy(),
+            StagedTransactionSubscriptionPolicy::SuppressUntilFinalDecision,
+        );
+        assert!(decision.requires_status_recovery_before_read());
+        assert!(!decision.staged_writes_visible_to_readers());
+        assert!(!decision.should_emit_subscription_invalidation());
+    }
+
+    #[test]
+    fn test_committed_decision_is_visible_and_invalidates_subscriptions() {
+        let decision = TwoPhaseDecision::committed(12345, vec![0, 1]);
+
+        assert_eq!(
+            decision.staged_read_policy(),
+            StagedTransactionReadPolicy::VisibleCommittedDecision,
+        );
+        assert_eq!(
+            decision.staged_subscription_policy(),
+            StagedTransactionSubscriptionPolicy::EmitCommittedDelta,
+        );
+        assert!(!decision.requires_status_recovery_before_read());
+        assert!(decision.staged_writes_visible_to_readers());
+        assert!(decision.should_emit_subscription_invalidation());
+    }
+
+    #[test]
+    fn test_rolled_back_decision_is_hidden_and_does_not_invalidate_subscriptions() {
+        let decision = TwoPhaseDecision::rolled_back("prepare failed".to_string(), vec![0, 1]);
+
+        assert_eq!(
+            decision.staged_read_policy(),
+            StagedTransactionReadPolicy::HiddenRolledBackDecision,
+        );
+        assert_eq!(
+            decision.staged_subscription_policy(),
+            StagedTransactionSubscriptionPolicy::SuppressRolledBack,
+        );
+        assert!(!decision.requires_status_recovery_before_read());
+        assert!(!decision.staged_writes_visible_to_readers());
+        assert!(!decision.should_emit_subscription_invalidation());
     }
 
     #[test]
