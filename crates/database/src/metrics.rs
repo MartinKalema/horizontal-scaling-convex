@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ::search::metrics::{
     SearchType,
     SEARCH_TYPE_LABEL,
@@ -500,6 +502,27 @@ pub fn log_two_phase_prepare_attempts(num_attempts: usize) {
         &DATABASE_TWO_PHASE_PREPARE_ATTEMPTS_TOTAL,
         num_attempts as f64,
     );
+}
+
+register_convex_counter!(
+    DATABASE_TWO_PHASE_STAGING_RECOVERY_TOTAL,
+    "Number of parallel-commit staging recovery attempts by outcome",
+    &OUTCOME_LABELS
+);
+pub fn log_two_phase_staging_recovery(outcome: &'static str) {
+    log_counter_with_labels(
+        &DATABASE_TWO_PHASE_STAGING_RECOVERY_TOTAL,
+        1,
+        vec![outcome_label(outcome)],
+    );
+}
+
+register_convex_histogram!(
+    DATABASE_TWO_PHASE_STAGING_AGE_SECONDS,
+    "Age of unresolved parallel-commit staging records observed by the watcher"
+);
+pub fn log_two_phase_staging_age(age: Duration) {
+    log_distribution(&DATABASE_TWO_PHASE_STAGING_AGE_SECONDS, age.as_secs_f64());
 }
 
 register_convex_histogram!(
