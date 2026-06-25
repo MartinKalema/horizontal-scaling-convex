@@ -18,6 +18,7 @@
 #   9. Two-Phase Commit Cross-Partition (Vitess 2PC)
 #   9f. 2PC Atomicity During NATS Outage
 #   9g. 2PC Atomicity During Participant Restart
+#   9h. 2PC Atomicity During Coordinator Restart
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -997,6 +998,60 @@ fi
 [ "$POST_RESTART_2PC_M" -eq "$POST_RESTART_2PC_BM" ] && [ "$POST_RESTART_2PC_T" -eq "$POST_RESTART_2PC_BT" ] \
     && pass "Nodes converged after participant restart 2PC race" \
     || fail "Nodes diverged after participant restart 2PC race" "A: $POST_RESTART_2PC_M,$POST_RESTART_2PC_T vs B: $POST_RESTART_2PC_BM,$POST_RESTART_2PC_BT"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 9h: 2PC Atomicity During Coordinator Restart${NC}"
+# ============================================================
+# Race a cross-partition mutation with a partition-0 coordinator restart. This
+# is the coordinator-crash window: after staging/decision work starts, the
+# persisted outcome must still be either fully absent or fully present.
+
+PRE_COORD_RESTART_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_COORD_RESTART_2PC_M=$(jval messages "$PRE_COORD_RESTART_2PC")
+PRE_COORD_RESTART_2PC_T=$(jval tasks "$PRE_COORD_RESTART_2PC")
+COORD_RESTART_2PC_RESPONSE_FILE=$(mktemp)
+
+(curl --max-time 20 -s "$NODE_A_URL/api/mutation" \
+    -H "Authorization: Convex $NODE_A_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"path":"messages:crossPartitionWrite","args":{"text":"2pc-coordinator-restart","taskTitle":"2pc-coordinator-restart-task"}}' \
+    > "$COORD_RESTART_2PC_RESPONSE_FILE" || echo '{"status":"transport_error"}' > "$COORD_RESTART_2PC_RESPONSE_FILE") &
+COORD_RESTART_2PC_PID=$!
+sleep 0.05
+docker restart docker-node-p0a-1 > /dev/null 2>&1
+wait "$COORD_RESTART_2PC_PID" || true
+
+echo "  Waiting for coordinator node p0a to recover..."
+for attempt in $(seq 1 60); do
+    curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY="$NODE_P0A_KEY"
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
+
+sleep 8
+POST_COORD_RESTART_2PC_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_COORD_RESTART_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_COORD_RESTART_2PC_M=$(jval messages "$POST_COORD_RESTART_2PC_A")
+POST_COORD_RESTART_2PC_T=$(jval tasks "$POST_COORD_RESTART_2PC_A")
+POST_COORD_RESTART_2PC_BM=$(jval messages "$POST_COORD_RESTART_2PC_B")
+POST_COORD_RESTART_2PC_BT=$(jval tasks "$POST_COORD_RESTART_2PC_B")
+COORD_RESTART_2PC_DM=$((POST_COORD_RESTART_2PC_M - PRE_COORD_RESTART_2PC_M))
+COORD_RESTART_2PC_DT=$((POST_COORD_RESTART_2PC_T - PRE_COORD_RESTART_2PC_T))
+COORD_RESTART_2PC_RESPONSE=$(cat "$COORD_RESTART_2PC_RESPONSE_FILE")
+rm -f "$COORD_RESTART_2PC_RESPONSE_FILE"
+
+if [ "$COORD_RESTART_2PC_DM" -eq "$COORD_RESTART_2PC_DT" ] && { [ "$COORD_RESTART_2PC_DM" -eq 0 ] || [ "$COORD_RESTART_2PC_DM" -eq 1 ]; }; then
+    pass "2PC during coordinator restart was atomic (msgs +$COORD_RESTART_2PC_DM tasks +$COORD_RESTART_2PC_DT)"
+else
+    fail "2PC during coordinator restart produced torn/non-idempotent result" "response=$COORD_RESTART_2PC_RESPONSE msgs +$COORD_RESTART_2PC_DM tasks +$COORD_RESTART_2PC_DT"
+fi
+
+[ "$POST_COORD_RESTART_2PC_M" -eq "$POST_COORD_RESTART_2PC_BM" ] && [ "$POST_COORD_RESTART_2PC_T" -eq "$POST_COORD_RESTART_2PC_BT" ] \
+    && pass "Nodes converged after coordinator restart 2PC race" \
+    || fail "Nodes diverged after coordinator restart 2PC race" "A: $POST_COORD_RESTART_2PC_M,$POST_COORD_RESTART_2PC_T vs B: $POST_COORD_RESTART_2PC_BM,$POST_COORD_RESTART_2PC_BT"
 
 # ============================================================
 echo ""
