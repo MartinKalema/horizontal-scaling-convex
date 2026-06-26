@@ -2120,6 +2120,399 @@ async fn test_replica_delta_redelivery_is_idempotent(rt: TestRuntime) -> anyhow:
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SeededReplicaApplyAction {
+    ApplyData,
+    DuplicateData,
+    Heartbeat,
+    RestartThenDuplicate,
+    LocalFloorThenData,
+}
+
+struct SeededReplicaApplySimulation {
+    seed: u64,
+    rng: ChaCha12Rng,
+    trace: Vec<String>,
+    data_deltas: Vec<(String, CommitDelta)>,
+    visible_project_names: Vec<String>,
+    last_freshness_watermark: Option<Timestamp>,
+    last_data_watermark: Option<Timestamp>,
+    last_read_frontier: Option<Timestamp>,
+    last_write_frontier: Option<Timestamp>,
+}
+
+impl SeededReplicaApplySimulation {
+    fn new(seed: u64) -> Self {
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        Self {
+            seed,
+            rng: ChaCha12Rng::from_seed(seed_bytes),
+            trace: Vec::new(),
+            data_deltas: Vec::new(),
+            visible_project_names: Vec::new(),
+            last_freshness_watermark: None,
+            last_data_watermark: None,
+            last_read_frontier: None,
+            last_write_frontier: None,
+        }
+    }
+
+    fn record(&mut self, event: impl Into<String>) {
+        self.trace.push(event.into());
+    }
+
+    fn trace_dump(&self) -> String {
+        self.trace.join("\n")
+    }
+
+    fn actions(&mut self) -> Vec<SeededReplicaApplyAction> {
+        let mut actions = vec![
+            SeededReplicaApplyAction::ApplyData,
+            SeededReplicaApplyAction::DuplicateData,
+            SeededReplicaApplyAction::Heartbeat,
+            SeededReplicaApplyAction::RestartThenDuplicate,
+            SeededReplicaApplyAction::LocalFloorThenData,
+        ];
+        for _ in 0..7 {
+            actions.push(match self.rng.random_range(0..5) {
+                0 => SeededReplicaApplyAction::ApplyData,
+                1 => SeededReplicaApplyAction::DuplicateData,
+                2 => SeededReplicaApplyAction::Heartbeat,
+                3 => SeededReplicaApplyAction::RestartThenDuplicate,
+                _ => SeededReplicaApplyAction::LocalFloorThenData,
+            });
+        }
+        // Keep a guaranteed first data event, then shuffle the remaining
+        // failure/replay actions. That keeps duplicate/restart actions useful
+        // without making the seed trace depend on skipped setup.
+        for i in (2..actions.len()).rev() {
+            let j = self.rng.random_range(1..=i);
+            actions.swap(i, j);
+        }
+        actions
+    }
+
+    fn normalize_remote_ts(&self, delta: &mut CommitDelta) -> anyhow::Result<()> {
+        let floor = [self.last_freshness_watermark, self.last_data_watermark]
+            .into_iter()
+            .flatten()
+            .max();
+        if let Some(floor) = floor
+            && delta.ts <= floor
+        {
+            delta.ts = floor.succ()?;
+        }
+        Ok(())
+    }
+
+    async fn assert_invariants(
+        &mut self,
+        target: &Database<TestRuntime>,
+        target_persistence: &Arc<TestPersistence>,
+    ) -> anyhow::Result<()> {
+        let freshness_watermark = persisted_partition_watermark(
+            target_persistence,
+            PersistenceGlobalKey::AppliedDeltaWatermarks,
+            PartitionId(1),
+        )
+        .await?;
+        let data_watermark = persisted_partition_watermark(
+            target_persistence,
+            PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+            PartitionId(1),
+        )
+        .await?;
+        let read_frontier = target.replication_frontier_for_test(PartitionId(1));
+        let write_frontier = target.replication_write_frontier_for_test(PartitionId(1));
+
+        ensure_monotonic_timestamp(
+            self.seed,
+            &self.trace_dump(),
+            "freshness watermark",
+            self.last_freshness_watermark,
+            freshness_watermark,
+        )?;
+        ensure_monotonic_timestamp(
+            self.seed,
+            &self.trace_dump(),
+            "data watermark",
+            self.last_data_watermark,
+            data_watermark,
+        )?;
+        ensure_monotonic_timestamp(
+            self.seed,
+            &self.trace_dump(),
+            "read frontier",
+            self.last_read_frontier,
+            read_frontier,
+        )?;
+        ensure_monotonic_timestamp(
+            self.seed,
+            &self.trace_dump(),
+            "write frontier",
+            self.last_write_frontier,
+            write_frontier,
+        )?;
+
+        self.last_freshness_watermark = freshness_watermark;
+        self.last_data_watermark = data_watermark;
+        self.last_read_frontier = read_frontier;
+        self.last_write_frontier = write_frontier;
+
+        let projects = run_query(
+            target.clone(),
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        for name in &self.visible_project_names {
+            let expected = assert_val!(name.clone());
+            let matches = projects
+                .iter()
+                .filter(|project| project.value().0.get("name") == Some(&expected))
+                .count();
+            anyhow::ensure!(
+                matches == 1,
+                "seed={:#x}\nexpected exactly one replicated project named {name:?}, got \
+                 {matches}\ntrace:\n{}",
+                self.seed,
+                self.trace_dump(),
+            );
+        }
+        Ok(())
+    }
+}
+
+async fn persisted_partition_watermark(
+    persistence: &Arc<TestPersistence>,
+    key: PersistenceGlobalKey,
+    partition: PartitionId,
+) -> anyhow::Result<Option<Timestamp>> {
+    let Some(value) = persistence.reader().get_persistence_global(key).await? else {
+        return Ok(None);
+    };
+    let frontiers = partition_timestamp_map_from_json(value, "replica simulation watermarks")?;
+    Ok(frontiers.get(&partition).copied())
+}
+
+fn ensure_monotonic_timestamp(
+    seed: u64,
+    trace: &str,
+    label: &str,
+    previous: Option<Timestamp>,
+    current: Option<Timestamp>,
+) -> anyhow::Result<()> {
+    if let (Some(previous), Some(current)) = (previous, current) {
+        anyhow::ensure!(
+            current >= previous,
+            "seed={seed:#x}\n{label} moved backwards from {previous} to {current}\ntrace:\n{trace}",
+        );
+    }
+    Ok(())
+}
+
+fn latest_delta_for_partition(
+    log: &InMemoryDistributedLog,
+    source_partition: PartitionId,
+) -> anyhow::Result<CommitDelta> {
+    log.deltas()
+        .into_iter()
+        .rev()
+        .find(|delta| delta.source_partition == Some(source_partition))
+        .context("expected source partition to publish a delta")
+}
+
+#[convex_macro::test_runtime]
+async fn test_seeded_replica_apply_simulation_preserves_frontier_and_idempotency_invariants(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    for seed in [0x1340_1340_0000_0001, 0x1340_1340_0000_0002] {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let target_persistence = Arc::new(TestPersistence::new());
+        let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+        let source = create_node_with_table_number_allocator(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            table_numbers.clone(),
+        )
+        .await?;
+        let mut target = create_node_with_persistence_and_table_number_allocator(
+            &rt,
+            target_persistence.clone(),
+            log.clone(),
+            Some(partitioned_map(PartitionId(0))),
+            None,
+            Arc::new(NoopTwoPhaseDecisionLog),
+            None,
+            table_numbers,
+        )
+        .await?;
+        let mut sim = SeededReplicaApplySimulation::new(seed);
+
+        for (round, action) in sim.actions().into_iter().enumerate() {
+            sim.record(format!("round={round} action={action:?}"));
+            let document_log_count_before =
+                persisted_document_log_count(&target_persistence).await?;
+            let snapshot_ts_before = *target.now_ts_for_reads();
+
+            match action {
+                SeededReplicaApplyAction::ApplyData => {
+                    let name = format!("seed-{seed:x}-remote-{round}");
+                    insert_doc(&source, "projects", assert_obj!("name" => name.clone())).await?;
+                    let mut delta = latest_delta_for_partition(&log, PartitionId(1))?;
+                    sim.normalize_remote_ts(&mut delta)?;
+                    target
+                        .committer_for_test()
+                        .apply_replica_delta(delta.clone())
+                        .await?;
+                    sim.record(format!(
+                        "applied data name={name} remote_ts={}",
+                        u64::from(delta.ts),
+                    ));
+                    sim.visible_project_names.push(name.clone());
+                    sim.data_deltas.push((name, delta));
+                },
+                SeededReplicaApplyAction::DuplicateData => {
+                    if let Some((name, delta)) = sim.data_deltas.last().cloned() {
+                        let applied_ts = target
+                            .committer_for_test()
+                            .apply_replica_delta(delta.clone())
+                            .await?;
+                        anyhow::ensure!(
+                            applied_ts == delta.ts,
+                            "seed={seed:#x}\nduplicate data delta for {name:?} should ACK as \
+                             skipped at origin ts, got {applied_ts}\ntrace:\n{}",
+                            sim.trace_dump(),
+                        );
+                        anyhow::ensure!(
+                            persisted_document_log_count(&target_persistence).await?
+                                == document_log_count_before,
+                            "seed={seed:#x}\nduplicate data delta appended document log \
+                             entries\ntrace:\n{}",
+                            sim.trace_dump(),
+                        );
+                        anyhow::ensure!(
+                            *target.now_ts_for_reads() == snapshot_ts_before,
+                            "seed={seed:#x}\nduplicate data delta published a new \
+                             snapshot\ntrace:\n{}",
+                            sim.trace_dump(),
+                        );
+                    }
+                },
+                SeededReplicaApplyAction::Heartbeat => {
+                    let heartbeat_ts = sim
+                        .last_freshness_watermark
+                        .or(sim.last_data_watermark)
+                        .or_else(|| sim.data_deltas.last().map(|(_, delta)| delta.ts));
+                    let Some(heartbeat_ts) = heartbeat_ts else {
+                        continue;
+                    };
+                    target
+                        .committer_for_test()
+                        .apply_replica_delta(CommitDelta {
+                            ts: heartbeat_ts,
+                            document_writes: Arc::new(Vec::new()),
+                            document_updates: Vec::new(),
+                            index_writes: Arc::new(Vec::new()),
+                            write_source: WriteSource::new("seeded_replica_frontier_heartbeat"),
+                            write_bytes: 0,
+                            tablet_id_to_table_name: Default::default(),
+                            source_partition: Some(PartitionId(1)),
+                        })
+                        .await?;
+                    anyhow::ensure!(
+                        persisted_document_log_count(&target_persistence).await?
+                            == document_log_count_before,
+                        "seed={seed:#x}\nfrontier heartbeat appended document log \
+                         entries\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                },
+                SeededReplicaApplyAction::RestartThenDuplicate => {
+                    if let Some((name, delta)) = sim.data_deltas.last().cloned() {
+                        target.shutdown().await?;
+                        sim.record(format!("round={round} restart_target"));
+                        target = create_node_with_persistence_and_table_number_allocator(
+                            &rt,
+                            target_persistence.clone(),
+                            log.clone(),
+                            Some(partitioned_map(PartitionId(0))),
+                            None,
+                            Arc::new(NoopTwoPhaseDecisionLog),
+                            None,
+                            Arc::new(InMemoryTableNumberAllocator::default()),
+                        )
+                        .await?;
+                        let applied_ts = target
+                            .committer_for_test()
+                            .apply_replica_delta(delta.clone())
+                            .await?;
+                        anyhow::ensure!(
+                            applied_ts == delta.ts,
+                            "seed={seed:#x}\npost-restart duplicate for {name:?} should ACK as \
+                             skipped at origin ts, got {applied_ts}\ntrace:\n{}",
+                            sim.trace_dump(),
+                        );
+                        anyhow::ensure!(
+                            persisted_document_log_count(&target_persistence).await?
+                                == document_log_count_before,
+                            "seed={seed:#x}\npost-restart duplicate appended document log \
+                             entries\ntrace:\n{}",
+                            sim.trace_dump(),
+                        );
+                    }
+                },
+                SeededReplicaApplyAction::LocalFloorThenData => {
+                    let local_ts = insert_doc(
+                        &target,
+                        "messages",
+                        assert_obj!("text" => format!("seed-{seed:x}-local-{round}")),
+                    )
+                    .await?;
+                    let name = format!("seed-{seed:x}-translated-{round}");
+                    insert_doc(&source, "projects", assert_obj!("name" => name.clone())).await?;
+                    let mut delta = latest_delta_for_partition(&log, PartitionId(1))?;
+                    sim.normalize_remote_ts(&mut delta)?;
+                    if let Some(remote_ts) = local_ts.pred().ok().filter(|candidate| {
+                        [sim.last_data_watermark, sim.last_freshness_watermark]
+                            .into_iter()
+                            .flatten()
+                            .all(|watermark| *candidate > watermark)
+                    }) {
+                        delta.ts = remote_ts;
+                    }
+                    let applied_ts = target
+                        .committer_for_test()
+                        .apply_replica_delta(delta.clone())
+                        .await?;
+                    anyhow::ensure!(
+                        applied_ts > local_ts || applied_ts == delta.ts,
+                        "seed={seed:#x}\nreplica apply returned unexpected ts={applied_ts} for \
+                         local floor {local_ts} and origin {}\ntrace:\n{}",
+                        u64::from(delta.ts),
+                        sim.trace_dump(),
+                    );
+                    sim.record(format!(
+                        "applied translated data name={name} origin_ts={} applied_ts={}",
+                        u64::from(delta.ts),
+                        u64::from(applied_ts),
+                    ));
+                    sim.visible_project_names.push(name.clone());
+                    sim.data_deltas.push((name, delta));
+                },
+            }
+
+            sim.assert_invariants(&target, &target_persistence).await?;
+        }
+
+        target.shutdown().await?;
+        source.shutdown().await?;
+    }
+    Ok(())
+}
+
 #[convex_macro::test_runtime]
 async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
     rt: TestRuntime,

@@ -1299,11 +1299,24 @@ impl<RT: Runtime> Committer<RT> {
                                 let mut sm = self.snapshot_manager.write();
                                 sm.push(commit_ts, snapshot, write_bytes);
                                 if let Some(source_partition) = source_partition {
-                                    sm.update_replication_frontier(source_partition, commit_ts)?;
-                                    sm.update_replication_write_frontier(
-                                        source_partition,
-                                        commit_ts,
-                                    )?;
+                                    if sm
+                                        .replication_frontier(source_partition)
+                                        .is_none_or(|current| current < commit_ts)
+                                    {
+                                        sm.update_replication_frontier(
+                                            source_partition,
+                                            commit_ts,
+                                        )?;
+                                    }
+                                    if sm
+                                        .replication_write_frontier(source_partition)
+                                        .is_none_or(|current| current < commit_ts)
+                                    {
+                                        sm.update_replication_write_frontier(
+                                            source_partition,
+                                            commit_ts,
+                                        )?;
+                                    }
                                     let origin_watermark = self
                                         .applied_delta_watermarks
                                         .get(&source_partition)
@@ -1865,7 +1878,12 @@ impl<RT: Runtime> Committer<RT> {
         // snapshot timestamp so we do not advertise a snapshot that does not
         // exist.
         let mut snapshot_manager = self.snapshot_manager.write();
-        snapshot_manager.update_replication_frontier(source_partition, frontier_ts)?;
+        if snapshot_manager
+            .replication_frontier(source_partition)
+            .is_none_or(|current| current < frontier_ts)
+        {
+            snapshot_manager.update_replication_frontier(source_partition, frontier_ts)?;
+        }
         snapshot_manager.update_applied_delta_watermark(source_partition, origin_watermark)?;
         Ok(())
     }
