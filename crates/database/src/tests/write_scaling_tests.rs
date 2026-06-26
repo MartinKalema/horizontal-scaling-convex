@@ -80,6 +80,11 @@ use pb::replication::{
     TwoPcRollbackRequest,
     TwoPcRollbackResponse,
 };
+use rand::{
+    Rng,
+    SeedableRng,
+};
+use rand_chacha::ChaCha12Rng;
 use search::searcher::SearcherStub;
 use storage::LocalDirStorage;
 use tokio::{
@@ -4864,6 +4869,396 @@ fn test_ambiguous_remote_prepare_failure_rolls_back_attempted_participant() -> a
         ambiguous_server.shutdown().await?;
         Ok(())
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SeededTwoPhaseRecoveryAction {
+    CommitRetainedFinalDecision,
+    RollbackAbandonedPrepare,
+    RecoverCompleteStaging,
+    RestartThenRecoverCompleteStaging,
+    WaitForPartialStagingThenComplete,
+}
+
+struct SeededTwoPhaseRecoverySimulation {
+    seed: u64,
+    rng: ChaCha12Rng,
+    trace: Vec<String>,
+    visible_project_names: Vec<String>,
+    hidden_project_names: Vec<String>,
+}
+
+impl SeededTwoPhaseRecoverySimulation {
+    fn new(seed: u64) -> Self {
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        Self {
+            seed,
+            rng: ChaCha12Rng::from_seed(seed_bytes),
+            trace: Vec::new(),
+            visible_project_names: Vec::new(),
+            hidden_project_names: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, event: impl Into<String>) {
+        self.trace.push(event.into());
+    }
+
+    fn trace_dump(&self) -> String {
+        self.trace.join("\n")
+    }
+
+    fn shuffled_actions(&mut self) -> Vec<SeededTwoPhaseRecoveryAction> {
+        let mut actions = vec![
+            SeededTwoPhaseRecoveryAction::CommitRetainedFinalDecision,
+            SeededTwoPhaseRecoveryAction::RollbackAbandonedPrepare,
+            SeededTwoPhaseRecoveryAction::RecoverCompleteStaging,
+            SeededTwoPhaseRecoveryAction::RestartThenRecoverCompleteStaging,
+            SeededTwoPhaseRecoveryAction::WaitForPartialStagingThenComplete,
+        ];
+        for _ in 0..5 {
+            actions.push(match self.rng.random_range(0..5) {
+                0 => SeededTwoPhaseRecoveryAction::CommitRetainedFinalDecision,
+                1 => SeededTwoPhaseRecoveryAction::RollbackAbandonedPrepare,
+                2 => SeededTwoPhaseRecoveryAction::RecoverCompleteStaging,
+                3 => SeededTwoPhaseRecoveryAction::RestartThenRecoverCompleteStaging,
+                _ => SeededTwoPhaseRecoveryAction::WaitForPartialStagingThenComplete,
+            });
+        }
+        for i in (1..actions.len()).rev() {
+            let j = self.rng.random_range(0..=i);
+            actions.swap(i, j);
+        }
+        actions
+    }
+
+    async fn assert_invariants(&self, node: &Database<TestRuntime>) -> anyhow::Result<()> {
+        let projects = run_query(
+            node.clone(),
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        for name in &self.visible_project_names {
+            let expected = assert_val!(name.clone());
+            anyhow::ensure!(
+                projects
+                    .iter()
+                    .any(|project| project.value().0.get("name") == Some(&expected)),
+                "seed={:#x}\nexpected committed/recovered project {name:?} to be \
+                 visible\ntrace:\n{}",
+                self.seed,
+                self.trace_dump(),
+            );
+        }
+        for name in &self.hidden_project_names {
+            let expected = assert_val!(name.clone());
+            anyhow::ensure!(
+                !projects
+                    .iter()
+                    .any(|project| project.value().0.get("name") == Some(&expected)),
+                "seed={:#x}\nrolled-back or incomplete prepared project {name:?} became \
+                 visible\ntrace:\n{}",
+                self.seed,
+                self.trace_dump(),
+            );
+        }
+        anyhow::ensure!(
+            node.committer_for_test()
+                .two_phase_redo_records()
+                .await?
+                .is_empty(),
+            "seed={:#x}\nresolved action leaked durable prepared redo\ntrace:\n{}",
+            self.seed,
+            self.trace_dump(),
+        );
+        Ok(())
+    }
+}
+
+async fn prepare_project_insert_for_2pc_sim(
+    node: &Database<TestRuntime>,
+    name: &str,
+    write_source_name: String,
+    participants: Vec<PartitionId>,
+) -> anyhow::Result<(TwoPhaseTransactionId, Timestamp, TwoPhaseRedoEntry)> {
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => name.to_string()),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new(write_source_name);
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            participants,
+        )
+        .await?;
+    let redo = node
+        .committer_for_test()
+        .two_phase_redo_records()
+        .await?
+        .get(&txn_id.0)
+        .cloned()
+        .context("prepare should persist a durable redo record")?;
+    Ok((txn_id, prepare_ts, redo))
+}
+
+#[convex_macro::test_runtime]
+async fn test_seeded_two_phase_recovery_simulation_preserves_prepared_invariants(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    for seed in [0x1340_2f00_0000_0001, 0x1340_2f00_0000_0002] {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let persistence = Arc::new(TestPersistence::new());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+        let mut node = create_node_with_persistence(
+            &rt,
+            persistence.clone(),
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            decision_log.clone(),
+            None,
+        )
+        .await?;
+        let mut sim = SeededTwoPhaseRecoverySimulation::new(seed);
+
+        for (round, action) in sim.shuffled_actions().into_iter().enumerate() {
+            sim.record(format!("round={round} action={action:?}"));
+            let name = format!("seed-{seed:x}-round-{round}");
+            match action {
+                SeededTwoPhaseRecoveryAction::CommitRetainedFinalDecision => {
+                    let (txn_id, prepare_ts, _) = prepare_project_insert_for_2pc_sim(
+                        &node,
+                        &name,
+                        format!("seeded_2pc_retained_commit_{round}"),
+                        vec![PartitionId(1)],
+                    )
+                    .await?;
+                    let decision = TwoPhaseDecision::committed(u64::from(prepare_ts), vec![1]);
+                    decision_log.write_decision(&txn_id, &decision).await?;
+                    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+                        &node.committer_for_test(),
+                        PartitionId(1),
+                        txn_id,
+                        decision,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        resolved,
+                        "seed={seed:#x}\nretained committed decision did not resolve\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                    sim.visible_project_names.push(name);
+                },
+                SeededTwoPhaseRecoveryAction::RollbackAbandonedPrepare => {
+                    let (txn_id, ..) = prepare_project_insert_for_2pc_sim(
+                        &node,
+                        &name,
+                        format!("seeded_2pc_abandoned_rollback_{round}"),
+                        vec![PartitionId(1)],
+                    )
+                    .await?;
+                    let resolved = crate::two_phase_watcher::rollback_expired_local_prepares(
+                        &node.committer_for_test(),
+                        PartitionId(1),
+                        Duration::ZERO,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        resolved == 1,
+                        "seed={seed:#x}\nabandoned prepare rollback resolved {resolved} \
+                         records\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                    anyhow::ensure!(
+                        decision_log
+                            .get_decision(&txn_id)
+                            .await?
+                            .is_some_and(|decision| matches!(
+                                decision,
+                                TwoPhaseDecision::RolledBack { .. }
+                            )),
+                        "seed={seed:#x}\nabandoned prepare did not retain a rollback \
+                         decision\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                    sim.hidden_project_names.push(name);
+                    let followup = format!("seed-{seed:x}-round-{round}-after-rollback");
+                    insert_doc(&node, "projects", assert_obj!("name" => followup.clone()))
+                        .await
+                        .context("rolled-back prepare should not block follow-up writes")?;
+                    sim.visible_project_names.push(followup);
+                },
+                SeededTwoPhaseRecoveryAction::RecoverCompleteStaging => {
+                    let (txn_id, prepare_ts, redo) = prepare_project_insert_for_2pc_sim(
+                        &node,
+                        &name,
+                        format!("seeded_2pc_complete_staging_{round}"),
+                        vec![PartitionId(1)],
+                    )
+                    .await?;
+                    let staging = TwoPhaseDecision::staging(
+                        u64::from(prepare_ts),
+                        vec![1],
+                        vec![TwoPhaseParticipantIntent::from_redo_entry(&redo)],
+                    );
+                    decision_log.write_decision(&txn_id, &staging).await?;
+                    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+                        &node.committer_for_test(),
+                        PartitionId(1),
+                        txn_id,
+                        staging,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        resolved,
+                        "seed={seed:#x}\ncomplete staging decision did not resolve\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                    sim.visible_project_names.push(name);
+                },
+                SeededTwoPhaseRecoveryAction::RestartThenRecoverCompleteStaging => {
+                    let (txn_id, prepare_ts, redo) = prepare_project_insert_for_2pc_sim(
+                        &node,
+                        &name,
+                        format!("seeded_2pc_restart_staging_{round}"),
+                        vec![PartitionId(1)],
+                    )
+                    .await?;
+                    let staging = TwoPhaseDecision::staging(
+                        u64::from(prepare_ts),
+                        vec![1],
+                        vec![TwoPhaseParticipantIntent::from_redo_entry(&redo)],
+                    );
+                    decision_log.write_decision(&txn_id, &staging).await?;
+                    node.shutdown().await?;
+                    sim.record(format!("round={round} restart_participant"));
+                    node = create_node_with_persistence(
+                        &rt,
+                        persistence.clone(),
+                        log.clone(),
+                        Some(partitioned_map(PartitionId(1))),
+                        None,
+                        decision_log.clone(),
+                        None,
+                    )
+                    .await?;
+                    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+                        &node.committer_for_test(),
+                        PartitionId(1),
+                        txn_id,
+                        staging,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        resolved,
+                        "seed={seed:#x}\nrestart staging decision did not resolve\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                    sim.visible_project_names.push(name);
+                },
+                SeededTwoPhaseRecoveryAction::WaitForPartialStagingThenComplete => {
+                    let (txn_id, prepare_ts, redo) = prepare_project_insert_for_2pc_sim(
+                        &node,
+                        &name,
+                        format!("seeded_2pc_partial_staging_{round}"),
+                        vec![PartitionId(0), PartitionId(1)],
+                    )
+                    .await?;
+                    let staging = TwoPhaseDecision::staging(
+                        u64::from(prepare_ts),
+                        vec![0, 1],
+                        vec![TwoPhaseParticipantIntent::from_redo_entry(&redo)],
+                    );
+                    decision_log.write_decision(&txn_id, &staging).await?;
+                    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+                        &node.committer_for_test(),
+                        PartitionId(1),
+                        txn_id.clone(),
+                        staging.clone(),
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        !resolved,
+                        "seed={seed:#x}\npartial staging resolved before all participants \
+                         staged\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                    let projects = run_query(
+                        node.clone(),
+                        TableNamespace::root_component(),
+                        Query::full_table_scan("projects".parse()?, Order::Asc),
+                    )
+                    .await?;
+                    let expected = assert_val!(name.clone());
+                    anyhow::ensure!(
+                        !projects
+                            .iter()
+                            .any(|project| project.value().0.get("name") == Some(&expected)),
+                        "seed={seed:#x}\npartial staging made prepared write visible \
+                         early\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                    decision_log
+                        .mark_participant_staged(
+                            &txn_id,
+                            TwoPhaseParticipantIntent {
+                                partition_id: 0,
+                                prepare_ts: u64::from(prepare_ts),
+                                participant_transaction_digest: format!(
+                                    "seeded-remote-digest-{seed:x}-{round}"
+                                ),
+                            },
+                        )
+                        .await?;
+                    let completed = decision_log
+                        .get_decision(&txn_id)
+                        .await?
+                        .context("partial staging decision should remain durable")?;
+                    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+                        &node.committer_for_test(),
+                        PartitionId(1),
+                        txn_id,
+                        completed,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        resolved,
+                        "seed={seed:#x}\ncompleted staging decision did not resolve\ntrace:\n{}",
+                        sim.trace_dump(),
+                    );
+                    sim.visible_project_names.push(name);
+                },
+            }
+            sim.assert_invariants(&node).await?;
+        }
+        node.shutdown().await?;
+    }
+    Ok(())
 }
 
 #[convex_macro::test_runtime]
