@@ -35,6 +35,16 @@ pub async fn resolve_decision_for_local_partition(
     decision: TwoPhaseDecision,
 ) -> anyhow::Result<bool> {
     let resolved = match decision {
+        TwoPhaseDecision::Staging { .. } => {
+            // True parallel-commit status recovery is added in a follow-up
+            // issue. Until then, Staging is metadata-only and must not be
+            // interpreted as either commit or rollback by the legacy watcher.
+            tracing::debug!(
+                "2PC Watcher: staging txn={} needs transaction status recovery",
+                txn_id,
+            );
+            false
+        },
         TwoPhaseDecision::Committed { participants, .. } => {
             if !participants.contains(&local_partition.0) {
                 return Ok(false);
