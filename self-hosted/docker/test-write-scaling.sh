@@ -1741,6 +1741,10 @@ for round in 1 2 3 4; do
     esac
 
     echo "  Round $round: stopping $stopped_label and issuing 2PC writes through surviving entrypoints..."
+    ROUND_PRE_CHURN_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+    ROUND_PRE_CHURN_2PC_M=$(jval messages "$ROUND_PRE_CHURN_2PC")
+    ROUND_PRE_CHURN_2PC_T=$(jval tasks "$ROUND_PRE_CHURN_2PC")
+
     docker stop "$stopped_container" > /dev/null 2>&1
     sleep 6
 
@@ -1791,6 +1795,16 @@ for round in 1 2 3 4; do
             ;;
     esac
     sleep 4
+
+    ROUND_POST_CHURN_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+    ROUND_POST_CHURN_2PC_M=$(jval messages "$ROUND_POST_CHURN_2PC")
+    ROUND_POST_CHURN_2PC_T=$(jval tasks "$ROUND_POST_CHURN_2PC")
+    ROUND_CHURN_2PC_DM=$((ROUND_POST_CHURN_2PC_M - ROUND_PRE_CHURN_2PC_M))
+    ROUND_CHURN_2PC_DT=$((ROUND_POST_CHURN_2PC_T - ROUND_PRE_CHURN_2PC_T))
+
+    [ "$ROUND_CHURN_2PC_DM" -eq "$ROUND_ACCEPTED" ] && [ "$ROUND_CHURN_2PC_DT" -eq "$ROUND_ACCEPTED" ] \
+        && pass "Round $round 2PC writes stayed atomic during $stopped_label outage (+$ROUND_ACCEPTED/+${ROUND_ACCEPTED})" \
+        || fail "Round $round lost/duplicated 2PC writes during $stopped_label outage" "msgs +$ROUND_CHURN_2PC_DM tasks +$ROUND_CHURN_2PC_DT expected +$ROUND_ACCEPTED"
 done
 
 [ "$CHURN_2PC_ATTEMPTED" -eq $((CHURN_2PC_ACCEPTED + CHURN_2PC_REJECTED)) ] \
