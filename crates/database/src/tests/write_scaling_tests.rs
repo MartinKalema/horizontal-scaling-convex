@@ -5043,6 +5043,133 @@ async fn test_watcher_recovers_complete_staging_decision_and_commits_prepared_wr
 }
 
 #[convex_macro::test_runtime]
+async fn test_watcher_recovers_complete_staging_after_participant_restart(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let persistence = Arc::new(TestPersistence::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_persistence(
+        &rt,
+        persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        decision_log.clone(),
+        None,
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "staged-before-participant-restart"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("complete_staging_restart_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+
+    let projects_before_restart = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        !projects_before_restart.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("staged-before-participant-restart"))
+        }),
+        "prepared staged writes must stay hidden before participant restart",
+    );
+
+    let redo_records = node.committer_for_test().two_phase_redo_records().await?;
+    let redo_entry = redo_records
+        .values()
+        .next()
+        .context("prepare should persist a redo entry before restart")?;
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(redo_entry)],
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+    node.shutdown().await?;
+
+    let restarted = create_node_with_persistence(
+        &rt,
+        persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        decision_log.clone(),
+        None,
+    )
+    .await?;
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &restarted.committer_for_test(),
+        PartitionId(1),
+        txn_id,
+        staging,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "watcher should recover complete staging from durable redo after participant restart",
+    );
+
+    let projects_after_recovery = run_query(
+        restarted.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        projects_after_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("staged-before-participant-restart"))
+        }),
+        "staging recovery after restart should make the committed write visible",
+    );
+    assert!(
+        decision_log.decisions().is_empty(),
+        "single-participant recovered staging decision should be deleted after restart cleanup",
+    );
+    assert!(
+        restarted
+            .committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "restart recovery should delete the participant redo record after commit",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_watcher_leaves_partial_staging_hidden_until_all_participants_stage(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
