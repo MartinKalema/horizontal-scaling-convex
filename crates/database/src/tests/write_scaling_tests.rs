@@ -4914,9 +4914,13 @@ async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
     .await?;
     assert_eq!(resolved, 1);
 
+    let decisions = decision_log.decisions();
+    assert_eq!(decisions.len(), 1);
     assert!(
-        decision_log.decisions().is_empty(),
-        "single-participant timeout rollback should delete the decision after local resolution",
+        decisions
+            .get(&txn_id.0)
+            .is_some_and(|decision| matches!(decision, TwoPhaseDecision::RolledBack { .. })),
+        "timeout rollback should retain its final decision for follower recovery",
     );
 
     insert_doc(

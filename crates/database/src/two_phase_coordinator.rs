@@ -34,6 +34,10 @@ use common::{
     },
     types::Timestamp,
 };
+use futures::{
+    stream::FuturesUnordered,
+    StreamExt,
+};
 
 use crate::{
     committer::{
@@ -57,6 +61,16 @@ use crate::{
 };
 
 const MAX_PREPARE_TS_RETRIES: usize = 8;
+
+struct PrepareParticipantFailure {
+    participant: PartitionId,
+    err: anyhow::Error,
+}
+
+struct PrepareParticipantsOutcome {
+    prepared: Vec<PartitionId>,
+    failures: Vec<PrepareParticipantFailure>,
+}
 
 /// Result of classifying a transaction's writes by partition.
 pub enum TransactionClassification {
@@ -263,6 +277,46 @@ async fn prepare_participant(
     verify_prepare_result(participant, prepare_ts, result)
 }
 
+async fn prepare_participants(
+    local_committer: &CommitterClient,
+    node_addresses: Option<&NodeAddresses>,
+    partition_map: &PartitionMap,
+    transaction_id: &TwoPhaseTransactionId,
+    all_participants: &[PartitionId],
+    participants: &[(PartitionId, ParticipantTransaction)],
+    write_source: &WriteSource,
+    prepare_ts: Timestamp,
+) -> PrepareParticipantsOutcome {
+    let mut prepares = FuturesUnordered::new();
+    for (participant, participant_tx) in participants {
+        prepares.push(async move {
+            let result = prepare_participant(
+                local_committer,
+                node_addresses,
+                partition_map,
+                transaction_id,
+                all_participants,
+                *participant,
+                participant_tx.clone(),
+                write_source,
+                prepare_ts,
+            )
+            .await;
+            (*participant, result)
+        });
+    }
+
+    let mut prepared = Vec::new();
+    let mut failures = Vec::new();
+    while let Some((participant, result)) = prepares.next().await {
+        match result {
+            Ok(()) => prepared.push(participant),
+            Err(err) => failures.push(PrepareParticipantFailure { participant, err }),
+        }
+    }
+    PrepareParticipantsOutcome { prepared, failures }
+}
+
 async fn rollback_participant(
     local_committer: &CommitterClient,
     node_addresses: Option<&NodeAddresses>,
@@ -293,6 +347,58 @@ async fn rollback_participant(
     }
 }
 
+async fn rollback_prepared_participants(
+    local_committer: &CommitterClient,
+    node_addresses: Option<&NodeAddresses>,
+    partition_map: &PartitionMap,
+    transaction_id: &TwoPhaseTransactionId,
+    participants: &[PartitionId],
+) {
+    for prepared in participants.iter().rev().copied() {
+        match rollback_participant(
+            local_committer,
+            node_addresses,
+            partition_map,
+            transaction_id,
+            prepared,
+        )
+        .await
+        {
+            Ok(()) => {
+                if let Err(mark_err) =
+                    mark_participant_resolved(local_committer, transaction_id, prepared).await
+                {
+                    tracing::warn!(
+                        "2PC Coordinator: rollback resolved on {} for txn={} but failed to mark \
+                         participant resolved: {mark_err:#}",
+                        prepared,
+                        transaction_id,
+                    );
+                }
+            },
+            Err(rollback_err) if is_unknown_rollback_error(&rollback_err) => {
+                if let Err(mark_err) =
+                    mark_participant_resolved(local_committer, transaction_id, prepared).await
+                {
+                    tracing::warn!(
+                        "2PC Coordinator: rollback on {} for txn={} was already clean but failed \
+                         to mark participant resolved: {mark_err:#}",
+                        prepared,
+                        transaction_id,
+                    );
+                }
+            },
+            Err(rollback_err) => {
+                tracing::error!(
+                    "2PC Coordinator: rollback failed on {} for txn={}: {rollback_err:#}",
+                    prepared,
+                    transaction_id,
+                );
+            },
+        }
+    }
+}
+
 async fn commit_participant(
     local_committer: &CommitterClient,
     node_addresses: Option<&NodeAddresses>,
@@ -320,6 +426,55 @@ async fn commit_participant(
             Ok(client.commit_prepared(transaction_id).await?.try_into()?)
         })
         .await
+    }
+}
+
+async fn commit_participants(
+    local_committer: &CommitterClient,
+    node_addresses: Option<&NodeAddresses>,
+    partition_map: &PartitionMap,
+    transaction_id: &TwoPhaseTransactionId,
+    participants: &[PartitionId],
+) -> anyhow::Result<Vec<(PartitionId, Timestamp)>> {
+    let mut commits = FuturesUnordered::new();
+    for participant in participants {
+        commits.push(async move {
+            let commit_ts = commit_participant(
+                local_committer,
+                node_addresses,
+                partition_map,
+                transaction_id,
+                *participant,
+            )
+            .await?;
+            mark_participant_resolved(local_committer, transaction_id, *participant)
+                .await
+                .with_context(|| {
+                    format!(
+                        "2PC Coordinator: participant {participant} committed \
+                         txn={transaction_id} but resolution acknowledgement failed"
+                    )
+                })?;
+            Ok((*participant, commit_ts))
+        });
+    }
+
+    let mut commit_results = Vec::new();
+    let mut first_err = None;
+    while let Some(result) = commits.next().await {
+        match result {
+            Ok(result) => commit_results.push(result),
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            },
+        }
+    }
+    if let Some(err) = first_err {
+        Err(err)
+    } else {
+        Ok(commit_results)
     }
 }
 
@@ -413,9 +568,8 @@ async fn mark_participant_resolved(
         return Ok(());
     };
     if decision.all_participants_resolved() {
-        decision_log.delete_decision(transaction_id).await?;
         tracing::info!(
-            "2PC Coordinator: deleted fully resolved decision for txn={}",
+            "2PC Coordinator: fully resolved decision for txn={} retained for follower recovery",
             transaction_id,
         );
     }
@@ -512,118 +666,88 @@ pub async fn coordinate_two_phase_commit(
             attempt + 1,
         );
 
-        let mut prepared_participants = Vec::new();
-        let mut attempted_participants = Vec::new();
+        let PrepareParticipantsOutcome {
+            prepared: prepared_participants,
+            mut failures,
+        } = prepare_participants(
+            local_committer,
+            node_addresses,
+            partition_map,
+            &txn_id,
+            &all_participants,
+            &participants,
+            &write_source,
+            prepare_ts,
+        )
+        .await;
         let mut retry_prepare = false;
-        for (participant, participant_tx) in &participants {
-            attempted_participants.push(*participant);
-            match prepare_participant(
+        if !failures.is_empty() {
+            for failure in &failures {
+                tracing::warn!(
+                    "2PC Coordinator: prepare failed on {} for txn={}: {:#}",
+                    failure.participant,
+                    txn_id,
+                    failure.err,
+                );
+            }
+
+            let has_ambiguous_prepare = failures
+                .iter()
+                .any(|failure| is_ambiguous_prepare_error(&failure.err));
+            let participants_to_rollback = if has_ambiguous_prepare {
+                all_participants.clone()
+            } else {
+                prepared_participants.clone()
+            };
+            let all_failures_retryable = failures
+                .iter()
+                .all(|failure| is_retryable_prepare_ts_error(&failure.err));
+            let selected_failure_index = failures
+                .iter()
+                .position(|failure| !is_retryable_prepare_ts_error(&failure.err))
+                .unwrap_or(0);
+            let selected_failure = failures.remove(selected_failure_index);
+            if !participants_to_rollback.is_empty() {
+                let decision = TwoPhaseDecision::rolled_back(
+                    selected_failure.err.to_string(),
+                    participants_to_rollback.iter().map(|p| p.0).collect(),
+                );
+                write_decision_record(local_committer, &txn_id, &decision)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "2PC Coordinator: failed to write rollback decision for txn={txn_id}"
+                        )
+                    })?;
+            }
+            rollback_prepared_participants(
                 local_committer,
                 node_addresses,
                 partition_map,
                 &txn_id,
-                &all_participants,
-                *participant,
-                participant_tx.clone(),
-                &write_source,
-                prepare_ts,
+                &participants_to_rollback,
             )
-            .await
-            {
-                Ok(()) => prepared_participants.push(*participant),
-                Err(err) => {
-                    tracing::warn!(
-                        "2PC Coordinator: prepare failed on {} for txn={}: {err:#}",
-                        participant,
-                        txn_id,
-                    );
-                    let retryable_prepare_ts_error =
-                        is_retryable_prepare_ts_error(&err) && attempt + 1 < MAX_PREPARE_TS_RETRIES;
-                    let rollback_participants = if is_ambiguous_prepare_error(&err) {
-                        attempted_participants.clone()
-                    } else {
-                        prepared_participants.clone()
-                    };
-                    if !rollback_participants.is_empty() {
-                        let decision = TwoPhaseDecision::rolled_back(
-                            err.to_string(),
-                            rollback_participants.iter().map(|p| p.0).collect(),
-                        );
-                        write_decision_record(local_committer, &txn_id, &decision)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "2PC Coordinator: failed to write rollback decision for \
-                                     txn={txn_id}"
-                                )
-                            })?;
-                    }
-                    for prepared in rollback_participants.iter().rev().copied() {
-                        match rollback_participant(
-                            local_committer,
-                            node_addresses,
-                            partition_map,
-                            &txn_id,
-                            prepared,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                if let Err(mark_err) =
-                                    mark_participant_resolved(local_committer, &txn_id, prepared)
-                                        .await
-                                {
-                                    tracing::warn!(
-                                        "2PC Coordinator: rollback resolved on {} for txn={} but \
-                                         failed to mark participant resolved: {mark_err:#}",
-                                        prepared,
-                                        txn_id,
-                                    );
-                                }
-                            },
-                            Err(rollback_err) if is_unknown_rollback_error(&rollback_err) => {
-                                if let Err(mark_err) =
-                                    mark_participant_resolved(local_committer, &txn_id, prepared)
-                                        .await
-                                {
-                                    tracing::warn!(
-                                        "2PC Coordinator: rollback on {} for txn={} was already \
-                                         clean but failed to mark participant resolved: \
-                                         {mark_err:#}",
-                                        prepared,
-                                        txn_id,
-                                    );
-                                }
-                            },
-                            Err(rollback_err) => {
-                                tracing::error!(
-                                    "2PC Coordinator: rollback failed on {} for txn={}: \
-                                     {rollback_err:#}",
-                                    prepared,
-                                    txn_id,
-                                );
-                            },
-                        }
-                    }
+            .await;
 
-                    if retryable_prepare_ts_error {
-                        metrics::log_two_phase_prepare_retry();
-                        tracing::info!(
-                            "2PC Coordinator: retrying txn={} with a newer prepare timestamp \
-                             after participant {} rejected ts on attempt {}",
-                            txn_id,
-                            participant,
-                            attempt + 1,
-                        );
-                        last_retryable_error = Some(err);
-                        retry_prepare = true;
-                        break;
-                    }
-                    metrics::log_two_phase_error("prepare");
-                    metrics::log_two_phase_decision("rollback");
-                    metrics::log_two_phase_prepare_attempts(prepare_attempts);
-                    return Err(err);
-                },
+            let retryable_prepare_ts_error = is_retryable_prepare_ts_error(&selected_failure.err)
+                && attempt + 1 < MAX_PREPARE_TS_RETRIES
+                && all_failures_retryable;
+            if retryable_prepare_ts_error {
+                metrics::log_two_phase_prepare_retry();
+                tracing::info!(
+                    "2PC Coordinator: retrying txn={} with a newer prepare timestamp after \
+                     participant {} rejected ts on attempt {}",
+                    txn_id,
+                    selected_failure.participant,
+                    attempt + 1,
+                );
+                last_retryable_error = Some(selected_failure.err);
+                retry_prepare = true;
+            } else {
+                metrics::log_two_phase_error("prepare");
+                metrics::log_two_phase_decision("rollback");
+                metrics::log_two_phase_prepare_attempts(prepare_attempts);
+                return Err(selected_failure.err);
             }
         }
 
@@ -641,33 +765,21 @@ pub async fn coordinate_two_phase_commit(
                 format!("2PC Coordinator: failed to write commit decision for txn={txn_id}")
             })?;
 
-        let mut commit_results = Vec::new();
-        for participant in &prepared_participants {
-            let commit_ts = match commit_participant(
-                local_committer,
-                node_addresses,
-                partition_map,
-                &txn_id,
-                *participant,
-            )
-            .await
-            {
-                Ok(commit_ts) => commit_ts,
-                Err(err) => {
-                    metrics::log_two_phase_error("commit");
-                    return Err(err);
-                },
-            };
-            mark_participant_resolved(local_committer, &txn_id, *participant)
-                .await
-                .with_context(|| {
-                    format!(
-                        "2PC Coordinator: participant {participant} committed txn={txn_id} but \
-                         resolution acknowledgement failed"
-                    )
-                })?;
-            commit_results.push((*participant, commit_ts));
-        }
+        let commit_results = match commit_participants(
+            local_committer,
+            node_addresses,
+            partition_map,
+            &txn_id,
+            &prepared_participants,
+        )
+        .await
+        {
+            Ok(commit_results) => commit_results,
+            Err(err) => {
+                metrics::log_two_phase_error("commit");
+                return Err(err);
+            },
+        };
 
         for (participant, commit_ts) in &commit_results {
             anyhow::ensure!(
@@ -733,6 +845,12 @@ mod tests {
              metadata: MetadataMap {{ headers: {{}} }}: transport error: connection error: stream \
              closed because of a broken pipe"
         );
+        assert!(is_ambiguous_prepare_error(&err));
+    }
+
+    #[test]
+    fn ambiguous_prepare_error_detects_rpc_timeout() {
+        let err = anyhow::anyhow!("gRPC Prepare failed: request timed out after 10s");
         assert!(is_ambiguous_prepare_error(&err));
     }
 
