@@ -850,6 +850,12 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_prepare_error_detects_rpc_timeout() {
+        let err = anyhow::anyhow!("gRPC Prepare failed: request timed out after 10s");
+        assert!(is_ambiguous_prepare_error(&err));
+    }
+
+    #[test]
     fn ambiguous_prepare_error_rejects_application_failure() {
         let err = anyhow::anyhow!(
             "gRPC Prepare failed: status: Internal, message: \"forced prepare failure\""
