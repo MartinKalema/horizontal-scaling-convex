@@ -5948,6 +5948,135 @@ async fn test_watcher_recovers_complete_staging_decision_and_commits_prepared_wr
 }
 
 #[convex_macro::test_runtime]
+async fn test_watcher_duplicate_complete_staging_recovery_is_idempotent(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let persistence = Arc::new(TestPersistence::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_persistence(
+        &rt,
+        persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        decision_log.clone(),
+        None,
+    )
+    .await?;
+
+    let project_name = "duplicate-staging-recovery-visible-once";
+    let (txn_id, prepare_ts, redo) = prepare_project_insert_for_2pc_sim(
+        &node,
+        project_name,
+        "duplicate_complete_staging_recovery_test".to_string(),
+        vec![PartitionId(1)],
+    )
+    .await?;
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(&redo)],
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id.clone(),
+        staging.clone(),
+    )
+    .await?;
+    assert!(
+        resolved,
+        "first complete staging recovery should commit the local participant",
+    );
+    let document_log_count_after_first = persisted_document_log_count(&persistence).await?;
+    let snapshot_ts_after_first = *node.now_ts_for_reads();
+    let projects_after_first = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        projects_after_first
+            .iter()
+            .filter(|project| project.value().0.get("name") == Some(&assert_val!(project_name)))
+            .count(),
+        1,
+        "first recovery should make the staged write visible exactly once",
+    );
+
+    let resolved_from_stale_staging =
+        crate::two_phase_watcher::resolve_decision_for_local_partition(
+            &node.committer_for_test(),
+            PartitionId(1),
+            txn_id.clone(),
+            staging,
+        )
+        .await?;
+    assert!(
+        resolved_from_stale_staging,
+        "duplicate recovery with a stale staging message should be treated as resolved",
+    );
+
+    let committed_decision = decision_log
+        .get_decision(&txn_id)
+        .await?
+        .context("staging recovery should retain a committed decision")?;
+    assert!(
+        matches!(committed_decision, TwoPhaseDecision::Committed { .. }),
+        "complete staging recovery should promote the durable decision to committed",
+    );
+    let resolved_from_final_decision =
+        crate::two_phase_watcher::resolve_decision_for_local_partition(
+            &node.committer_for_test(),
+            PartitionId(1),
+            txn_id.clone(),
+            committed_decision,
+        )
+        .await?;
+    assert!(
+        resolved_from_final_decision,
+        "duplicate recovery with a retained final decision should be treated as resolved",
+    );
+
+    assert_eq!(
+        persisted_document_log_count(&persistence).await?,
+        document_log_count_after_first,
+        "duplicate staging/final recovery must not append duplicate document log entries",
+    );
+    assert_eq!(
+        *node.now_ts_for_reads(),
+        snapshot_ts_after_first,
+        "duplicate staging/final recovery must not publish another snapshot",
+    );
+    let projects_after_duplicates = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        projects_after_duplicates
+            .iter()
+            .filter(|project| project.value().0.get("name") == Some(&assert_val!(project_name)))
+            .count(),
+        1,
+        "duplicate recovery must not make the staged write visible more than once",
+    );
+    assert!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "duplicate recovery should leave the prepared redo cleaned up",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_watcher_recovers_complete_staging_after_participant_restart(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
