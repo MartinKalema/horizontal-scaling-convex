@@ -568,9 +568,8 @@ async fn mark_participant_resolved(
         return Ok(());
     };
     if decision.all_participants_resolved() {
-        decision_log.delete_decision(transaction_id).await?;
         tracing::info!(
-            "2PC Coordinator: deleted fully resolved decision for txn={}",
+            "2PC Coordinator: fully resolved decision for txn={} retained for follower recovery",
             transaction_id,
         );
     }

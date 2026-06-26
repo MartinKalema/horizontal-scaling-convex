@@ -166,9 +166,8 @@ pub async fn resolve_decision_for_local_partition(
             .await?
             && updated.all_participants_resolved()
         {
-            decision_log.delete_decision(&txn_id).await?;
             tracing::info!(
-                "2PC Watcher: deleted fully resolved decision for txn={}",
+                "2PC Watcher: fully resolved decision for txn={} retained for follower recovery",
                 txn_id,
             );
         }
