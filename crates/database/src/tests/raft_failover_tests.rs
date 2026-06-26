@@ -10,7 +10,10 @@
 //!   - YugabyteDB Jepsen nightly resilience benchmarks
 
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeSet,
+        HashMap,
+    },
     sync::Arc,
 };
 
@@ -20,6 +23,11 @@ use raft::{
     StateRole,
     Storage,
 };
+use rand::{
+    Rng,
+    SeedableRng,
+};
+use rand_chacha::ChaCha12Rng;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -215,6 +223,474 @@ fn wait_for_committed_payload(
         }
     }
     false
+}
+
+#[derive(Clone)]
+struct SimMessage {
+    from: u64,
+    to: u64,
+    deliver_at_tick: usize,
+    msg: raft::prelude::Message,
+}
+
+struct SeededRaftSimulation {
+    seed: u64,
+    tick: usize,
+    nodes: Vec<RaftNode>,
+    active: Vec<bool>,
+    rng: ChaCha12Rng,
+    network: Vec<SimMessage>,
+    reliable_network: bool,
+    trace: Vec<String>,
+    proposed_payloads: BTreeSet<Vec<u8>>,
+    committed_payloads: BTreeSet<Vec<u8>>,
+}
+
+impl SeededRaftSimulation {
+    const MAX_TRACE_LINES: usize = 512;
+
+    fn new(seed: u64) -> Self {
+        let mut nodes = create_three_node_group();
+        nodes[0].raw_node.campaign().unwrap();
+        let all_active = vec![true; nodes.len()];
+        for _ in 0..20 {
+            tick_cycle(&mut nodes, &all_active);
+            if nodes[0].raw_node.raft.state == StateRole::Leader {
+                break;
+            }
+        }
+        assert_eq!(
+            nodes[0].raw_node.raft.state,
+            StateRole::Leader,
+            "seed={seed:#x}: deterministic simulator setup expected node 1 to win the initial \
+             campaign",
+        );
+        let leader = nodes[0].node_id();
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        let mut sim = Self {
+            seed,
+            tick: 0,
+            active: vec![true; nodes.len()],
+            nodes,
+            rng: ChaCha12Rng::from_seed(seed_bytes),
+            network: Vec::new(),
+            reliable_network: false,
+            trace: Vec::new(),
+            proposed_payloads: BTreeSet::new(),
+            committed_payloads: BTreeSet::new(),
+        };
+        sim.record(format!("initial_leader={leader}"));
+        sim
+    }
+
+    fn record(&mut self, event: impl Into<String>) {
+        if self.trace.len() == Self::MAX_TRACE_LINES {
+            self.trace.remove(0);
+        }
+        self.trace
+            .push(format!("tick={}: {}", self.tick, event.into()));
+    }
+
+    fn trace_dump(&self) -> String {
+        self.trace.join("\n")
+    }
+
+    fn current_leader_idx(&self) -> Option<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .find(|(idx, node)| self.active[*idx] && node.raw_node.raft.state == StateRole::Leader)
+            .map(|(idx, _)| idx)
+    }
+
+    fn active_count(&self) -> usize {
+        self.active.iter().filter(|active| **active).count()
+    }
+
+    fn propose_on_current_leader(&mut self) {
+        let Some(leader_idx) = self.current_leader_idx() else {
+            self.record("proposal_skipped_no_active_leader");
+            return;
+        };
+        let payload = format!(
+            "seed-{:#x}-proposal-{}",
+            self.seed,
+            self.proposed_payloads.len()
+        )
+        .into_bytes();
+        match self.nodes[leader_idx]
+            .raw_node
+            .propose(vec![], payload.clone())
+        {
+            Ok(()) => {
+                self.record(format!(
+                    "proposal node={} payload={}",
+                    self.nodes[leader_idx].node_id(),
+                    String::from_utf8_lossy(&payload),
+                ));
+                self.proposed_payloads.insert(payload);
+            },
+            Err(err) => {
+                self.record(format!(
+                    "proposal_rejected node={} error={err:?}",
+                    self.nodes[leader_idx].node_id(),
+                ));
+            },
+        }
+    }
+
+    fn pause_random_follower_if_safe(&mut self) {
+        if self.active_count() <= 2 {
+            return;
+        }
+        let leader_idx = self.current_leader_idx();
+        let active_indices: Vec<_> = self
+            .active
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, active)| (*active && Some(idx) != leader_idx).then_some(idx))
+            .collect();
+        if active_indices.is_empty() {
+            return;
+        }
+        let idx = active_indices[self.rng.random_range(0..active_indices.len())];
+        self.active[idx] = false;
+        let node_id = self.nodes[idx].node_id();
+        let before = self.network.len();
+        self.network
+            .retain(|msg| msg.from != node_id && msg.to != node_id);
+        let dropped = before - self.network.len();
+        self.record(format!("pause node={node_id} dropped_inflight={dropped}"));
+    }
+
+    fn heal_all_nodes(&mut self) {
+        if self.active.iter().all(|active| *active) {
+            return;
+        }
+        for active in &mut self.active {
+            *active = true;
+        }
+        self.record("heal_all_nodes");
+    }
+
+    fn enqueue_or_drop_message(&mut self, from: u64, to: u64, msg: raft::prelude::Message) {
+        let msg_type = msg.get_msg_type();
+        let is_snapshot = msg_type == raft::prelude::MessageType::MsgSnapshot;
+        if self.reliable_network {
+            self.record(format!(
+                "enqueue_reliable from={from} to={to} type={msg_type:?}"
+            ));
+            self.network.push(SimMessage {
+                from,
+                to,
+                deliver_at_tick: self.tick,
+                msg,
+            });
+            return;
+        }
+
+        let roll = self.rng.random_range(0..100);
+        if roll < 8 {
+            self.record(format!("drop from={from} to={to} type={msg_type:?}"));
+            if is_snapshot {
+                self.report_snapshot(from, to, SnapshotStatus::Failure);
+            }
+            return;
+        }
+
+        let delay = self.rng.random_range(0..=3);
+        self.record(format!(
+            "enqueue from={from} to={to} type={msg_type:?} delay={delay}",
+        ));
+        self.network.push(SimMessage {
+            from,
+            to,
+            deliver_at_tick: self.tick + delay,
+            msg: msg.clone(),
+        });
+
+        if roll >= 8 && roll < 13 {
+            let duplicate_delay = delay + self.rng.random_range(0..=2);
+            self.record(format!(
+                "duplicate from={from} to={to} type={msg_type:?} delay={duplicate_delay}",
+            ));
+            self.network.push(SimMessage {
+                from,
+                to,
+                deliver_at_tick: self.tick + duplicate_delay,
+                msg,
+            });
+        }
+    }
+
+    fn report_snapshot(&mut self, from: u64, to: u64, status: SnapshotStatus) {
+        if let Some(source) = self.nodes.iter_mut().find(|node| node.node_id() == from) {
+            source.raw_node.report_snapshot(to, status);
+        }
+    }
+
+    fn deliver_due_messages(&mut self) {
+        let mut due = Vec::new();
+        let mut pending = Vec::new();
+        for msg in self.network.drain(..) {
+            if msg.deliver_at_tick <= self.tick {
+                due.push(msg);
+            } else {
+                pending.push(msg);
+            }
+        }
+        self.network = pending;
+
+        while !due.is_empty() {
+            let idx = self.rng.random_range(0..due.len());
+            let msg = due.swap_remove(idx);
+            let msg_type = msg.msg.get_msg_type();
+            let is_snapshot = msg_type == raft::prelude::MessageType::MsgSnapshot;
+            let Some(target_idx) = self.nodes.iter().position(|node| node.node_id() == msg.to)
+            else {
+                self.record(format!(
+                    "drop_unknown_target from={} to={} type={msg_type:?}",
+                    msg.from, msg.to,
+                ));
+                if is_snapshot {
+                    self.report_snapshot(msg.from, msg.to, SnapshotStatus::Failure);
+                }
+                continue;
+            };
+            if !self.active[target_idx] {
+                self.record(format!(
+                    "drop_inactive_target from={} to={} type={msg_type:?}",
+                    msg.from, msg.to,
+                ));
+                if is_snapshot {
+                    self.report_snapshot(msg.from, msg.to, SnapshotStatus::Failure);
+                }
+                continue;
+            }
+
+            self.record(format!(
+                "deliver from={} to={} type={msg_type:?}",
+                msg.from, msg.to,
+            ));
+            if let Err(err) = self.nodes[target_idx].raw_node.step(msg.msg) {
+                self.record(format!(
+                    "step_error target={} type={msg_type:?} error={err:?}",
+                    msg.to,
+                ));
+                if is_snapshot {
+                    self.report_snapshot(msg.from, msg.to, SnapshotStatus::Failure);
+                }
+            } else if is_snapshot {
+                self.report_snapshot(msg.from, msg.to, SnapshotStatus::Finish);
+            }
+        }
+    }
+
+    fn tick_once(&mut self) {
+        self.tick += 1;
+        let mut all_messages: Vec<(u64, u64, raft::prelude::Message)> = Vec::new();
+        let mut commit_events = Vec::new();
+        let mut committed_payloads = Vec::new();
+        for (idx, node) in self.nodes.iter_mut().enumerate() {
+            if self.active[idx] {
+                node.raw_node.tick();
+            }
+        }
+
+        for (idx, node) in self.nodes.iter_mut().enumerate() {
+            if !self.active[idx] || !node.raw_node.has_ready() {
+                continue;
+            }
+
+            let mut ready = node.raw_node.ready();
+            for msg in ready.take_messages() {
+                all_messages.push((node.node_id(), msg.to, msg));
+            }
+
+            if !ready.snapshot().is_empty() {
+                node.storage.apply_snapshot(ready.snapshot()).unwrap();
+                node.storage
+                    .set_applied_index(ready.snapshot().get_metadata().index)
+                    .unwrap();
+            }
+            node.storage.append_entries(ready.entries()).unwrap();
+            if let Some(hs) = ready.hs() {
+                node.storage.set_hardstate(hs).unwrap();
+            }
+
+            for entry in ready.take_committed_entries() {
+                if !entry.data.is_empty()
+                    && entry.get_entry_type() == raft::prelude::EntryType::EntryNormal
+                {
+                    commit_events.push(format!(
+                        "commit node={} index={} payload={}",
+                        node.node_id(),
+                        entry.index,
+                        String::from_utf8_lossy(&entry.data),
+                    ));
+                    committed_payloads.push(entry.data.to_vec());
+                }
+                node.storage.set_applied_index(entry.index).unwrap();
+            }
+
+            for msg in ready.take_persisted_messages() {
+                all_messages.push((node.node_id(), msg.to, msg));
+            }
+
+            let mut light_rd = node.raw_node.advance(ready);
+            for entry in light_rd.take_committed_entries() {
+                if !entry.data.is_empty()
+                    && entry.get_entry_type() == raft::prelude::EntryType::EntryNormal
+                {
+                    commit_events.push(format!(
+                        "commit_light node={} index={} payload={}",
+                        node.node_id(),
+                        entry.index,
+                        String::from_utf8_lossy(&entry.data),
+                    ));
+                    committed_payloads.push(entry.data.to_vec());
+                }
+                node.storage.set_applied_index(entry.index).unwrap();
+            }
+            node.raw_node.advance_apply();
+        }
+
+        for event in commit_events {
+            self.record(event);
+        }
+        self.committed_payloads.extend(committed_payloads);
+
+        for (from, to, msg) in all_messages {
+            self.enqueue_or_drop_message(from, to, msg);
+        }
+        self.deliver_due_messages();
+    }
+
+    fn random_nemesis_step(&mut self) {
+        match self.rng.random_range(0..100) {
+            0..=34 => self.propose_on_current_leader(),
+            35..=42 => self.pause_random_follower_if_safe(),
+            43..=50 => self.heal_all_nodes(),
+            _ => {},
+        }
+        self.tick_once();
+    }
+
+    fn drain_to_convergence(&mut self) {
+        self.heal_all_nodes();
+        self.reliable_network = true;
+        for msg in &mut self.network {
+            msg.deliver_at_tick = self.tick;
+        }
+        for _ in 0..500 {
+            self.tick_once();
+            if self.network.is_empty()
+                && self.nodes.iter().all(|node| {
+                    node.raw_node.raft.raft_log.committed
+                        == self.nodes[0].raw_node.raft.raft_log.committed
+                })
+                && self.committed_payloads_replicated()
+            {
+                break;
+            }
+        }
+    }
+
+    fn committed_payloads_replicated(&self) -> bool {
+        self.committed_payloads.iter().all(|payload| {
+            self.nodes
+                .iter()
+                .all(|node| persisted_log_contains(node, payload))
+        })
+    }
+
+    fn assert_invariants(&self) {
+        assert!(
+            self.proposed_payloads.len() >= 8,
+            "seed={:#x}\nexpected enough proposals to exercise the simulator, got {}\ntrace:\n{}",
+            self.seed,
+            self.proposed_payloads.len(),
+            self.trace_dump(),
+        );
+        assert!(
+            self.committed_payloads.len() >= 4,
+            "seed={:#x}\nexpected enough committed entries to exercise the simulator, got \
+             {}\ntrace:\n{}",
+            self.seed,
+            self.committed_payloads.len(),
+            self.trace_dump(),
+        );
+
+        let committed_indices: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|node| node.raw_node.raft.raft_log.committed)
+            .collect();
+        assert!(
+            committed_indices
+                .windows(2)
+                .all(|window| window[0] == window[1]),
+            "seed={:#x}\ncommitted indexes diverged after convergence: {:?}\ntrace:\n{}",
+            self.seed,
+            committed_indices,
+            self.trace_dump(),
+        );
+
+        for payload in &self.committed_payloads {
+            for node in &self.nodes {
+                assert!(
+                    persisted_log_contains(node, payload),
+                    "seed={:#x}\ncommitted payload {} missing from node {}\ntrace:\n{}",
+                    self.seed,
+                    String::from_utf8_lossy(payload),
+                    node.node_id(),
+                    self.trace_dump(),
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_seeded_raft_nemesis_preserves_committed_payloads() {
+    // This is the first bounded #134 deterministic simulation slice. It does
+    // not replace Docker chaos tests; it explores many more Raft message
+    // interleavings cheaply and prints a seed/trace if an invariant fails.
+    for seed in [
+        0x1340_0000_0000_0001,
+        0x1340_0000_0000_0002,
+        0x1340_0000_0000_0003,
+    ] {
+        let mut sim = SeededRaftSimulation::new(seed);
+        for _ in 0..240 {
+            sim.random_nemesis_step();
+        }
+        sim.drain_to_convergence();
+        sim.assert_invariants();
+    }
+}
+
+#[tokio::test]
+async fn test_seeded_raft_simulation_trace_is_reproducible() {
+    let seed = 0x1340_0000_0000_00aa;
+    let run = |seed| {
+        let mut sim = SeededRaftSimulation::new(seed);
+        for _ in 0..80 {
+            sim.random_nemesis_step();
+        }
+        sim.drain_to_convergence();
+        let trace = sim.trace_dump();
+        sim.assert_invariants();
+        trace
+    };
+
+    let first_trace = run(seed);
+    let second_trace = run(seed);
+    assert_eq!(
+        first_trace, second_trace,
+        "same seed should produce the same Raft nemesis trace",
+    );
 }
 
 // ============================================================
