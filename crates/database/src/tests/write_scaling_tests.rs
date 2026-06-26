@@ -4764,9 +4764,14 @@ fn test_failed_remote_prepare_rolls_back_local_participant() -> anyhow::Result<(
             format!("{err:#}").contains("forced prepare failure"),
             "expected remote prepare failure, got: {err:#}",
         );
+        let decisions = decision_log.decisions();
+        assert_eq!(decisions.len(), 1);
         assert!(
-            decision_log.decisions().is_empty(),
-            "rollback decision should be deleted once every prepared participant resolved",
+            decisions.values().any(|decision| {
+                matches!(decision, TwoPhaseDecision::RolledBack { .. })
+                    && decision.all_participants_resolved()
+            }),
+            "rollback decision should be retained after every prepared participant resolves",
         );
 
         let mut retry_tx = node_a.begin(Identity::system()).await?;
@@ -4838,9 +4843,14 @@ fn test_ambiguous_remote_prepare_failure_rolls_back_attempted_participant() -> a
             format!("{err:#}").contains("transport error"),
             "expected transport-shaped prepare failure, got: {err:#}",
         );
+        let decisions = decision_log.decisions();
+        assert_eq!(decisions.len(), 1);
         assert!(
-            decision_log.decisions().is_empty(),
-            "rollback decision should be deleted once attempted participants are resolved",
+            decisions.values().any(|decision| {
+                matches!(decision, TwoPhaseDecision::RolledBack { .. })
+                    && decision.all_participants_resolved()
+            }),
+            "rollback decision should be retained once attempted participants are resolved",
         );
         assert!(
             node_b
@@ -4934,6 +4944,99 @@ async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
 }
 
 #[convex_macro::test_runtime]
+async fn test_watcher_commits_prepared_redo_when_final_decision_was_already_resolved(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "prepared-before-final-decision-retention"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("retained_final_decision_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+
+    let mut committed = TwoPhaseDecision::committed(u64::from(prepare_ts), vec![1]);
+    committed.mark_participant_resolved(PartitionId(1));
+    assert!(
+        committed.all_participants_resolved(),
+        "test setup should model a coordinator-retained final decision after partition-level \
+         resolution",
+    );
+    decision_log.write_decision(&txn_id, &committed).await?;
+
+    let resolved = crate::two_phase_watcher::rollback_expired_local_prepares(
+        &node.committer_for_test(),
+        PartitionId(1),
+        Duration::ZERO,
+    )
+    .await?;
+    assert_eq!(
+        resolved, 1,
+        "expired local redo with a retained committed decision must be committed, not rolled back",
+    );
+
+    let projects_after_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        projects_after_recovery.iter().any(|project| {
+            project.value().0.get("name")
+                == Some(&assert_val!("prepared-before-final-decision-retention"))
+        }),
+        "retained committed decision should make the prepared write visible",
+    );
+    assert!(
+        decision_log
+            .get_decision(&txn_id)
+            .await?
+            .is_some_and(|decision| matches!(decision, TwoPhaseDecision::Committed { .. })),
+        "committed decision should remain retained for other followers/restarts",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_watcher_recovers_complete_staging_decision_and_commits_prepared_write(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
@@ -5011,7 +5114,7 @@ async fn test_watcher_recovers_complete_staging_decision_and_commits_prepared_wr
     let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
         &node.committer_for_test(),
         PartitionId(1),
-        txn_id,
+        txn_id.clone(),
         staging,
     )
     .await?;
@@ -5032,9 +5135,19 @@ async fn test_watcher_recovers_complete_staging_decision_and_commits_prepared_wr
         }),
         "watcher recovery should make the recovered committed write visible",
     );
-    assert!(
-        decision_log.decisions().is_empty(),
-        "single-participant recovered staging decision should be deleted after cleanup",
+    let Some(TwoPhaseDecision::Committed {
+        resolved_participants,
+        ..
+    }) = decision_log.get_decision(&txn_id).await?
+    else {
+        anyhow::bail!(
+            "single-participant recovered staging decision should be retained as committed"
+        );
+    };
+    assert_eq!(
+        resolved_participants,
+        vec![1],
+        "recovered staging decision should mark the local participant resolved",
     );
     assert!(
         node.committer_for_test()
@@ -5137,7 +5250,7 @@ async fn test_watcher_recovers_complete_staging_after_participant_restart(
     let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
         &restarted.committer_for_test(),
         PartitionId(1),
-        txn_id,
+        txn_id.clone(),
         staging,
     )
     .await?;
@@ -5158,9 +5271,20 @@ async fn test_watcher_recovers_complete_staging_after_participant_restart(
         }),
         "staging recovery after restart should make the committed write visible",
     );
-    assert!(
-        decision_log.decisions().is_empty(),
-        "single-participant recovered staging decision should be deleted after restart cleanup",
+    let Some(TwoPhaseDecision::Committed {
+        resolved_participants,
+        ..
+    }) = decision_log.get_decision(&txn_id).await?
+    else {
+        anyhow::bail!(
+            "single-participant recovered staging decision should be retained as committed after \
+             restart cleanup",
+        );
+    };
+    assert_eq!(
+        resolved_participants,
+        vec![1],
+        "restart recovery should mark the local participant resolved",
     );
     assert!(
         restarted
@@ -5433,9 +5557,21 @@ fn test_rollback_decision_survives_failed_rollback_rpc_for_watcher() -> anyhow::
             decision.clone(),
         )
         .await?;
-        assert!(
-            decision_log.decisions().is_empty(),
-            "decision should be deleted after the delayed participant resolves",
+        let Some(TwoPhaseDecision::RolledBack {
+            resolved_participants,
+            ..
+        }) = decision_log
+            .get_decision(&TwoPhaseTransactionId(txn_id.clone()))
+            .await?
+        else {
+            anyhow::bail!(
+                "rollback decision should remain retained after delayed participant resolves"
+            );
+        };
+        assert_eq!(
+            resolved_participants,
+            vec![1],
+            "delayed participant should be marked resolved on the retained rollback decision",
         );
         insert_doc(
             &node_b,
@@ -5564,9 +5700,21 @@ fn test_commit_decision_survives_failed_participant_commit() -> anyhow::Result<(
             decision.clone(),
         )
         .await?;
-        assert!(
-            decision_log.decisions().is_empty(),
-            "commit decision should be deleted after the delayed participant resolves",
+        let Some(TwoPhaseDecision::Committed {
+            resolved_participants,
+            ..
+        }) = decision_log
+            .get_decision(&TwoPhaseTransactionId(txn_id.clone()))
+            .await?
+        else {
+            anyhow::bail!(
+                "commit decision should remain retained after delayed participant resolves"
+            );
+        };
+        assert_eq!(
+            resolved_participants,
+            vec![0, 1],
+            "delayed participant should be marked resolved on the retained commit decision",
         );
         let projects = run_query(
             node_b,
