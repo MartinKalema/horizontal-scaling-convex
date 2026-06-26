@@ -62,7 +62,10 @@ use common::{
         Timestamp,
     },
 };
-use futures::TryStreamExt;
+use futures::{
+    stream::BoxStream,
+    TryStreamExt,
+};
 use keybroker::Identity;
 use parking_lot::Mutex;
 use pb::replication::{
@@ -104,6 +107,8 @@ use crate::{
     commit_delta::{
         testing::InMemoryDistributedLog,
         CommitDelta,
+        DistributedLog,
+        ReplicationMessage,
     },
     committer::{
         CommitterClient,
@@ -135,6 +140,7 @@ use crate::{
         TwoPhaseCommitGrpcClient,
         TwoPhaseDecision,
         TwoPhaseDecisionLog,
+        TwoPhaseParticipantIntent,
         TwoPhaseRedoEntry,
         TwoPhaseTransactionId,
     },
@@ -269,6 +275,78 @@ async fn create_node_with_persistence_and_table_number_allocator(
     let handle = db.start_search_and_vector_bootstrap();
     handle.join().await?;
     Ok(db)
+}
+
+async fn create_node_with_custom_distributed_log(
+    rt: &TestRuntime,
+    tp: Arc<TestPersistence>,
+    distributed_log: Arc<dyn DistributedLog>,
+    partition_map: Option<PartitionMap>,
+    table_number_allocator: Arc<dyn TableNumberAllocator>,
+) -> anyhow::Result<Database<TestRuntime>> {
+    let searcher: Arc<dyn search::Searcher> = Arc::new(SearcherStub {});
+    let (deleted_tablet_sender, _) = tokio::sync::mpsc::channel(100);
+    let db = Database::load(
+        tp,
+        rt.clone(),
+        searcher,
+        ShutdownSignal::panic(),
+        Default::default(),
+        None,
+        Arc::new(new_unlimited_rate_limiter(rt.clone())),
+        deleted_tablet_sender,
+        distributed_log,
+        false,
+        partition_map,
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        None,
+        table_number_allocator,
+        None,
+    )
+    .await?;
+    db.set_search_storage(Arc::new(LocalDirStorage::new(rt.clone())?));
+    let handle = db.start_search_and_vector_bootstrap();
+    handle.join().await?;
+    Ok(db)
+}
+
+#[derive(Default)]
+struct SwitchableDistributedLog {
+    fail_publishes: AtomicBool,
+    published: Mutex<Vec<Timestamp>>,
+}
+
+impl SwitchableDistributedLog {
+    fn failing() -> Self {
+        Self {
+            fail_publishes: AtomicBool::new(true),
+            published: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn published(&self) -> Vec<Timestamp> {
+        self.published.lock().clone()
+    }
+}
+
+#[async_trait]
+impl DistributedLog for SwitchableDistributedLog {
+    async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+        if self.fail_publishes.load(Ordering::SeqCst) {
+            anyhow::bail!("injected replication publish failure");
+        }
+        self.published.lock().push(delta.ts);
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        _from_ts: Timestamp,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+        Ok(Box::pin(futures::stream::pending()))
+    }
 }
 
 fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
@@ -2032,6 +2110,109 @@ async fn test_replica_delta_redelivery_is_idempotent(rt: TestRuntime) -> anyhow:
         persisted_document_log_count(&node_a_persistence).await?,
         docs_after_first_apply,
         "redelivered delta after restart must not append duplicate document log entries",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let source_log = Arc::new(InMemoryDistributedLog::new());
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_table_number_allocator(
+        &rt,
+        source_log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers.clone(),
+    )
+    .await?;
+
+    insert_doc(&source, "projects", assert_obj!("name" => "raft-outbox")).await?;
+    let delta = source_log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("source partition insert should publish a delta");
+    assert_eq!(delta.source_partition, Some(PartitionId(1)));
+    let delta_ts = delta.ts;
+
+    let replay_log = Arc::new(SwitchableDistributedLog::failing());
+    let follower_persistence = Arc::new(TestPersistence::new());
+    let follower = create_node_with_custom_distributed_log(
+        &rt,
+        follower_persistence.clone(),
+        replay_log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers,
+    )
+    .await?;
+
+    follower
+        .committer_for_test()
+        .apply_raft_commit_delta(delta)
+        .await?;
+
+    let outbox = follower_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+        .await?
+        .context("Raft follower apply should record the delta before NATS publish")?;
+    let records: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_value(outbox)?;
+    assert_eq!(
+        records.len(),
+        1,
+        "failed NATS publish should leave the Raft-applied delta in the outbox",
+    );
+    assert!(records.contains_key(&u64::from(delta_ts).to_string()));
+    assert!(
+        replay_log.published().is_empty(),
+        "the failing log must not observe a successful publish before recovery",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_partitioned_commit_records_nats_outbox_when_publish_unavailable(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let replay_log = Arc::new(SwitchableDistributedLog::failing());
+    let persistence = Arc::new(TestPersistence::new());
+    let db = create_node_with_custom_distributed_log(
+        &rt,
+        persistence.clone(),
+        replay_log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        Arc::new(InMemoryTableNumberAllocator::default()),
+    )
+    .await?;
+
+    let commit_ts = insert_doc(
+        &db,
+        "messages",
+        assert_obj!("body" => "accepted while nats is unavailable"),
+    )
+    .await?;
+
+    let outbox = persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+        .await?
+        .context("partitioned local commit should record a Raft->NATS outbox entry")?;
+    let records: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_value(outbox)?;
+    assert_eq!(
+        records.len(),
+        1,
+        "failed NATS publish should leave the accepted local commit in the outbox",
+    );
+    assert!(records.contains_key(&u64::from(commit_ts).to_string()));
+    assert!(
+        replay_log.published().is_empty(),
+        "the failing log must not observe a successful publish",
     );
 
     Ok(())
@@ -4745,6 +4926,411 @@ async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
     )
     .await
     .context("timed-out prepare should no longer block conflicting writes")?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_watcher_recovers_complete_staging_decision_and_commits_prepared_write(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "staged-before-coordinator-crash"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("complete_staging_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+
+    let projects_before_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        !projects_before_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("staged-before-coordinator-crash"))
+        }),
+        "abortable staged writes must stay hidden before status recovery",
+    );
+
+    let redo_records = node.committer_for_test().two_phase_redo_records().await?;
+    let redo_entry = redo_records
+        .values()
+        .next()
+        .context("prepare should persist a redo entry")?;
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(redo_entry)],
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id,
+        staging,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "complete staged decision should recover to a committed decision",
+    );
+
+    let projects_after_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        projects_after_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("staged-before-coordinator-crash"))
+        }),
+        "watcher recovery should make the recovered committed write visible",
+    );
+    assert!(
+        decision_log.decisions().is_empty(),
+        "single-participant recovered staging decision should be deleted after cleanup",
+    );
+    assert!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "committing the recovered staged transaction should delete the participant redo record",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_watcher_recovers_complete_staging_after_participant_restart(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let persistence = Arc::new(TestPersistence::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_persistence(
+        &rt,
+        persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        decision_log.clone(),
+        None,
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "staged-before-participant-restart"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("complete_staging_restart_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+
+    let projects_before_restart = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        !projects_before_restart.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("staged-before-participant-restart"))
+        }),
+        "prepared staged writes must stay hidden before participant restart",
+    );
+
+    let redo_records = node.committer_for_test().two_phase_redo_records().await?;
+    let redo_entry = redo_records
+        .values()
+        .next()
+        .context("prepare should persist a redo entry before restart")?;
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(redo_entry)],
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+    node.shutdown().await?;
+
+    let restarted = create_node_with_persistence(
+        &rt,
+        persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        decision_log.clone(),
+        None,
+    )
+    .await?;
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &restarted.committer_for_test(),
+        PartitionId(1),
+        txn_id,
+        staging,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "watcher should recover complete staging from durable redo after participant restart",
+    );
+
+    let projects_after_recovery = run_query(
+        restarted.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        projects_after_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("staged-before-participant-restart"))
+        }),
+        "staging recovery after restart should make the committed write visible",
+    );
+    assert!(
+        decision_log.decisions().is_empty(),
+        "single-participant recovered staging decision should be deleted after restart cleanup",
+    );
+    assert!(
+        restarted
+            .committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "restart recovery should delete the participant redo record after commit",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_watcher_leaves_partial_staging_hidden_until_all_participants_stage(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "partial-staging-hidden"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("partial_staging_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(0), PartitionId(1)],
+        )
+        .await?;
+
+    let redo_records = node.committer_for_test().two_phase_redo_records().await?;
+    let redo_entry = redo_records
+        .values()
+        .next()
+        .context("prepare should persist a redo entry")?;
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![0, 1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(redo_entry)],
+    );
+    assert!(
+        !staging.all_participants_staged(),
+        "test setup should represent an incomplete parallel-commit staging record",
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id.clone(),
+        staging.clone(),
+    )
+    .await?;
+    assert!(
+        !resolved,
+        "watcher must not resolve or expose a transaction before all participants stage",
+    );
+
+    let projects_before_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        !projects_before_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("partial-staging-hidden"))
+        }),
+        "partial staged writes must stay hidden while the staging decision is pending",
+    );
+    assert!(
+        !decision_log
+            .get_decision(&txn_id)
+            .await?
+            .context("pending staging decision should remain durable")?
+            .all_participants_staged(),
+        "missing participant proof should keep the decision in staging",
+    );
+    assert_eq!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .len(),
+        1,
+        "pending staging should keep the local prepared redo for later recovery",
+    );
+
+    decision_log
+        .mark_participant_staged(
+            &txn_id,
+            TwoPhaseParticipantIntent {
+                partition_id: 0,
+                prepare_ts: u64::from(prepare_ts),
+                participant_transaction_digest: "remote-participant-digest".to_string(),
+            },
+        )
+        .await?;
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id.clone(),
+        staging,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "watcher may recover the local participant once every participant proof exists",
+    );
+
+    let projects_after_recovery = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        projects_after_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("partial-staging-hidden"))
+        }),
+        "complete staged decision should make the recovered local write visible",
+    );
+    assert!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "local recovery should clean up the participant redo after commit",
+    );
+    let Some(TwoPhaseDecision::Committed {
+        resolved_participants,
+        ..
+    }) = decision_log.get_decision(&txn_id).await?
+    else {
+        anyhow::bail!("complete staging recovery should promote the decision to committed");
+    };
+    assert_eq!(
+        resolved_participants,
+        vec![1],
+        "local watcher should mark only this participant resolved and leave the decision for \
+         other participants",
+    );
     Ok(())
 }
 

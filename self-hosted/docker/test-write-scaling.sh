@@ -18,6 +18,7 @@
 #   9. Two-Phase Commit Cross-Partition (Vitess 2PC)
 #   9f. 2PC Atomicity During NATS Outage
 #   9g. 2PC Atomicity During Participant Restart
+#   9h. 2PC Atomicity During Coordinator Restart
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -32,6 +33,7 @@
 #  20b. Writes Through Followers During Raft Leader Outage
 #  20c. Lagging Follower Catch-Up After Cross-Partition Writes
 #  20d. Cross-Partition 2PC During Participant Leader Outage
+#  20e. Repeated Raft Leadership Churn During Cross-Partition 2PC
 #  21. Sustained Writes 30s (long-running replication)
 #  22. Duplicate Insert Idempotency
 #  23. Final Exhaustive Invariant Check
@@ -1000,6 +1002,60 @@ fi
 
 # ============================================================
 echo ""
+echo -e "${BOLD}Test 9h: 2PC Atomicity During Coordinator Restart${NC}"
+# ============================================================
+# Race a cross-partition mutation with a partition-0 coordinator restart. This
+# is the coordinator-crash window: after staging/decision work starts, the
+# persisted outcome must still be either fully absent or fully present.
+
+PRE_COORD_RESTART_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_COORD_RESTART_2PC_M=$(jval messages "$PRE_COORD_RESTART_2PC")
+PRE_COORD_RESTART_2PC_T=$(jval tasks "$PRE_COORD_RESTART_2PC")
+COORD_RESTART_2PC_RESPONSE_FILE=$(mktemp)
+
+(curl --max-time 20 -s "$NODE_A_URL/api/mutation" \
+    -H "Authorization: Convex $NODE_A_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"path":"messages:crossPartitionWrite","args":{"text":"2pc-coordinator-restart","taskTitle":"2pc-coordinator-restart-task"}}' \
+    > "$COORD_RESTART_2PC_RESPONSE_FILE" || echo '{"status":"transport_error"}' > "$COORD_RESTART_2PC_RESPONSE_FILE") &
+COORD_RESTART_2PC_PID=$!
+sleep 0.05
+docker restart docker-node-p0a-1 > /dev/null 2>&1
+wait "$COORD_RESTART_2PC_PID" || true
+
+echo "  Waiting for coordinator node p0a to recover..."
+for attempt in $(seq 1 60); do
+    curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY="$NODE_P0A_KEY"
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
+
+sleep 8
+POST_COORD_RESTART_2PC_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_COORD_RESTART_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_COORD_RESTART_2PC_M=$(jval messages "$POST_COORD_RESTART_2PC_A")
+POST_COORD_RESTART_2PC_T=$(jval tasks "$POST_COORD_RESTART_2PC_A")
+POST_COORD_RESTART_2PC_BM=$(jval messages "$POST_COORD_RESTART_2PC_B")
+POST_COORD_RESTART_2PC_BT=$(jval tasks "$POST_COORD_RESTART_2PC_B")
+COORD_RESTART_2PC_DM=$((POST_COORD_RESTART_2PC_M - PRE_COORD_RESTART_2PC_M))
+COORD_RESTART_2PC_DT=$((POST_COORD_RESTART_2PC_T - PRE_COORD_RESTART_2PC_T))
+COORD_RESTART_2PC_RESPONSE=$(cat "$COORD_RESTART_2PC_RESPONSE_FILE")
+rm -f "$COORD_RESTART_2PC_RESPONSE_FILE"
+
+if [ "$COORD_RESTART_2PC_DM" -eq "$COORD_RESTART_2PC_DT" ] && { [ "$COORD_RESTART_2PC_DM" -eq 0 ] || [ "$COORD_RESTART_2PC_DM" -eq 1 ]; }; then
+    pass "2PC during coordinator restart was atomic (msgs +$COORD_RESTART_2PC_DM tasks +$COORD_RESTART_2PC_DT)"
+else
+    fail "2PC during coordinator restart produced torn/non-idempotent result" "response=$COORD_RESTART_2PC_RESPONSE msgs +$COORD_RESTART_2PC_DM tasks +$COORD_RESTART_2PC_DT"
+fi
+
+[ "$POST_COORD_RESTART_2PC_M" -eq "$POST_COORD_RESTART_2PC_BM" ] && [ "$POST_COORD_RESTART_2PC_T" -eq "$POST_COORD_RESTART_2PC_BT" ] \
+    && pass "Nodes converged after coordinator restart 2PC race" \
+    || fail "Nodes diverged after coordinator restart 2PC race" "A: $POST_COORD_RESTART_2PC_M,$POST_COORD_RESTART_2PC_T vs B: $POST_COORD_RESTART_2PC_BM,$POST_COORD_RESTART_2PC_BT"
+
+# ============================================================
+echo ""
 echo -e "${BOLD}Test 10: Rapid-Fire Writes Under Load (Jepsen Stress Pattern)${NC}"
 # ============================================================
 # CockroachDB Jepsen found timestamp collision bugs at ~20 txns/sec after
@@ -1630,6 +1686,134 @@ P1_OUTAGE_DT=$((POST_P1_OUTAGE_AT - PRE_P1_OUTAGE_T))
 [ "$POST_P1_OUTAGE_AM" -eq "$POST_P1_OUTAGE_BM" ] && [ "$POST_P1_OUTAGE_AT" -eq "$POST_P1_OUTAGE_BT" ] \
     && pass "Nodes converged after p1a participant leader outage" \
     || fail "Nodes diverged after p1a participant leader outage" "p0a=$POST_P1_OUTAGE_AM,$POST_P1_OUTAGE_AT p1a=$POST_P1_OUTAGE_BM,$POST_P1_OUTAGE_BT"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 20e: Repeated Raft Leadership Churn During Cross-Partition 2PC${NC}"
+# ============================================================
+# Alternate partition-0 and partition-1 node outages while issuing
+# cross-partition 2PC writes through surviving entrypoints. This is a
+# deterministic precursor to randomized nemesis testing: every accepted write
+# must remain atomic and every restarted node must converge.
+
+PRE_CHURN_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+PRE_CHURN_2PC_M=$(jval messages "$PRE_CHURN_2PC")
+PRE_CHURN_2PC_T=$(jval tasks "$PRE_CHURN_2PC")
+CHURN_2PC_RUN="churn-2pc-$(date +%s)"
+CHURN_2PC_ACCEPTED=0
+CHURN_2PC_REJECTED=0
+CHURN_2PC_ATTEMPTED=0
+
+for round in 1 2 3 4; do
+    case "$round" in
+        1)
+            stopped_container="docker-node-p0a-1"
+            stopped_url="$NODE_P0A_URL"
+            stopped_label="p0a"
+            survivor_labels=(p1a p1b p1c)
+            survivor_urls=("$NODE_P1A_URL" "$NODE_P1B_URL" "$NODE_P1C_URL")
+            survivor_keys=("$NODE_P1A_KEY" "$NODE_P1B_KEY" "$NODE_P1C_KEY")
+            ;;
+        2)
+            stopped_container="docker-node-p1a-1"
+            stopped_url="$NODE_P1A_URL"
+            stopped_label="p1a"
+            survivor_labels=(p0a p0b p0c)
+            survivor_urls=("$NODE_P0A_URL" "$NODE_P0B_URL" "$NODE_P0C_URL")
+            survivor_keys=("$NODE_P0A_KEY" "$NODE_P0B_KEY" "$NODE_P0C_KEY")
+            ;;
+        3)
+            stopped_container="docker-node-p0b-1"
+            stopped_url="$NODE_P0B_URL"
+            stopped_label="p0b"
+            survivor_labels=(p1a p1b p1c)
+            survivor_urls=("$NODE_P1A_URL" "$NODE_P1B_URL" "$NODE_P1C_URL")
+            survivor_keys=("$NODE_P1A_KEY" "$NODE_P1B_KEY" "$NODE_P1C_KEY")
+            ;;
+        4)
+            stopped_container="docker-node-p1b-1"
+            stopped_url="$NODE_P1B_URL"
+            stopped_label="p1b"
+            survivor_labels=(p0a p0b p0c)
+            survivor_urls=("$NODE_P0A_URL" "$NODE_P0B_URL" "$NODE_P0C_URL")
+            survivor_keys=("$NODE_P0A_KEY" "$NODE_P0B_KEY" "$NODE_P0C_KEY")
+            ;;
+    esac
+
+    echo "  Round $round: stopping $stopped_label and issuing 2PC writes through surviving entrypoints..."
+    docker stop "$stopped_container" > /dev/null 2>&1
+    sleep 6
+
+    ROUND_ACCEPTED=0
+    for i in "${!survivor_labels[@]}"; do
+        label="${survivor_labels[$i]}"
+        CHURN_2PC_ATTEMPTED=$((CHURN_2PC_ATTEMPTED + 1))
+        R=$(mutation_response "${survivor_urls[$i]}" "${survivor_keys[$i]}" "messages:crossPartitionWrite" \
+            "{\"text\":\"$CHURN_2PC_RUN-r${round}-$label\",\"taskTitle\":\"$CHURN_2PC_RUN-r${round}-task-$label\"}")
+        if echo "$R" | grep -q '"status":"success"'; then
+            CHURN_2PC_ACCEPTED=$((CHURN_2PC_ACCEPTED + 1))
+            ROUND_ACCEPTED=$((ROUND_ACCEPTED + 1))
+        else
+            CHURN_2PC_REJECTED=$((CHURN_2PC_REJECTED + 1))
+            echo -e "  ${YELLOW}WARN${NC} $label 2PC write rejected during $stopped_label outage (fail-closed): $R"
+        fi
+    done
+
+    [ "$ROUND_ACCEPTED" -gt 0 ] \
+        && pass "Round $round accepted at least one 2PC write during $stopped_label outage ($ROUND_ACCEPTED/3)" \
+        || fail "Round $round accepted no 2PC writes during $stopped_label outage" "all three attempts failed closed"
+
+    echo "  Restarting $stopped_label..."
+    docker start "$stopped_container" > /dev/null 2>&1
+    for attempt in $(seq 1 60); do
+        curl -sf "$stopped_url/version" > /dev/null 2>&1 && break
+        sleep 1
+    done
+
+    case "$round" in
+        1)
+            NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+            NODE_A_KEY="$NODE_P0A_KEY"
+            (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_P0A_KEY" --url "$NODE_P0A_URL" > /dev/null 2>&1)
+            ;;
+        2)
+            NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+            NODE_B_KEY="$NODE_P1A_KEY"
+            (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_P1A_KEY" --url "$NODE_P1A_URL" > /dev/null 2>&1)
+            ;;
+        3)
+            NODE_P0B_KEY=$(docker exec docker-node-p0b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+            (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_P0B_KEY" --url "$NODE_P0B_URL" > /dev/null 2>&1)
+            ;;
+        4)
+            NODE_P1B_KEY=$(docker exec docker-node-p1b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+            (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_P1B_KEY" --url "$NODE_P1B_URL" > /dev/null 2>&1)
+            ;;
+    esac
+    sleep 4
+done
+
+[ "$CHURN_2PC_ATTEMPTED" -eq $((CHURN_2PC_ACCEPTED + CHURN_2PC_REJECTED)) ] \
+    && pass "Repeated-churn 2PC attempts were all accounted for (accepted=$CHURN_2PC_ACCEPTED rejected=$CHURN_2PC_REJECTED)" \
+    || fail "Repeated-churn 2PC accounting mismatch" "attempted=$CHURN_2PC_ATTEMPTED accepted=$CHURN_2PC_ACCEPTED rejected=$CHURN_2PC_REJECTED"
+
+sleep 10
+POST_CHURN_2PC_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_CHURN_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_CHURN_2PC_M=$(jval messages "$POST_CHURN_2PC_A")
+POST_CHURN_2PC_T=$(jval tasks "$POST_CHURN_2PC_A")
+POST_CHURN_2PC_BM=$(jval messages "$POST_CHURN_2PC_B")
+POST_CHURN_2PC_BT=$(jval tasks "$POST_CHURN_2PC_B")
+CHURN_2PC_DM=$((POST_CHURN_2PC_M - PRE_CHURN_2PC_M))
+CHURN_2PC_DT=$((POST_CHURN_2PC_T - PRE_CHURN_2PC_T))
+
+[ "$CHURN_2PC_DM" -eq "$CHURN_2PC_ACCEPTED" ] && [ "$CHURN_2PC_DT" -eq "$CHURN_2PC_ACCEPTED" ] \
+    && pass "Repeated-churn 2PC writes remained atomic (+$CHURN_2PC_ACCEPTED/+${CHURN_2PC_ACCEPTED})" \
+    || fail "Lost/extra 2PC writes during repeated leadership churn" "msgs +$CHURN_2PC_DM tasks +$CHURN_2PC_DT expected +$CHURN_2PC_ACCEPTED"
+
+[ "$POST_CHURN_2PC_M" -eq "$POST_CHURN_2PC_BM" ] && [ "$POST_CHURN_2PC_T" -eq "$POST_CHURN_2PC_BT" ] \
+    && pass "Nodes converged after repeated Raft leadership churn" \
+    || fail "Nodes diverged after repeated Raft leadership churn" "p0a=$POST_CHURN_2PC_M,$POST_CHURN_2PC_T p1a=$POST_CHURN_2PC_BM,$POST_CHURN_2PC_BT"
 
 # ============================================================
 echo ""
