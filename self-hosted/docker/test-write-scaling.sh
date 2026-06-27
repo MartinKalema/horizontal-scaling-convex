@@ -19,6 +19,7 @@
 #   9f. 2PC Atomicity During NATS Outage
 #   9g. 2PC Atomicity During Participant Restart
 #   9h. 2PC Atomicity During Coordinator Restart
+#   9i. Per-Write 2PC Exactness During Failure Windows
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -414,6 +415,14 @@ query_with_args() {
 
 jval() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']['$1']))" <<< "$2"; }
 jtotal() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" <<< "$1"; }
+
+count_message_text() {
+    jtotal "$(query_with_args "$1" "$2" "messages:countMessagesByText" "{\"text\":\"$3\"}")"
+}
+
+count_task_title() {
+    jtotal "$(query_with_args "$1" "$2" "messages:countTasksByTitle" "{\"title\":\"$3\"}")"
+}
 
 # --- Baseline: capture existing counts before tests ---
 
@@ -914,6 +923,11 @@ DELTA_T=$((POST_T_A - PRE_2PC_T))
     && pass "2PC invariant: msgs and tasks incremented equally (+$DELTA_M)" \
     || fail "2PC invariant violated" "msgs +$DELTA_M vs tasks +$DELTA_T"
 
+FAILURE_WINDOW_2PC_LABELS=()
+FAILURE_WINDOW_2PC_TEXTS=()
+FAILURE_WINDOW_2PC_TASKS=()
+FAILURE_WINDOW_2PC_RESPONSES=()
+
 # ============================================================
 echo ""
 echo -e "${BOLD}Test 9f: 2PC Atomicity During NATS Outage${NC}"
@@ -935,6 +949,10 @@ NATS_2PC_RESPONSE=$(curl --max-time 10 -s "$NODE_A_URL/api/mutation" \
 sleep 2
 docker unpause docker-nats-1 > /dev/null 2>&1
 echo "  NATS resumed."
+FAILURE_WINDOW_2PC_LABELS+=("nats-outage")
+FAILURE_WINDOW_2PC_TEXTS+=("2pc-nats-outage")
+FAILURE_WINDOW_2PC_TASKS+=("2pc-nats-outage-task")
+FAILURE_WINDOW_2PC_RESPONSES+=("$NATS_2PC_RESPONSE")
 
 sleep 6
 POST_NATS_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
@@ -998,6 +1016,10 @@ RESTART_2PC_DM=$((POST_RESTART_2PC_M - PRE_RESTART_2PC_M))
 RESTART_2PC_DT=$((POST_RESTART_2PC_T - PRE_RESTART_2PC_T))
 RESTART_2PC_RESPONSE=$(cat "$RESTART_2PC_RESPONSE_FILE")
 rm -f "$RESTART_2PC_RESPONSE_FILE"
+FAILURE_WINDOW_2PC_LABELS+=("participant-restart")
+FAILURE_WINDOW_2PC_TEXTS+=("2pc-participant-restart")
+FAILURE_WINDOW_2PC_TASKS+=("2pc-participant-restart-task")
+FAILURE_WINDOW_2PC_RESPONSES+=("$RESTART_2PC_RESPONSE")
 
 if [ "$RESTART_2PC_DM" -eq "$RESTART_2PC_DT" ] && { [ "$RESTART_2PC_DM" -eq 0 ] || [ "$RESTART_2PC_DM" -eq 1 ]; }; then
     pass "2PC during participant restart was atomic (msgs +$RESTART_2PC_DM tasks +$RESTART_2PC_DT)"
@@ -1052,6 +1074,10 @@ COORD_RESTART_2PC_DM=$((POST_COORD_RESTART_2PC_M - PRE_COORD_RESTART_2PC_M))
 COORD_RESTART_2PC_DT=$((POST_COORD_RESTART_2PC_T - PRE_COORD_RESTART_2PC_T))
 COORD_RESTART_2PC_RESPONSE=$(cat "$COORD_RESTART_2PC_RESPONSE_FILE")
 rm -f "$COORD_RESTART_2PC_RESPONSE_FILE"
+FAILURE_WINDOW_2PC_LABELS+=("coordinator-restart")
+FAILURE_WINDOW_2PC_TEXTS+=("2pc-coordinator-restart")
+FAILURE_WINDOW_2PC_TASKS+=("2pc-coordinator-restart-task")
+FAILURE_WINDOW_2PC_RESPONSES+=("$COORD_RESTART_2PC_RESPONSE")
 
 if [ "$COORD_RESTART_2PC_DM" -eq "$COORD_RESTART_2PC_DT" ] && { [ "$COORD_RESTART_2PC_DM" -eq 0 ] || [ "$COORD_RESTART_2PC_DM" -eq 1 ]; }; then
     pass "2PC during coordinator restart was atomic (msgs +$COORD_RESTART_2PC_DM tasks +$COORD_RESTART_2PC_DT)"
@@ -1062,6 +1088,43 @@ fi
 [ "$POST_COORD_RESTART_2PC_M" -eq "$POST_COORD_RESTART_2PC_BM" ] && [ "$POST_COORD_RESTART_2PC_T" -eq "$POST_COORD_RESTART_2PC_BT" ] \
     && pass "Nodes converged after coordinator restart 2PC race" \
     || fail "Nodes diverged after coordinator restart 2PC race" "A: $POST_COORD_RESTART_2PC_M,$POST_COORD_RESTART_2PC_T vs B: $POST_COORD_RESTART_2PC_BM,$POST_COORD_RESTART_2PC_BT"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 9i: Per-Write 2PC Exactness During Failure Windows${NC}"
+# ============================================================
+# Aggregate deltas prove atomicity at a coarse level, but they can miss a bad
+# recovery pattern where one accepted 2PC write is duplicated while another
+# ambiguous write is lost. Check each NATS/restart window by its unique keys.
+
+FAILURE_EXACTNESS_OK=true
+FAILURE_EXACTNESS_DETAILS=""
+for i in "${!FAILURE_WINDOW_2PC_LABELS[@]}"; do
+    label="${FAILURE_WINDOW_2PC_LABELS[$i]}"
+    text="${FAILURE_WINDOW_2PC_TEXTS[$i]}"
+    task="${FAILURE_WINDOW_2PC_TASKS[$i]}"
+    response="${FAILURE_WINDOW_2PC_RESPONSES[$i]}"
+
+    MSG_A=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$text")
+    MSG_B=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$text")
+    TASK_A=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$task")
+    TASK_B=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$task")
+    if echo "$response" | grep -q '"status":"success"'; then
+        if [ "$MSG_A" -ne 1 ] || [ "$MSG_B" -ne 1 ] || [ "$TASK_A" -ne 1 ] || [ "$TASK_B" -ne 1 ]; then
+            FAILURE_EXACTNESS_OK=false
+            FAILURE_EXACTNESS_DETAILS="$FAILURE_EXACTNESS_DETAILS [$label success msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
+        fi
+    elif [ "$MSG_A" -eq "$MSG_B" ] && [ "$MSG_A" -eq "$TASK_A" ] && [ "$MSG_A" -eq "$TASK_B" ] && { [ "$MSG_A" -eq 0 ] || [ "$MSG_A" -eq 1 ]; }; then
+        :
+    else
+        FAILURE_EXACTNESS_OK=false
+        FAILURE_EXACTNESS_DETAILS="$FAILURE_EXACTNESS_DETAILS [$label ambiguous msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B response=$response]"
+    fi
+done
+
+$FAILURE_EXACTNESS_OK \
+    && pass "Every NATS/restart-window 2PC write was absent or appeared exactly once on both nodes" \
+    || fail "Failure-window 2PC exactness violated" "$FAILURE_EXACTNESS_DETAILS"
 
 # ============================================================
 echo ""
