@@ -150,6 +150,10 @@ use crate::{
         TwoPhaseRedoEntry,
         TwoPhaseTransactionId,
     },
+    two_phase_coordinator::{
+        coordinate_two_phase_commit_with_mode,
+        TwoPhaseCommitMode,
+    },
     Database,
     SystemMetadataModel,
     TableModel,
@@ -5251,6 +5255,155 @@ fn test_cross_partition_commit_uses_remote_prepare_over_grpc() -> anyhow::Result
             assert_obj!("name" => "follow-up-remote"),
         )
         .await?;
+
+        server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_parallel_early_ack_recovers_staging_before_async_cleanup() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b_map = partitioned_map(PartitionId(1));
+        let node_b = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(node_b_map),
+            None,
+            Some(tso.clone()),
+            decision_log.clone(),
+        )
+        .await?;
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+            node_b.committer_for_test(),
+        ))
+        .await?;
+
+        let node_a_map = partitioned_map(PartitionId(0));
+        let node_a = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(node_a_map.clone()),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(tso),
+            decision_log.clone(),
+        )
+        .await?;
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let remote_seed_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(remote_seed_delta)
+            .await?;
+        insert_doc(&node_a, "messages", assert_obj!("text" => "seed")).await?;
+        let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(CommitDelta {
+                ts: heartbeat_ts,
+                document_writes: Arc::new(Vec::new()),
+                document_updates: Vec::new(),
+                index_writes: Arc::new(Vec::new()),
+                write_source: WriteSource::new("parallel_early_ack_test"),
+                write_bytes: 0,
+                tablet_id_to_table_name: Default::default(),
+                source_partition: Some(PartitionId(1)),
+            })
+            .await?;
+
+        let initial_delta_count = log.deltas().len();
+        let mut tx = node_a.begin(Identity::system()).await?;
+        let mut model = TestFacingModel::new(&mut tx);
+        model
+            .insert(
+                &"messages".parse()?,
+                assert_obj!("text" => "parallel-local"),
+            )
+            .await?;
+        model
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "parallel-remote"),
+            )
+            .await?;
+        let final_tx = tx.finalize()?;
+
+        let outcome = coordinate_two_phase_commit_with_mode(
+            &node_a.committer_for_test(),
+            final_tx,
+            WriteSource::new("parallel_early_ack_test"),
+            &node_a_map,
+            TwoPhaseCommitMode::ParallelEarlyAck,
+        )
+        .await?;
+
+        let decisions = decision_log.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            decisions.values().any(|decision| matches!(
+                decision,
+                TwoPhaseDecision::Committed {
+                    commit_ts,
+                    participants,
+                    ..
+                } if *commit_ts == u64::from(outcome.ts)
+                    && participants == &vec![PartitionId(0).0, PartitionId(1).0]
+            )),
+            "parallel early ACK should recover the durable staging proof into a committed decision"
+        );
+
+        let mut commit_deltas = Vec::new();
+        for _ in 0..50 {
+            let deltas = log.deltas();
+            commit_deltas = deltas[initial_delta_count..]
+                .iter()
+                .filter(|delta| delta.ts == outcome.ts)
+                .cloned()
+                .collect();
+            if commit_deltas.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            commit_deltas.len(),
+            2,
+            "parallel cleanup should eventually publish one committed delta per participant",
+        );
+        let mut sources: Vec<_> = commit_deltas
+            .iter()
+            .map(|delta| delta.source_partition)
+            .collect();
+        sources.sort();
+        assert_eq!(sources, vec![Some(PartitionId(0)), Some(PartitionId(1))]);
+
+        for _ in 0..50 {
+            if decision_log
+                .decisions()
+                .values()
+                .any(TwoPhaseDecision::all_participants_resolved)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            decision_log
+                .decisions()
+                .values()
+                .any(TwoPhaseDecision::all_participants_resolved),
+            "async cleanup should mark every participant resolved",
+        );
 
         server.shutdown().await?;
         Ok(())

@@ -400,6 +400,16 @@ pub static REMOTE_READ_FRONTIER_WAIT_TIMEOUT: LazyLock<Duration> = LazyLock::new
     Duration::from_millis(env_config("REMOTE_READ_FRONTIER_WAIT_TIMEOUT_MS", 5000))
 });
 
+/// Enable true 2PC parallel-commit early acknowledgement.
+///
+/// When false, cross-partition 2PC uses the conservative durable-decision path:
+/// the coordinator acknowledges the client only after participant cleanup makes
+/// writes visible. When true, the coordinator may acknowledge after it has a
+/// durable staging record plus every participant's Raft-replicated intent
+/// proof, and cleanup proceeds asynchronously.
+pub static ENABLE_PARALLEL_2PC_EARLY_ACK: LazyLock<bool> =
+    LazyLock::new(|| env_config("ENABLE_PARALLEL_2PC_EARLY_ACK", false));
+
 /// This is the max duration between a Commit and bumping max_repeatable_ts.
 /// When reading from a follower persistence, we can only read commits at
 /// timestamps <= max_repeatable_ts (because commits > max_repeatable_ts are

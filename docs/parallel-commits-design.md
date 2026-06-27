@@ -2,17 +2,25 @@
 
 ## Status
 
-Design for issue `#206`.
+Design and rollout notes for issue `#69`.
 
 This document is intentionally conservative. It describes what is required to
 turn `#69` into true CockroachDB-style parallel commits without weakening the
 properties that make Convex feel like Convex.
 
 The current codebase already has durable-decision 2PC, Raft-backed participant
-prepare records, abandoned-prepare rollback, retained decision records, and
-same-partition Raft failover. PR `#205` adds safe parallel participant fanout
-inside that existing protocol. That is useful, but it is not yet true parallel
-commit.
+prepare records, abandoned-prepare rollback, retained decision records,
+same-partition Raft failover, staged decision metadata, staged status recovery,
+and staged read/subscription policy hooks. The default runtime path remains the
+conservative durable-decision protocol.
+
+Issue `#69` now has a guarded early-ack implementation behind
+`ENABLE_PARALLEL_2PC_EARLY_ACK=false` by default. When enabled, the coordinator
+acknowledges a cross-partition transaction after it writes a complete durable
+`Staging` record, recovers that proof into `Committed`, and schedules ordinary
+participant cleanup asynchronously. This preserves the durable-decision path as
+the production fallback while we continue hardening the staged cleanup and
+read-after-write windows.
 
 ## Summary
 
@@ -186,9 +194,10 @@ database: an acknowledged mutation is commonly followed immediately by a query
 or subscription update. Therefore, early ACK is allowed only after the read and
 subscription paths can handle committed-but-not-cleaned-up staged writes.
 
-Until issue `#209` is complete, true early ACK must stay disabled. The system
-may still use the staging machinery internally but should wait for normal
-`CommitPrepared` visibility before returning success.
+The production default remains disabled. The system can use the staging
+machinery internally, but ordinary clusters should continue waiting for normal
+`CommitPrepared` visibility before returning success unless
+`ENABLE_PARALLEL_2PC_EARLY_ACK=true` is explicitly set for validation.
 
 ### Cleanup
 
@@ -293,11 +302,12 @@ state alone.
 ## Relationship To Existing Issues
 
 - `#69` remains the umbrella for CockroachDB-style parallel commits.
-- `#205` is a safe fanout improvement and can merge independently.
-- `#207` should add the durable `Staging` record and participant intent proof.
-- `#208` should add transaction status recovery.
-- `#209` should make reads, OCC, and subscriptions staged-write-aware.
-- `#210` should add the adversarial tests before enabling true early ACK.
+- `#205` added safe parallel participant fanout inside the durable-decision
+  protocol.
+- `#207` added the durable `Staging` record and participant intent proof.
+- `#208` added transaction status recovery.
+- `#209` made reads, OCC, and subscriptions staged-write-aware.
+- `#210` added adversarial tests for 2PC/Raft/NATS ambiguity windows.
 - `#131` remains the broader resolver-style conflict checking work. Parallel
   commits must not make current read validation weaker while that evolves.
 - `#134` remains the long-term deterministic simulation goal.
@@ -314,8 +324,9 @@ state alone.
    recovery mature.
 5. Teach read, OCC, and subscription paths to handle staged committed intents.
 6. Add cluster fault-injection tests for every ambiguous window.
-7. Enable early ACK behind a feature flag only after the tests prove no torn
-   visibility, stale read-after-write, or speculative subscription result.
+7. Enable early ACK behind `ENABLE_PARALLEL_2PC_EARLY_ACK` only after the tests
+   prove no torn visibility, stale read-after-write, or speculative
+   subscription result.
 
 ## Test Gates
 
