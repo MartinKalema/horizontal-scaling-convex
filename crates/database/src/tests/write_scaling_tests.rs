@@ -3280,6 +3280,154 @@ async fn test_raft_prepared_redo_apply_can_commit_after_failover(
 }
 
 #[convex_macro::test_runtime]
+async fn test_watcher_recovers_staged_prepare_after_participant_leader_failover(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let table_number_allocator = Arc::new(InMemoryTableNumberAllocator::default());
+    let old_leader = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        decision_log.clone(),
+        None,
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let new_leader = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        decision_log.clone(),
+        None,
+        table_number_allocator,
+    )
+    .await?;
+
+    let project_name = "staged-before-participant-leader-failover";
+    let mut tx = old_leader.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"projects".parse()?, assert_obj!("name" => project_name))
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("participant_leader_failover_staging_recovery_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = old_leader.committer_for_test().allocate_commit_ts().await?;
+    old_leader
+        .committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+    let redo = old_leader
+        .committer_for_test()
+        .two_phase_redo_records()
+        .await?
+        .get(&txn_id.0)
+        .cloned()
+        .context("old participant leader should persist a prepared redo record")?;
+
+    new_leader
+        .committer_for_test()
+        .apply_raft_prepared_redo(redo.clone())
+        .await
+        .context("new participant leader should replay the Raft-prepared redo")?;
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(&redo)],
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+
+    old_leader.shutdown().await?;
+
+    let before_recovery = run_query(
+        new_leader.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        !before_recovery
+            .iter()
+            .any(|project| project.value().0.get("name") == Some(&assert_val!(project_name))),
+        "Raft-prepared writes must remain hidden until the new leader recovers the staged decision",
+    );
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &new_leader.committer_for_test(),
+        PartitionId(1),
+        txn_id.clone(),
+        staging,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "new participant leader should recover a complete staged decision from Raft-prepared redo",
+    );
+
+    let after_recovery = run_query(
+        new_leader.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        after_recovery
+            .iter()
+            .filter(|project| project.value().0.get("name") == Some(&assert_val!(project_name)))
+            .count(),
+        1,
+        "participant-leader failover recovery must expose the staged write exactly once",
+    );
+    let Some(TwoPhaseDecision::Committed {
+        resolved_participants,
+        ..
+    }) = decision_log.get_decision(&txn_id).await?
+    else {
+        anyhow::bail!(
+            "participant-leader failover recovery should retain the decision as committed"
+        );
+    };
+    assert_eq!(
+        resolved_participants,
+        vec![1],
+        "new participant leader should mark the local participant resolved",
+    );
+    assert!(
+        new_leader
+            .committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "new participant leader should clean the replayed prepared redo after commit",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
