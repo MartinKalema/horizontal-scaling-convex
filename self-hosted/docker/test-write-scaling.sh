@@ -20,6 +20,7 @@
 #   9g. 2PC Atomicity During Participant Restart
 #   9h. 2PC Atomicity During Coordinator Restart
 #   9i. Per-Write 2PC Exactness During Failure Windows
+#   9j. 2PC Exactness During Repeated NATS Flaps
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -1125,6 +1126,99 @@ done
 $FAILURE_EXACTNESS_OK \
     && pass "Every NATS/restart-window 2PC write was absent or appeared exactly once on both nodes" \
     || fail "Failure-window 2PC exactness violated" "$FAILURE_EXACTNESS_DETAILS"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 9j: 2PC Exactness During Repeated NATS Flaps${NC}"
+# ============================================================
+# Pause/unpause NATS repeatedly while issuing cross-partition writes. NATS backs
+# the TSO, 2PC decision log, and replication transport, so accepted operations
+# must recover exactly once and rejected/ambiguous operations must leave either
+# no data or one complete 2PC pair, never a torn participant result.
+
+NATS_FLAP_RUN="nats-flap-2pc-$(date +%s)"
+NATS_FLAP_ATTEMPTS=10
+NATS_FLAP_ACCEPTED=0
+NATS_FLAP_REJECTED=0
+NATS_FLAP_LABELS=()
+NATS_FLAP_TEXTS=()
+NATS_FLAP_TASKS=()
+NATS_FLAP_RESPONSES=()
+
+(
+    for flap in $(seq 1 5); do
+        docker pause docker-nats-1 > /dev/null 2>&1 || true
+        sleep 0.7
+        docker unpause docker-nats-1 > /dev/null 2>&1 || true
+        sleep 0.7
+    done
+) &
+NATS_FLAPPER_PID=$!
+
+for i in $(seq 1 "$NATS_FLAP_ATTEMPTS"); do
+    text="$NATS_FLAP_RUN-msg-$i"
+    task="$NATS_FLAP_RUN-task-$i"
+    response=$(curl --max-time 8 -s "$NODE_A_URL/api/mutation" \
+        -H "Authorization: Convex $NODE_A_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"path\":\"messages:crossPartitionWrite\",\"args\":{\"text\":\"$text\",\"taskTitle\":\"$task\"}}" \
+        || echo '{"status":"transport_error"}')
+    NATS_FLAP_LABELS+=("attempt-$i")
+    NATS_FLAP_TEXTS+=("$text")
+    NATS_FLAP_TASKS+=("$task")
+    NATS_FLAP_RESPONSES+=("$response")
+    if echo "$response" | grep -q '"status":"success"'; then
+        NATS_FLAP_ACCEPTED=$((NATS_FLAP_ACCEPTED + 1))
+    else
+        NATS_FLAP_REJECTED=$((NATS_FLAP_REJECTED + 1))
+        echo -e "  ${YELLOW}WARN${NC} 2PC attempt $i rejected/ambiguous during NATS flap: $response"
+    fi
+done
+
+wait "$NATS_FLAPPER_PID" || true
+docker unpause docker-nats-1 > /dev/null 2>&1 || true
+sleep 8
+
+[ "$NATS_FLAP_ACCEPTED" -gt 0 ] \
+    && pass "NATS-flap 2PC workload accepted at least one write ($NATS_FLAP_ACCEPTED/$NATS_FLAP_ATTEMPTS)" \
+    || fail "NATS-flap 2PC workload accepted no writes" "all attempts failed closed; test did not exercise recovery of accepted work"
+
+curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 \
+    && pass "Node A survived repeated NATS flaps during 2PC workload" \
+    || fail "Node A crashed during NATS-flap 2PC workload"
+
+curl -sf "$NODE_B_URL/version" > /dev/null 2>&1 \
+    && pass "Node B survived repeated NATS flaps during 2PC workload" \
+    || fail "Node B crashed during NATS-flap 2PC workload"
+
+NATS_FLAP_EXACTNESS_OK=true
+NATS_FLAP_EXACTNESS_DETAILS=""
+for i in "${!NATS_FLAP_LABELS[@]}"; do
+    label="${NATS_FLAP_LABELS[$i]}"
+    text="${NATS_FLAP_TEXTS[$i]}"
+    task="${NATS_FLAP_TASKS[$i]}"
+    response="${NATS_FLAP_RESPONSES[$i]}"
+
+    MSG_A=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$text")
+    MSG_B=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$text")
+    TASK_A=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$task")
+    TASK_B=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$task")
+    if echo "$response" | grep -q '"status":"success"'; then
+        if [ "$MSG_A" -ne 1 ] || [ "$MSG_B" -ne 1 ] || [ "$TASK_A" -ne 1 ] || [ "$TASK_B" -ne 1 ]; then
+            NATS_FLAP_EXACTNESS_OK=false
+            NATS_FLAP_EXACTNESS_DETAILS="$NATS_FLAP_EXACTNESS_DETAILS [$label success msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
+        fi
+    elif [ "$MSG_A" -eq "$MSG_B" ] && [ "$MSG_A" -eq "$TASK_A" ] && [ "$MSG_A" -eq "$TASK_B" ] && { [ "$MSG_A" -eq 0 ] || [ "$MSG_A" -eq 1 ]; }; then
+        :
+    else
+        NATS_FLAP_EXACTNESS_OK=false
+        NATS_FLAP_EXACTNESS_DETAILS="$NATS_FLAP_EXACTNESS_DETAILS [$label ambiguous msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B response=$response]"
+    fi
+done
+
+$NATS_FLAP_EXACTNESS_OK \
+    && pass "Every NATS-flap 2PC attempt was absent or appeared exactly once on both nodes" \
+    || fail "NATS-flap 2PC exactness violated" "$NATS_FLAP_EXACTNESS_DETAILS"
 
 # ============================================================
 echo ""
