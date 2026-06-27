@@ -21,6 +21,7 @@
 #   9h. 2PC Atomicity During Coordinator Restart
 #   9i. Per-Write 2PC Exactness During Failure Windows
 #   9j. 2PC Exactness During Repeated NATS Flaps
+#   9k. Post-Ack 2PC Exactness After Cleanup-Window Restarts
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -1219,6 +1220,73 @@ done
 $NATS_FLAP_EXACTNESS_OK \
     && pass "Every NATS-flap 2PC attempt was absent or appeared exactly once on both nodes" \
     || fail "NATS-flap 2PC exactness violated" "$NATS_FLAP_EXACTNESS_DETAILS"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 9k: Post-Ack 2PC Exactness After Cleanup-Window Restarts${NC}"
+# ============================================================
+# Once the client has observed success, recovery and cleanup may still be
+# racing in the background. Restart the coordinator and participant entrypoints
+# immediately after a successful cross-partition write, then prove that cleanup
+# recovery neither drops nor duplicates the committed pair.
+
+POST_ACK_RUN="post-ack-2pc-$(date +%s)"
+POST_ACK_TEXT="$POST_ACK_RUN-msg"
+POST_ACK_TASK="$POST_ACK_RUN-task"
+POST_ACK_RESPONSE=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+    "{\"text\":\"$POST_ACK_TEXT\",\"taskTitle\":\"$POST_ACK_TASK\"}")
+
+if echo "$POST_ACK_RESPONSE" | grep -q '"status":"success"'; then
+    pass "Post-ack cleanup-window 2PC write returned success"
+else
+    fail "Post-ack cleanup-window 2PC write did not return success" "$POST_ACK_RESPONSE"
+fi
+
+echo "  Restarting coordinator and participant entrypoints immediately after success..."
+(docker restart docker-node-p0a-1 > /dev/null 2>&1) &
+POST_ACK_RESTART_P0_PID=$!
+(docker restart docker-node-p1a-1 > /dev/null 2>&1) &
+POST_ACK_RESTART_P1_PID=$!
+wait "$POST_ACK_RESTART_P0_PID" || true
+wait "$POST_ACK_RESTART_P1_PID" || true
+
+for attempt in $(seq 1 60); do
+    curl -sf "$NODE_A_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+for attempt in $(seq 1 60); do
+    curl -sf "$NODE_B_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_A_KEY="$NODE_P0A_KEY"
+NODE_B_KEY="$NODE_P1A_KEY"
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
+(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
+
+sleep 8
+POST_ACK_MSG_A=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$POST_ACK_TEXT")
+POST_ACK_MSG_B=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$POST_ACK_TEXT")
+POST_ACK_TASK_A=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$POST_ACK_TASK")
+POST_ACK_TASK_B=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$POST_ACK_TASK")
+
+[ "$POST_ACK_MSG_A" -eq 1 ] && [ "$POST_ACK_MSG_B" -eq 1 ] && \
+    [ "$POST_ACK_TASK_A" -eq 1 ] && [ "$POST_ACK_TASK_B" -eq 1 ] \
+    && pass "Post-ack 2PC write appeared exactly once after restart cleanup" \
+    || fail "Post-ack 2PC write was lost or duplicated after restart cleanup" \
+        "msgA=$POST_ACK_MSG_A msgB=$POST_ACK_MSG_B taskA=$POST_ACK_TASK_A taskB=$POST_ACK_TASK_B"
+
+POST_ACK_DASH_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+POST_ACK_DASH_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+POST_ACK_DASH_AM=$(jval messages "$POST_ACK_DASH_A")
+POST_ACK_DASH_AT=$(jval tasks "$POST_ACK_DASH_A")
+POST_ACK_DASH_BM=$(jval messages "$POST_ACK_DASH_B")
+POST_ACK_DASH_BT=$(jval tasks "$POST_ACK_DASH_B")
+[ "$POST_ACK_DASH_AM" -eq "$POST_ACK_DASH_BM" ] && [ "$POST_ACK_DASH_AT" -eq "$POST_ACK_DASH_BT" ] \
+    && pass "Nodes converged after post-ack 2PC cleanup-window restarts" \
+    || fail "Nodes diverged after post-ack 2PC cleanup-window restarts" \
+        "p0a=$POST_ACK_DASH_AM,$POST_ACK_DASH_AT p1a=$POST_ACK_DASH_BM,$POST_ACK_DASH_BT"
 
 # ============================================================
 echo ""

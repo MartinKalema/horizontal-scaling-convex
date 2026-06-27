@@ -2155,4 +2155,42 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn test_final_decision_survives_duplicate_and_complete_cleanup_marks() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("post-ack-cleanup-recovery".to_string());
+            let committed = TwoPhaseDecision::committed(12345, vec![0, 1]);
+            log.write_decision(&txn_id, &committed).await.unwrap();
+
+            let partially_resolved = log
+                .mark_participant_resolved(&txn_id, PartitionId(0))
+                .await
+                .unwrap()
+                .expect("commit decision should remain after first cleanup mark");
+            assert_eq!(partially_resolved.resolved_participants(), &[0]);
+            assert!(!partially_resolved.all_participants_resolved());
+
+            let duplicate_resolution = log
+                .mark_participant_resolved(&txn_id, PartitionId(0))
+                .await
+                .unwrap()
+                .expect("duplicate cleanup mark must not delete the decision");
+            assert_eq!(duplicate_resolution.resolved_participants(), &[0]);
+
+            let fully_resolved = log
+                .mark_participant_resolved(&txn_id, PartitionId(1))
+                .await
+                .unwrap()
+                .expect("final cleanup mark must retain the decision for crash recovery");
+            assert_eq!(fully_resolved.resolved_participants(), &[0, 1]);
+            assert!(fully_resolved.all_participants_resolved());
+
+            assert_eq!(
+                log.recover_staging_decision(&txn_id).await.unwrap(),
+                StagingRecoveryResult::AlreadyFinal(fully_resolved),
+            );
+        });
+    }
 }
