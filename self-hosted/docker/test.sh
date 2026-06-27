@@ -7,8 +7,8 @@
 #
 # Usage:
 #   ./test.sh              # Run all tests (scaling + failover)
-#   ./test.sh scaling      # Write scaling only (77 tests)
-#   ./test.sh failover     # Raft failover only (10 tests)
+#   ./test.sh scaling      # Write scaling only
+#   ./test.sh failover     # Raft failover only
 #
 # Prerequisites:
 #   docker compose --profile cluster up
@@ -22,8 +22,8 @@ case "$SUITE" in
     *)
         echo "Usage: $0 [all|scaling|failover]"
         echo "  all       Run all tests (default)"
-        echo "  scaling   Write scaling tests only (77 tests)"
-        echo "  failover  Raft failover tests only (10 tests)"
+        echo "  scaling   Write scaling tests only"
+        echo "  failover  Raft failover tests only"
         exit 1
         ;;
 esac
