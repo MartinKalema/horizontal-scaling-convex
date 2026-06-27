@@ -34,6 +34,7 @@
 #  20c. Lagging Follower Catch-Up After Cross-Partition Writes
 #  20d. Cross-Partition 2PC During Participant Leader Outage
 #  20e. Repeated Raft Leadership Churn During Cross-Partition 2PC
+#  20f. Per-Write 2PC Exactness During Leadership Churn
 #  21. Sustained Writes 30s (long-running replication)
 #  22. Duplicate Insert Idempotency
 #  23. Final Exhaustive Invariant Check
@@ -261,6 +262,14 @@ export const countMessagesByAuthorChannel = query({
   handler: async (ctx, args) => {
     const rows = await ctx.db.query("messages").collect();
     return rows.filter((r: any) => r.author === args.author && r.channel === args.channel).length;
+  },
+});
+
+export const countMessagesByText = query({
+  args: { text: v.string() },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db.query("messages").collect();
+    return rows.filter((r: any) => r.text === args.text).length;
   },
 });
 
@@ -1703,6 +1712,8 @@ CHURN_2PC_RUN="churn-2pc-$(date +%s)"
 CHURN_2PC_ACCEPTED=0
 CHURN_2PC_REJECTED=0
 CHURN_2PC_ATTEMPTED=0
+CHURN_2PC_ACCEPTED_TEXTS=()
+CHURN_2PC_ACCEPTED_TASKS=()
 
 for round in 1 2 3 4; do
     case "$round" in
@@ -1752,11 +1763,15 @@ for round in 1 2 3 4; do
     for i in "${!survivor_labels[@]}"; do
         label="${survivor_labels[$i]}"
         CHURN_2PC_ATTEMPTED=$((CHURN_2PC_ATTEMPTED + 1))
+        write_text="$CHURN_2PC_RUN-r${round}-$label"
+        task_title="$CHURN_2PC_RUN-r${round}-task-$label"
         R=$(mutation_response "${survivor_urls[$i]}" "${survivor_keys[$i]}" "messages:crossPartitionWrite" \
-            "{\"text\":\"$CHURN_2PC_RUN-r${round}-$label\",\"taskTitle\":\"$CHURN_2PC_RUN-r${round}-task-$label\"}")
+            "{\"text\":\"$write_text\",\"taskTitle\":\"$task_title\"}")
         if echo "$R" | grep -q '"status":"success"'; then
             CHURN_2PC_ACCEPTED=$((CHURN_2PC_ACCEPTED + 1))
             ROUND_ACCEPTED=$((ROUND_ACCEPTED + 1))
+            CHURN_2PC_ACCEPTED_TEXTS+=("$write_text")
+            CHURN_2PC_ACCEPTED_TASKS+=("$task_title")
         else
             CHURN_2PC_REJECTED=$((CHURN_2PC_REJECTED + 1))
             echo -e "  ${YELLOW}WARN${NC} $label 2PC write rejected during $stopped_label outage (fail-closed): $R"
@@ -1828,6 +1843,34 @@ CHURN_2PC_DT=$((POST_CHURN_2PC_T - PRE_CHURN_2PC_T))
 [ "$POST_CHURN_2PC_M" -eq "$POST_CHURN_2PC_BM" ] && [ "$POST_CHURN_2PC_T" -eq "$POST_CHURN_2PC_BT" ] \
     && pass "Nodes converged after repeated Raft leadership churn" \
     || fail "Nodes diverged after repeated Raft leadership churn" "p0a=$POST_CHURN_2PC_M,$POST_CHURN_2PC_T p1a=$POST_CHURN_2PC_BM,$POST_CHURN_2PC_BT"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 20f: Per-Write 2PC Exactness During Leadership Churn${NC}"
+# ============================================================
+# Aggregate counts alone can miss a bad parallel-commit recovery pattern where
+# one accepted cross-partition operation is duplicated while another is lost.
+# Verify every accepted 2PC write from the churn window appears exactly once in
+# both halves and on both serving nodes.
+
+CHURN_EXACTNESS_OK=true
+CHURN_EXACTNESS_DETAILS=""
+for i in "${!CHURN_2PC_ACCEPTED_TEXTS[@]}"; do
+    text="${CHURN_2PC_ACCEPTED_TEXTS[$i]}"
+    task="${CHURN_2PC_ACCEPTED_TASKS[$i]}"
+    MSG_A=$(jtotal "$(query_with_args "$NODE_A_URL" "$NODE_A_KEY" "messages:countMessagesByText" "{\"text\":\"$text\"}")")
+    MSG_B=$(jtotal "$(query_with_args "$NODE_B_URL" "$NODE_B_KEY" "messages:countMessagesByText" "{\"text\":\"$text\"}")")
+    TASK_A=$(jtotal "$(query_with_args "$NODE_A_URL" "$NODE_A_KEY" "messages:countTasksByTitle" "{\"title\":\"$task\"}")")
+    TASK_B=$(jtotal "$(query_with_args "$NODE_B_URL" "$NODE_B_KEY" "messages:countTasksByTitle" "{\"title\":\"$task\"}")")
+    if [ "$MSG_A" -ne 1 ] || [ "$MSG_B" -ne 1 ] || [ "$TASK_A" -ne 1 ] || [ "$TASK_B" -ne 1 ]; then
+        CHURN_EXACTNESS_OK=false
+        CHURN_EXACTNESS_DETAILS="$CHURN_EXACTNESS_DETAILS [$text/$task msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
+    fi
+done
+
+$CHURN_EXACTNESS_OK \
+    && pass "Every accepted churn-window 2PC write appeared exactly once on both nodes" \
+    || fail "Churn-window 2PC exactness violated" "$CHURN_EXACTNESS_DETAILS"
 
 # ============================================================
 echo ""
