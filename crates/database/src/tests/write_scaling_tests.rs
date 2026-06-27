@@ -126,6 +126,7 @@ use crate::{
         PlacementVersion,
         StaticPlacementConfig,
     },
+    query::ResolvedQuery,
     raft_partition::RaftPartitionState,
     snapshot_manager::partition_timestamp_map_from_json,
     table_number_allocator::{
@@ -5417,6 +5418,135 @@ async fn prepare_project_insert_for_2pc_sim(
         .cloned()
         .context("prepare should persist a durable redo record")?;
     Ok((txn_id, prepare_ts, redo))
+}
+
+#[convex_macro::test_runtime]
+async fn test_staged_2pc_write_invalidates_subscription_only_after_recovery(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    insert_doc(
+        &node,
+        "projects",
+        assert_obj!("name" => "subscription-baseline"),
+    )
+    .await?;
+
+    let mut read_tx = node.begin(Identity::system()).await?;
+    let mut query_stream = ResolvedQuery::new(
+        &mut read_tx,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )?;
+    let mut initial_results = 0;
+    while query_stream.next(&mut read_tx, Some(2)).await?.is_some() {
+        initial_results += 1;
+    }
+    assert_eq!(
+        initial_results, 1,
+        "subscription setup should read the baseline project",
+    );
+    let token = read_tx.into_token()?;
+    let subscription = node.subscribe(token).await?;
+
+    let (txn_id, prepare_ts, redo) = prepare_project_insert_for_2pc_sim(
+        &node,
+        "subscription-staged-recovery",
+        "staged_subscription_recovery_test".to_string(),
+        vec![PartitionId(0), PartitionId(1)],
+    )
+    .await?;
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            subscription.wait_for_invalidation()
+        )
+        .await
+        .is_err(),
+        "a merely prepared 2PC write is abortable and must not invalidate subscriptions",
+    );
+
+    let staging = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        vec![0, 1],
+        vec![TwoPhaseParticipantIntent::from_redo_entry(&redo)],
+    );
+    decision_log.write_decision(&txn_id, &staging).await?;
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id.clone(),
+        staging.clone(),
+    )
+    .await?;
+    assert!(
+        !resolved,
+        "incomplete staged decisions must not expose the prepared write",
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            subscription.wait_for_invalidation()
+        )
+        .await
+        .is_err(),
+        "partial staging is still abortable and must not invalidate subscriptions",
+    );
+
+    decision_log
+        .mark_participant_staged(
+            &txn_id,
+            TwoPhaseParticipantIntent {
+                partition_id: 0,
+                prepare_ts: u64::from(prepare_ts),
+                participant_transaction_digest: "remote-participant-digest".to_string(),
+            },
+        )
+        .await?;
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        txn_id,
+        staging,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "complete staged decisions should recover and commit the prepared write",
+    );
+    let invalid_ts =
+        tokio::time::timeout(Duration::from_secs(1), subscription.wait_for_invalidation()).await?;
+    assert!(
+        invalid_ts.is_some(),
+        "committed staged recovery must invalidate overlapping subscriptions",
+    );
+
+    let projects_after_recovery = run_query(
+        node,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        projects_after_recovery.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("subscription-staged-recovery"))
+        }),
+        "recovered committed write should be visible after subscription invalidation",
+    );
+
+    Ok(())
 }
 
 #[convex_macro::test_runtime]
