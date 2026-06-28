@@ -32,6 +32,7 @@ x-node-env-common: &node-env-common
   GRPC_PORT: "50051"
   CHECKPOINT_STORAGE_PATH: /convex/data/checkpoints
   SHARED_INSTANCE_SECRET_PATH: /convex/data/storage/cluster_credentials/instance_secret
+  ENABLE_PARALLEL_2PC_EARLY_ACK: ${ENABLE_PARALLEL_2PC_EARLY_ACK:-false}
   REPLICATION_MODE: primary
 
 # ── Infrastructure ─────────────────────────────────────────────────
