@@ -341,6 +341,11 @@ True parallel commits should not be enabled until these pass:
 - subscription tests proving no speculative invalidation and no missed
   committed invalidation;
 - full Docker write-scaling and Raft failover suites on a freshly rebuilt image;
+- `ENABLE_PARALLEL_2PC_EARLY_ACK=true BACKEND_PULL_POLICY=never bash
+  self-hosted/docker/test.sh parallel` on a freshly rebuilt image, which
+  requires every backend container to run with the early-ack knob enabled and
+  verifies the `parallel-committed` coordinator path during the failure-window
+  2PC checks;
 - adversarial soak tests with repeated elections, NATS interruptions, and
   duplicate RPC delivery.
 

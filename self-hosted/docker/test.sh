@@ -9,6 +9,7 @@
 #   ./test.sh              # Run all tests (scaling + failover)
 #   ./test.sh scaling      # Write scaling only
 #   ./test.sh failover     # Raft failover only
+#   ./test.sh parallel     # Write scaling with parallel-2PC early ack required
 #
 # Prerequisites:
 #   docker compose --profile cluster up
@@ -18,12 +19,13 @@ set -euo pipefail
 SUITE="${1:-all}"
 
 case "$SUITE" in
-    all|scaling|failover) ;;
+    all|scaling|failover|parallel) ;;
     *)
-        echo "Usage: $0 [all|scaling|failover]"
+        echo "Usage: $0 [all|scaling|failover|parallel]"
         echo "  all       Run all tests (default)"
         echo "  scaling   Write scaling tests only"
         echo "  failover  Raft failover tests only"
+        echo "  parallel  Write scaling only, requiring ENABLE_PARALLEL_2PC_EARLY_ACK=true"
         exit 1
         ;;
 esac
@@ -40,9 +42,12 @@ echo ""
 TOTAL_PASSED=0
 TOTAL_FAILED=0
 
-if [ "$SUITE" = "all" ] || [ "$SUITE" = "scaling" ]; then
+if [ "$SUITE" = "all" ] || [ "$SUITE" = "scaling" ] || [ "$SUITE" = "parallel" ]; then
     echo "── Running Write Scaling Suite ──────────────────────────────"
     echo ""
+    if [ "$SUITE" = "parallel" ]; then
+        export EXPECT_PARALLEL_2PC_EARLY_ACK=true
+    fi
     if bash "$SCRIPT_DIR/test-write-scaling.sh"; then
         echo ""
         echo "  Write scaling suite: PASSED"

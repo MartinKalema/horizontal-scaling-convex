@@ -22,6 +22,7 @@
 #   9i. Per-Write 2PC Exactness During Failure Windows
 #   9j. 2PC Exactness During Repeated NATS Flaps
 #   9k. Post-Ack 2PC Exactness After Cleanup-Window Restarts
+#   9l. Parallel 2PC Early-Ack Code-Path Proof
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -85,6 +86,14 @@ NC='\033[0m'
 
 PASSED=0
 FAILED=0
+BACKEND_CONTAINERS=(
+    docker-node-p0a-1
+    docker-node-p0b-1
+    docker-node-p0c-1
+    docker-node-p1a-1
+    docker-node-p1b-1
+    docker-node-p1c-1
+)
 
 pass() {
     PASSED=$((PASSED + 1))
@@ -97,12 +106,22 @@ fail() {
     [ -n "${2:-}" ] && echo -e "       $2"
 }
 
+parallel_commit_log_count() {
+    local count=0
+    local matches=0
+    for name in "${BACKEND_CONTAINERS[@]}"; do
+        matches=$(docker logs "$name" 2>&1 | grep -c "parallel-committed" || true)
+        count=$((count + matches))
+    done
+    echo "$count"
+}
+
 # --- Preflight ---
 
 echo ""
 echo -e "${BOLD}Preflight checks${NC}"
 
-for name in docker-node-p0a-1 docker-node-p0b-1 docker-node-p0c-1 docker-node-p1a-1 docker-node-p1b-1 docker-node-p1c-1; do
+for name in "${BACKEND_CONTAINERS[@]}"; do
     if ! docker inspect "$name" > /dev/null 2>&1; then
         echo -e "${RED}Container $name not running. Start the deployment first:${NC}"
         echo "  docker compose --profile cluster up"
@@ -110,6 +129,24 @@ for name in docker-node-p0a-1 docker-node-p0b-1 docker-node-p0c-1 docker-node-p1
     fi
 done
 echo "  Containers running."
+
+if [ "${EXPECT_PARALLEL_2PC_EARLY_ACK:-false}" = "true" ]; then
+    EARLY_ACK_ENV_OK=true
+    EARLY_ACK_ENV_DETAILS=""
+    for name in "${BACKEND_CONTAINERS[@]}"; do
+        value=$(docker exec "$name" printenv ENABLE_PARALLEL_2PC_EARLY_ACK 2>/dev/null || true)
+        if [ "$value" != "true" ]; then
+            EARLY_ACK_ENV_OK=false
+            EARLY_ACK_ENV_DETAILS="$EARLY_ACK_ENV_DETAILS $name=${value:-unset}"
+        fi
+    done
+    if $EARLY_ACK_ENV_OK; then
+        pass "Parallel 2PC early-ack knob enabled on all backend containers"
+    else
+        fail "Parallel 2PC early-ack suite requires ENABLE_PARALLEL_2PC_EARLY_ACK=true" "$EARLY_ACK_ENV_DETAILS"
+        exit "$FAILED"
+    fi
+fi
 
 NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 NODE_P0B_KEY=$(docker exec docker-node-p0b-1 ./generate_admin_key.sh 2>&1 | tail -1)
@@ -1287,6 +1324,48 @@ POST_ACK_DASH_BT=$(jval tasks "$POST_ACK_DASH_B")
     && pass "Nodes converged after post-ack 2PC cleanup-window restarts" \
     || fail "Nodes diverged after post-ack 2PC cleanup-window restarts" \
         "p0a=$POST_ACK_DASH_AM,$POST_ACK_DASH_AT p1a=$POST_ACK_DASH_BM,$POST_ACK_DASH_BT"
+
+if [ "${EXPECT_PARALLEL_2PC_EARLY_ACK:-false}" = "true" ]; then
+    # ============================================================
+    echo ""
+    echo -e "${BOLD}Test 9l: Parallel 2PC Early-Ack Code-Path Proof${NC}"
+    # ============================================================
+    # The previous 2PC failure-window tests are the real adversarial coverage.
+    # This block proves those tests are exercising the parallel-commit path,
+    # not the default durable-decision path: run one more successful 2PC write,
+    # verify exact visibility, and require a new `parallel-committed` log line.
+
+    PARALLEL_LOG_BEFORE=$(parallel_commit_log_count)
+    PARALLEL_RUN="parallel-early-ack-$(date +%s)"
+    PARALLEL_TEXT="$PARALLEL_RUN-msg"
+    PARALLEL_TASK="$PARALLEL_RUN-task"
+    PARALLEL_RESPONSE=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+        "{\"text\":\"$PARALLEL_TEXT\",\"taskTitle\":\"$PARALLEL_TASK\"}")
+
+    if echo "$PARALLEL_RESPONSE" | grep -q '"status":"success"'; then
+        pass "Parallel early-ack 2PC write returned success"
+    else
+        fail "Parallel early-ack 2PC write did not return success" "$PARALLEL_RESPONSE"
+    fi
+
+    sleep 6
+    PARALLEL_MSG_A=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$PARALLEL_TEXT")
+    PARALLEL_MSG_B=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$PARALLEL_TEXT")
+    PARALLEL_TASK_A=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$PARALLEL_TASK")
+    PARALLEL_TASK_B=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$PARALLEL_TASK")
+
+    [ "$PARALLEL_MSG_A" -eq 1 ] && [ "$PARALLEL_MSG_B" -eq 1 ] && \
+        [ "$PARALLEL_TASK_A" -eq 1 ] && [ "$PARALLEL_TASK_B" -eq 1 ] \
+        && pass "Parallel early-ack 2PC write appeared exactly once on both nodes" \
+        || fail "Parallel early-ack 2PC write was lost or duplicated" \
+            "msgA=$PARALLEL_MSG_A msgB=$PARALLEL_MSG_B taskA=$PARALLEL_TASK_A taskB=$PARALLEL_TASK_B"
+
+    PARALLEL_LOG_AFTER=$(parallel_commit_log_count)
+    [ "$PARALLEL_LOG_AFTER" -gt "$PARALLEL_LOG_BEFORE" ] \
+        && pass "Observed parallel-committed coordinator log during early-ack suite" \
+        || fail "Parallel suite did not exercise the parallel-commit coordinator path" \
+            "parallel-committed logs before=$PARALLEL_LOG_BEFORE after=$PARALLEL_LOG_AFTER"
+fi
 
 # ============================================================
 echo ""
