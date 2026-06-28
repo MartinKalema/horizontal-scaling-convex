@@ -1071,6 +1071,13 @@ impl<RT: Runtime> Database<RT> {
             },
             None => BTreeMap::new(),
         };
+        let applied_data_delta_ids = match reader
+            .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaIds)
+            .await?
+        {
+            Some(value) => crate::committer::applied_data_delta_ids_from_json(value)?,
+            None => BTreeMap::new(),
+        };
 
         let snapshot_manager = SnapshotManager::new(
             *ts,
@@ -1135,6 +1142,7 @@ impl<RT: Runtime> Database<RT> {
             raft_state,
             applied_delta_watermarks,
             applied_data_delta_watermarks,
+            applied_data_delta_ids,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");

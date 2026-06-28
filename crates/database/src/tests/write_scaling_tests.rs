@@ -2743,6 +2743,139 @@ async fn test_frontier_heartbeat_does_not_dedupe_later_data_delta(
     Ok(())
 }
 
+#[convex_macro::test_runtime]
+async fn test_late_outbox_replay_data_delta_not_deduped_by_newer_data_watermark(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let target_persistence = Arc::new(TestPersistence::new());
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers.clone(),
+    )
+    .await?;
+    let mut target = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        target_persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_numbers.clone(),
+    )
+    .await?;
+
+    insert_doc(&source, "projects", assert_obj!("name" => "schema-seed")).await?;
+    let schema_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    target
+        .committer_for_test()
+        .apply_replica_delta(schema_delta)
+        .await?;
+
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "older-outbox-replay"),
+    )
+    .await?;
+    let older_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "newer-outbox-replay"),
+    )
+    .await?;
+    let newer_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    anyhow::ensure!(
+        older_delta.ts < newer_delta.ts,
+        "test setup should create an older origin delta before the newer one",
+    );
+
+    target
+        .committer_for_test()
+        .apply_replica_delta(newer_delta.clone())
+        .await?;
+    let data_watermarks = target_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaWatermarks)
+        .await?
+        .context("newer data delta should persist the max data watermark")?;
+    let data_watermarks =
+        partition_timestamp_map_from_json(data_watermarks, "applied data delta watermarks")?;
+    assert_eq!(
+        data_watermarks.get(&PartitionId(1)).copied(),
+        Some(newer_delta.ts),
+        "newer delta should advance the diagnostic max data watermark",
+    );
+
+    let older_apply_ts = target
+        .committer_for_test()
+        .apply_replica_delta(older_delta.clone())
+        .await?;
+    assert!(
+        older_apply_ts > newer_delta.ts,
+        "older origin delta should still apply at a fresh local timestamp after a newer watermark",
+    );
+
+    let projects = run_query(
+        target.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    for name in ["schema-seed", "older-outbox-replay", "newer-outbox-replay"] {
+        let matches = projects
+            .iter()
+            .filter(|project| project.value().0.get("name") == Some(&assert_val!(name)))
+            .count();
+        assert_eq!(
+            matches, 1,
+            "replicated project {name:?} should appear exactly once",
+        );
+    }
+
+    target.shutdown().await?;
+    target = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        target_persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_numbers,
+    )
+    .await?;
+
+    let document_log_count_before_duplicate =
+        persisted_document_log_count(&target_persistence).await?;
+    let snapshot_ts_before_duplicate = *target.now_ts_for_reads();
+    let duplicate_apply_ts = target
+        .committer_for_test()
+        .apply_replica_delta(older_delta.clone())
+        .await?;
+    assert_eq!(
+        duplicate_apply_ts, older_delta.ts,
+        "post-restart duplicate should ACK as skipped at its origin timestamp",
+    );
+    assert_eq!(
+        persisted_document_log_count(&target_persistence).await?,
+        document_log_count_before_duplicate,
+        "post-restart duplicate must not append document log entries",
+    );
+    assert_eq!(
+        *target.now_ts_for_reads(),
+        snapshot_ts_before_duplicate,
+        "post-restart duplicate must not publish a new snapshot",
+    );
+
+    Ok(())
+}
+
 fn rewrite_index_document_ids(mut delta: CommitDelta) -> anyhow::Result<CommitDelta> {
     let mut rewritten = 1u8;
     for update in &mut delta.document_updates {

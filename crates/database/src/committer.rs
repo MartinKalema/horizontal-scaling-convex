@@ -197,6 +197,7 @@ const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
 const RAFT_NATS_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 
 type RaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
+pub(crate) type AppliedDataDeltaIds = BTreeMap<crate::partition::PartitionId, BTreeSet<Timestamp>>;
 
 /// State held for a 2PC-prepared transaction awaiting commit/rollback.
 struct PreparedTransaction {
@@ -262,6 +263,7 @@ enum PersistenceWrite {
         source_partition: Option<crate::partition::PartitionId>,
         applied_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
         applied_data_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
+        applied_data_delta_ids: Option<AppliedDataDeltaIds>,
         raft_nats_outbox_delta: Option<CommitDelta>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
@@ -279,6 +281,7 @@ enum PersistenceWrite {
         replication_frontiers: BTreeMap<crate::partition::PartitionId, Timestamp>,
         applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+        applied_data_delta_ids: AppliedDataDeltaIds,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -363,6 +366,60 @@ fn merge_partition_timestamp_max(
         }
     }
     merged
+}
+
+fn merge_applied_data_delta_ids(
+    current: &AppliedDataDeltaIds,
+    proposed: AppliedDataDeltaIds,
+) -> AppliedDataDeltaIds {
+    let mut merged = current.clone();
+    for (partition, timestamps) in proposed {
+        merged.entry(partition).or_default().extend(timestamps);
+    }
+    merged
+}
+
+fn applied_data_delta_ids_to_json(ids: &AppliedDataDeltaIds) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for (partition, timestamps) in ids {
+        object.insert(
+            partition.0.to_string(),
+            serde_json::Value::Array(
+                timestamps
+                    .iter()
+                    .map(|ts| serde_json::Value::from(u64::from(*ts)))
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
+pub(crate) fn applied_data_delta_ids_from_json(
+    value: serde_json::Value,
+) -> anyhow::Result<AppliedDataDeltaIds> {
+    let object = value
+        .as_object()
+        .context("applied data delta ids should be an object")?;
+    let mut ids = AppliedDataDeltaIds::new();
+    for (partition, timestamps) in object {
+        let partition_id = partition
+            .parse::<u32>()
+            .with_context(|| format!("invalid applied data delta ids partition {partition:?}"))?;
+        let timestamps = timestamps
+            .as_array()
+            .context("applied data delta ids entries should be arrays")?
+            .iter()
+            .map(|value| {
+                let ts = value
+                    .as_u64()
+                    .context("applied data delta id should be a u64 timestamp")?;
+                Timestamp::try_from(ts)
+            })
+            .collect::<anyhow::Result<BTreeSet<_>>>()?;
+        ids.insert(crate::partition::PartitionId(partition_id), timestamps);
+    }
+    Ok(ids)
 }
 
 fn compact_checkpoint_documents(checkpoint: &CheckpointData) -> Vec<DocumentLogEntry> {
@@ -685,8 +742,15 @@ pub struct Committer<RT: Runtime> {
     applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
 
     // Durable origin-timestamp idempotency frontier for non-empty replicated
-    // data deltas only. Heartbeats must never advance this map.
+    // data deltas only. Heartbeats must never advance this map. This is only a
+    // max watermark; exact idempotency lives in `applied_data_delta_ids` because
+    // Raft->NATS outbox replay can deliver older origin timestamps after newer
+    // ones.
     applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+
+    // Exact durable origin ids for non-empty replicated data deltas. Keyed by
+    // source partition and origin commit timestamp.
+    applied_data_delta_ids: AppliedDataDeltaIds,
 
     // Sender for requeueing internal work that must wait for earlier state
     // machine timestamps to become visible without blocking the committer loop.
@@ -766,6 +830,7 @@ impl<RT: Runtime> Committer<RT> {
         raft_state: Option<crate::raft_partition::RaftPartitionState>,
         applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+        applied_data_delta_ids: AppliedDataDeltaIds,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
@@ -794,6 +859,7 @@ impl<RT: Runtime> Committer<RT> {
             raft_state,
             applied_delta_watermarks,
             applied_data_delta_watermarks,
+            applied_data_delta_ids,
             sender: tx.clone(),
         };
         let handle = runtime.spawn("committer", async move {
@@ -1248,6 +1314,7 @@ impl<RT: Runtime> Committer<RT> {
                             source_partition,
                             applied_delta_watermarks,
                             applied_data_delta_watermarks,
+                            applied_data_delta_ids,
                             raft_nats_outbox_delta,
                             result,
                             ..
@@ -1287,6 +1354,20 @@ impl<RT: Runtime> Committer<RT> {
                                     )
                                     .await?;
                                 self.applied_data_delta_watermarks = frontiers;
+                            }
+                            if let Some(applied_ids) = applied_data_delta_ids {
+                                self.applied_data_delta_ids = merge_applied_data_delta_ids(
+                                    &self.applied_data_delta_ids,
+                                    applied_ids,
+                                );
+                                let applied_data_delta_ids_json =
+                                    applied_data_delta_ids_to_json(&self.applied_data_delta_ids);
+                                self.persistence
+                                    .write_persistence_global(
+                                        PersistenceGlobalKey::AppliedDataDeltaIds,
+                                        applied_data_delta_ids_json,
+                                    )
+                                    .await?;
                             }
                             if let Some(delta) = raft_nats_outbox_delta.as_ref() {
                                 Self::add_raft_nats_outbox_delta(
@@ -1386,6 +1467,7 @@ impl<RT: Runtime> Committer<RT> {
                             replication_frontiers,
                             applied_delta_watermarks,
                             applied_data_delta_watermarks,
+                            applied_data_delta_ids,
                             result,
                             ..
                         } => {
@@ -1397,6 +1479,7 @@ impl<RT: Runtime> Committer<RT> {
                             self.last_assigned_ts = snapshot_ts;
                             self.applied_delta_watermarks = applied_delta_watermarks.clone();
                             self.applied_data_delta_watermarks = applied_data_delta_watermarks;
+                            self.applied_data_delta_ids = applied_data_delta_ids;
                             self.snapshot_manager.write().replace(
                                 snapshot_ts,
                                 snapshot,
@@ -3061,6 +3144,17 @@ impl<RT: Runtime> Committer<RT> {
                         )
                         .await?;
                 }
+                if !checkpoint
+                    .globals
+                    .contains_key(&String::from(PersistenceGlobalKey::AppliedDataDeltaIds))
+                {
+                    persistence
+                        .write_persistence_global(
+                            PersistenceGlobalKey::AppliedDataDeltaIds,
+                            serde_json::json!({}),
+                        )
+                        .await?;
+                }
 
                 let replication_frontiers = checkpoint
                     .globals
@@ -3102,6 +3196,12 @@ impl<RT: Runtime> Committer<RT> {
                     })
                     .transpose()?
                     .unwrap_or_default();
+                let applied_data_delta_ids = checkpoint
+                    .globals
+                    .get(&String::from(PersistenceGlobalKey::AppliedDataDeltaIds))
+                    .map(|value| applied_data_delta_ids_from_json(value.clone()))
+                    .transpose()?
+                    .unwrap_or_default();
 
                 Ok(PersistenceWrite::InstallSnapshot {
                     snapshot_ts: checkpoint_ts,
@@ -3109,6 +3209,7 @@ impl<RT: Runtime> Committer<RT> {
                     replication_frontiers,
                     applied_delta_watermarks,
                     applied_data_delta_watermarks,
+                    applied_data_delta_ids,
                     result,
                     commit_id,
                 })
@@ -3423,9 +3524,9 @@ impl<RT: Runtime> Committer<RT> {
         if let Some(source_partition) = delta.source_partition
             && local_prepared_commit_ts.is_none()
             && self
-                .applied_data_delta_watermarks
+                .applied_data_delta_ids
                 .get(&source_partition)
-                .is_some_and(|frontier| *frontier >= remote_ts)
+                .is_some_and(|timestamps| timestamps.contains(&remote_ts))
         {
             tracing::info!(
                 "Skipping duplicate non-empty replica delta: source_partition={}, remote_ts={}",
@@ -3672,6 +3773,11 @@ impl<RT: Runtime> Committer<RT> {
                 }
                 frontiers
             });
+        let updated_applied_data_delta_ids = delta.source_partition.map(|source_partition| {
+            let mut ids = self.applied_data_delta_ids.clone();
+            ids.entry(source_partition).or_default().insert(remote_ts);
+            ids
+        });
         if let Some(source_partition) = delta.source_partition {
             if self
                 .applied_delta_watermarks
@@ -3689,6 +3795,10 @@ impl<RT: Runtime> Committer<RT> {
                 self.applied_data_delta_watermarks
                     .insert(source_partition, remote_ts);
             }
+            self.applied_data_delta_ids
+                .entry(source_partition)
+                .or_default()
+                .insert(remote_ts);
         }
         let raft_nats_outbox_delta = (mode == ReplicaDeltaApplyMode::FullRaftState
             && delta.source_partition.is_some())
@@ -3703,6 +3813,7 @@ impl<RT: Runtime> Committer<RT> {
             let replication_frontiers = updated_replication_frontiers.clone();
             let applied_delta_watermarks = updated_applied_delta_watermarks.clone();
             let applied_data_delta_watermarks = updated_applied_data_delta_watermarks.clone();
+            let applied_data_delta_ids = updated_applied_data_delta_ids.clone();
             let source_partition = delta.source_partition;
             async move {
                 // Write to persistence (so function runner can load modules).
@@ -3737,6 +3848,7 @@ impl<RT: Runtime> Committer<RT> {
                     source_partition,
                     applied_delta_watermarks,
                     applied_data_delta_watermarks,
+                    applied_data_delta_ids,
                     raft_nats_outbox_delta,
                     result,
                     commit_id,
