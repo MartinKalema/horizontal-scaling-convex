@@ -170,8 +170,13 @@ pub enum PersistenceGlobalKey {
     /// Latest origin commit timestamp for a non-empty data delta durably
     /// applied per source partition. Unlike `AppliedDeltaWatermarks`, this
     /// must not advance on frontier-only heartbeats because it is used for
-    /// transport redelivery idempotency.
+    /// transport lag/diagnostics, not exact redelivery idempotency.
     AppliedDataDeltaWatermarks,
+
+    /// Exact set of non-empty data delta origin timestamps durably applied per
+    /// source partition. This is separate from the max watermark because
+    /// Raft->NATS outbox recovery can replay older deltas after newer ones.
+    AppliedDataDeltaIds,
 
     /// Latest snapshot of all tables' summaries, cached to speed up startup.
     TableSummary,
@@ -216,6 +221,7 @@ impl From<PersistenceGlobalKey> for String {
             PersistenceGlobalKey::AppliedDataDeltaWatermarks => {
                 "applied_data_delta_watermarks".to_string()
             },
+            PersistenceGlobalKey::AppliedDataDeltaIds => "applied_data_delta_ids".to_string(),
             PersistenceGlobalKey::TableSummary => "table_summary".to_string(),
             PersistenceGlobalKey::TwoPhaseRedoRecords => "two_phase_redo_records".to_string(),
             PersistenceGlobalKey::RaftNatsOutbox => "raft_nats_outbox".to_string(),
@@ -240,6 +246,7 @@ impl FromStr for PersistenceGlobalKey {
             "replication_frontiers" => Ok(Self::ReplicationFrontiers),
             "applied_delta_watermarks" => Ok(Self::AppliedDeltaWatermarks),
             "applied_data_delta_watermarks" => Ok(Self::AppliedDataDeltaWatermarks),
+            "applied_data_delta_ids" => Ok(Self::AppliedDataDeltaIds),
             "table_summary" => Ok(Self::TableSummary),
             "two_phase_redo_records" => Ok(Self::TwoPhaseRedoRecords),
             "raft_nats_outbox" => Ok(Self::RaftNatsOutbox),

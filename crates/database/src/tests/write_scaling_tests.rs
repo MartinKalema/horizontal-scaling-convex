@@ -150,6 +150,10 @@ use crate::{
         TwoPhaseRedoEntry,
         TwoPhaseTransactionId,
     },
+    two_phase_coordinator::{
+        coordinate_two_phase_commit_with_mode,
+        TwoPhaseCommitMode,
+    },
     Database,
     SystemMetadataModel,
     TableModel,
@@ -2739,6 +2743,139 @@ async fn test_frontier_heartbeat_does_not_dedupe_later_data_delta(
     Ok(())
 }
 
+#[convex_macro::test_runtime]
+async fn test_late_outbox_replay_data_delta_not_deduped_by_newer_data_watermark(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let target_persistence = Arc::new(TestPersistence::new());
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers.clone(),
+    )
+    .await?;
+    let mut target = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        target_persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_numbers.clone(),
+    )
+    .await?;
+
+    insert_doc(&source, "projects", assert_obj!("name" => "schema-seed")).await?;
+    let schema_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    target
+        .committer_for_test()
+        .apply_replica_delta(schema_delta)
+        .await?;
+
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "older-outbox-replay"),
+    )
+    .await?;
+    let older_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "newer-outbox-replay"),
+    )
+    .await?;
+    let newer_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    anyhow::ensure!(
+        older_delta.ts < newer_delta.ts,
+        "test setup should create an older origin delta before the newer one",
+    );
+
+    target
+        .committer_for_test()
+        .apply_replica_delta(newer_delta.clone())
+        .await?;
+    let data_watermarks = target_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaWatermarks)
+        .await?
+        .context("newer data delta should persist the max data watermark")?;
+    let data_watermarks =
+        partition_timestamp_map_from_json(data_watermarks, "applied data delta watermarks")?;
+    assert_eq!(
+        data_watermarks.get(&PartitionId(1)).copied(),
+        Some(newer_delta.ts),
+        "newer delta should advance the diagnostic max data watermark",
+    );
+
+    let older_apply_ts = target
+        .committer_for_test()
+        .apply_replica_delta(older_delta.clone())
+        .await?;
+    assert!(
+        older_apply_ts > newer_delta.ts,
+        "older origin delta should still apply at a fresh local timestamp after a newer watermark",
+    );
+
+    let projects = run_query(
+        target.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    for name in ["schema-seed", "older-outbox-replay", "newer-outbox-replay"] {
+        let matches = projects
+            .iter()
+            .filter(|project| project.value().0.get("name") == Some(&assert_val!(name)))
+            .count();
+        assert_eq!(
+            matches, 1,
+            "replicated project {name:?} should appear exactly once",
+        );
+    }
+
+    target.shutdown().await?;
+    target = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        target_persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_numbers,
+    )
+    .await?;
+
+    let document_log_count_before_duplicate =
+        persisted_document_log_count(&target_persistence).await?;
+    let snapshot_ts_before_duplicate = *target.now_ts_for_reads();
+    let duplicate_apply_ts = target
+        .committer_for_test()
+        .apply_replica_delta(older_delta.clone())
+        .await?;
+    assert_eq!(
+        duplicate_apply_ts, older_delta.ts,
+        "post-restart duplicate should ACK as skipped at its origin timestamp",
+    );
+    assert_eq!(
+        persisted_document_log_count(&target_persistence).await?,
+        document_log_count_before_duplicate,
+        "post-restart duplicate must not append document log entries",
+    );
+    assert_eq!(
+        *target.now_ts_for_reads(),
+        snapshot_ts_before_duplicate,
+        "post-restart duplicate must not publish a new snapshot",
+    );
+
+    Ok(())
+}
+
 fn rewrite_index_document_ids(mut delta: CommitDelta) -> anyhow::Result<CommitDelta> {
     let mut rewritten = 1u8;
     for update in &mut delta.document_updates {
@@ -5251,6 +5388,155 @@ fn test_cross_partition_commit_uses_remote_prepare_over_grpc() -> anyhow::Result
             assert_obj!("name" => "follow-up-remote"),
         )
         .await?;
+
+        server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_parallel_early_ack_recovers_staging_before_async_cleanup() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b_map = partitioned_map(PartitionId(1));
+        let node_b = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(node_b_map),
+            None,
+            Some(tso.clone()),
+            decision_log.clone(),
+        )
+        .await?;
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+            node_b.committer_for_test(),
+        ))
+        .await?;
+
+        let node_a_map = partitioned_map(PartitionId(0));
+        let node_a = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(node_a_map.clone()),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(tso),
+            decision_log.clone(),
+        )
+        .await?;
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let remote_seed_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(remote_seed_delta)
+            .await?;
+        insert_doc(&node_a, "messages", assert_obj!("text" => "seed")).await?;
+        let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(CommitDelta {
+                ts: heartbeat_ts,
+                document_writes: Arc::new(Vec::new()),
+                document_updates: Vec::new(),
+                index_writes: Arc::new(Vec::new()),
+                write_source: WriteSource::new("parallel_early_ack_test"),
+                write_bytes: 0,
+                tablet_id_to_table_name: Default::default(),
+                source_partition: Some(PartitionId(1)),
+            })
+            .await?;
+
+        let initial_delta_count = log.deltas().len();
+        let mut tx = node_a.begin(Identity::system()).await?;
+        let mut model = TestFacingModel::new(&mut tx);
+        model
+            .insert(
+                &"messages".parse()?,
+                assert_obj!("text" => "parallel-local"),
+            )
+            .await?;
+        model
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "parallel-remote"),
+            )
+            .await?;
+        let final_tx = tx.finalize()?;
+
+        let outcome = coordinate_two_phase_commit_with_mode(
+            &node_a.committer_for_test(),
+            final_tx,
+            WriteSource::new("parallel_early_ack_test"),
+            &node_a_map,
+            TwoPhaseCommitMode::ParallelEarlyAck,
+        )
+        .await?;
+
+        let decisions = decision_log.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            decisions.values().any(|decision| matches!(
+                decision,
+                TwoPhaseDecision::Committed {
+                    commit_ts,
+                    participants,
+                    ..
+                } if *commit_ts == u64::from(outcome.ts)
+                    && participants == &vec![PartitionId(0).0, PartitionId(1).0]
+            )),
+            "parallel early ACK should recover the durable staging proof into a committed decision"
+        );
+
+        let mut commit_deltas = Vec::new();
+        for _ in 0..50 {
+            let deltas = log.deltas();
+            commit_deltas = deltas[initial_delta_count..]
+                .iter()
+                .filter(|delta| delta.ts == outcome.ts)
+                .cloned()
+                .collect();
+            if commit_deltas.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            commit_deltas.len(),
+            2,
+            "parallel cleanup should eventually publish one committed delta per participant",
+        );
+        let mut sources: Vec<_> = commit_deltas
+            .iter()
+            .map(|delta| delta.source_partition)
+            .collect();
+        sources.sort();
+        assert_eq!(sources, vec![Some(PartitionId(0)), Some(PartitionId(1))]);
+
+        for _ in 0..50 {
+            if decision_log
+                .decisions()
+                .values()
+                .any(TwoPhaseDecision::all_participants_resolved)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            decision_log
+                .decisions()
+                .values()
+                .any(TwoPhaseDecision::all_participants_resolved),
+            "async cleanup should mark every participant resolved",
+        );
 
         server.shutdown().await?;
         Ok(())

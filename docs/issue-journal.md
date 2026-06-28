@@ -850,6 +850,28 @@ own for distributed changes.
   - `cargo test -p common test_persistence_global_roundtrips -- --nocapture`
   - `cargo check -p database -p local_backend`
 
+### 2026-06 — Added guarded 2PC parallel-commit early acknowledgement
+
+- **Status:** complete behind feature flag
+- **Related issue:** `#69`
+- **What this fixes:** the 2PC coordinator had accumulated the staged decision,
+  participant intent, recovery, and adversarial-test prerequisites for
+  CockroachDB-style parallel commits, but the live coordinator still always
+  waited for participant `CommitPrepared` cleanup before acknowledging the
+  client. That kept the safe durable-decision semantics but did not exercise
+  the true early-ack path.
+- **Behavior:** `ENABLE_PARALLEL_2PC_EARLY_ACK` now selects an explicit
+  parallel-commit coordinator mode. The default remains the conservative
+  durable-decision path. When enabled, the coordinator writes a complete
+  durable `Staging` record, recovers it into `Committed`, acknowledges at the
+  assigned commit timestamp, and schedules ordinary participant cleanup
+  asynchronously. Cleanup remains retriable through the retained decision log
+  and watcher if the background task fails.
+- **Validation:**
+  - `cargo test -p database two_phase -- --nocapture`
+  - `cargo test -p database test_parallel_early_ack_recovers_staging_before_async_cleanup -- --nocapture`
+  - `cargo test -p database test_cross_partition_commit_uses_remote_prepare_over_grpc -- --nocapture`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

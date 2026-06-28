@@ -32,6 +32,8 @@ use common::{
         ParseDocument,
         ResolvedDocument,
     },
+    knobs::ENABLE_PARALLEL_2PC_EARLY_ACK,
+    runtime::tokio_spawn,
     types::Timestamp,
 };
 use futures::{
@@ -54,13 +56,32 @@ use crate::{
     two_phase::{
         NodeAddresses,
         ParticipantTransaction,
+        StagingRecoveryResult,
         TwoPhaseDecision,
+        TwoPhaseParticipantIntent,
+        TwoPhaseRedoEntry,
         TwoPhaseTransactionId,
     },
     write_log::WriteSource,
 };
 
 const MAX_PREPARE_TS_RETRIES: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TwoPhaseCommitMode {
+    DurableDecision,
+    ParallelEarlyAck,
+}
+
+impl TwoPhaseCommitMode {
+    fn from_knob() -> Self {
+        if *ENABLE_PARALLEL_2PC_EARLY_ACK {
+            Self::ParallelEarlyAck
+        } else {
+            Self::DurableDecision
+        }
+    }
+}
 
 struct PrepareParticipantFailure {
     participant: PartitionId,
@@ -555,6 +576,151 @@ async fn write_decision_record(
     Ok(())
 }
 
+fn participant_intents_for_staging(
+    transaction_id: &TwoPhaseTransactionId,
+    prepare_ts: Timestamp,
+    all_participants: &[PartitionId],
+    participants: &[(PartitionId, ParticipantTransaction)],
+    write_source: &WriteSource,
+) -> anyhow::Result<Vec<TwoPhaseParticipantIntent>> {
+    let mut intents = participants
+        .iter()
+        .map(|(participant, transaction)| {
+            let redo = TwoPhaseRedoEntry::new_with_participants(
+                transaction_id,
+                prepare_ts,
+                *participant,
+                all_participants,
+                transaction.clone(),
+                write_source,
+            )?;
+            Ok(TwoPhaseParticipantIntent::from_redo_entry(&redo))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    intents.sort_by_key(|intent| intent.partition_id);
+    Ok(intents)
+}
+
+async fn write_complete_staging_decision(
+    local_committer: &CommitterClient,
+    transaction_id: &TwoPhaseTransactionId,
+    prepare_ts: Timestamp,
+    all_participants: &[PartitionId],
+    participants: &[(PartitionId, ParticipantTransaction)],
+    write_source: &WriteSource,
+) -> anyhow::Result<TwoPhaseDecision> {
+    let decision = TwoPhaseDecision::staging(
+        u64::from(prepare_ts),
+        all_participants
+            .iter()
+            .map(|participant| participant.0)
+            .collect(),
+        participant_intents_for_staging(
+            transaction_id,
+            prepare_ts,
+            all_participants,
+            participants,
+            write_source,
+        )?,
+    );
+    anyhow::ensure!(
+        decision.all_participants_staged(),
+        "2PC Coordinator: constructed incomplete staging decision for txn={transaction_id}",
+    );
+    write_decision_record(local_committer, transaction_id, &decision)
+        .await
+        .with_context(|| {
+            format!("2PC Coordinator: failed to write staging decision for txn={transaction_id}")
+        })?;
+    Ok(decision)
+}
+
+async fn recover_complete_staging_decision(
+    local_committer: &CommitterClient,
+    transaction_id: &TwoPhaseTransactionId,
+) -> anyhow::Result<TwoPhaseDecision> {
+    let decision_log = local_committer.two_phase_decision_log();
+    let recovered = decision_log
+        .recover_staging_decision(transaction_id)
+        .await
+        .with_context(|| {
+            format!(
+                "2PC Coordinator: failed to recover complete staging decision for \
+                 txn={transaction_id}"
+            )
+        })?;
+    match recovered {
+        StagingRecoveryResult::Committed(decision)
+        | StagingRecoveryResult::AlreadyFinal(decision @ TwoPhaseDecision::Committed { .. }) => {
+            Ok(decision)
+        },
+        StagingRecoveryResult::Pending(decision) => {
+            anyhow::bail!(
+                "2PC Coordinator: staging decision for txn={} is still pending: {:?}",
+                transaction_id,
+                decision,
+            )
+        },
+        StagingRecoveryResult::AlreadyFinal(decision) => {
+            anyhow::bail!(
+                "2PC Coordinator: staging decision for txn={} recovered to non-committed final \
+                 state: {:?}",
+                transaction_id,
+                decision,
+            )
+        },
+        StagingRecoveryResult::Missing => {
+            anyhow::bail!(
+                "2PC Coordinator: staging decision for txn={} disappeared before recovery",
+                transaction_id,
+            )
+        },
+    }
+}
+
+fn spawn_parallel_commit_cleanup(
+    local_committer: CommitterClient,
+    node_addresses: Option<NodeAddresses>,
+    partition_map: PartitionMap,
+    transaction_id: TwoPhaseTransactionId,
+    prepared_participants: Vec<PartitionId>,
+    prepare_ts: Timestamp,
+) {
+    tokio_spawn("two_phase_parallel_commit_cleanup", async move {
+        match commit_participants(
+            &local_committer,
+            node_addresses.as_ref(),
+            &partition_map,
+            &transaction_id,
+            &prepared_participants,
+        )
+        .await
+        {
+            Ok(commit_results) => {
+                for (participant, commit_ts) in &commit_results {
+                    if *commit_ts != prepare_ts {
+                        tracing::error!(
+                            "2PC parallel cleanup: participant {} committed txn={} at ts={} but \
+                             coordinator assigned ts={}",
+                            participant,
+                            transaction_id,
+                            commit_ts,
+                            prepare_ts,
+                        );
+                    }
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    "2PC parallel cleanup for txn={} did not finish; watcher will retry from the \
+                     durable decision: {err:#}",
+                    transaction_id,
+                );
+            },
+        }
+    });
+}
+
 async fn mark_participant_resolved(
     local_committer: &CommitterClient,
     transaction_id: &TwoPhaseTransactionId,
@@ -606,6 +772,51 @@ fn is_unknown_rollback_error(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("unknown transaction")
 }
 
+fn verify_committed_decision(
+    transaction_id: &TwoPhaseTransactionId,
+    decision: &TwoPhaseDecision,
+    expected_ts: Timestamp,
+    expected_participants: &[PartitionId],
+) -> anyhow::Result<()> {
+    let TwoPhaseDecision::Committed {
+        commit_ts,
+        participants,
+        ..
+    } = decision
+    else {
+        anyhow::bail!(
+            "2PC Coordinator: expected committed decision for txn={} but found {:?}",
+            transaction_id,
+            decision,
+        );
+    };
+    anyhow::ensure!(
+        *commit_ts == u64::from(expected_ts),
+        "2PC Coordinator: recovered commit decision for txn={} at ts={} but expected ts={}",
+        transaction_id,
+        commit_ts,
+        u64::from(expected_ts),
+    );
+    let mut actual_participants = participants.clone();
+    actual_participants.sort_unstable();
+    actual_participants.dedup();
+    let mut expected_participants: Vec<_> = expected_participants
+        .iter()
+        .map(|participant| participant.0)
+        .collect();
+    expected_participants.sort_unstable();
+    expected_participants.dedup();
+    anyhow::ensure!(
+        actual_participants == expected_participants,
+        "2PC Coordinator: recovered commit decision for txn={} has participants {:?} but expected \
+         {:?}",
+        transaction_id,
+        actual_participants,
+        expected_participants,
+    );
+    Ok(())
+}
+
 /// Execute the 2PC protocol for a transaction that cannot commit on the local
 /// fast path.
 pub async fn coordinate_two_phase_commit(
@@ -613,6 +824,23 @@ pub async fn coordinate_two_phase_commit(
     transaction: FinalTransaction,
     write_source: WriteSource,
     partition_map: &PartitionMap,
+) -> anyhow::Result<CommitOutcome> {
+    coordinate_two_phase_commit_with_mode(
+        local_committer,
+        transaction,
+        write_source,
+        partition_map,
+        TwoPhaseCommitMode::from_knob(),
+    )
+    .await
+}
+
+pub(crate) async fn coordinate_two_phase_commit_with_mode(
+    local_committer: &CommitterClient,
+    transaction: FinalTransaction,
+    write_source: WriteSource,
+    partition_map: &PartitionMap,
+    commit_mode: TwoPhaseCommitMode,
 ) -> anyhow::Result<CommitOutcome> {
     let timer = metrics::two_phase_coordinator_timer();
     let source_partition = match classify_transaction(&transaction, partition_map, &write_source) {
@@ -755,54 +983,93 @@ pub async fn coordinate_two_phase_commit(
             continue;
         }
 
-        let decision = TwoPhaseDecision::committed(
-            u64::from(prepare_ts),
-            prepared_participants.iter().map(|p| p.0).collect(),
-        );
-        write_decision_record(local_committer, &txn_id, &decision)
-            .await
-            .with_context(|| {
-                format!("2PC Coordinator: failed to write commit decision for txn={txn_id}")
-            })?;
+        match commit_mode {
+            TwoPhaseCommitMode::DurableDecision => {
+                let decision = TwoPhaseDecision::committed(
+                    u64::from(prepare_ts),
+                    prepared_participants.iter().map(|p| p.0).collect(),
+                );
+                write_decision_record(local_committer, &txn_id, &decision)
+                    .await
+                    .with_context(|| {
+                        format!("2PC Coordinator: failed to write commit decision for txn={txn_id}")
+                    })?;
 
-        let commit_results = match commit_participants(
-            local_committer,
-            node_addresses,
-            partition_map,
-            &txn_id,
-            &prepared_participants,
-        )
-        .await
-        {
-            Ok(commit_results) => commit_results,
-            Err(err) => {
-                metrics::log_two_phase_error("commit");
-                return Err(err);
+                let commit_results = match commit_participants(
+                    local_committer,
+                    node_addresses,
+                    partition_map,
+                    &txn_id,
+                    &prepared_participants,
+                )
+                .await
+                {
+                    Ok(commit_results) => commit_results,
+                    Err(err) => {
+                        metrics::log_two_phase_error("commit");
+                        return Err(err);
+                    },
+                };
+
+                for (participant, commit_ts) in &commit_results {
+                    anyhow::ensure!(
+                        *commit_ts == prepare_ts,
+                        "Participant {} committed at ts={} but coordinator assigned ts={}",
+                        participant,
+                        commit_ts,
+                        prepare_ts,
+                    );
+                }
+
+                tracing::info!(
+                    "2PC Coordinator: committed txn={} at ts={}",
+                    txn_id,
+                    u64::from(prepare_ts),
+                );
+                metrics::log_two_phase_prepare_attempts(prepare_attempts);
+                metrics::log_two_phase_decision("commit");
+                timer.finish();
+                return Ok(CommitOutcome {
+                    ts: prepare_ts,
+                    source_partition,
+                });
             },
-        };
+            TwoPhaseCommitMode::ParallelEarlyAck => {
+                write_complete_staging_decision(
+                    local_committer,
+                    &txn_id,
+                    prepare_ts,
+                    &all_participants,
+                    &participants,
+                    &write_source,
+                )
+                .await?;
+                let recovered = recover_complete_staging_decision(local_committer, &txn_id).await?;
+                verify_committed_decision(&txn_id, &recovered, prepare_ts, &prepared_participants)?;
+                spawn_parallel_commit_cleanup(
+                    local_committer.clone(),
+                    node_addresses.cloned(),
+                    partition_map.clone(),
+                    txn_id.clone(),
+                    prepared_participants.clone(),
+                    prepare_ts,
+                );
 
-        for (participant, commit_ts) in &commit_results {
-            anyhow::ensure!(
-                *commit_ts == prepare_ts,
-                "Participant {} committed at ts={} but coordinator assigned ts={}",
-                participant,
-                commit_ts,
-                prepare_ts,
-            );
+                tracing::info!(
+                    "2PC Coordinator: parallel-committed txn={} at ts={} with asynchronous \
+                     participant cleanup",
+                    txn_id,
+                    u64::from(prepare_ts),
+                );
+                metrics::log_two_phase_prepare_attempts(prepare_attempts);
+                metrics::log_two_phase_decision("parallel_commit");
+                timer.finish();
+                return Ok(CommitOutcome {
+                    ts: prepare_ts,
+                    source_partition,
+                });
+            },
         }
-
-        tracing::info!(
-            "2PC Coordinator: committed txn={} at ts={}",
-            txn_id,
-            u64::from(prepare_ts),
-        );
-        metrics::log_two_phase_prepare_attempts(prepare_attempts);
-        metrics::log_two_phase_decision("commit");
-        timer.finish();
-        return Ok(CommitOutcome {
-            ts: prepare_ts,
-            source_partition,
-        });
     }
 
     metrics::log_two_phase_error("prepare");
@@ -818,10 +1085,40 @@ pub async fn coordinate_two_phase_commit(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use common::types::{
+        RepeatableTimestamp,
+        Timestamp,
+    };
+
     use super::{
         is_ambiguous_prepare_error,
         is_retryable_prepare_ts_error,
+        participant_intents_for_staging,
+        verify_committed_decision,
     };
+    use crate::{
+        partition::PartitionId,
+        reads::ReadSet,
+        two_phase::{
+            ParticipantTransaction,
+            TwoPhaseDecision,
+            TwoPhaseParticipantIntent,
+            TwoPhaseRedoEntry,
+            TwoPhaseTransactionId,
+        },
+        write_log::WriteSource,
+    };
+
+    fn empty_participant_transaction() -> ParticipantTransaction {
+        ParticipantTransaction {
+            begin_timestamp: RepeatableTimestamp::MIN,
+            tablet_metadata: BTreeMap::new(),
+            reads: ReadSet::empty(),
+            writes: Vec::new(),
+        }
+    }
 
     #[test]
     fn retryable_prepare_ts_error_detects_wrapped_grpc_status() {
@@ -860,5 +1157,81 @@ mod tests {
             "gRPC Prepare failed: status: Internal, message: \"forced prepare failure\""
         );
         assert!(!is_ambiguous_prepare_error(&err));
+    }
+
+    #[test]
+    fn staging_intents_match_participant_redo_records() -> anyhow::Result<()> {
+        let transaction_id = TwoPhaseTransactionId::new();
+        let prepare_ts = Timestamp::try_from(12345u64)?;
+        let write_source = WriteSource::unknown();
+        let all_participants = vec![PartitionId(0), PartitionId(1)];
+        let participant_tx = empty_participant_transaction();
+        let participants = vec![
+            (PartitionId(1), participant_tx.clone()),
+            (PartitionId(0), participant_tx.clone()),
+        ];
+
+        let intents = participant_intents_for_staging(
+            &transaction_id,
+            prepare_ts,
+            &all_participants,
+            &participants,
+            &write_source,
+        )?;
+
+        let mut expected_intents = participants
+            .iter()
+            .map(|(participant, transaction)| {
+                let redo = TwoPhaseRedoEntry::new_with_participants(
+                    &transaction_id,
+                    prepare_ts,
+                    *participant,
+                    &all_participants,
+                    transaction.clone(),
+                    &write_source,
+                )?;
+                Ok(TwoPhaseParticipantIntent::from_redo_entry(&redo))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        expected_intents.sort_by_key(|intent| intent.partition_id);
+
+        assert_eq!(intents, expected_intents);
+        Ok(())
+    }
+
+    #[test]
+    fn committed_decision_verifier_rejects_wrong_timestamp_or_participants() -> anyhow::Result<()> {
+        let transaction_id = TwoPhaseTransactionId::new();
+        let prepare_ts = Timestamp::try_from(12345u64)?;
+        let committed = TwoPhaseDecision::committed(
+            u64::from(prepare_ts),
+            vec![PartitionId(1).0, PartitionId(0).0],
+        );
+
+        verify_committed_decision(
+            &transaction_id,
+            &committed,
+            prepare_ts,
+            &[PartitionId(0), PartitionId(1)],
+        )?;
+
+        let wrong_ts = TwoPhaseDecision::committed(u64::from(prepare_ts) + 1, vec![0, 1]);
+        assert!(verify_committed_decision(
+            &transaction_id,
+            &wrong_ts,
+            prepare_ts,
+            &[PartitionId(0), PartitionId(1)],
+        )
+        .is_err());
+
+        let wrong_participants = TwoPhaseDecision::committed(u64::from(prepare_ts), vec![0]);
+        assert!(verify_committed_decision(
+            &transaction_id,
+            &wrong_participants,
+            prepare_ts,
+            &[PartitionId(0), PartitionId(1)],
+        )
+        .is_err());
+        Ok(())
     }
 }
