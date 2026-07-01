@@ -88,8 +88,16 @@ services:
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
       PARTITION_ID: "0"
       NUM_PARTITIONS: "1"
+      CLUSTER_NODE_ID: partition-0-peer-0
+      ADVERTISE_GRPC_ADDR: node-0-${CLUSTER_RUN_ID:-local}:50051
+      ADVERTISE_HTTP_ORIGIN: http://node-0-${CLUSTER_RUN_ID:-local}:3210
+      ADVERTISE_RAFT_ADDR: node-0-${CLUSTER_RUN_ID:-local}:50051
       RAFT_NODE_ID: "1"
       RAFT_PEERS: 1=http://node-0:50051
+    networks:
+      default:
+        aliases:
+          - node-0-${CLUSTER_RUN_ID:-local}
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,8 +133,16 @@ services:
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
+      CLUSTER_NODE_ID: partition-0-peer-0
+      ADVERTISE_GRPC_ADDR: node-p0a-${CLUSTER_RUN_ID:-local}:50051
+      ADVERTISE_HTTP_ORIGIN: http://node-p0a-${CLUSTER_RUN_ID:-local}:3210
+      ADVERTISE_RAFT_ADDR: node-p0a-${CLUSTER_RUN_ID:-local}:50051
       RAFT_NODE_ID: "1"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
+    networks:
+      default:
+        aliases:
+          - node-p0a-${CLUSTER_RUN_ID:-local}
     depends_on:
       postgres:
         condition: service_healthy
@@ -152,9 +168,17 @@ services:
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
+      CLUSTER_NODE_ID: partition-0-peer-1
+      ADVERTISE_GRPC_ADDR: node-p0b-${CLUSTER_RUN_ID:-local}:50051
+      ADVERTISE_HTTP_ORIGIN: http://node-p0b-${CLUSTER_RUN_ID:-local}:3210
+      ADVERTISE_RAFT_ADDR: node-p0b-${CLUSTER_RUN_ID:-local}:50051
       RAFT_NODE_ID: "2"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
+    networks:
+      default:
+        aliases:
+          - node-p0b-${CLUSTER_RUN_ID:-local}
     depends_on:
       node-p0a:
         condition: service_healthy
@@ -180,9 +204,17 @@ services:
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
+      CLUSTER_NODE_ID: partition-0-peer-2
+      ADVERTISE_GRPC_ADDR: node-p0c-${CLUSTER_RUN_ID:-local}:50051
+      ADVERTISE_HTTP_ORIGIN: http://node-p0c-${CLUSTER_RUN_ID:-local}:3210
+      ADVERTISE_RAFT_ADDR: node-p0c-${CLUSTER_RUN_ID:-local}:50051
       RAFT_NODE_ID: "3"
       RAFT_PEERS: 1=http://node-p0a:50051,2=http://node-p0b:50051,3=http://node-p0c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
+    networks:
+      default:
+        aliases:
+          - node-p0c-${CLUSTER_RUN_ID:-local}
     depends_on:
       node-p0b:
         condition: service_healthy
@@ -210,8 +242,16 @@ services:
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
+      CLUSTER_NODE_ID: partition-1-peer-0
+      ADVERTISE_GRPC_ADDR: node-p1a-${CLUSTER_RUN_ID:-local}:50051
+      ADVERTISE_HTTP_ORIGIN: http://node-p1a-${CLUSTER_RUN_ID:-local}:3210
+      ADVERTISE_RAFT_ADDR: node-p1a-${CLUSTER_RUN_ID:-local}:50051
       RAFT_NODE_ID: "1"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
+    networks:
+      default:
+        aliases:
+          - node-p1a-${CLUSTER_RUN_ID:-local}
     depends_on:
       node-p0c:
         condition: service_healthy
@@ -237,9 +277,17 @@ services:
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
+      CLUSTER_NODE_ID: partition-1-peer-1
+      ADVERTISE_GRPC_ADDR: node-p1b-${CLUSTER_RUN_ID:-local}:50051
+      ADVERTISE_HTTP_ORIGIN: http://node-p1b-${CLUSTER_RUN_ID:-local}:3210
+      ADVERTISE_RAFT_ADDR: node-p1b-${CLUSTER_RUN_ID:-local}:50051
       RAFT_NODE_ID: "2"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
+    networks:
+      default:
+        aliases:
+          - node-p1b-${CLUSTER_RUN_ID:-local}
     depends_on:
       node-p1a:
         condition: service_healthy
@@ -265,9 +313,17 @@ services:
       PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
+      CLUSTER_NODE_ID: partition-1-peer-2
+      ADVERTISE_GRPC_ADDR: node-p1c-${CLUSTER_RUN_ID:-local}:50051
+      ADVERTISE_HTTP_ORIGIN: http://node-p1c-${CLUSTER_RUN_ID:-local}:3210
+      ADVERTISE_RAFT_ADDR: node-p1c-${CLUSTER_RUN_ID:-local}:50051
       RAFT_NODE_ID: "3"
       RAFT_PEERS: 1=http://node-p1a:50051,2=http://node-p1b:50051,3=http://node-p1c:50051
       REPLICA_STORAGE_PATH: /convex/data/storage
+    networks:
+      default:
+        aliases:
+          - node-p1c-${CLUSTER_RUN_ID:-local}
     depends_on:
       node-p1b:
         condition: service_healthy

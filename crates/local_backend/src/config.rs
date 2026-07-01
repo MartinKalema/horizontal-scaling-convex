@@ -182,6 +182,34 @@ pub struct LocalConfig {
     #[clap(long, env = "NODE_ADDRESSES")]
     pub node_addresses: Option<String>,
 
+    /// Stable logical node id used when this process registers itself in the
+    /// shared membership directory. If omitted in Raft mode, this defaults to
+    /// `partition-{PARTITION_ID}-peer-{RAFT_NODE_ID - 1}` so it replaces the
+    /// bootstrap NODE_ADDRESSES entry instead of creating a duplicate node.
+    #[clap(long, env = "CLUSTER_NODE_ID")]
+    pub cluster_node_id: Option<String>,
+
+    /// gRPC address this node advertises into the shared membership directory.
+    /// This may be different from the static Docker service name and can change
+    /// across runs.
+    #[clap(long, env = "ADVERTISE_GRPC_ADDR")]
+    pub advertise_grpc_addr: Option<String>,
+
+    /// Public HTTP origin this node advertises into membership.
+    #[clap(long, env = "ADVERTISE_HTTP_ORIGIN")]
+    pub advertise_http_origin: Option<String>,
+
+    /// Raft peer address this node advertises into membership. Dynamic Raft
+    /// reconfiguration is tracked separately; this is recorded now so the same
+    /// membership directory can carry physical endpoint data.
+    #[clap(long, env = "ADVERTISE_RAFT_ADDR")]
+    pub advertise_raft_addr: Option<String>,
+
+    /// Monotonic generation for this node advertisement. Operators and tests
+    /// can bump this when a node is recreated with a new physical address.
+    #[clap(long, env = "CLUSTER_NODE_GENERATION", default_value = "0")]
+    pub cluster_node_generation: u64,
+
     /// Raft node ID for this node. Each node in a Raft group must have
     /// a unique ID. When set, enables Raft consensus for the partition.
     /// Example: "1"

@@ -141,6 +141,18 @@ impl MembershipSnapshot {
         &self.nodes
     }
 
+    pub fn with_registered_node(&self, node: NodeMembership) -> Self {
+        if self.nodes.get(&node.node_id) == Some(&node) {
+            return self.clone();
+        }
+        let mut nodes = self.nodes.clone();
+        nodes.insert(node.node_id.clone(), node);
+        MembershipSnapshot {
+            version: MembershipVersion::new(u64::from(self.version).saturating_add(1)),
+            nodes,
+        }
+    }
+
     pub fn to_node_addresses(&self) -> NodeAddresses {
         let mut addresses: BTreeMap<PartitionId, Vec<String>> = BTreeMap::new();
         for node in self.nodes.values() {
@@ -235,6 +247,7 @@ pub trait MembershipStore: Send + Sync + 'static {
         &self,
         bootstrap_snapshot: MembershipSnapshot,
     ) -> anyhow::Result<MembershipSnapshot>;
+    async fn register_node(&self, node: NodeMembership) -> anyhow::Result<MembershipSnapshot>;
 }
 
 pub struct NatsMembershipStore {
@@ -300,6 +313,57 @@ impl MembershipStore for NatsMembershipStore {
                 .await?
                 .context("Membership: failed to initialize and no current snapshot exists"),
         }
+    }
+
+    async fn register_node(&self, node: NodeMembership) -> anyhow::Result<MembershipSnapshot> {
+        for attempt in 0..10 {
+            if let Some(entry) = self
+                .kv
+                .entry(MEMBERSHIP_CURRENT_KEY)
+                .await
+                .context("Membership: failed to read current snapshot")?
+            {
+                let current = Self::decode(&entry.value)?;
+                let updated = current.with_registered_node(node.clone());
+                if updated == current {
+                    return Ok(current);
+                }
+                let bytes = Self::encode(&updated)?;
+                match self
+                    .kv
+                    .update(MEMBERSHIP_CURRENT_KEY, bytes.into(), entry.revision)
+                    .await
+                {
+                    Ok(_) => return Ok(updated),
+                    Err(_) => {
+                        tracing::debug!(
+                            attempt,
+                            node_id = %node.node_id,
+                            "Membership: CAS conflict while registering node"
+                        );
+                    },
+                }
+            } else {
+                let snapshot =
+                    MembershipSnapshot::new(MembershipVersion::BOOTSTRAP, vec![node.clone()]);
+                let bytes = Self::encode(&snapshot)?;
+                match self.kv.create(MEMBERSHIP_CURRENT_KEY, bytes.into()).await {
+                    Ok(_) => return Ok(snapshot),
+                    Err(_) => {
+                        tracing::debug!(
+                            attempt,
+                            node_id = %node.node_id,
+                            "Membership: create conflict while registering node"
+                        );
+                    },
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt)).await;
+        }
+        anyhow::bail!(
+            "Membership: failed to register node {} after CAS retries",
+            node.node_id
+        )
     }
 }
 
@@ -369,6 +433,35 @@ mod tests {
         let decoded = NatsMembershipStore::decode(&bytes)?;
 
         assert_eq!(decoded, snapshot);
+        Ok(())
+    }
+
+    #[test]
+    fn test_membership_snapshot_registration_replaces_advertised_address() -> anyhow::Result<()> {
+        let existing = NodeMembership::new(
+            ClusterNodeId::new("partition-0-peer-0")?,
+            PartitionId(0),
+            "node-p0a:50051",
+        )?;
+        let snapshot = MembershipSnapshot::new(MembershipVersion::BOOTSTRAP, vec![existing]);
+        let mut replacement = NodeMembership::new(
+            ClusterNodeId::new("partition-0-peer-0")?,
+            PartitionId(0),
+            "random-p0a-20260701:50051",
+        )?;
+        replacement.generation = 2;
+
+        let updated = snapshot.with_registered_node(replacement.clone());
+
+        assert_eq!(updated.version(), MembershipVersion::new(1));
+        assert_eq!(
+            updated.nodes().get(&replacement.node_id),
+            Some(&replacement)
+        );
+        assert_eq!(
+            updated.to_node_addresses().address_for(PartitionId(0)),
+            Some("random-p0a-20260701:50051")
+        );
         Ok(())
     }
 }

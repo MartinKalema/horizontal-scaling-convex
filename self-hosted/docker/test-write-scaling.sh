@@ -57,9 +57,10 @@
 #  36. Write Skew Detection (G2 anomaly)
 #  37. Ultimate Final Invariant Check
 #  38. Sync Route Authority Guard
+#  39. Dynamic Membership Advertisement
 #
 # Prerequisites:
-#   docker compose --profile cluster up
+#   ./start-cluster.sh
 #
 # Usage:
 #   cd self-hosted/docker && ./test-write-scaling.sh
@@ -116,6 +117,39 @@ parallel_commit_log_count() {
     echo "$count"
 }
 
+assert_dynamic_membership_advertisements() {
+    local run_id="${CLUSTER_RUN_ID:-local}"
+    local details=""
+    local specs=(
+        "docker-node-p0a-1 node-p0a"
+        "docker-node-p0b-1 node-p0b"
+        "docker-node-p0c-1 node-p0c"
+        "docker-node-p1a-1 node-p1a"
+        "docker-node-p1b-1 node-p1b"
+        "docker-node-p1c-1 node-p1c"
+    )
+
+    for spec in "${specs[@]}"; do
+        read -r container base <<< "$spec"
+        local expected="${base}-${run_id}:50051"
+        local configured
+        configured=$(docker exec "$container" printenv ADVERTISE_GRPC_ADDR 2>/dev/null || true)
+        if [ "$configured" != "$expected" ]; then
+            details="$details $container env=$configured expected=$expected;"
+            continue
+        fi
+        if ! docker logs "$container" 2>&1 | grep -F "Registered cluster membership node" | grep -F "$expected" > /dev/null; then
+            details="$details $container did not log membership registration for $expected;"
+        fi
+    done
+
+    if [ -z "$details" ]; then
+        pass "Cluster membership registered per-run advertised gRPC aliases"
+    else
+        fail "Cluster membership advertised-address registration missing" "$details"
+    fi
+}
+
 # --- Preflight ---
 
 echo ""
@@ -124,11 +158,13 @@ echo -e "${BOLD}Preflight checks${NC}"
 for name in "${BACKEND_CONTAINERS[@]}"; do
     if ! docker inspect "$name" > /dev/null 2>&1; then
         echo -e "${RED}Container $name not running. Start the deployment first:${NC}"
-        echo "  docker compose --profile cluster up"
+        echo "  ./start-cluster.sh"
         exit 1
     fi
 done
 echo "  Containers running."
+
+assert_dynamic_membership_advertisements
 
 if [ "${EXPECT_PARALLEL_2PC_EARLY_ACK:-false}" = "true" ]; then
     EARLY_ACK_ENV_OK=true

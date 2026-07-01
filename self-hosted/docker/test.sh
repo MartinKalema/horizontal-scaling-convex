@@ -12,7 +12,7 @@
 #   ./test.sh parallel     # Write scaling with parallel-2PC early ack required
 #
 # Prerequisites:
-#   docker compose --profile cluster up
+#   ./start-cluster.sh
 
 set -euo pipefail
 

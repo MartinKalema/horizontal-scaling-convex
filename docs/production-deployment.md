@@ -2,7 +2,7 @@
 
 How to deploy the Convex horizontally-scaled cluster on Kubernetes (GKE, EKS) and bare VMs (EC2). Based on how CockroachDB, TiDB, and YugabyteDB deploy in production.
 
-The Docker Compose setup (`docker compose --profile cluster up`) is for development only — the same pattern all three giants follow. Production uses Kubernetes StatefulSets or bare VM processes with persistent storage.
+The Docker Compose setup (`self-hosted/docker/start-cluster.sh`) is for development only — the same pattern all three giants follow. Compose still has stable service names for local orchestration and Raft bootstrap, but the wrapper gives each run a fresh advertised-address namespace so the routing path exercises membership discovery instead of treating the static Compose names as the source of truth. Production uses Kubernetes StatefulSets or bare VM processes with persistent storage.
 
 ## Kubernetes (GKE / EKS)
 
