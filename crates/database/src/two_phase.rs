@@ -1067,12 +1067,28 @@ impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
 /// Partition-to-address mapping for gRPC communication.
 /// Each entry maps a partition ID to one or more gRPC addresses for that
 /// partition's Raft peers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeAddresses {
     addresses: BTreeMap<PartitionId, Vec<String>>,
 }
 
 impl NodeAddresses {
+    pub fn from_entries(addresses: BTreeMap<PartitionId, Vec<String>>) -> Self {
+        Self {
+            addresses: addresses
+                .into_iter()
+                .filter_map(|(partition, addresses)| {
+                    let addresses = addresses
+                        .into_iter()
+                        .map(|address| address.trim().to_string())
+                        .filter(|address| !address.is_empty())
+                        .collect::<Vec<_>>();
+                    (!addresses.is_empty()).then_some((partition, addresses))
+                })
+                .collect(),
+        }
+    }
+
     /// Parse from config string: "0=host:port|host:port,1=host:port|host:port".
     ///
     /// A partition can list multiple Raft peers with `|`, e.g.
@@ -1095,7 +1111,11 @@ impl NodeAddresses {
                 }
             }
         }
-        Self { addresses }
+        Self::from_entries(addresses)
+    }
+
+    pub fn to_entries(&self) -> BTreeMap<PartitionId, Vec<String>> {
+        self.addresses.clone()
     }
 
     /// Get the gRPC address for a partition.
@@ -1742,6 +1762,26 @@ mod tests {
     fn test_node_addresses_empty() {
         let addrs = NodeAddresses::from_config("");
         assert!(addrs.partitions().is_empty());
+    }
+
+    #[test]
+    fn test_node_addresses_round_trip_structured_entries() {
+        let addrs = NodeAddresses::from_entries(BTreeMap::from([
+            (
+                PartitionId(0),
+                vec![" node-p0a:50051 ".to_string(), "node-p0b:50051".to_string()],
+            ),
+            (
+                PartitionId(1),
+                vec!["".to_string(), "node-p1a:50051".to_string()],
+            ),
+            (PartitionId(2), vec!["".to_string()]),
+        ]));
+
+        assert_eq!(addrs.address_for(PartitionId(0)), Some("node-p0a:50051"));
+        assert_eq!(addrs.address_for(PartitionId(1)), Some("node-p1a:50051"));
+        assert_eq!(addrs.address_for(PartitionId(2)), None);
+        assert_eq!(NodeAddresses::from_entries(addrs.to_entries()), addrs);
     }
 
     #[test]

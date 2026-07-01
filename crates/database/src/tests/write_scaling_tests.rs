@@ -121,6 +121,12 @@ use crate::{
         CommitterClient,
         AFTER_PENDING_WRITE_SNAPSHOT,
     },
+    membership::{
+        ClusterNodeId,
+        MembershipSnapshot,
+        MembershipVersion,
+        NodeMembership,
+    },
     partition::{
         PartitionId,
         PartitionMap,
@@ -5857,6 +5863,51 @@ fn test_committer_client_refreshes_placement_metadata() -> anyhow::Result<()> {
         ))?;
 
         committer.ensure_placement_version(PlacementVersion::new(2))?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_committer_client_refreshes_membership_snapshot() -> anyhow::Result<()> {
+    let td = TestDriver::new();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let node = create_node(
+            &rt,
+            log,
+            Some(partitioned_map_with_version(
+                PartitionId(1),
+                PlacementVersion::new(1),
+            )),
+        )
+        .await?;
+        let committer = node.committer_for_test();
+        assert!(committer.node_addresses().is_none());
+
+        committer.refresh_membership_snapshot(MembershipSnapshot::new(
+            MembershipVersion::new(2),
+            vec![
+                NodeMembership::new(
+                    ClusterNodeId::new("node-p0a")?,
+                    PartitionId(0),
+                    "node-p0:50051",
+                )?,
+                NodeMembership::new(
+                    ClusterNodeId::new("node-p1a")?,
+                    PartitionId(1),
+                    "node-p1:50051",
+                )?,
+            ],
+        ))?;
+
+        let node_addresses = committer
+            .node_addresses()
+            .expect("membership refresh should install node addresses");
+        assert_eq!(
+            node_addresses.address_for(PartitionId(1)),
+            Some("node-p1:50051"),
+        );
         Ok(())
     })
 }
