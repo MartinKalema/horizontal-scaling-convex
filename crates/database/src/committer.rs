@@ -5574,12 +5574,10 @@ impl CommitterClient {
         &self,
         snapshot: crate::membership::MembershipSnapshot,
     ) -> anyhow::Result<()> {
-        let node_addresses = snapshot.to_node_addresses();
-        anyhow::ensure!(
-            !node_addresses.partitions().is_empty(),
-            "Cannot refresh membership from an empty node directory"
-        );
-        *self.node_addresses.write() = Some(node_addresses);
+        let node_addresses =
+            snapshot.to_live_node_addresses(crate::membership::current_unix_timestamp_millis());
+        *self.node_addresses.write() =
+            (!node_addresses.partitions().is_empty()).then_some(node_addresses);
         Ok(())
     }
 

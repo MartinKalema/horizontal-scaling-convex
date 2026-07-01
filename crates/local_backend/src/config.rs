@@ -210,6 +210,11 @@ pub struct LocalConfig {
     #[clap(long, env = "CLUSTER_NODE_GENERATION", default_value = "0")]
     pub cluster_node_generation: u64,
 
+    /// Mark this node as draining in the membership directory. Draining nodes
+    /// continue running but are excluded from new routed work.
+    #[clap(long, env = "CLUSTER_NODE_DRAINING", default_value = "false")]
+    pub cluster_node_draining: bool,
+
     /// Raft node ID for this node. Each node in a Raft group must have
     /// a unique ID. When set, enables Raft consensus for the partition.
     /// Example: "1"
