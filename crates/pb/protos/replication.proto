@@ -129,6 +129,7 @@ message QueryError {
 // to remote partitions, then CommitPrepared or RollbackPrepared.
 service TwoPhaseCommitService {
   rpc Prepare(TwoPcPrepareRequest) returns (TwoPcPrepareResponse);
+  rpc ValidateReads(TwoPcValidateReadsRequest) returns (TwoPcValidateReadsResponse);
   rpc CommitPrepared(TwoPcCommitRequest) returns (TwoPcCommitResponse);
   rpc RollbackPrepared(TwoPcRollbackRequest) returns (TwoPcRollbackResponse);
 }
@@ -161,6 +162,29 @@ message TwoPcPrepareRequest {
 message TwoPcPrepareResponse {
   // The prepare timestamp assigned by the participant's TSO.
   uint64 prepare_ts = 1;
+}
+
+message TwoPcValidateReadsRequest {
+  // Globally unique 2PC transaction ID, used only for tracing validation
+  // failures. Read-only validators do not stage durable participant state.
+  string transaction_id = 1;
+
+  // The participant's read subset. The writes field must be empty; write
+  // owners still use Prepare so they can stage a durable participant intent.
+  TwoPcParticipantTransaction transaction = 2;
+
+  // Write source for logging.
+  string write_source = 3;
+
+  // Globally assigned prepare/commit timestamp chosen by the coordinator.
+  uint64 validate_ts = 4;
+
+  // Placement metadata version used by the coordinator to route this
+  // validation request.
+  uint64 placement_version = 5;
+}
+
+message TwoPcValidateReadsResponse {
 }
 
 message TwoPcParticipantTransaction {

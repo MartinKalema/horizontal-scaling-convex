@@ -38,6 +38,8 @@ use pb::replication::{
     TwoPcPrepareResponse,
     TwoPcRollbackRequest,
     TwoPcRollbackResponse,
+    TwoPcValidateReadsRequest,
+    TwoPcValidateReadsResponse,
 };
 use tonic::{
     Request,
@@ -219,6 +221,47 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
         Ok(Response::new(TwoPcPrepareResponse {
             prepare_ts: u64::from(result.prepare_ts),
         }))
+    }
+
+    async fn validate_reads(
+        &self,
+        request: Request<TwoPcValidateReadsRequest>,
+    ) -> Result<Response<TwoPcValidateReadsResponse>, Status> {
+        self.authenticate(&request)?;
+        let req = request.into_inner();
+        let txn_id = TwoPhaseTransactionId(req.transaction_id);
+        let transaction = req
+            .transaction
+            .ok_or_else(|| Status::invalid_argument("ValidateReads missing transaction payload"))?;
+        let transaction = ParticipantTransaction::try_from(transaction).map_err(|e| {
+            Status::invalid_argument(format!("Invalid ValidateReads payload: {e:#}"))
+        })?;
+        let validate_ts = req.validate_ts.try_into().map_err(|e| {
+            Status::invalid_argument(format!("Invalid ValidateReads timestamp: {e:#}"))
+        })?;
+        let placement_version = PlacementVersion::from(req.placement_version);
+        self.ensure_placement_version(placement_version).await?;
+
+        if let Some(client) = self.leader_client().await? {
+            client
+                .validate_reads(
+                    &txn_id,
+                    transaction,
+                    req.write_source.into(),
+                    validate_ts,
+                    placement_version,
+                )
+                .await
+                .map_err(|e| Status::internal(format!("Leader ValidateReads failed: {e:#}")))?;
+            return Ok(Response::new(TwoPcValidateReadsResponse {}));
+        }
+
+        self.committer
+            .validate_remote_reads(txn_id, transaction, req.write_source.into(), validate_ts)
+            .await
+            .map_err(|e| Status::internal(format!("ValidateReads failed: {e:#}")))?;
+
+        Ok(Response::new(TwoPcValidateReadsResponse {}))
     }
 
     async fn commit_prepared(

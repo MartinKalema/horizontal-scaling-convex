@@ -9,6 +9,7 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
+            AtomicUsize,
             Ordering,
         },
         Arc,
@@ -78,6 +79,8 @@ use pb::replication::{
     TwoPcPrepareResponse,
     TwoPcRollbackRequest,
     TwoPcRollbackResponse,
+    TwoPcValidateReadsRequest,
+    TwoPcValidateReadsResponse,
 };
 use rand::{
     Rng,
@@ -461,11 +464,29 @@ async fn global_table_scan_or_empty(
 
 struct TestTwoPhaseCommitGrpcService {
     committer: CommitterClient,
+    prepare_calls: Arc<AtomicUsize>,
+    validate_reads_calls: Arc<AtomicUsize>,
 }
 
 impl TestTwoPhaseCommitGrpcService {
     fn new(committer: CommitterClient) -> Self {
-        Self { committer }
+        Self::with_counters(
+            committer,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    fn with_counters(
+        committer: CommitterClient,
+        prepare_calls: Arc<AtomicUsize>,
+        validate_reads_calls: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            committer,
+            prepare_calls,
+            validate_reads_calls,
+        }
     }
 }
 
@@ -475,6 +496,7 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
         &self,
         request: Request<TwoPcPrepareRequest>,
     ) -> Result<Response<TwoPcPrepareResponse>, Status> {
+        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
         let req = request.into_inner();
         let txn_id = TwoPhaseTransactionId(req.transaction_id);
         let transaction = req
@@ -505,6 +527,34 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
         Ok(Response::new(TwoPcPrepareResponse {
             prepare_ts: u64::from(result.prepare_ts),
         }))
+    }
+
+    async fn validate_reads(
+        &self,
+        request: Request<TwoPcValidateReadsRequest>,
+    ) -> Result<Response<TwoPcValidateReadsResponse>, Status> {
+        self.validate_reads_calls.fetch_add(1, Ordering::SeqCst);
+        let req = request.into_inner();
+        let txn_id = TwoPhaseTransactionId(req.transaction_id);
+        let transaction = req
+            .transaction
+            .ok_or_else(|| Status::invalid_argument("ValidateReads missing transaction payload"))?;
+        let transaction = ParticipantTransaction::try_from(transaction).map_err(|e| {
+            Status::invalid_argument(format!("Invalid ValidateReads payload: {e:#}"))
+        })?;
+        let validate_ts: Timestamp = req.validate_ts.try_into().map_err(|e| {
+            Status::invalid_argument(format!("Invalid ValidateReads timestamp: {e:#}"))
+        })?;
+        self.committer
+            .ensure_placement_version(PlacementVersion::from(req.placement_version))
+            .map_err(|e| Status::failed_precondition(format!("ValidateReads rejected: {e:#}")))?;
+
+        self.committer
+            .validate_remote_reads(txn_id, transaction, req.write_source.into(), validate_ts)
+            .await
+            .map_err(|e| Status::internal(format!("ValidateReads failed: {e:#}")))?;
+
+        Ok(Response::new(TwoPcValidateReadsResponse {}))
     }
 
     async fn commit_prepared(
@@ -545,6 +595,13 @@ impl TwoPhaseCommitService for FailingPrepareGrpcService {
         _request: Request<TwoPcPrepareRequest>,
     ) -> Result<Response<TwoPcPrepareResponse>, Status> {
         Err(Status::internal("forced prepare failure"))
+    }
+
+    async fn validate_reads(
+        &self,
+        _request: Request<TwoPcValidateReadsRequest>,
+    ) -> Result<Response<TwoPcValidateReadsResponse>, Status> {
+        Err(Status::internal("forced validate reads failure"))
     }
 
     async fn commit_prepared(
@@ -677,6 +734,15 @@ impl TwoPhaseCommitService for AmbiguousPrepareAfterLocalPrepareGrpcService {
         ))
     }
 
+    async fn validate_reads(
+        &self,
+        _request: Request<TwoPcValidateReadsRequest>,
+    ) -> Result<Response<TwoPcValidateReadsResponse>, Status> {
+        Err(Status::failed_precondition(
+            "validate_reads should not be called during ambiguous prepare test",
+        ))
+    }
+
     async fn commit_prepared(
         &self,
         _request: Request<TwoPcCommitRequest>,
@@ -757,6 +823,15 @@ impl TwoPhaseCommitService for FailingCommitAfterLocalPrepareGrpcService {
         Ok(Response::new(TwoPcPrepareResponse {
             prepare_ts: u64::from(result.prepare_ts),
         }))
+    }
+
+    async fn validate_reads(
+        &self,
+        _request: Request<TwoPcValidateReadsRequest>,
+    ) -> Result<Response<TwoPcValidateReadsResponse>, Status> {
+        Err(Status::failed_precondition(
+            "validate_reads should not be called during commit failure test",
+        ))
     }
 
     async fn commit_prepared(
@@ -850,6 +925,15 @@ impl TwoPhaseCommitService for FailingRollbackAfterPrepareGrpcService {
         Ok(Response::new(TwoPcPrepareResponse {
             prepare_ts: u64::from(result.prepare_ts),
         }))
+    }
+
+    async fn validate_reads(
+        &self,
+        _request: Request<TwoPcValidateReadsRequest>,
+    ) -> Result<Response<TwoPcValidateReadsResponse>, Status> {
+        Err(Status::failed_precondition(
+            "validate_reads should not be called during rollback failure test",
+        ))
     }
 
     async fn commit_prepared(
@@ -1557,7 +1641,7 @@ async fn test_prepare_participants_include_remote_read_owner(
 }
 
 #[convex_macro::test_runtime]
-async fn test_read_owner_prepare_rejects_conflicting_owner_write(
+async fn test_read_owner_validation_rejects_conflicting_owner_write(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
@@ -1618,18 +1702,25 @@ async fn test_read_owner_prepare_rejects_conflicting_owner_write(
     let prepare_ts = node_b.committer_for_test().allocate_commit_ts().await?;
     let err = node_b
         .committer_for_test()
-        .prepare_remote(
+        .validate_remote_reads(
             TwoPhaseTransactionId::new(),
             read_owner_tx,
             write_source,
             prepare_ts,
-            vec![PartitionId(0), PartitionId(1)],
         )
         .await
         .expect_err("read owner should reject a read set made stale by its own write log");
     assert!(
         format!("{err:#}").contains("changed while this mutation was being run"),
         "expected read-owner OCC conflict, got {err:#}",
+    );
+    assert!(
+        node_b
+            .committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "validation-only read owners must not persist 2PC redo records",
     );
 
     Ok(())
@@ -1951,8 +2042,12 @@ fn test_local_commit_with_remote_read_routes_to_read_owner() -> anyhow::Result<(
             Some(tso.clone()),
         )
         .await?;
-        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let validate_reads_calls = Arc::new(AtomicUsize::new(0));
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::with_counters(
             node_b.committer_for_test(),
+            prepare_calls.clone(),
+            validate_reads_calls.clone(),
         ))
         .await?;
         let node_a = create_node_with_options(
@@ -1994,6 +2089,16 @@ fn test_local_commit_with_remote_read_routes_to_read_owner() -> anyhow::Result<(
         assert!(
             commit_ts > initial_delta_ts,
             "resolver-routed commit should use a timestamp after the remote seed",
+        );
+        assert_eq!(
+            validate_reads_calls.load(Ordering::SeqCst),
+            1,
+            "remote read owner should receive a validation-only resolver RPC",
+        );
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst),
+            0,
+            "read-only resolver participants should not stage prepared writes",
         );
         server.shutdown().await?;
         Ok(())

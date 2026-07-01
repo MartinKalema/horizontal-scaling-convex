@@ -264,22 +264,36 @@ async fn prepare_participant(
     node_addresses: Option<&NodeAddresses>,
     partition_map: &PartitionMap,
     transaction_id: &TwoPhaseTransactionId,
-    all_participants: &[PartitionId],
+    stateful_participants: &[PartitionId],
     participant: PartitionId,
     participant_tx: ParticipantTransaction,
     write_source: &WriteSource,
     prepare_ts: Timestamp,
-) -> anyhow::Result<()> {
-    let result = if participant == partition_map.local_partition() {
+) -> anyhow::Result<bool> {
+    let stages_writes = !participant_tx.writes.is_empty();
+    if participant == partition_map.local_partition() {
+        if stages_writes {
+            let result = local_committer
+                .prepare_remote(
+                    transaction_id.clone(),
+                    participant_tx,
+                    write_source.clone(),
+                    prepare_ts,
+                    stateful_participants.to_vec(),
+                )
+                .await?;
+            verify_prepare_result(participant, prepare_ts, result)?;
+            return Ok(true);
+        }
         local_committer
-            .prepare_remote(
+            .validate_remote_reads(
                 transaction_id.clone(),
                 participant_tx,
                 write_source.clone(),
                 prepare_ts,
-                all_participants.to_vec(),
             )
-            .await?
+            .await?;
+        return Ok(false);
     } else {
         let node_addresses = node_addresses.with_context(|| {
             format!(
@@ -295,30 +309,56 @@ async fn prepare_participant(
         for addr in addresses {
             match local_committer.two_phase_client(addr).await {
                 Ok(client) => {
-                    match client
-                        .prepare(
-                            transaction_id,
-                            participant_tx.clone(),
-                            write_source.clone(),
-                            prepare_ts,
-                            partition_map.placement_version(),
-                            all_participants,
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            return verify_prepare_result(participant, prepare_ts, result)
-                        },
-                        Err(err) if should_try_next_participant_address(&err) => {
-                            tracing::warn!(
-                                "2PC Coordinator: prepare to participant {} via {} failed, trying \
-                                 next address: {err:#}",
-                                participant,
-                                addr,
-                            );
-                            last_err = Some(err);
-                        },
-                        Err(err) => return Err(err),
+                    if stages_writes {
+                        match client
+                            .prepare(
+                                transaction_id,
+                                participant_tx.clone(),
+                                write_source.clone(),
+                                prepare_ts,
+                                partition_map.placement_version(),
+                                stateful_participants,
+                            )
+                            .await
+                        {
+                            Ok(result) => {
+                                verify_prepare_result(participant, prepare_ts, result)?;
+                                return Ok(true);
+                            },
+                            Err(err) if should_try_next_participant_address(&err) => {
+                                tracing::warn!(
+                                    "2PC Coordinator: prepare to participant {} via {} failed, \
+                                     trying next address: {err:#}",
+                                    participant,
+                                    addr,
+                                );
+                                last_err = Some(err);
+                            },
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        match client
+                            .validate_reads(
+                                transaction_id,
+                                participant_tx.clone(),
+                                write_source.clone(),
+                                prepare_ts,
+                                partition_map.placement_version(),
+                            )
+                            .await
+                        {
+                            Ok(()) => return Ok(false),
+                            Err(err) if should_try_next_participant_address(&err) => {
+                                tracing::warn!(
+                                    "2PC Coordinator: read validation on participant {} via {} \
+                                     failed, trying next address: {err:#}",
+                                    participant,
+                                    addr,
+                                );
+                                last_err = Some(err);
+                            },
+                            Err(err) => return Err(err),
+                        }
                     }
                 },
                 Err(err) if should_try_next_participant_address(&err) => {
@@ -336,9 +376,7 @@ async fn prepare_participant(
         return Err(last_err.unwrap_or_else(|| {
             anyhow!("2PC: No usable NODE_ADDRESSES entry for participant {participant}")
         }));
-    };
-
-    verify_prepare_result(participant, prepare_ts, result)
+    }
 }
 
 async fn prepare_participants(
@@ -346,7 +384,7 @@ async fn prepare_participants(
     node_addresses: Option<&NodeAddresses>,
     partition_map: &PartitionMap,
     transaction_id: &TwoPhaseTransactionId,
-    all_participants: &[PartitionId],
+    stateful_participants: &[PartitionId],
     participants: &[(PartitionId, ParticipantTransaction)],
     write_source: &WriteSource,
     prepare_ts: Timestamp,
@@ -359,7 +397,7 @@ async fn prepare_participants(
                 node_addresses,
                 partition_map,
                 transaction_id,
-                all_participants,
+                stateful_participants,
                 *participant,
                 participant_tx.clone(),
                 write_source,
@@ -374,7 +412,8 @@ async fn prepare_participants(
     let mut failures = Vec::new();
     while let Some((participant, result)) = prepares.next().await {
         match result {
-            Ok(()) => prepared.push(participant),
+            Ok(true) => prepared.push(participant),
+            Ok(false) => {},
             Err(err) => failures.push(PrepareParticipantFailure { participant, err }),
         }
     }
@@ -918,9 +957,16 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
             ))
         })
         .collect::<anyhow::Result<_>>()?;
-    let all_participants: Vec<_> = participants
+    let stateful_participants: Vec<_> = participants
         .iter()
-        .map(|(participant, _)| *participant)
+        .filter_map(|(participant, transaction)| {
+            (!transaction.writes.is_empty()).then_some(*participant)
+        })
+        .collect();
+    let stateful_participant_transactions: Vec<_> = participants
+        .iter()
+        .filter(|(_, transaction)| !transaction.writes.is_empty())
+        .cloned()
         .collect();
     metrics::log_two_phase_participants(participants.len());
 
@@ -946,7 +992,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
             node_addresses,
             partition_map,
             &txn_id,
-            &all_participants,
+            &stateful_participants,
             &participants,
             &write_source,
             prepare_ts,
@@ -967,7 +1013,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                 .iter()
                 .any(|failure| is_ambiguous_prepare_error(&failure.err));
             let participants_to_rollback = if has_ambiguous_prepare {
-                all_participants.clone()
+                stateful_participants.clone()
             } else {
                 prepared_participants.clone()
             };
@@ -1083,8 +1129,8 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                     local_committer,
                     &txn_id,
                     prepare_ts,
-                    &all_participants,
-                    &participants,
+                    &stateful_participants,
+                    &stateful_participant_transactions,
                     &write_source,
                 )
                 .await?;
