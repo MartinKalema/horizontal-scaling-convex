@@ -11,6 +11,7 @@
 #   4. Transparent Partition Routing (topology hiding)
 #   4b. All Replica Entrypoint Routing (cluster-wide topology hiding)
 #   4c. Six-Entrypoint Read-After-Write (session/topology hiding)
+#   4d. Live Membership Refresh After Node Readdress
 #   5. Concurrent Write Scaling (CockroachDB KV)
 #   6. Monotonic Reads (TiDB monotonic)
 #   7. Node Restart Recovery (TiDB kill -9 / CockroachDB nemesis)
@@ -767,6 +768,69 @@ $SIX_RAR_OK \
 POST_SIX_RAR=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 AM=$(jval messages "$POST_SIX_RAR"); AU=$(jval users "$POST_SIX_RAR")
 AP=$(jval projects "$POST_SIX_RAR"); AT=$(jval tasks "$POST_SIX_RAR")
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 4d: Live Membership Refresh After Node Readdress${NC}"
+# ============================================================
+
+# Recreate one participant with a different advertised address namespace. The
+# Compose service and host port stay stable for the harness, but the gRPC alias
+# advertised into membership changes. Other nodes must refresh from membership
+# without a process restart.
+READDR_RUN_ID="readdr-$(date +%s)"
+READDR_ADDR="node-p1a-${READDR_RUN_ID}:50051"
+echo "  Recreating p1a with advertised address $READDR_ADDR..."
+(
+    cd "$SCRIPT_DIR"
+    CLUSTER_RUN_ID="$READDR_RUN_ID" BACKEND_PULL_POLICY=never \
+        docker compose --profile cluster up -d --no-deps --force-recreate node-p1a > /dev/null
+)
+
+for _ in $(seq 1 40); do
+    curl -sf "$NODE_P1A_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
+ENTRYPOINT_KEYS[3]="$NODE_P1A_KEY"
+
+P1A_ADVERTISED=$(docker exec docker-node-p1a-1 printenv ADVERTISE_GRPC_ADDR 2>/dev/null || true)
+[ "$P1A_ADVERTISED" = "$READDR_ADDR" ] \
+    && pass "p1a restarted with a new advertised gRPC address" \
+    || fail "p1a did not restart with the expected advertised address" "got=$P1A_ADVERTISED expected=$READDR_ADDR"
+
+OBSERVED_REFRESH=false
+for _ in $(seq 1 30); do
+    if docker logs docker-node-p0a-1 2>&1 | grep -F "Refreshed cluster membership snapshot" | grep -F "$READDR_ADDR" > /dev/null; then
+        OBSERVED_REFRESH=true
+        break
+    fi
+    sleep 1
+done
+$OBSERVED_REFRESH \
+    && pass "p0a refreshed membership and observed p1a's new advertised address" \
+    || fail "p0a did not observe p1a's new advertised address" "$READDR_ADDR"
+
+R=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+    "{\"text\":\"membership-readdress-${READDR_RUN_ID}\",\"taskTitle\":\"membership-readdress-${READDR_RUN_ID}\"}")
+if echo "$R" | grep -q '"status":"success"'; then
+    sleep 2
+    MT=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "membership-readdress-${READDR_RUN_ID}")
+    TT=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "membership-readdress-${READDR_RUN_ID}")
+    if [ "$MT" -eq 1 ] && [ "$TT" -eq 1 ]; then
+        pass "Cross-partition routing worked after live membership readdress"
+        POST_READDR=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+        AM=$(jval messages "$POST_READDR"); AU=$(jval users "$POST_READDR")
+        AP=$(jval projects "$POST_READDR"); AT=$(jval tasks "$POST_READDR")
+    else
+        fail "Readdress 2PC write did not appear exactly once" "messages=$MT tasks=$TT"
+    fi
+else
+    fail "Cross-partition routing failed after live membership readdress" "$R"
+fi
+
+export CLUSTER_RUN_ID="$READDR_RUN_ID"
 
 # ============================================================
 echo ""
@@ -1977,7 +2041,9 @@ echo ""
 echo -e "${BOLD}Test 20d: Cross-Partition 2PC During Participant Leader Outage${NC}"
 # ============================================================
 # Stop the partition-1 leader and require every surviving public entrypoint to
-# coordinate cross-partition writes through the new partition-1 Raft leader.
+# eventually coordinate cross-partition writes through the new partition-1 Raft
+# leader. Leader changes are asynchronous, so the test waits for bounded
+# readiness instead of relying on a fixed sleep to mean "new leader is routable."
 
 PRE_P1_OUTAGE=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_P1_OUTAGE_M=$(jval messages "$PRE_P1_OUTAGE")
@@ -1992,20 +2058,35 @@ P1_OUTAGE_URLS=("$NODE_P0A_URL" "$NODE_P0B_URL" "$NODE_P0C_URL" "$NODE_P1B_URL" 
 P1_OUTAGE_KEYS=("$NODE_P0A_KEY" "$NODE_P0B_KEY" "$NODE_P0C_KEY" "$NODE_P1B_KEY" "$NODE_P1C_KEY")
 P1_OUTAGE_ACCEPTED=0
 P1_OUTAGE_RUN="p1-outage-$(date +%s)"
+P1_OUTAGE_TEXTS=()
+P1_OUTAGE_TASKS=()
 
 for i in "${!P1_OUTAGE_LABELS[@]}"; do
     label="${P1_OUTAGE_LABELS[$i]}"
-    R=$(mutation_response "${P1_OUTAGE_URLS[$i]}" "${P1_OUTAGE_KEYS[$i]}" "messages:crossPartitionWrite" \
-        "{\"text\":\"$P1_OUTAGE_RUN-$label\",\"taskTitle\":\"$P1_OUTAGE_RUN-task-$label\"}")
-    if echo "$R" | grep -q '"status":"success"'; then
-        P1_OUTAGE_ACCEPTED=$((P1_OUTAGE_ACCEPTED + 1))
-    else
-        fail "$label could not route 2PC write while p1a was down" "$R"
+    SUCCESS=false
+    LAST_R=""
+    for attempt in $(seq 1 30); do
+        text="$P1_OUTAGE_RUN-$label-attempt-$attempt"
+        task="$P1_OUTAGE_RUN-task-$label-attempt-$attempt"
+        R=$(mutation_response "${P1_OUTAGE_URLS[$i]}" "${P1_OUTAGE_KEYS[$i]}" "messages:crossPartitionWrite" \
+            "{\"text\":\"$text\",\"taskTitle\":\"$task\"}")
+        LAST_R="$R"
+        if echo "$R" | grep -q '"status":"success"'; then
+            P1_OUTAGE_ACCEPTED=$((P1_OUTAGE_ACCEPTED + 1))
+            P1_OUTAGE_TEXTS+=("$text")
+            P1_OUTAGE_TASKS+=("$task")
+            SUCCESS=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$SUCCESS" != "true" ]; then
+        fail "$label could not route 2PC write while p1a was down" "$LAST_R"
     fi
 done
 
 [ "$P1_OUTAGE_ACCEPTED" -eq 5 ] \
-    && pass "All five surviving entrypoints accepted 2PC writes while p1a was down" \
+    && pass "All five surviving entrypoints accepted 2PC writes after p1a leader failover" \
     || fail "Some 2PC writes failed during p1a outage" "accepted=$P1_OUTAGE_ACCEPTED expected=5"
 
 echo "  Restarting p1a..."
@@ -2025,6 +2106,25 @@ POST_P1_OUTAGE_AM=$(jval messages "$POST_P1_OUTAGE_A")
 POST_P1_OUTAGE_AT=$(jval tasks "$POST_P1_OUTAGE_A")
 POST_P1_OUTAGE_BM=$(jval messages "$POST_P1_OUTAGE_B")
 POST_P1_OUTAGE_BT=$(jval tasks "$POST_P1_OUTAGE_B")
+P1_OUTAGE_EXACT=true
+P1_OUTAGE_EXACT_DETAILS=""
+
+for i in "${!P1_OUTAGE_TEXTS[@]}"; do
+    text="${P1_OUTAGE_TEXTS[$i]}"
+    task="${P1_OUTAGE_TASKS[$i]}"
+    MSG_A=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$text")
+    MSG_B=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$text")
+    TASK_A=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$task")
+    TASK_B=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$task")
+    if [ "$MSG_A" -ne 1 ] || [ "$MSG_B" -ne 1 ] || [ "$TASK_A" -ne 1 ] || [ "$TASK_B" -ne 1 ]; then
+        P1_OUTAGE_EXACT=false
+        P1_OUTAGE_EXACT_DETAILS="$P1_OUTAGE_EXACT_DETAILS text=$text msgA=$MSG_A msgB=$MSG_B task=$task taskA=$TASK_A taskB=$TASK_B;"
+    fi
+done
+
+$P1_OUTAGE_EXACT \
+    && pass "Every participant-outage 2PC write appeared exactly once on both nodes" \
+    || fail "Participant-outage 2PC write exactness failed" "$P1_OUTAGE_EXACT_DETAILS"
 P1_OUTAGE_DM=$((POST_P1_OUTAGE_AM - PRE_P1_OUTAGE_M))
 P1_OUTAGE_DT=$((POST_P1_OUTAGE_AT - PRE_P1_OUTAGE_T))
 

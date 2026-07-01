@@ -27,7 +27,6 @@ use common::{
 use database::{
     partition::PartitionId,
     raft_partition::RaftPartitionState,
-    two_phase::NodeAddresses,
     Database,
 };
 use errors::ErrorMetadata;
@@ -57,7 +56,10 @@ use value::{
     PublicDocumentId,
 };
 
-use crate::mutation_forwarder::MutationForwarderGrpcClientPool;
+use crate::{
+    mutation_forwarder::MutationForwarderGrpcClientPool,
+    SharedNodeAddresses,
+};
 
 const SELECTIVE_QUERY_AUTHORITY_PARTITION: PartitionId = PartitionId(0);
 const RECENT_QUERY_INTEREST_TTL: Duration = Duration::from_secs(60);
@@ -68,7 +70,7 @@ pub struct SelectiveQueryForwardingApi {
     database: Database<ProdRuntime>,
     replica_mode: bool,
     partition_id: Option<PartitionId>,
-    node_addresses: Option<NodeAddresses>,
+    node_addresses: SharedNodeAddresses,
     raft_state: Option<RaftPartitionState>,
     raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     mutation_forwarder_pool: MutationForwarderGrpcClientPool,
@@ -80,7 +82,7 @@ impl SelectiveQueryForwardingApi {
         database: Database<ProdRuntime>,
         replica_mode: bool,
         partition_id: Option<PartitionId>,
-        node_addresses: Option<NodeAddresses>,
+        node_addresses: SharedNodeAddresses,
         raft_state: Option<RaftPartitionState>,
         raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
         cluster_grpc_auth: Option<ClusterGrpcAuth>,
@@ -135,15 +137,15 @@ impl SelectiveQueryForwardingApi {
     }
 
     fn authority_grpc_url(&self) -> anyhow::Result<String> {
-        let addresses = self.node_addresses.as_ref().context(
-            "Selective public query forwarding requires NODE_ADDRESSES to find the authoritative \
+        let addresses = self.node_addresses.get().context(
+            "Selective public query forwarding requires membership to find the authoritative \
              query node",
         )?;
         addresses
             .address_for(SELECTIVE_QUERY_AUTHORITY_PARTITION)
             .map(ToOwned::to_owned)
             .context(
-                "Selective public query forwarding requires a partition-0 NODE_ADDRESSES entry",
+                "Selective public query forwarding requires a live partition-0 membership entry",
             )
     }
 

@@ -8,6 +8,10 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 use anyhow::Context;
@@ -72,6 +76,7 @@ pub struct NodeMembership {
     pub raft_addr: Option<String>,
     pub generation: u64,
     pub draining: bool,
+    pub heartbeat_expires_at_ms: Option<u64>,
 }
 
 impl NodeMembership {
@@ -93,8 +98,26 @@ impl NodeMembership {
             raft_addr: None,
             generation: 0,
             draining: false,
+            heartbeat_expires_at_ms: None,
         })
     }
+
+    pub fn is_live_at(&self, now_ms: u64) -> bool {
+        if self.draining {
+            return false;
+        }
+        self.heartbeat_expires_at_ms
+            .is_none_or(|expires_at| expires_at > now_ms)
+    }
+}
+
+pub fn current_unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,9 +177,20 @@ impl MembershipSnapshot {
     }
 
     pub fn to_node_addresses(&self) -> NodeAddresses {
+        self.to_node_addresses_with_filter(|node| !node.draining)
+    }
+
+    pub fn to_live_node_addresses(&self, now_ms: u64) -> NodeAddresses {
+        self.to_node_addresses_with_filter(|node| node.is_live_at(now_ms))
+    }
+
+    fn to_node_addresses_with_filter(
+        &self,
+        keep: impl Fn(&NodeMembership) -> bool,
+    ) -> NodeAddresses {
         let mut addresses: BTreeMap<PartitionId, Vec<String>> = BTreeMap::new();
         for node in self.nodes.values() {
-            if node.draining {
+            if !keep(node) {
                 continue;
             }
             addresses
@@ -189,6 +223,8 @@ struct SerializedNodeMembership {
     generation: u64,
     #[serde(default)]
     draining: bool,
+    #[serde(default)]
+    heartbeat_expires_at_ms: Option<u64>,
 }
 
 impl From<&MembershipSnapshot> for SerializedMembershipSnapshot {
@@ -206,6 +242,7 @@ impl From<&MembershipSnapshot> for SerializedMembershipSnapshot {
                     raft_addr: node.raft_addr.clone(),
                     generation: node.generation,
                     draining: node.draining,
+                    heartbeat_expires_at_ms: node.heartbeat_expires_at_ms,
                 })
                 .collect(),
         }
@@ -227,6 +264,7 @@ impl TryFrom<SerializedMembershipSnapshot> for MembershipSnapshot {
                 membership.raft_addr = node.raft_addr;
                 membership.generation = node.generation;
                 membership.draining = node.draining;
+                membership.heartbeat_expires_at_ms = node.heartbeat_expires_at_ms;
                 Ok(membership)
             })
             .collect::<anyhow::Result<_>>()?;
@@ -461,6 +499,47 @@ mod tests {
         assert_eq!(
             updated.to_node_addresses().address_for(PartitionId(0)),
             Some("random-p0a-20260701:50051")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_membership_live_addresses_filter_expired_and_draining_nodes() -> anyhow::Result<()> {
+        let mut live =
+            NodeMembership::new(ClusterNodeId::new("live")?, PartitionId(0), "live:50051")?;
+        live.heartbeat_expires_at_ms = Some(2_000);
+        let mut expired = NodeMembership::new(
+            ClusterNodeId::new("expired")?,
+            PartitionId(0),
+            "expired:50051",
+        )?;
+        expired.heartbeat_expires_at_ms = Some(999);
+        let mut draining = NodeMembership::new(
+            ClusterNodeId::new("draining")?,
+            PartitionId(1),
+            "draining:50051",
+        )?;
+        draining.heartbeat_expires_at_ms = Some(2_000);
+        draining.draining = true;
+        let static_bootstrap = NodeMembership::new(
+            ClusterNodeId::new("bootstrap")?,
+            PartitionId(1),
+            "bootstrap:50051",
+        )?;
+
+        let snapshot = MembershipSnapshot::new(
+            MembershipVersion::BOOTSTRAP,
+            vec![live, expired, draining, static_bootstrap],
+        );
+        let addresses = snapshot.to_live_node_addresses(1_000);
+
+        assert_eq!(
+            addresses.addresses_for(PartitionId(0)).unwrap(),
+            &["live:50051".to_string()]
+        );
+        assert_eq!(
+            addresses.addresses_for(PartitionId(1)).unwrap(),
+            &["bootstrap:50051".to_string()]
         );
         Ok(())
     }

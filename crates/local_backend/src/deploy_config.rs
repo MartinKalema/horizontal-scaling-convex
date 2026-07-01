@@ -196,11 +196,11 @@ fn metadata_owner_origin(st: &DeployRouterState) -> anyhow::Result<Option<String
     }
     let node_addresses = st
         .node_addresses
-        .as_ref()
-        .context("NODE_ADDRESSES is required to forward deploy metadata operations to the owner")?;
+        .get()
+        .context("Membership is required to forward deploy metadata operations to the owner")?;
     let owner_addr = node_addresses
         .address_for(PartitionId::DEFAULT)
-        .context("Missing NODE_ADDRESSES entry for deploy metadata owner partition-0")?;
+        .context("Missing live membership entry for deploy metadata owner partition-0")?;
     Ok(Some(http_origin_from_peer_addr(owner_addr)?))
 }
 

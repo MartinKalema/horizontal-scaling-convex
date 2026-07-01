@@ -76,6 +76,7 @@ use node_executor::{
     local::LocalNodeExecutor,
     Actions,
 };
+use parking_lot::RwLock;
 use runtime::prod::ProdRuntime;
 use search::{
     searcher::InProcessSearcher,
@@ -122,6 +123,27 @@ mod test_helpers;
 pub mod two_phase_service;
 
 pub const MAX_CONCURRENT_REQUESTS: usize = 128;
+const MEMBERSHIP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const MEMBERSHIP_LEASE_TTL: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Default)]
+pub struct SharedNodeAddresses(Arc<RwLock<Option<database::two_phase::NodeAddresses>>>);
+
+impl SharedNodeAddresses {
+    pub fn new(addresses: Option<database::two_phase::NodeAddresses>) -> Self {
+        Self(Arc::new(RwLock::new(addresses)))
+    }
+
+    pub fn get(&self) -> Option<database::two_phase::NodeAddresses> {
+        self.0.read().clone()
+    }
+
+    pub fn refresh_from_membership(&self, snapshot: &database::membership::MembershipSnapshot) {
+        let addresses =
+            snapshot.to_live_node_addresses(database::membership::current_unix_timestamp_millis());
+        *self.0.write() = (!addresses.partitions().is_empty()).then_some(addresses);
+    }
+}
 
 #[derive(Clone)]
 pub struct BackendAppState {
@@ -136,7 +158,7 @@ pub struct BackendAppState {
     pub zombify_rx: async_broadcast::Receiver<()>,
     pub replica_mode: bool,
     pub partition_id: Option<database::partition::PartitionId>,
-    pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub node_addresses: SharedNodeAddresses,
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
     pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
     pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
@@ -191,7 +213,93 @@ fn advertised_membership_node(
     };
     node.raft_addr = config.advertise_raft_addr.clone();
     node.generation = config.cluster_node_generation;
+    node.draining = config.cluster_node_draining;
+    refresh_membership_lease(&mut node);
     Ok(Some(node))
+}
+
+fn refresh_membership_lease(node: &mut database::membership::NodeMembership) {
+    let now_ms = database::membership::current_unix_timestamp_millis();
+    let ttl_ms = MEMBERSHIP_LEASE_TTL
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    node.heartbeat_expires_at_ms = Some(now_ms.saturating_add(ttl_ms));
+}
+
+fn apply_membership_snapshot(
+    database: &Database<ProdRuntime>,
+    shared_node_addresses: &SharedNodeAddresses,
+    snapshot: database::membership::MembershipSnapshot,
+) -> anyhow::Result<()> {
+    shared_node_addresses.refresh_from_membership(&snapshot);
+    database
+        .committer_client()
+        .refresh_membership_snapshot(snapshot)?;
+    Ok(())
+}
+
+fn start_membership_refresh_loop(
+    runtime: ProdRuntime,
+    database: Database<ProdRuntime>,
+    store: Arc<dyn database::membership::MembershipStore>,
+    shared_node_addresses: SharedNodeAddresses,
+    advertised_node: Option<database::membership::NodeMembership>,
+) {
+    let refresh_runtime = runtime.clone();
+    runtime.spawn_background("cluster_membership_refresh", async move {
+        let mut backoff = Duration::from_millis(250);
+        let mut last_live_addresses = None;
+        loop {
+            let refresh_result = async {
+                let snapshot = if let Some(base_node) = advertised_node.as_ref() {
+                    let mut node = base_node.clone();
+                    refresh_membership_lease(&mut node);
+                    let node_id = node.node_id.to_string();
+                    let grpc_addr = node.grpc_addr.clone();
+                    let snapshot = store.register_node(node).await?;
+                    tracing::debug!(
+                        node_id,
+                        grpc_addr,
+                        version = u64::from(snapshot.version()),
+                        "Refreshed cluster membership heartbeat"
+                    );
+                    snapshot
+                } else {
+                    store.load().await?.ok_or_else(|| {
+                        anyhow::anyhow!("Membership refresh found no current snapshot")
+                    })?
+                };
+                let live_addresses = snapshot
+                    .to_live_node_addresses(database::membership::current_unix_timestamp_millis());
+                if last_live_addresses.as_ref() != Some(&live_addresses) {
+                    tracing::info!(
+                        version = u64::from(snapshot.version()),
+                        ?live_addresses,
+                        "Refreshed cluster membership snapshot"
+                    );
+                    last_live_addresses = Some(live_addresses);
+                }
+                apply_membership_snapshot(&database, &shared_node_addresses, snapshot)
+            }
+            .await;
+
+            match refresh_result {
+                Ok(()) => {
+                    backoff = Duration::from_millis(250);
+                    refresh_runtime.wait(MEMBERSHIP_HEARTBEAT_INTERVAL).await;
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "Cluster membership refresh failed; retrying after {:?}: {e:#}",
+                        backoff
+                    );
+                    refresh_runtime.wait(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                },
+            }
+        }
+    });
 }
 
 // Contains state needed to serve most http routes. Similar to BackendAppState,
@@ -204,7 +312,7 @@ pub struct RouterState {
     pub runtime: ProdRuntime,
     pub replica_mode: bool,
     pub partition_id: Option<database::partition::PartitionId>,
-    pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub node_addresses: SharedNodeAddresses,
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
     pub raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
     pub cluster_grpc_auth: Option<common::grpc::ClusterGrpcAuth>,
@@ -219,7 +327,7 @@ pub struct DeployRouterState {
     pub application: Application<ProdRuntime>,
     pub replica_mode: bool,
     pub partition_id: Option<database::partition::PartitionId>,
-    pub node_addresses: Option<database::two_phase::NodeAddresses>,
+    pub node_addresses: SharedNodeAddresses,
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
     pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
 }
@@ -479,6 +587,7 @@ pub async fn make_app(
         .node_addresses
         .as_deref()
         .map(database::two_phase::NodeAddresses::from_config);
+    let shared_node_addresses = SharedNodeAddresses::new(static_node_addresses.clone());
     let mut effective_node_addresses = static_node_addresses.clone();
     let static_placement_metadata = config.partition_id.map(|_| {
         let partition_map_str = config.partition_map.as_deref().unwrap_or("");
@@ -554,7 +663,7 @@ pub async fn make_app(
                 } else {
                     store.load().await?
                 };
-            let authoritative_snapshot = if let Some(advertised_node) = advertised_node {
+            let authoritative_snapshot = if let Some(advertised_node) = advertised_node.clone() {
                 let node_id = advertised_node.node_id.to_string();
                 let grpc_addr = advertised_node.grpc_addr.clone();
                 let snapshot = store.register_node(advertised_node).await?;
@@ -573,11 +682,19 @@ pub async fn make_app(
                     )
                 })?
             };
-            let membership_node_addresses = authoritative_snapshot.to_node_addresses();
-            database
-                .committer_client()
-                .refresh_membership_snapshot(authoritative_snapshot)?;
-            effective_node_addresses = Some(membership_node_addresses);
+            apply_membership_snapshot(
+                &database,
+                &shared_node_addresses,
+                authoritative_snapshot.clone(),
+            )?;
+            effective_node_addresses = shared_node_addresses.get();
+            start_membership_refresh_loop(
+                runtime.clone(),
+                database.clone(),
+                store.clone(),
+                shared_node_addresses.clone(),
+                advertised_node,
+            );
             Some(store)
         } else {
             None
@@ -753,7 +870,7 @@ pub async fn make_app(
     let origin = config.convex_origin_url()?;
     let instance_name = config.name();
     let partition_id = config.partition_id.map(database::partition::PartitionId);
-    let node_addresses = effective_node_addresses.clone();
+    let node_addresses = shared_node_addresses.clone();
     let mut raft_state_for_app = None;
     let mut raft_peer_http_origins = None;
     let mut raft_peer_grpc_urls = None;

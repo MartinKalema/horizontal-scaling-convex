@@ -38,9 +38,19 @@ source is available.
 When a partitioned node also has NATS, startup initializes or loads the shared
 `convex_membership/current` NATS KV record and refreshes the committer's 2PC
 routing addresses from that membership directory. `NODE_ADDRESSES` is now only a
-bootstrap seed for local/dev deployments or the first membership snapshot. Once
-the shared membership directory exists, a node can load physical endpoints from
-NATS instead of every process carrying the full topology in its env.
+bootstrap seed for local/dev deployments or the first membership snapshot. Each
+node can also advertise its own gRPC/HTTP/Raft endpoints, generation, drain
+state, and heartbeat lease into that shared directory. A background refresh loop
+renews the local node's lease and refreshes in-process routing addresses from
+the live, non-draining membership entries. Once the shared membership directory
+exists, a node can load physical endpoints from NATS instead of every process
+carrying the full topology in its env.
+
+Bootstrap records without heartbeat leases are treated as live so a brand-new
+dev cluster can initialize before every node has self-registered. In the normal
+cluster path, each node overwrites its bootstrap entry with the same stable
+`node_id`, a fresh advertised endpoint, and a renewable lease. Operators should
+prefer a small seed/control-plane config over a hand-maintained full topology.
 
 Placement metadata is control-plane state, not an application API. Nodes,
 routers, and operators may reason about placement versions and ownership, but
@@ -70,11 +80,14 @@ preparing against the wrong owner.
 - Add an authority/lease model for who may publish a new placement version.
 - Decide whether NATS KV remains the placement authority long term or becomes a
   bootstrap/transport layer for a replicated placement system table.
-- Move membership from a whole-snapshot KV record to per-node self-registration
-  with heartbeats, TTLs, and watch-driven in-process refresh.
-- Extend node membership use beyond 2PC gRPC routing: HTTP/deploy forwarding,
-  Raft peer discovery, liveness, role, generation/epoch, and drain state must
-  all converge on the same directory before automated add/remove/rebalance.
+- Move membership from a whole-snapshot KV record to independent per-node keys
+  or another append/update-friendly control-plane representation. The current
+  implementation uses CAS on the whole snapshot, which is adequate for the
+  local harness but not the final large-cluster shape.
+- Extend node membership to dynamic Raft peer discovery and membership changes.
+  Recording `raft_addr` is not enough; adding/removing voters requires Raft
+  learner catch-up, promotion, and removal through consensus configuration
+  changes.
 - Add an online movement workflow: freeze source writes for the moved range or
   table, copy/catch up data, publish the new placement version, then unfreeze.
 - Add stale-map refresh behavior across every routing surface; 2PC prepare
