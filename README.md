@@ -182,8 +182,10 @@ cd self-hosted/docker
 # 1 backend node for local development
 docker compose --profile single up
 
-# 2 partitions x 3 Raft nodes
-docker compose --profile cluster up
+# 2 partitions x 3 Raft nodes.
+# This wrapper gives each run a fresh advertised-address namespace so routing
+# uses membership discovery instead of only the static Compose service names.
+./start-cluster.sh
 ```
 
 Images are published to:

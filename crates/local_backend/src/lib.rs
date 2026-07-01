@@ -159,6 +159,41 @@ impl BackendAppState {
     }
 }
 
+fn advertised_membership_node(
+    config: &LocalConfig,
+) -> anyhow::Result<Option<database::membership::NodeMembership>> {
+    let Some(partition_id) = config.partition_id else {
+        return Ok(None);
+    };
+    let Some(grpc_addr) = config.advertise_grpc_addr.as_deref() else {
+        return Ok(None);
+    };
+    let node_id = config
+        .cluster_node_id
+        .clone()
+        .or_else(|| {
+            config.raft_node_id.map(|raft_node_id| {
+                format!(
+                    "partition-{partition_id}-peer-{}",
+                    raft_node_id.saturating_sub(1)
+                )
+            })
+        })
+        .unwrap_or_else(|| config.name());
+    let mut node = database::membership::NodeMembership::new(
+        database::membership::ClusterNodeId::new(node_id)?,
+        database::partition::PartitionId(partition_id),
+        grpc_addr,
+    )?;
+    node.http_origin = match config.advertise_http_origin.clone() {
+        Some(origin) => Some(origin),
+        None => Some(config.convex_origin_url()?.to_string()),
+    };
+    node.raft_addr = config.advertise_raft_addr.clone();
+    node.generation = config.cluster_node_generation;
+    Ok(Some(node))
+}
+
 // Contains state needed to serve most http routes. Similar to BackendAppState,
 // but uses ApplicationApi instead of Application, which allows it to be used
 // in both Backend and Usher.
@@ -507,22 +542,37 @@ pub async fn make_app(
         if let (Some(_), Some(nats_url)) = (config.partition_id, config.nats_url.as_deref()) {
             let store: Arc<dyn database::membership::MembershipStore> =
                 Arc::new(database::membership::NatsMembershipStore::connect(nats_url).await?);
-            let authoritative_snapshot =
+            let advertised_node = advertised_membership_node(&config)?;
+            let seeded_snapshot =
                 if let Some(static_node_addresses) = static_node_addresses.as_ref() {
                     let bootstrap_snapshot =
                         database::membership::MembershipSnapshot::from_node_addresses(
                             database::membership::MembershipVersion::BOOTSTRAP,
                             static_node_addresses,
                         );
-                    store.ensure_initialized(bootstrap_snapshot).await?
+                    Some(store.ensure_initialized(bootstrap_snapshot).await?)
                 } else {
-                    store.load().await?.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Partitioned startup requires NODE_ADDRESSES until the shared \
-                             membership directory has been initialized"
-                        )
-                    })?
+                    store.load().await?
                 };
+            let authoritative_snapshot = if let Some(advertised_node) = advertised_node {
+                let node_id = advertised_node.node_id.to_string();
+                let grpc_addr = advertised_node.grpc_addr.clone();
+                let snapshot = store.register_node(advertised_node).await?;
+                tracing::info!(
+                    node_id,
+                    grpc_addr,
+                    version = u64::from(snapshot.version()),
+                    "Registered cluster membership node"
+                );
+                snapshot
+            } else {
+                seeded_snapshot.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Partitioned startup requires NODE_ADDRESSES or ADVERTISE_GRPC_ADDR until \
+                         the shared membership directory has been initialized"
+                    )
+                })?
+            };
             let membership_node_addresses = authoritative_snapshot.to_node_addresses();
             database
                 .committer_client()

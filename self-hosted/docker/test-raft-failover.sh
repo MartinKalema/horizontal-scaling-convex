@@ -11,7 +11,7 @@
 #   - YugabyteDB Jepsen nightly resilience benchmarks
 #
 # Prerequisites:
-#   docker compose --profile cluster up
+#   ./start-cluster.sh
 #
 # Usage:
 #   cd self-hosted/docker && ./test-raft-failover.sh
@@ -52,7 +52,7 @@ echo -e "${BOLD}Preflight checks${NC}"
 for name in docker-node-p0a-1 docker-node-p0b-1 docker-node-p0c-1; do
     if ! docker inspect "$name" > /dev/null 2>&1; then
         echo -e "${RED}Container $name not running. Start:${NC}"
-        echo "  docker compose --profile cluster up"
+        echo "  ./start-cluster.sh"
         exit 1
     fi
 done
