@@ -1636,6 +1636,21 @@ impl<RT: Runtime> Committer<RT> {
                             .await;
                             let _ = result.send(r);
                         },
+                        Some(CommitterMessage::ValidateRemoteReads {
+                            transaction_id,
+                            transaction,
+                            write_source,
+                            validate_ts,
+                            result,
+                        }) => {
+                            let r = self.handle_validate_remote_reads(
+                                transaction_id,
+                                transaction,
+                                write_source,
+                                validate_ts,
+                            );
+                            let _ = result.send(r);
+                        },
                         Some(CommitterMessage::AllocateCommitTs { result }) => {
                             let r = self
                                 .ensure_leader_for_writes()
@@ -2099,6 +2114,47 @@ impl<RT: Runtime> Committer<RT> {
                     partition_map.local_partition(),
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_read_ownership(
+        &self,
+        reads: &ReadSet,
+        table_mapping: &TableMapping,
+        write_source: &WriteSource,
+    ) -> anyhow::Result<()> {
+        let Some(placement_state) = self.placement_state.as_ref() else {
+            return Ok(());
+        };
+        let partition_map = placement_state.partition_map();
+
+        let validate_tablet = |tablet_id| -> anyhow::Result<()> {
+            let table_name = table_mapping
+                .tablet_name(tablet_id)
+                .with_context(|| format!("Missing table mapping for validated read {tablet_id}"))?;
+            if let Some(partition) = crate::partition::routed_partition_for_table(
+                &table_name,
+                &partition_map,
+                write_source,
+            ) && partition != partition_map.local_partition()
+            {
+                anyhow::bail!(
+                    "Read validation for table '{}' rejected: owned by {}, not this node ({}). \
+                     Coordinator routed this read set to the wrong participant.",
+                    table_name,
+                    partition,
+                    partition_map.local_partition(),
+                );
+            }
+            Ok(())
+        };
+
+        for (index_name, _) in reads.iter_indexed() {
+            validate_tablet(*index_name.table())?;
+        }
+        for (index_name, _) in reads.iter_search() {
+            validate_tablet(*index_name.table())?;
         }
         Ok(())
     }
@@ -3990,6 +4046,65 @@ impl<RT: Runtime> Committer<RT> {
         )
     }
 
+    fn validate_participant_reads(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        validate_ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        let mut table_mapping = self
+            .snapshot_manager
+            .read()
+            .latest_snapshot()
+            .table_mapping()
+            .clone();
+        transaction.augment_table_mapping(&mut table_mapping)?;
+        self.ensure_leader_for_writes()?;
+        anyhow::ensure!(
+            transaction.writes.is_empty(),
+            "2PC ValidateReads txn={} received {} writes; write participants must use Prepare",
+            transaction_id,
+            transaction.writes.len(),
+        );
+        self.ensure_read_ownership(&transaction.reads, &table_mapping, &write_source)?;
+        self.validate_remote_read_frontiers(
+            *transaction.begin_timestamp,
+            &transaction.reads,
+            &table_mapping,
+            &write_source,
+        )?;
+
+        let local_commit_floor = self.explicit_prepare_commit_floor()?;
+        if validate_ts < local_commit_floor {
+            anyhow::bail!(
+                "2PC Prepare assigned ts={} but this participant requires ts>={}",
+                validate_ts,
+                local_commit_floor,
+            );
+        }
+
+        let timer = metrics::commit_is_stale_timer();
+        if let Some(conflicting_read) = self.commit_has_conflict(
+            &transaction.reads,
+            *transaction.begin_timestamp,
+            validate_ts,
+        )? {
+            anyhow::bail!(conflicting_read.into_error(&table_mapping, &write_source));
+        }
+        timer.finish();
+
+        if validate_ts > self.last_assigned_ts {
+            self.last_assigned_ts = validate_ts;
+        }
+        tracing::info!(
+            "2PC ValidateReads: txn={}, validate_ts={}",
+            transaction_id,
+            u64::from(validate_ts),
+        );
+        Ok(())
+    }
+
     fn remap_participant_system_table_writes(
         writes: Vec<DocumentUpdateWithPrevTs>,
         source_mapping: &TableMapping,
@@ -4430,6 +4545,22 @@ impl<RT: Runtime> Committer<RT> {
             raft_state.mark_applied(raft_applied_index).await?;
         }
         Ok(result)
+    }
+
+    fn handle_validate_remote_reads(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        validate_ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            "2PC ValidateReads: txn={}, {} indexed reads, validate_ts={}",
+            transaction_id,
+            transaction.reads.iter_indexed().count(),
+            u64::from(validate_ts),
+        );
+        self.validate_participant_reads(transaction_id, transaction, write_source, validate_ts)
     }
 
     /// Start committing a previously prepared transaction without blocking the
@@ -5669,6 +5800,34 @@ impl CommitterClient {
         rx.await.map_err(|_| metrics::shutdown_error())?
     }
 
+    pub async fn validate_remote_reads(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        validate_ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        self.wait_for_remote_read_frontiers(
+            *transaction.begin_timestamp,
+            &transaction.reads,
+            &write_source,
+        )
+        .await?;
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::ValidateRemoteReads {
+            transaction_id,
+            transaction,
+            write_source,
+            validate_ts,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
     /// 2PC CommitPrepared: finalize a prepared transaction.
     pub async fn commit_prepared(
         &self,
@@ -5876,6 +6035,13 @@ enum CommitterMessage {
         prepare_ts: Timestamp,
         participants: Vec<crate::partition::PartitionId>,
         result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
+    },
+    ValidateRemoteReads {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        validate_ts: Timestamp,
+        result: oneshot::Sender<anyhow::Result<()>>,
     },
     AllocateCommitTs {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,

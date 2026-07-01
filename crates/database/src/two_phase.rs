@@ -59,6 +59,7 @@ use pb::{
         TwoPcSearchRead,
         TwoPcTabletMetadata,
         TwoPcTextQueryTermRead,
+        TwoPcValidateReadsRequest,
     },
     searchlight,
 };
@@ -1644,6 +1645,29 @@ impl TwoPhaseCommitGrpcClient {
         Ok(PrepareResult {
             prepare_ts: prepare_ts.try_into()?,
         })
+    }
+
+    pub async fn validate_reads(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        transaction: ParticipantTransaction,
+        write_source: WriteSource,
+        validate_ts: Timestamp,
+        placement_version: crate::partition::PlacementVersion,
+    ) -> anyhow::Result<()> {
+        let request = TwoPcValidateReadsRequest {
+            transaction_id: transaction_id.0.clone(),
+            transaction: Some(transaction.try_into()?),
+            write_source: write_source.as_str().unwrap_or_default().to_string(),
+            validate_ts: u64::from(validate_ts),
+            placement_version: u64::from(placement_version),
+        };
+        self.client
+            .clone()
+            .validate_reads(self.request(request))
+            .await
+            .context("gRPC ValidateReads failed")?;
+        Ok(())
     }
 
     pub async fn commit_prepared(
