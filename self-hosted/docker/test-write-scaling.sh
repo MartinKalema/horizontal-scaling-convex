@@ -12,6 +12,8 @@
 #   4b. All Replica Entrypoint Routing (cluster-wide topology hiding)
 #   4c. Six-Entrypoint Read-After-Write (session/topology hiding)
 #   4d. Live Membership Refresh After Node Readdress
+#   4e. Membership Drain Exclusion
+#   4f. Membership Heartbeat Expiry
 #   5. Concurrent Write Scaling (CockroachDB KV)
 #   6. Monotonic Reads (TiDB monotonic)
 #   7. Node Restart Recovery (TiDB kill -9 / CockroachDB nemesis)
@@ -500,6 +502,72 @@ count_task_title() {
     jtotal "$(query_with_args "$1" "$2" "messages:countTasksByTitle" "{\"title\":\"$3\"}")"
 }
 
+latest_membership_log() {
+    docker logs --since "${2:-120s}" "$1" 2>&1 \
+        | grep -F "Refreshed cluster membership snapshot" \
+        | tail -1 || true
+}
+
+wait_membership_contains() {
+    local container="$1"
+    local needle="$2"
+    local attempts="${3:-45}"
+    local latest=""
+    for _ in $(seq 1 "$attempts"); do
+        latest=$(latest_membership_log "$container" 120s)
+        if echo "$latest" | grep -F "$needle" > /dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "$latest"
+    return 1
+}
+
+wait_membership_excludes() {
+    local container="$1"
+    local absent="$2"
+    local required="$3"
+    local attempts="${4:-45}"
+    local latest=""
+    for _ in $(seq 1 "$attempts"); do
+        latest=$(latest_membership_log "$container" 120s)
+        if echo "$latest" | grep -F "$required" > /dev/null \
+            && ! echo "$latest" | grep -F "$absent" > /dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "$latest"
+    return 1
+}
+
+assert_cross_partition_write_exact_once() {
+    local url="$1"
+    local key="$2"
+    local text="$3"
+    local task="$4"
+    local label="$5"
+    local response
+    response=$(mutation_response "$url" "$key" "messages:crossPartitionWrite" \
+        "{\"text\":\"$text\",\"taskTitle\":\"$task\"}")
+    if ! echo "$response" | grep -q '"status":"success"'; then
+        fail "$label failed" "$response"
+        return 1
+    fi
+    sleep 2
+    local msg_count
+    local task_count
+    msg_count=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$text")
+    task_count=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$task")
+    if [ "$msg_count" -eq 1 ] && [ "$task_count" -eq 1 ]; then
+        pass "$label"
+        return 0
+    fi
+    fail "$label did not appear exactly once" "messages=$msg_count tasks=$task_count"
+    return 1
+}
+
 # --- Baseline: capture existing counts before tests ---
 
 echo ""
@@ -831,6 +899,181 @@ else
 fi
 
 export CLUSTER_RUN_ID="$READDR_RUN_ID"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 4e: Membership Drain Exclusion${NC}"
+# ============================================================
+
+# A draining node may still be alive for Raft/cleanup, but new membership-routed
+# work must not select its advertised endpoint. Advertise an intentionally
+# unusable gRPC address while draining; if routing ignores drain state, the write
+# below will try that address first and fail.
+DRAIN_ADDR="draining-p1a-invalid-$(date +%s):50051"
+DRAIN_OVERRIDE=$(mktemp)
+cat > "$DRAIN_OVERRIDE" << EOF
+services:
+  node-p1a:
+    environment:
+      CLUSTER_NODE_DRAINING: "true"
+      ADVERTISE_GRPC_ADDR: "$DRAIN_ADDR"
+EOF
+
+echo "  Recreating p1a as draining with invalid advertised address $DRAIN_ADDR..."
+(
+    cd "$SCRIPT_DIR"
+    CLUSTER_RUN_ID="$READDR_RUN_ID" BACKEND_PULL_POLICY=never \
+        docker compose -f docker-compose.yml -f "$DRAIN_OVERRIDE" --profile cluster \
+        up -d --no-deps --force-recreate node-p1a > /dev/null
+)
+rm -f "$DRAIN_OVERRIDE"
+
+for _ in $(seq 1 40); do
+    curl -sf "$NODE_P1A_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
+ENTRYPOINT_KEYS[3]="$NODE_P1A_KEY"
+
+P1A_DRAINING=$(docker exec docker-node-p1a-1 printenv CLUSTER_NODE_DRAINING 2>/dev/null || true)
+P1A_DRAIN_ADDR=$(docker exec docker-node-p1a-1 printenv ADVERTISE_GRPC_ADDR 2>/dev/null || true)
+[ "$P1A_DRAINING" = "true" ] && [ "$P1A_DRAIN_ADDR" = "$DRAIN_ADDR" ] \
+    && pass "p1a registered as draining with a test-only invalid advertised address" \
+    || fail "p1a drain test did not start with expected env" "draining=$P1A_DRAINING addr=$P1A_DRAIN_ADDR expected=$DRAIN_ADDR"
+
+DRAIN_LOG=$(wait_membership_excludes docker-node-p0a-1 "node-p1a-" "node-p1b" 45 || true)
+if [ -z "$DRAIN_LOG" ] && ! latest_membership_log docker-node-p0a-1 120s | grep -F "$DRAIN_ADDR" > /dev/null; then
+    pass "Live membership excluded draining p1a from routed addresses"
+else
+    fail "Live membership did not exclude draining p1a" "${DRAIN_LOG:-$(latest_membership_log docker-node-p0a-1 120s)}"
+fi
+
+assert_cross_partition_write_exact_once \
+    "$NODE_A_URL" "$NODE_A_KEY" \
+    "membership-drain-${READDR_RUN_ID}" \
+    "membership-drain-${READDR_RUN_ID}" \
+    "Cross-partition routing avoided the draining p1a endpoint"
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 4f: Membership Heartbeat Expiry${NC}"
+# ============================================================
+
+# Register a non-draining node with an unusable advertised address, prove that
+# the bad endpoint enters live membership, then stop the node and wait for its
+# heartbeat lease to expire. Routing should fail closed around the expired entry
+# and use the remaining live members.
+STALE_ADDR="stale-p1a-invalid-$(date +%s):50051"
+STALE_OVERRIDE=$(mktemp)
+cat > "$STALE_OVERRIDE" << EOF
+services:
+  node-p1a:
+    environment:
+      CLUSTER_NODE_DRAINING: "false"
+      ADVERTISE_GRPC_ADDR: "$STALE_ADDR"
+EOF
+
+echo "  Recreating p1a with stale-test advertised address $STALE_ADDR..."
+(
+    cd "$SCRIPT_DIR"
+    CLUSTER_RUN_ID="$READDR_RUN_ID" BACKEND_PULL_POLICY=never \
+        docker compose -f docker-compose.yml -f "$STALE_OVERRIDE" --profile cluster \
+        up -d --no-deps --force-recreate node-p1a > /dev/null
+)
+rm -f "$STALE_OVERRIDE"
+
+for _ in $(seq 1 40); do
+    curl -sf "$NODE_P1A_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
+ENTRYPOINT_KEYS[3]="$NODE_P1A_KEY"
+
+if wait_membership_contains docker-node-p0a-1 "$STALE_ADDR" 45 > /dev/null; then
+    pass "Live membership observed p1a's stale-test advertised address"
+else
+    fail "Live membership did not observe p1a's stale-test address" "$(latest_membership_log docker-node-p0a-1 120s)"
+fi
+
+echo "  Stopping p1a and waiting for its membership heartbeat lease to expire..."
+docker stop docker-node-p1a-1 > /dev/null 2>&1
+STALE_LOG=$(wait_membership_excludes docker-node-p0a-1 "$STALE_ADDR" "node-p1b" 60 || true)
+if [ -z "$STALE_LOG" ]; then
+    pass "Live membership excluded p1a after heartbeat expiry"
+else
+    fail "Live membership did not exclude expired p1a heartbeat" "$STALE_LOG"
+fi
+
+assert_cross_partition_write_exact_once \
+    "$NODE_A_URL" "$NODE_A_KEY" \
+    "membership-expiry-${READDR_RUN_ID}" \
+    "membership-expiry-${READDR_RUN_ID}" \
+    "Cross-partition routing avoided the expired p1a endpoint"
+
+echo "  Restoring p1a as a live non-draining member..."
+(
+    cd "$SCRIPT_DIR"
+    CLUSTER_RUN_ID="$READDR_RUN_ID" BACKEND_PULL_POLICY=never \
+        docker compose --profile cluster up -d --no-deps --force-recreate node-p1a > /dev/null
+)
+for _ in $(seq 1 40); do
+    curl -sf "$NODE_P1A_URL/version" > /dev/null 2>&1 && break
+    sleep 1
+done
+NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+NODE_B_KEY="$NODE_P1A_KEY"
+ENTRYPOINT_KEYS[3]="$NODE_P1A_KEY"
+RESTORED_ADDR="node-p1a-${READDR_RUN_ID}:50051"
+if wait_membership_contains docker-node-p0a-1 "$RESTORED_ADDR" 45 > /dev/null; then
+    pass "p1a restored as a live routed member"
+else
+    fail "p1a did not restore into live membership" "$(latest_membership_log docker-node-p0a-1 120s)"
+fi
+
+RESTORE_DEPLOYED=false
+echo "  Re-deploying functions to restored p1a..."
+for _ in $(seq 1 5); do
+    if (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1); then
+        RESTORE_DEPLOYED=true
+        break
+    fi
+    sleep 2
+done
+$RESTORE_DEPLOYED \
+    && pass "Functions redeployed to restored p1a" \
+    || fail "Could not redeploy functions to restored p1a"
+
+RESTORED_WRITE_READY=false
+RESTORED_READY_TITLE=""
+RESTORED_READY_RESPONSE=""
+for attempt in $(seq 1 20); do
+    # Deploy can race Raft leader discovery after a force-recreate. Retry both
+    # deploy and a real write through the restored entrypoint until the public
+    # mutation path proves it can execute again.
+    (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1) || true
+    RESTORED_READY_TITLE="membership-restore-ready-${READDR_RUN_ID}-$attempt"
+    RESTORED_READY_RESPONSE=$(mutation_response "$NODE_B_URL" "$NODE_B_KEY" "messages:createTask" \
+        "{\"title\":\"$RESTORED_READY_TITLE\",\"assignee\":\"membership\",\"project\":\"membership\",\"status\":\"done\"}")
+    if echo "$RESTORED_READY_RESPONSE" | grep -q '"status":"success"'; then
+        RESTORED_WRITE_READY=true
+        break
+    fi
+    sleep 2
+done
+if $RESTORED_WRITE_READY; then
+    READY_TASK_COUNT=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$RESTORED_READY_TITLE")
+    [ "$READY_TASK_COUNT" -eq 1 ] \
+        && pass "Restored p1a is ready for public write traffic" \
+        || fail "Restored p1a readiness write did not appear exactly once" "tasks=$READY_TASK_COUNT title=$RESTORED_READY_TITLE"
+else
+    fail "Restored p1a public write API did not become ready" "$RESTORED_READY_RESPONSE"
+fi
+
+POST_MEMBERSHIP_PROBES=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+AM=$(jval messages "$POST_MEMBERSHIP_PROBES"); AU=$(jval users "$POST_MEMBERSHIP_PROBES")
+AP=$(jval projects "$POST_MEMBERSHIP_PROBES"); AT=$(jval tasks "$POST_MEMBERSHIP_PROBES")
 
 # ============================================================
 echo ""
