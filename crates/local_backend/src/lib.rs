@@ -144,6 +144,7 @@ pub struct BackendAppState {
     pub mutation_forwarder_pool: mutation_forwarder::MutationForwarderGrpcClientPool,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
     pub placement_metadata_store: Option<Arc<dyn database::partition::PlacementMetadataStore>>,
+    pub membership_store: Option<Arc<dyn database::membership::MembershipStore>>,
     /// Raft partition mailbox for receiving Raft messages from peers.
     /// None if Raft is not enabled.
     pub raft_mailbox_tx:
@@ -439,6 +440,11 @@ pub async fn make_app(
     } else {
         None
     };
+    let static_node_addresses = config
+        .node_addresses
+        .as_deref()
+        .map(database::two_phase::NodeAddresses::from_config);
+    let mut effective_node_addresses = static_node_addresses.clone();
     let static_placement_metadata = config.partition_id.map(|_| {
         let partition_map_str = config.partition_map.as_deref().unwrap_or("");
         let num_partitions = config.num_partitions.unwrap_or(1);
@@ -473,10 +479,7 @@ pub async fn make_app(
                 .expect("partitioned startup should have placement metadata")
                 .into_partition_map(database::partition::PartitionId(id))
         }),
-        config
-            .node_addresses
-            .as_deref()
-            .map(database::two_phase::NodeAddresses::from_config),
+        static_node_addresses.clone(),
         two_phase_decision_log,
         Some(cluster_grpc_auth.clone()),
         timestamp_oracle,
@@ -496,6 +499,35 @@ pub async fn make_app(
             database
                 .committer_client()
                 .refresh_placement_metadata(authoritative_metadata)?;
+            Some(store)
+        } else {
+            None
+        };
+    let membership_store: Option<Arc<dyn database::membership::MembershipStore>> =
+        if let (Some(_), Some(nats_url)) = (config.partition_id, config.nats_url.as_deref()) {
+            let store: Arc<dyn database::membership::MembershipStore> =
+                Arc::new(database::membership::NatsMembershipStore::connect(nats_url).await?);
+            let authoritative_snapshot =
+                if let Some(static_node_addresses) = static_node_addresses.as_ref() {
+                    let bootstrap_snapshot =
+                        database::membership::MembershipSnapshot::from_node_addresses(
+                            database::membership::MembershipVersion::BOOTSTRAP,
+                            static_node_addresses,
+                        );
+                    store.ensure_initialized(bootstrap_snapshot).await?
+                } else {
+                    store.load().await?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Partitioned startup requires NODE_ADDRESSES until the shared \
+                             membership directory has been initialized"
+                        )
+                    })?
+                };
+            let membership_node_addresses = authoritative_snapshot.to_node_addresses();
+            database
+                .committer_client()
+                .refresh_membership_snapshot(authoritative_snapshot)?;
+            effective_node_addresses = Some(membership_node_addresses);
             Some(store)
         } else {
             None
@@ -671,10 +703,7 @@ pub async fn make_app(
     let origin = config.convex_origin_url()?;
     let instance_name = config.name();
     let partition_id = config.partition_id.map(database::partition::PartitionId);
-    let node_addresses = config
-        .node_addresses
-        .as_deref()
-        .map(database::two_phase::NodeAddresses::from_config);
+    let node_addresses = effective_node_addresses.clone();
     let mut raft_state_for_app = None;
     let mut raft_peer_http_origins = None;
     let mut raft_peer_grpc_urls = None;
@@ -829,10 +858,8 @@ pub async fn make_app(
                         .filter(|partition| partition.0 != local_partition)
                         .collect::<Vec<_>>()
                 } else {
-                    config
-                        .node_addresses
-                        .as_deref()
-                        .map(database::two_phase::NodeAddresses::from_config)
+                    effective_node_addresses
+                        .as_ref()
                         .map(|addresses| {
                             addresses
                                 .partitions()
@@ -1186,6 +1213,7 @@ pub async fn make_app(
         replica_mutation_forwarder,
         mutation_forwarder_pool,
         placement_metadata_store,
+        membership_store,
         raft_mailbox_tx,
         cluster_grpc_auth: Some(cluster_grpc_auth),
     };

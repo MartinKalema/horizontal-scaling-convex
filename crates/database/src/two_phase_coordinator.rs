@@ -989,7 +989,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
             mut failures,
         } = prepare_participants(
             local_committer,
-            node_addresses,
+            node_addresses.as_ref(),
             partition_map,
             &txn_id,
             &stateful_participants,
@@ -1040,7 +1040,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
             }
             rollback_prepared_participants(
                 local_committer,
-                node_addresses,
+                node_addresses.as_ref(),
                 partition_map,
                 &txn_id,
                 &participants_to_rollback,
@@ -1087,7 +1087,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
 
                 let commit_results = match commit_participants(
                     local_committer,
-                    node_addresses,
+                    node_addresses.as_ref(),
                     partition_map,
                     &txn_id,
                     &prepared_participants,
@@ -1138,7 +1138,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                 verify_committed_decision(&txn_id, &recovered, prepare_ts, &prepared_participants)?;
                 spawn_parallel_commit_cleanup(
                     local_committer.clone(),
-                    node_addresses.cloned(),
+                    node_addresses.clone(),
                     partition_map.clone(),
                     txn_id.clone(),
                     prepared_participants.clone(),

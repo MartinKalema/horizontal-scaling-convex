@@ -107,7 +107,10 @@ use futures::{
 };
 use indexing::index_registry::IndexRegistry;
 use itertools::Itertools;
-use parking_lot::Mutex;
+use parking_lot::{
+    Mutex,
+    RwLock,
+};
 use prometheus::VMHistogram;
 use rand::Rng;
 use search::{
@@ -846,6 +849,7 @@ impl<RT: Runtime> Committer<RT> {
         let placement_state =
             partition_map.map(crate::partition::PlacementState::from_partition_map);
         let client_placement_state = placement_state.clone();
+        let client_node_addresses = Arc::new(RwLock::new(node_addresses));
         let committer = Self {
             pending_writes: PendingWrites::new(),
             prepared_writes: PreparedWrites::new(),
@@ -886,7 +890,7 @@ impl<RT: Runtime> Committer<RT> {
             retention_validator,
             snapshot_reader,
             placement_state: client_placement_state,
-            node_addresses,
+            node_addresses: client_node_addresses,
             two_phase_decision_log,
             two_phase_client_pool: Arc::new(crate::two_phase::TwoPhaseCommitGrpcClientPool::new(
                 cluster_grpc_auth,
@@ -5394,7 +5398,7 @@ pub struct CommitterClient {
     retention_validator: Arc<dyn RetentionValidator>,
     snapshot_reader: Reader<SnapshotManager>,
     placement_state: Option<crate::partition::PlacementState>,
-    node_addresses: Option<crate::two_phase::NodeAddresses>,
+    node_addresses: Arc<RwLock<Option<crate::two_phase::NodeAddresses>>>,
     two_phase_decision_log: Arc<dyn crate::two_phase::TwoPhaseDecisionLog>,
     two_phase_client_pool: Arc<crate::two_phase::TwoPhaseCommitGrpcClientPool>,
 }
@@ -5538,8 +5542,8 @@ impl CommitterClient {
         self.persistence_reader.clone()
     }
 
-    pub(crate) fn node_addresses(&self) -> Option<&crate::two_phase::NodeAddresses> {
-        self.node_addresses.as_ref()
+    pub(crate) fn node_addresses(&self) -> Option<crate::two_phase::NodeAddresses> {
+        self.node_addresses.read().clone()
     }
 
     pub(crate) async fn two_phase_client(
@@ -5564,6 +5568,19 @@ impl CommitterClient {
             anyhow::bail!("Cannot refresh placement metadata in single-partition mode");
         };
         placement_state.refresh(metadata)
+    }
+
+    pub fn refresh_membership_snapshot(
+        &self,
+        snapshot: crate::membership::MembershipSnapshot,
+    ) -> anyhow::Result<()> {
+        let node_addresses = snapshot.to_node_addresses();
+        anyhow::ensure!(
+            !node_addresses.partitions().is_empty(),
+            "Cannot refresh membership from an empty node directory"
+        );
+        *self.node_addresses.write() = Some(node_addresses);
+        Ok(())
     }
 
     pub fn ensure_placement_version(

@@ -19,6 +19,7 @@ mod database;
 mod database_index_workers;
 pub mod delta_interest;
 mod execution_size;
+pub mod membership;
 mod metrics;
 pub mod nats_distributed_log;
 pub mod partition;
