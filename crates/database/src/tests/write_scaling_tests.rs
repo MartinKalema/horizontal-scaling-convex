@@ -588,6 +588,18 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
 
 struct FailingPrepareGrpcService;
 
+struct UnavailableValidateReadsGrpcService {
+    validate_reads_calls: Arc<AtomicUsize>,
+}
+
+impl UnavailableValidateReadsGrpcService {
+    fn new(validate_reads_calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            validate_reads_calls,
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl TwoPhaseCommitService for FailingPrepareGrpcService {
     async fn prepare(
@@ -619,6 +631,44 @@ impl TwoPhaseCommitService for FailingPrepareGrpcService {
     ) -> Result<Response<TwoPcRollbackResponse>, Status> {
         Err(Status::failed_precondition(
             "rollback_prepared should not be called after a failed prepare",
+        ))
+    }
+}
+
+#[tonic::async_trait]
+impl TwoPhaseCommitService for UnavailableValidateReadsGrpcService {
+    async fn prepare(
+        &self,
+        _request: Request<TwoPcPrepareRequest>,
+    ) -> Result<Response<TwoPcPrepareResponse>, Status> {
+        Err(Status::failed_precondition(
+            "prepare should not be called for a read-only resolver participant",
+        ))
+    }
+
+    async fn validate_reads(
+        &self,
+        _request: Request<TwoPcValidateReadsRequest>,
+    ) -> Result<Response<TwoPcValidateReadsResponse>, Status> {
+        self.validate_reads_calls.fetch_add(1, Ordering::SeqCst);
+        Err(Status::unavailable("forced transient ValidateReads outage"))
+    }
+
+    async fn commit_prepared(
+        &self,
+        _request: Request<TwoPcCommitRequest>,
+    ) -> Result<Response<TwoPcCommitResponse>, Status> {
+        Err(Status::failed_precondition(
+            "commit_prepared should not be called for a read-only resolver participant",
+        ))
+    }
+
+    async fn rollback_prepared(
+        &self,
+        _request: Request<TwoPcRollbackRequest>,
+    ) -> Result<Response<TwoPcRollbackResponse>, Status> {
+        Err(Status::failed_precondition(
+            "rollback_prepared should not be called for a read-only resolver participant",
         ))
     }
 }
@@ -1727,6 +1777,170 @@ async fn test_read_owner_validation_rejects_conflicting_owner_write(
 }
 
 #[convex_macro::test_runtime]
+async fn test_read_owner_validate_reads_is_retry_safe(rt: TestRuntime) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let seed_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(seed_delta)
+        .await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "local-write"))
+        .await?;
+    let mut final_tx = tx.finalize()?;
+    let project_tablet = final_tx
+        .table_mapping
+        .namespace(TableNamespace::Global)
+        .name_to_tablet()("projects".parse()?)?;
+    final_tx.reads.record_indexed_derived(
+        TabletIndexName::by_id(project_tablet),
+        IndexedFields::by_id(),
+        Interval::all(),
+    );
+
+    let write_source = WriteSource::new("read_owner_retry_safe_test");
+    let source_map = partitioned_map(PartitionId(0));
+    let participant_indexes = crate::two_phase_coordinator::participant_prepare_indexes(
+        &final_tx,
+        &source_map,
+        &write_source,
+    );
+    let read_owner_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        participant_indexes
+            .get(&PartitionId(1))
+            .expect("remote read owner should participate"),
+        &source_map,
+        &write_source,
+    )?;
+    assert!(read_owner_tx.writes.is_empty());
+
+    let txn_id = TwoPhaseTransactionId::new();
+    let validate_ts = node_b.committer_for_test().allocate_commit_ts().await?;
+    node_b
+        .committer_for_test()
+        .validate_remote_reads(
+            txn_id.clone(),
+            read_owner_tx.clone(),
+            write_source.clone(),
+            validate_ts,
+        )
+        .await?;
+    node_b
+        .committer_for_test()
+        .validate_remote_reads(txn_id, read_owner_tx, write_source, validate_ts)
+        .await?;
+
+    assert!(
+        node_b
+            .committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "duplicate validation-only resolver retries must not stage durable 2PC state",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_read_owner_validation_rejects_timestamp_below_local_floor(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let seed_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(seed_delta)
+        .await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "local-write"))
+        .await?;
+    let mut final_tx = tx.finalize()?;
+    let project_tablet = final_tx
+        .table_mapping
+        .namespace(TableNamespace::Global)
+        .name_to_tablet()("projects".parse()?)?;
+    final_tx.reads.record_indexed_derived(
+        TabletIndexName::by_id(project_tablet),
+        IndexedFields::by_id(),
+        Interval::all(),
+    );
+
+    let write_source = WriteSource::new("read_owner_timestamp_floor_test");
+    let source_map = partitioned_map(PartitionId(0));
+    let participant_indexes = crate::two_phase_coordinator::participant_prepare_indexes(
+        &final_tx,
+        &source_map,
+        &write_source,
+    );
+    let read_owner_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        participant_indexes
+            .get(&PartitionId(1))
+            .expect("remote read owner should participate"),
+        &source_map,
+        &write_source,
+    )?;
+    assert!(read_owner_tx.writes.is_empty());
+
+    let validate_ts = node_b.committer_for_test().allocate_commit_ts().await?;
+    insert_doc(
+        &node_b,
+        "projects",
+        assert_obj!("name" => "local-floor-advancer"),
+    )
+    .await?;
+
+    let err = node_b
+        .committer_for_test()
+        .validate_remote_reads(
+            TwoPhaseTransactionId::new(),
+            read_owner_tx,
+            write_source,
+            validate_ts,
+        )
+        .await
+        .expect_err("resolver should reject validation below the owner timestamp floor");
+    assert!(
+        format!("{err:#}").contains("2PC Prepare assigned ts="),
+        "expected timestamp-floor rejection, got {err:#}",
+    );
+    assert!(
+        node_b
+            .committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "timestamp-floor rejection must not stage durable 2PC state",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_local_only_prepare_does_not_wait_for_remote_frontier(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
@@ -2101,6 +2315,94 @@ fn test_local_commit_with_remote_read_routes_to_read_owner() -> anyhow::Result<(
             "read-only resolver participants should not stage prepared writes",
         );
         server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_local_commit_retries_validate_reads_on_next_owner_address() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+        )
+        .await?;
+        let unavailable_validate_reads_calls = Arc::new(AtomicUsize::new(0));
+        let unavailable_server = start_two_pc_server(UnavailableValidateReadsGrpcService::new(
+            unavailable_validate_reads_calls.clone(),
+        ))
+        .await?;
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let validate_reads_calls = Arc::new(AtomicUsize::new(0));
+        let owner_server = start_two_pc_server(TestTwoPhaseCommitGrpcService::with_counters(
+            node_b.committer_for_test(),
+            prepare_calls.clone(),
+            validate_reads_calls.clone(),
+        ))
+        .await?;
+        let node_a = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!(
+                "1={}|{}",
+                unavailable_server.addr(),
+                owner_server.addr(),
+            ))),
+            Some(tso),
+        )
+        .await?;
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let initial_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(initial_delta)
+            .await?;
+
+        let mut tx = node_a.begin(Identity::system()).await?;
+        TestFacingModel::new(&mut tx)
+            .insert(&"messages".parse()?, assert_obj!("text" => "commit"))
+            .await?;
+        let remote_tablet = tx
+            .table_mapping()
+            .namespace(TableNamespace::Global)
+            .name_to_tablet()("projects".parse()?)?;
+        tx.reads.record_indexed_derived(
+            TabletIndexName::by_id(remote_tablet),
+            IndexedFields::by_id(),
+            Interval::all(),
+        );
+
+        node_a.commit(tx).await?;
+        assert_eq!(
+            unavailable_validate_reads_calls.load(Ordering::SeqCst),
+            1,
+            "coordinator should try the first resolver address before falling back",
+        );
+        assert_eq!(
+            validate_reads_calls.load(Ordering::SeqCst),
+            1,
+            "coordinator should retry validation on the next owner address",
+        );
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst),
+            0,
+            "read-only resolver retries must not become stateful prepares",
+        );
+        unavailable_server.shutdown().await?;
+        owner_server.shutdown().await?;
         Ok(())
     })
 }
