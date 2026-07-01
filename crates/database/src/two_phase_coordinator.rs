@@ -10,7 +10,10 @@
 //! The coordinator runs on the node where the mutation was received.
 //! Remote partitions are reached via gRPC.
 
-use std::collections::BTreeMap;
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 
 use anyhow::{
     anyhow,
@@ -115,21 +118,19 @@ pub fn classify_transaction(
     partition_map: &PartitionMap,
     write_source: &WriteSource,
 ) -> TransactionClassification {
-    let mut partitions: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
-
-    for (i, write) in transaction.writes.coalesced_writes().enumerate() {
-        if let Some(partition) =
-            routed_partition_for_write(transaction, write, partition_map, write_source)
-        {
-            partitions.entry(partition).or_default().push(i);
-        }
-    }
+    let partitions = participant_write_indexes(transaction, partition_map, write_source);
+    let mut prepare_participants: BTreeSet<_> = partitions.keys().copied().collect();
+    prepare_participants.extend(participant_read_owners(
+        transaction,
+        partition_map,
+        write_source,
+    ));
 
     if partitions.is_empty() {
         TransactionClassification::SinglePartition
-    } else if partitions.len() == 1 {
-        let owner = *partitions
-            .keys()
+    } else if prepare_participants.len() == 1 {
+        let owner = *prepare_participants
+            .iter()
             .next()
             .expect("single-partition classification should have one owner");
         if owner == partition_map.local_partition() {
@@ -163,6 +164,48 @@ pub(crate) fn participant_write_indexes(
 
     participant_indexes.retain(|_, indexes| !indexes.is_empty());
     participant_indexes
+}
+
+pub(crate) fn participant_prepare_indexes(
+    transaction: &FinalTransaction,
+    partition_map: &PartitionMap,
+    write_source: &WriteSource,
+) -> BTreeMap<PartitionId, Vec<usize>> {
+    let mut participant_indexes =
+        participant_write_indexes(transaction, partition_map, write_source);
+
+    for participant in participant_read_owners(transaction, partition_map, write_source) {
+        participant_indexes.entry(participant).or_default();
+    }
+
+    participant_indexes
+}
+
+fn participant_read_owners(
+    transaction: &FinalTransaction,
+    partition_map: &PartitionMap,
+    write_source: &WriteSource,
+) -> BTreeSet<PartitionId> {
+    let mut participants = BTreeSet::new();
+    let mut visit_tablet = |tablet_id| {
+        let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) else {
+            return;
+        };
+        if let Some(partition) =
+            routed_partition_for_table(&table_name, partition_map, write_source)
+        {
+            participants.insert(partition);
+        }
+    };
+
+    for (index_name, _) in transaction.reads.read_set().iter_indexed() {
+        visit_tablet(*index_name.table());
+    }
+    for (index_name, _) in transaction.reads.read_set().iter_search() {
+        visit_tablet(*index_name.table());
+    }
+
+    participants
 }
 
 fn routed_partition_for_write(
@@ -857,7 +900,8 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
         TransactionClassification::CrossPartition { partitions: _ } => None,
     };
 
-    let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
+    let participant_indexes =
+        participant_prepare_indexes(&transaction, partition_map, &write_source);
     let node_addresses = local_committer.node_addresses();
     let participants: Vec<_> = participant_indexes
         .iter()

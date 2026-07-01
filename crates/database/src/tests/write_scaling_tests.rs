@@ -29,7 +29,6 @@ use common::{
         ID_FIELD,
     },
     interval::Interval,
-    knobs::REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
     maybe_val,
     pause::PauseController,
     persistence::{
@@ -1465,6 +1464,178 @@ async fn test_cross_partition_prepare_waits_for_remote_frontier(
 }
 
 #[convex_macro::test_runtime]
+async fn test_prepare_participants_include_remote_read_owner(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let project_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(project_delta)
+        .await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "local-write"))
+        .await?;
+    let mut final_tx = tx.finalize()?;
+    let project_tablet = final_tx
+        .table_mapping
+        .namespace(TableNamespace::Global)
+        .name_to_tablet()("projects".parse()?)?;
+    let project_read = TabletIndexName::by_id(project_tablet);
+    final_tx.reads.record_indexed_derived(
+        project_read.clone(),
+        IndexedFields::by_id(),
+        Interval::all(),
+    );
+
+    let write_source = WriteSource::new("remote_read_owner_prepare_test");
+    let partition_map = partitioned_map(PartitionId(0));
+    let classification = crate::two_phase_coordinator::classify_transaction(
+        &final_tx,
+        &partition_map,
+        &write_source,
+    );
+    assert!(
+        matches!(
+            classification,
+            crate::two_phase_coordinator::TransactionClassification::CrossPartition { .. }
+        ),
+        "a transaction that writes locally but reads a remote-owned table must use 2PC resolver \
+         validation",
+    );
+
+    let participant_indexes = crate::two_phase_coordinator::participant_prepare_indexes(
+        &final_tx,
+        &partition_map,
+        &write_source,
+    );
+    assert_eq!(
+        participant_indexes.keys().copied().collect::<Vec<_>>(),
+        vec![PartitionId(0), PartitionId(1)],
+    );
+    assert!(
+        !participant_indexes
+            .get(&PartitionId(0))
+            .expect("local write owner should participate")
+            .is_empty(),
+        "local write owner should receive the physical document and catalog writes",
+    );
+    assert!(
+        participant_indexes
+            .get(&PartitionId(1))
+            .expect("remote read owner should participate")
+            .is_empty(),
+        "read-owner participant validates conflicts without receiving writes",
+    );
+
+    let read_owner_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        participant_indexes
+            .get(&PartitionId(1))
+            .expect("remote read owner should participate"),
+        &partition_map,
+        &write_source,
+    )?;
+    assert!(read_owner_tx.writes.is_empty());
+    assert!(!read_owner_tx
+        .reads
+        .index_reads_for_test(&project_read)
+        .is_empty());
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_read_owner_prepare_rejects_conflicting_owner_write(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+    let seed_delta = log
+        .deltas()
+        .into_iter()
+        .last()
+        .expect("seed project should publish a delta");
+    node_a
+        .committer_for_test()
+        .apply_replica_delta(seed_delta)
+        .await?;
+
+    let mut tx = node_a.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "local-write"))
+        .await?;
+    let mut final_tx = tx.finalize()?;
+    let project_tablet = final_tx
+        .table_mapping
+        .namespace(TableNamespace::Global)
+        .name_to_tablet()("projects".parse()?)?;
+    final_tx.reads.record_indexed_derived(
+        TabletIndexName::by_id(project_tablet),
+        IndexedFields::by_id(),
+        Interval::all(),
+    );
+
+    insert_doc(
+        &node_b,
+        "projects",
+        assert_obj!("name" => "conflicting-owner-write"),
+    )
+    .await?;
+
+    let write_source = WriteSource::new("read_owner_conflict_prepare_test");
+    let source_map = partitioned_map(PartitionId(0));
+    let participant_indexes = crate::two_phase_coordinator::participant_prepare_indexes(
+        &final_tx,
+        &source_map,
+        &write_source,
+    );
+    let read_owner_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        participant_indexes
+            .get(&PartitionId(1))
+            .expect("remote read owner should participate"),
+        &source_map,
+        &write_source,
+    )?;
+    assert!(read_owner_tx.writes.is_empty());
+
+    let prepare_ts = node_b.committer_for_test().allocate_commit_ts().await?;
+    let err = node_b
+        .committer_for_test()
+        .prepare_remote(
+            TwoPhaseTransactionId::new(),
+            read_owner_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(0), PartitionId(1)],
+        )
+        .await
+        .expect_err("read owner should reject a read set made stale by its own write log");
+    assert!(
+        format!("{err:#}").contains("changed while this mutation was being run"),
+        "expected read-owner OCC conflict, got {err:#}",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_local_only_prepare_does_not_wait_for_remote_frontier(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
@@ -1765,71 +1936,72 @@ async fn test_prepare_retries_while_local_commit_is_pending(
     Ok(())
 }
 
-#[convex_macro::test_runtime]
-async fn test_local_commit_waits_for_remote_frontier(rt: TestRuntime) -> anyhow::Result<()> {
-    let log = Arc::new(InMemoryDistributedLog::new());
-    let node_a = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
-    let node_b = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
-
-    insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
-    let initial_delta = log
-        .deltas()
-        .into_iter()
-        .last()
-        .expect("seed project should publish a delta");
-    node_a
-        .committer_for_test()
-        .apply_replica_delta(initial_delta)
+#[test]
+fn test_local_commit_with_remote_read_routes_to_read_owner() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+        )
+        .await?;
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+            node_b.committer_for_test(),
+        ))
+        .await?;
+        let node_a = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(tso),
+        )
         .await?;
 
-    // Advance node A's local snapshot without advancing partition 1's frontier.
-    insert_doc(&node_a, "messages", assert_obj!("text" => "lag-maker")).await?;
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let initial_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        let initial_delta_ts = initial_delta.ts;
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(initial_delta)
+            .await?;
 
-    let mut tx = node_a.begin(Identity::system()).await?;
-    TestFacingModel::new(&mut tx)
-        .insert(&"messages".parse()?, assert_obj!("text" => "commit"))
-        .await?;
-    let remote_tablet = tx
-        .table_mapping()
-        .namespace(TableNamespace::Global)
-        .name_to_tablet()("projects".parse()?)?;
-    tx.reads.record_indexed_derived(
-        TabletIndexName::by_id(remote_tablet),
-        IndexedFields::by_id(),
-        Interval::all(),
-    );
+        let mut tx = node_a.begin(Identity::system()).await?;
+        TestFacingModel::new(&mut tx)
+            .insert(&"messages".parse()?, assert_obj!("text" => "commit"))
+            .await?;
+        let remote_tablet = tx
+            .table_mapping()
+            .namespace(TableNamespace::Global)
+            .name_to_tablet()("projects".parse()?)?;
+        tx.reads.record_indexed_derived(
+            TabletIndexName::by_id(remote_tablet),
+            IndexedFields::by_id(),
+            Interval::all(),
+        );
 
-    let node_a_for_commit = node_a.clone();
-    let commit = tokio::spawn(async move { node_a_for_commit.commit(tx).await });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        !commit.is_finished(),
-        "commit should wait for the remote partition frontier to catch up",
-    );
-
-    let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
-    node_a
-        .committer_for_test()
-        .apply_replica_delta(CommitDelta {
-            ts: heartbeat_ts,
-            document_writes: Arc::new(Vec::new()),
-            document_updates: Vec::new(),
-            index_writes: Arc::new(Vec::new()),
-            write_source: WriteSource::new("remote_read_frontier_heartbeat_commit_test"),
-            write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
-            source_partition: Some(PartitionId(1)),
-        })
-        .await?;
-
-    let commit_result = tokio::time::timeout(Duration::from_secs(1), commit).await??;
-    commit_result?;
-    Ok(())
+        let commit_ts = node_a.commit(tx).await?;
+        assert!(
+            commit_ts > initial_delta_ts,
+            "resolver-routed commit should use a timestamp after the remote seed",
+        );
+        server.shutdown().await?;
+        Ok(())
+    })
 }
 
 #[convex_macro::test_runtime]
-async fn test_local_commit_times_out_waiting_for_remote_read_frontier(
+async fn test_local_commit_with_remote_read_fails_closed_without_owner_addresses(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
@@ -1864,22 +2036,12 @@ async fn test_local_commit_times_out_waiting_for_remote_read_frontier(
         Interval::all(),
     );
 
-    let node_a_for_commit = node_a.clone();
-    let commit = tokio::spawn(async move { node_a_for_commit.commit(tx).await });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let err = node_a
+        .commit(tx)
+        .await
+        .expect_err("remote read owner should be required when local writes use resolver 2PC");
     assert!(
-        !commit.is_finished(),
-        "commit should wait before the bounded remote read frontier timeout fires",
-    );
-
-    rt.advance_time(*REMOTE_READ_FRONTIER_WAIT_TIMEOUT + Duration::from_millis(1))
-        .await;
-
-    let commit_result = tokio::time::timeout(Duration::from_millis(100), commit).await??;
-    let err = commit_result.expect_err("stale remote frontier should time out");
-    assert!(
-        err.to_string().contains("Timed out after"),
+        format!("{err:#}").contains("NODE_ADDRESSES is required"),
         "unexpected error: {err:#}",
     );
     Ok(())
