@@ -333,6 +333,14 @@ fn remote_read_partitions(
     partitions
 }
 
+fn resolver_read_set_interval_count(reads: &ReadSet) -> usize {
+    reads
+        .iter_indexed()
+        .map(|(_, reads)| reads.intervals.len())
+        .sum::<usize>()
+        + reads.iter_search().count()
+}
+
 fn stale_replica_frontiers(
     snapshot_manager: &SnapshotManager,
     begin_ts: Timestamp,
@@ -4053,30 +4061,68 @@ impl<RT: Runtime> Committer<RT> {
         write_source: WriteSource,
         validate_ts: Timestamp,
     ) -> anyhow::Result<()> {
+        let local_partition = self.local_partition_for_two_phase();
+        let timer = metrics::two_phase_resolver_validation_timer(local_partition);
+        metrics::log_two_phase_resolver_read_set_intervals(
+            local_partition,
+            resolver_read_set_interval_count(&transaction.reads),
+        );
+
         let mut table_mapping = self
             .snapshot_manager
             .read()
             .latest_snapshot()
             .table_mapping()
             .clone();
-        transaction.augment_table_mapping(&mut table_mapping)?;
-        self.ensure_leader_for_writes()?;
-        anyhow::ensure!(
-            transaction.writes.is_empty(),
-            "2PC ValidateReads txn={} received {} writes; write participants must use Prepare",
-            transaction_id,
-            transaction.writes.len(),
-        );
-        self.ensure_read_ownership(&transaction.reads, &table_mapping, &write_source)?;
-        self.validate_remote_read_frontiers(
+        if let Err(err) = transaction.augment_table_mapping(&mut table_mapping) {
+            metrics::log_two_phase_resolver_validation(local_partition, "metadata");
+            timer.finish_with("metadata");
+            return Err(err);
+        }
+        if let Err(err) = self.ensure_leader_for_writes() {
+            metrics::log_two_phase_resolver_validation(local_partition, "not_leader");
+            timer.finish_with("not_leader");
+            return Err(err);
+        }
+        if !transaction.writes.is_empty() {
+            metrics::log_two_phase_resolver_validation(local_partition, "invalid_request");
+            timer.finish_with("invalid_request");
+            anyhow::bail!(
+                "2PC ValidateReads txn={} received {} writes; write participants must use Prepare",
+                transaction_id,
+                transaction.writes.len(),
+            );
+        }
+        if let Err(err) =
+            self.ensure_read_ownership(&transaction.reads, &table_mapping, &write_source)
+        {
+            metrics::log_two_phase_resolver_validation(local_partition, "ownership");
+            timer.finish_with("ownership");
+            return Err(err);
+        }
+        if let Err(err) = self.validate_remote_read_frontiers(
             *transaction.begin_timestamp,
             &transaction.reads,
             &table_mapping,
             &write_source,
-        )?;
+        ) {
+            metrics::log_two_phase_resolver_validation(local_partition, "frontier");
+            timer.finish_with("frontier");
+            return Err(err);
+        }
 
-        let local_commit_floor = self.explicit_prepare_commit_floor()?;
+        let local_commit_floor = match self.explicit_prepare_commit_floor() {
+            Ok(local_commit_floor) => local_commit_floor,
+            Err(err) => {
+                metrics::log_two_phase_resolver_validation(local_partition, "error");
+                timer.finish_with("error");
+                return Err(err);
+            },
+        };
         if validate_ts < local_commit_floor {
+            metrics::log_two_phase_resolver_validation(local_partition, "timestamp_floor");
+            metrics::log_two_phase_resolver_timestamp_floor_rejection(local_partition);
+            timer.finish_with("timestamp_floor");
             anyhow::bail!(
                 "2PC Prepare assigned ts={} but this participant requires ts>={}",
                 validate_ts,
@@ -4084,19 +4130,32 @@ impl<RT: Runtime> Committer<RT> {
             );
         }
 
-        let timer = metrics::commit_is_stale_timer();
-        if let Some(conflicting_read) = self.commit_has_conflict(
+        let stale_timer = metrics::commit_is_stale_timer();
+        let conflicting_read = match self.commit_has_conflict(
             &transaction.reads,
             *transaction.begin_timestamp,
             validate_ts,
-        )? {
+        ) {
+            Ok(conflicting_read) => conflicting_read,
+            Err(err) => {
+                metrics::log_two_phase_resolver_validation(local_partition, "error");
+                timer.finish_with("error");
+                return Err(err);
+            },
+        };
+        if let Some(conflicting_read) = conflicting_read {
+            metrics::log_two_phase_resolver_validation(local_partition, "conflict");
+            metrics::log_two_phase_resolver_conflict(local_partition);
+            timer.finish_with("conflict");
             anyhow::bail!(conflicting_read.into_error(&table_mapping, &write_source));
         }
-        timer.finish();
+        stale_timer.finish();
 
         if validate_ts > self.last_assigned_ts {
             self.last_assigned_ts = validate_ts;
         }
+        metrics::log_two_phase_resolver_validation(local_partition, "success");
+        timer.finish();
         tracing::info!(
             "2PC ValidateReads: txn={}, validate_ts={}",
             transaction_id,

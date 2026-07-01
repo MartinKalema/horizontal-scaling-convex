@@ -42,6 +42,8 @@ use crate::{
 };
 
 const PARTITION_LABELS: [&str; 1] = ["partition"];
+const PARTITION_OUTCOME_LABELS: [&str; 2] = ["partition", "outcome"];
+const PARTITION_STATUS_LABELS: [&str; 2] = ["partition", "status"];
 const SOURCE_PARTITION_LABELS: [&str; 1] = ["source_partition"];
 const OUTCOME_LABELS: [&str; 1] = ["outcome"];
 const PHASE_LABELS: [&str; 1] = ["phase"];
@@ -66,6 +68,13 @@ fn outcome_label(outcome: &'static str) -> StaticMetricLabel {
 
 fn phase_label(phase: &'static str) -> StaticMetricLabel {
     StaticMetricLabel::new("phase", phase)
+}
+
+fn partition_outcome_labels(
+    partition: PartitionId,
+    outcome: &'static str,
+) -> Vec<StaticMetricLabel> {
+    vec![partition_label(partition), outcome_label(outcome)]
 }
 
 fn commit_path_label(path: &'static str) -> StaticMetricLabel {
@@ -501,6 +510,69 @@ pub fn log_two_phase_prepare_attempts(num_attempts: usize) {
     log_distribution(
         &DATABASE_TWO_PHASE_PREPARE_ATTEMPTS_TOTAL,
         num_attempts as f64,
+    );
+}
+
+register_convex_histogram!(
+    DATABASE_TWO_PHASE_RESOLVER_VALIDATION_SECONDS,
+    "Time to validate a read-only 2PC resolver participant by partition and status",
+    &PARTITION_STATUS_LABELS
+);
+pub fn two_phase_resolver_validation_timer(partition: PartitionId) -> StatusTimer {
+    let mut timer = StatusTimer::new(&DATABASE_TWO_PHASE_RESOLVER_VALIDATION_SECONDS);
+    timer.add_label(partition_label(partition));
+    timer
+}
+
+register_convex_counter!(
+    DATABASE_TWO_PHASE_RESOLVER_VALIDATIONS_TOTAL,
+    "Number of read-only 2PC resolver validations by partition and outcome",
+    &PARTITION_OUTCOME_LABELS
+);
+pub fn log_two_phase_resolver_validation(partition: PartitionId, outcome: &'static str) {
+    log_counter_with_labels(
+        &DATABASE_TWO_PHASE_RESOLVER_VALIDATIONS_TOTAL,
+        1,
+        partition_outcome_labels(partition, outcome),
+    );
+}
+
+register_convex_counter!(
+    DATABASE_TWO_PHASE_RESOLVER_CONFLICTS_TOTAL,
+    "Number of read-only 2PC resolver validations that rejected conflicting reads",
+    &PARTITION_LABELS
+);
+pub fn log_two_phase_resolver_conflict(partition: PartitionId) {
+    log_counter_with_labels(
+        &DATABASE_TWO_PHASE_RESOLVER_CONFLICTS_TOTAL,
+        1,
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_TWO_PHASE_RESOLVER_TIMESTAMP_FLOOR_REJECTIONS_TOTAL,
+    "Number of read-only 2PC resolver validations rejected below the local timestamp floor",
+    &PARTITION_LABELS
+);
+pub fn log_two_phase_resolver_timestamp_floor_rejection(partition: PartitionId) {
+    log_counter_with_labels(
+        &DATABASE_TWO_PHASE_RESOLVER_TIMESTAMP_FLOOR_REJECTIONS_TOTAL,
+        1,
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_histogram!(
+    DATABASE_TWO_PHASE_RESOLVER_READ_SET_INTERVALS_TOTAL,
+    "Number of indexed and search read intervals checked by read-only 2PC resolver validation",
+    &PARTITION_LABELS
+);
+pub fn log_two_phase_resolver_read_set_intervals(partition: PartitionId, intervals: usize) {
+    log_distribution_with_labels(
+        &DATABASE_TWO_PHASE_RESOLVER_READ_SET_INTERVALS_TOTAL,
+        intervals as f64,
+        vec![partition_label(partition)],
     );
 }
 
