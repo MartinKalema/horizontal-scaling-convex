@@ -2177,71 +2177,58 @@ async fn test_cross_partition_replica_delta_waits_behind_unresolved_prepared_tra
 }
 
 #[convex_macro::test_runtime]
-async fn test_prepare_retries_while_local_commit_is_pending(
+async fn test_prepare_waits_behind_pending_local_commit(
     rt: TestRuntime,
     pause: PauseController,
 ) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
     let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    insert_doc(&node, "messages", assert_obj!("text" => "seed")).await?;
 
     let hold_guard = pause.hold(AFTER_PENDING_WRITE_SNAPSHOT);
     let node_for_commit = node.clone();
-    let local_commit = async move {
+    let local_commit = tokio::spawn(async move {
         insert_doc(
             &node_for_commit,
             "messages",
             assert_obj!("text" => "pending-local"),
         )
         .await
-    };
+    });
 
     let node_for_prepare = node.clone();
-    let prepare_while_pending = async move {
-        let pause_guard = hold_guard.wait_for_blocked().await;
-
+    let pause_guard = hold_guard.wait_for_blocked().await;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_txn_id = txn_id.clone();
+    let prepare_while_pending = tokio::spawn(async move {
         let mut tx = node_for_prepare.begin(Identity::system()).await?;
         TestFacingModel::new(&mut tx)
             .insert(&"messages".parse()?, assert_obj!("text" => "prepared"))
             .await?;
         let final_tx = tx.finalize()?;
-        let err = node_for_prepare
+        node_for_prepare
             .committer_for_test()
             .prepare(
-                TwoPhaseTransactionId::new(),
+                prepare_txn_id,
                 final_tx,
                 WriteSource::new("prepare_waits_for_pending_commit_test"),
             )
             .await
-            .expect_err("prepare should retry while an older local commit is pending");
-        assert!(
-            format!("{err:#}").contains("blocked by an unresolved pending write"),
-            "unexpected error: {err:#}",
-        );
+    });
 
-        if let Some(guard) = pause_guard {
-            guard.unpause();
-        }
-        anyhow::Ok(())
-    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !prepare_while_pending.is_finished(),
+        "prepare should wait behind the older pending local commit instead of failing or \
+         bypassing it",
+    );
 
-    futures::try_join!(local_commit, prepare_while_pending)?;
+    if let Some(guard) = pause_guard {
+        guard.unpause();
+    }
 
-    let mut tx = node.begin(Identity::system()).await?;
-    TestFacingModel::new(&mut tx)
-        .insert(
-            &"messages".parse()?,
-            assert_obj!("text" => "prepared-after-publish"),
-        )
-        .await?;
-    let final_tx = tx.finalize()?;
-    let txn_id = TwoPhaseTransactionId::new();
-    node.committer_for_test()
-        .prepare(
-            txn_id.clone(),
-            final_tx,
-            WriteSource::new("prepare_after_pending_commit_test"),
-        )
-        .await?;
+    tokio::time::timeout(Duration::from_secs(1), local_commit).await???;
+    tokio::time::timeout(Duration::from_secs(1), prepare_while_pending).await???;
     node.committer_for_test().rollback_prepared(txn_id).await?;
 
     Ok(())
