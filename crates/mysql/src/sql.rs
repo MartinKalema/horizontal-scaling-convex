@@ -596,6 +596,34 @@ pub const fn get_persistence_global(multitenant: bool) -> &'static str {
     )
 }
 
+pub const fn list_persistence_globals_with_prefix(multitenant: bool) -> &'static str {
+    tableify!(
+        multitenant,
+        formatcp!(
+            r#"SELECT `key`, json_value FROM @db_name.persistence_globals FORCE INDEX (PRIMARY) WHERE `key` LIKE ? {instance_clause} ORDER BY `key` ASC"#,
+            instance_clause = if multitenant {
+                "AND instance_name = ?"
+            } else {
+                ""
+            }
+        )
+    )
+}
+
+pub const fn delete_persistence_global(multitenant: bool) -> &'static str {
+    tableify!(
+        multitenant,
+        formatcp!(
+            r#"DELETE FROM @db_name.persistence_globals WHERE `key` = ? {instance_clause}"#,
+            instance_clause = if multitenant {
+                "AND instance_name = ?"
+            } else {
+                ""
+            }
+        )
+    )
+}
+
 // Maximum number of writes within a single transaction. This is the sum of
 // TRANSACTION_MAX_SYSTEM_NUM_WRITES and TRANSACTION_MAX_NUM_USER_WRITES.
 pub const MAX_INSERT_SIZE: usize = 56000;

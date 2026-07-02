@@ -679,6 +679,35 @@ pub const fn get_persistence_global(multitenant: bool) -> &'static str {
     )
 }
 
+pub const fn list_persistence_globals_with_prefix(multitenant: bool) -> &'static str {
+    tableify!(
+        multitenant,
+        formatcp!(
+            "SELECT key, json_value FROM @db_name.persistence_globals WHERE key LIKE \
+             $1{instance_clause} ORDER BY key ASC",
+            instance_clause = if multitenant {
+                " AND instance_name = $2"
+            } else {
+                ""
+            }
+        )
+    )
+}
+
+pub const fn delete_persistence_global(multitenant: bool) -> &'static str {
+    tableify!(
+        multitenant,
+        formatcp!(
+            "DELETE FROM @db_name.persistence_globals WHERE key = $1{instance_clause}",
+            instance_clause = if multitenant {
+                " AND instance_name = $2"
+            } else {
+                ""
+            }
+        )
+    )
+}
+
 // Gross: after initialization, the first thing database does is insert metadata
 // documents.
 pub const fn check_newly_created(multitenant: bool) -> &'static str {

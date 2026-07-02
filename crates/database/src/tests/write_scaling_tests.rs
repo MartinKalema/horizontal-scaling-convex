@@ -3132,19 +3132,21 @@ async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
         .apply_raft_commit_delta(delta)
         .await?;
 
-    let outbox = follower_persistence
+    let records = follower_persistence
         .reader()
-        .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
-        .await?
-        .context("Raft follower apply should record the delta before NATS publish")?;
-    let records: std::collections::BTreeMap<String, serde_json::Value> =
-        serde_json::from_value(outbox)?;
+        .list_persistence_globals_with_prefix("raft_nats_outbox/")
+        .await?;
     assert_eq!(
         records.len(),
         1,
         "failed NATS publish should leave the Raft-applied delta in the outbox",
     );
-    assert!(records.contains_key(&u64::from(delta_ts).to_string()));
+    assert!(
+        records
+            .iter()
+            .any(|(key, _)| key.ends_with(&format!("/{:020}", u64::from(delta_ts)))),
+        "outbox should include one per-entry record for the failed delta timestamp",
+    );
     assert!(
         replay_log.published().is_empty(),
         "the failing log must not observe a successful publish before recovery",
@@ -3175,19 +3177,21 @@ async fn test_partitioned_commit_records_nats_outbox_when_publish_unavailable(
     )
     .await?;
 
-    let outbox = persistence
+    let records = persistence
         .reader()
-        .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
-        .await?
-        .context("partitioned local commit should record a Raft->NATS outbox entry")?;
-    let records: std::collections::BTreeMap<String, serde_json::Value> =
-        serde_json::from_value(outbox)?;
+        .list_persistence_globals_with_prefix("raft_nats_outbox/")
+        .await?;
     assert_eq!(
         records.len(),
         1,
         "failed NATS publish should leave the accepted local commit in the outbox",
     );
-    assert!(records.contains_key(&u64::from(commit_ts).to_string()));
+    assert!(
+        records
+            .iter()
+            .any(|(key, _)| key.ends_with(&format!("/{:020}", u64::from(commit_ts)))),
+        "outbox should include one per-entry record for the failed commit timestamp",
+    );
     assert!(
         replay_log.published().is_empty(),
         "the failing log must not observe a successful publish",

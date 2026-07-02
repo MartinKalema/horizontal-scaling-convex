@@ -217,13 +217,9 @@ ORDER BY B.key {order}
         Ok(triples)
     }
 
-    fn _get_persistence_global(
-        &self,
-        key: PersistenceGlobalKey,
-    ) -> anyhow::Result<Option<JsonValue>> {
+    fn _get_persistence_global_raw(&self, key: &str) -> anyhow::Result<Option<JsonValue>> {
         let connection = &self.inner.lock().connection;
         let mut stmt = connection.prepare(GET_PERSISTENCE_GLOBAL)?;
-        let key = String::from(key);
         let params: Vec<&dyn ToSql> = vec![&key];
         let mut row_iter = stmt.query_map(&params[..], |row| {
             let json_value_str: String = row.get(0)?;
@@ -331,12 +327,29 @@ impl Persistence for SqlitePersistence {
         key: PersistenceGlobalKey,
         value: JsonValue,
     ) -> anyhow::Result<()> {
+        self.write_persistence_global_raw(&String::from(key), value)
+            .await
+    }
+
+    async fn write_persistence_global_raw(
+        &self,
+        key: &str,
+        value: JsonValue,
+    ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
         let tx = inner.connection.transaction()?;
         let mut write_query = tx.prepare_cached(WRITE_PERSISTENCE_GLOBAL)?;
         let json_value = serde_json::to_string(&value)?;
-        write_query.execute(params![&String::from(key), &json_value])?;
+        write_query.execute(params![key, &json_value])?;
         drop(write_query);
+        tx.commit()?;
+        Ok(())
+    }
+
+    async fn delete_persistence_global_raw(&self, key: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        let tx = inner.connection.transaction()?;
+        tx.execute(DELETE_PERSISTENCE_GLOBAL, params![key])?;
         tx.commit()?;
         Ok(())
     }
@@ -579,7 +592,35 @@ impl PersistenceReader for SqlitePersistence {
         &self,
         key: PersistenceGlobalKey,
     ) -> anyhow::Result<Option<JsonValue>> {
-        self._get_persistence_global(key)
+        self.get_persistence_global_raw(&String::from(key)).await
+    }
+
+    async fn get_persistence_global_raw(&self, key: &str) -> anyhow::Result<Option<JsonValue>> {
+        self._get_persistence_global_raw(key)
+    }
+
+    async fn list_persistence_globals_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, JsonValue)>> {
+        let connection = &self.inner.lock().connection;
+        let like_prefix = format!("{prefix}%");
+        let mut stmt = connection.prepare(LIST_PERSISTENCE_GLOBALS_WITH_PREFIX)?;
+        let rows = stmt.query_map(params![like_prefix], |row| {
+            let key: String = row.get(0)?;
+            let json_value_str: String = row.get(1)?;
+            Ok((key, json_value_str))
+        })?;
+        rows.map(|row| {
+            let (key, json_value_str) = row?;
+            let mut json_deserializer = serde_json::Deserializer::from_str(&json_value_str);
+            json_deserializer.disable_recursion_limit();
+            let json_value = JsonValue::deserialize(&mut json_deserializer)
+                .with_context(|| format!("Invalid JSON at persistence key {key:?}"))?;
+            json_deserializer.end()?;
+            Ok((key, json_value))
+        })
+        .collect()
     }
 
     fn version(&self) -> PersistenceVersion {
@@ -686,6 +727,9 @@ fn load_document_row(
 }
 
 const GET_PERSISTENCE_GLOBAL: &str = "SELECT json_value FROM persistence_globals WHERE key = ?";
+const LIST_PERSISTENCE_GLOBALS_WITH_PREFIX: &str =
+    "SELECT key, json_value FROM persistence_globals WHERE key LIKE ? ORDER BY key ASC";
+const DELETE_PERSISTENCE_GLOBAL: &str = "DELETE FROM persistence_globals WHERE key = ?";
 
 const INSERT_DOCUMENT: &str = "INSERT INTO documents (id, ts, table_id, json_value, deleted, \
                                prev_ts) VALUES (?, ?, ?, ?, ?, ?)";

@@ -596,18 +596,44 @@ impl Persistence for PostgresPersistence {
         key: PersistenceGlobalKey,
         value: JsonValue,
     ) -> anyhow::Result<()> {
+        self.write_persistence_global_raw(&String::from(key), value)
+            .await
+    }
+
+    async fn write_persistence_global_raw(
+        &self,
+        key: &str,
+        value: JsonValue,
+    ) -> anyhow::Result<()> {
         let multitenant = self.multitenant;
         let instance_name = self.instance_name.clone();
+        let key = key.to_string();
         self.lease
             .transact(async move |tx| {
                 let stmt = tx
                     .prepare_cached(sql::write_persistence_global(multitenant))
                     .await?;
-                let mut params = [
-                    Param::PersistenceGlobalKey(key),
-                    Param::JsonValue(value.to_string()),
-                ]
-                .to_vec();
+                let mut params = [Param::Text(key), Param::JsonValue(value.to_string())].to_vec();
+                if multitenant {
+                    params.push(Param::Text(instance_name.to_string()));
+                }
+                tx.execute_raw(&stmt, params).await?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_persistence_global_raw(&self, key: &str) -> anyhow::Result<()> {
+        let multitenant = self.multitenant;
+        let instance_name = self.instance_name.clone();
+        let key = key.to_string();
+        self.lease
+            .transact(async move |tx| {
+                let stmt = tx
+                    .prepare_cached(sql::delete_persistence_global(multitenant))
+                    .await?;
+                let mut params = vec![Param::Text(key)];
                 if multitenant {
                     params.push(Param::Text(instance_name.to_string()));
                 }
@@ -1676,15 +1702,20 @@ impl PersistenceReader for PostgresReader {
         &self,
         key: PersistenceGlobalKey,
     ) -> anyhow::Result<Option<JsonValue>> {
+        self.get_persistence_global_raw(&String::from(key)).await
+    }
+
+    async fn get_persistence_global_raw(&self, key: &str) -> anyhow::Result<Option<JsonValue>> {
         let mut client = self
             .read_pool
             .get_connection("get_persistence_global", &self.schema, &self.instance_name)
             .await?;
-        let mut params = vec![Param::PersistenceGlobalKey(key)];
+        let mut params = vec![Param::Text(key.to_string())];
         if self.multitenant {
             params.push(Param::Text(self.instance_name.to_string()));
         }
         let multitenant = self.multitenant;
+        let key = key.to_string();
         let row_stream = client
             .with_retry(async move |client| {
                 let stmt = client
@@ -1707,6 +1738,47 @@ impl PersistenceReader for PostgresReader {
             Ok(json_value)
         });
         value.transpose()
+    }
+
+    async fn list_persistence_globals_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, JsonValue)>> {
+        let mut client = self
+            .read_pool
+            .get_connection(
+                "list_persistence_globals_with_prefix",
+                &self.schema,
+                &self.instance_name,
+            )
+            .await?;
+        let mut params = vec![Param::Text(format!("{prefix}%"))];
+        if self.multitenant {
+            params.push(Param::Text(self.instance_name.to_string()));
+        }
+        let multitenant = self.multitenant;
+        let row_stream = client
+            .with_retry(async move |client| {
+                let stmt = client
+                    .prepare_cached(sql::list_persistence_globals_with_prefix(multitenant))
+                    .await?;
+                client.query_raw(&stmt, &params).await
+            })
+            .await?;
+        futures::pin_mut!(row_stream);
+
+        let mut results = Vec::new();
+        while let Some(row) = row_stream.try_next().await? {
+            let key: String = row.get(0);
+            let binary_value: Vec<u8> = row.get(1);
+            let mut json_deserializer = serde_json::Deserializer::from_slice(&binary_value);
+            json_deserializer.disable_recursion_limit();
+            let json_value = JsonValue::deserialize(&mut json_deserializer)
+                .with_context(|| format!("Invalid JSON at persistence key {key:?}"))?;
+            json_deserializer.end()?;
+            results.push((key, json_value));
+        }
+        Ok(results)
     }
 
     fn version(&self) -> PersistenceVersion {
@@ -1959,7 +2031,6 @@ enum Param {
     JsonValue(String),
     Deleted(bool),
     Bytes(Vec<u8>),
-    PersistenceGlobalKey(PersistenceGlobalKey),
     Text(String),
 }
 
@@ -1979,7 +2050,6 @@ impl ToSql for Param {
             Param::Deleted(d) => d.to_sql(ty, out),
             Param::Bytes(v) => v.to_sql(ty, out),
             Param::Limit(v) => v.to_sql(ty, out),
-            Param::PersistenceGlobalKey(key) => String::from(*key).to_sql(ty, out),
             Param::Text(v) => v.to_sql(ty, out),
         }
     }
