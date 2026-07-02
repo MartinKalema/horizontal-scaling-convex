@@ -227,7 +227,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         args: SerializedArgs,
         caller: FunctionCaller,
         ts: application::api::ExecuteQueryTimestamp,
-        read_after_write: Option<application::api::ReadAfterWriteFence>,
+        read_after_write: Option<Vec<application::api::ReadAfterWriteFence>>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<application::RedactedQueryReturn> {
         let result = if let Some(target_grpc_url) = self.public_query_target_grpc_url().await? {

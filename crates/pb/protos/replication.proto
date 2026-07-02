@@ -56,6 +56,16 @@ message MutationSuccess {
   // Partition that originated the committed write, if the commit can be
   // represented by a single origin partition.
   optional uint32 source_partition = 4;
+
+  // Portable read-after-write fences that must all be satisfied before a
+  // latest query can observe this mutation atomically. Cross-partition 2PC
+  // commits include one fence per stateful participant.
+  repeated ReadAfterWriteFence read_after_write_fences = 5;
+}
+
+message ReadAfterWriteFence {
+  optional uint32 source_partition = 1;
+  uint64 ts = 2;
 }
 
 message MutationError {
@@ -91,6 +101,7 @@ message ForwardQueryRequest {
   // Optional portable read-after-write fence from a mutation response.
   optional uint32 read_after_write_source_partition = 7;
   optional uint64 read_after_write_ts = 8;
+  repeated ReadAfterWriteFence read_after_write_fences = 9;
 }
 
 message ForwardQueryResponse {

@@ -473,6 +473,7 @@ pub struct MutationReturn {
     pub log_lines: LogLines,
     pub ts: Timestamp,
     pub source_partition: Option<database::partition::PartitionId>,
+    pub read_after_write_partitions: Vec<database::partition::PartitionId>,
 }
 
 #[derive(Debug)]
@@ -481,6 +482,7 @@ pub struct RedactedMutationReturn {
     pub log_lines: RedactedLogLines,
     pub ts: Timestamp,
     pub source_partition: Option<database::partition::PartitionId>,
+    pub read_after_write_partitions: Vec<database::partition::PartitionId>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1413,6 +1415,7 @@ impl<RT: Runtime> Application<RT> {
                 ),
                 ts: mutation_return.ts,
                 source_partition: mutation_return.source_partition,
+                read_after_write_partitions: mutation_return.read_after_write_partitions,
             }),
             Ok(Err(mutation_error)) => Err(RedactedMutationError {
                 error: RedactedJsError::from_js_error(

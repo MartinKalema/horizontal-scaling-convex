@@ -212,10 +212,11 @@ struct PreparedTransaction {
     index_writes: Arc<Vec<PersistenceIndexEntry>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitOutcome {
     pub ts: Timestamp,
     pub source_partition: Option<crate::partition::PartitionId>,
+    pub read_after_write_partitions: Vec<crate::partition::PartitionId>,
 }
 
 enum PersistenceWrite {
@@ -1100,6 +1101,11 @@ impl<RT: Runtime> Committer<RT> {
                             let _ = result.send(Ok(CommitOutcome {
                                 ts: commit_ts,
                                 source_partition: published_commit.delta.source_partition,
+                                read_after_write_partitions: published_commit
+                                    .delta
+                                    .source_partition
+                                    .into_iter()
+                                    .collect(),
                             }));
 
                             // When we next get free cycles and there is no ongoing bump,
@@ -4981,6 +4987,7 @@ impl<RT: Runtime> Committer<RT> {
                     .placement_state
                     .as_ref()
                     .map(|placement_state| placement_state.local_partition()),
+                read_after_write_partitions: Vec::new(),
             }));
             return None;
         }

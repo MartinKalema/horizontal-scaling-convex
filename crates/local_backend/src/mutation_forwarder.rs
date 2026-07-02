@@ -48,6 +48,7 @@ use pb::replication::{
     MutationSuccess,
     QueryError,
     QuerySuccess,
+    ReadAfterWriteFence as PbReadAfterWriteFence,
 };
 use serde_json::Value as JsonValue;
 use sync_types::types::SerializedArgs;
@@ -150,6 +151,14 @@ impl MutationForwarder for MutationForwarderService {
                         log_lines: ret.log_lines.iter().cloned().collect(),
                         ts: u64::from(ret.ts),
                         source_partition: ret.source_partition.map(|partition| partition.0),
+                        read_after_write_fences: ret
+                            .read_after_write_partitions
+                            .iter()
+                            .map(|partition| PbReadAfterWriteFence {
+                                source_partition: Some(partition.0),
+                                ts: u64::from(ret.ts),
+                            })
+                            .collect(),
                     },
                 )),
             })),
@@ -216,14 +225,32 @@ impl MutationForwarder for MutationForwarderService {
             })?),
             None => ExecuteQueryTimestamp::Latest,
         };
-        let read_after_write = match req.read_after_write_ts {
-            Some(ts) => Some(ReadAfterWriteFence {
-                source_partition: req.read_after_write_source_partition.map(PartitionId),
-                ts: ts.try_into().map_err(|e: anyhow::Error| {
-                    Status::invalid_argument(format!("Invalid read-after-write ts: {e}"))
-                })?,
-            }),
-            None => None,
+        let read_after_write = if !req.read_after_write_fences.is_empty() {
+            Some(
+                req.read_after_write_fences
+                    .into_iter()
+                    .map(|fence| {
+                        Ok(ReadAfterWriteFence {
+                            source_partition: fence.source_partition.map(PartitionId),
+                            ts: fence.ts.try_into().map_err(|e: anyhow::Error| {
+                                Status::invalid_argument(format!(
+                                    "Invalid read-after-write fence ts: {e}"
+                                ))
+                            })?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?,
+            )
+        } else {
+            match req.read_after_write_ts {
+                Some(ts) => Some(vec![ReadAfterWriteFence {
+                    source_partition: req.read_after_write_source_partition.map(PartitionId),
+                    ts: ts.try_into().map_err(|e: anyhow::Error| {
+                        Status::invalid_argument(format!("Invalid read-after-write ts: {e}"))
+                    })?,
+                }]),
+                None => None,
+            }
         };
 
         let result = self
@@ -393,10 +420,12 @@ impl MutationForwarderGrpcClient {
         identity: Identity,
         caller: FunctionCaller,
         ts: Option<u64>,
-        read_after_write: Option<ReadAfterWriteFence>,
+        read_after_write: Option<Vec<ReadAfterWriteFence>>,
         journal: Option<String>,
     ) -> anyhow::Result<RedactedQueryReturn> {
         let identity_proto: pb::convex_identity::UncheckedIdentity = identity.into();
+        let read_after_write_fences = read_after_write.clone().unwrap_or_default();
+        let legacy_read_after_write_fence = read_after_write_fences.first().copied();
         let request = ForwardQueryRequest {
             path: path.to_string(),
             args: args.to_string(),
@@ -404,9 +433,16 @@ impl MutationForwarderGrpcClient {
             caller: Some(caller.into()),
             ts,
             journal,
-            read_after_write_source_partition: read_after_write
+            read_after_write_source_partition: legacy_read_after_write_fence
                 .and_then(|fence| fence.source_partition.map(|partition| partition.0)),
-            read_after_write_ts: read_after_write.map(|fence| u64::from(fence.ts)),
+            read_after_write_ts: legacy_read_after_write_fence.map(|fence| u64::from(fence.ts)),
+            read_after_write_fences: read_after_write_fences
+                .into_iter()
+                .map(|fence| PbReadAfterWriteFence {
+                    source_partition: fence.source_partition.map(|partition| partition.0),
+                    ts: u64::from(fence.ts),
+                })
+                .collect(),
         };
         let response = self
             .client

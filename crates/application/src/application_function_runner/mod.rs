@@ -924,6 +924,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     log_lines,
                     ts: outcome.ts,
                     source_partition: outcome.source_partition,
+                    read_after_write_partitions: outcome.read_after_write_partitions,
                 }),
                 Err(e) => {
                     if e.is_deterministic_user_error() {
@@ -1916,6 +1917,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     log_lines,
                     ts,
                     source_partition: None,
+                    read_after_write_partitions: Vec::new(),
                 })
             },
             None => return Ok(None),
