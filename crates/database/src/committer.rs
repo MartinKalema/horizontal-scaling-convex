@@ -5461,8 +5461,9 @@ impl<RT: Runtime> Committer<RT> {
         // When a global TSO is configured (TiDB PD pattern), draw timestamps
         // from it instead of the local clock. This ensures globally unique,
         // monotonically increasing timestamps across all nodes in the cluster.
-        // The BatchTimestampOracle keeps range reservation batched, but still
-        // checks the global committed floor before assignment.
+        // The BatchTimestampOracle reserves globally unique ranges and refreshes
+        // the committed floor at batch/leadership boundaries so in-batch
+        // assignment stays local.
         if let Some(ref tso) = self.timestamp_oracle {
             let tso = tso.clone();
             let ts = block_in_place(|| {
