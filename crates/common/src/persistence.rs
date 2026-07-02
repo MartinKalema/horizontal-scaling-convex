@@ -296,6 +296,15 @@ pub trait Persistence: Sync + Send + 'static {
         value: JsonValue,
     ) -> anyhow::Result<()>;
 
+    /// Writes global key-value data under an arbitrary persistence-global key.
+    /// This is for internally namespaced records where one logical feature owns
+    /// a bounded key prefix instead of one fixed enum key.
+    async fn write_persistence_global_raw(&self, key: &str, value: JsonValue)
+        -> anyhow::Result<()>;
+
+    /// Deletes global key-value data under an arbitrary persistence-global key.
+    async fn delete_persistence_global_raw(&self, key: &str) -> anyhow::Result<()>;
+
     async fn load_index_chunk(
         &self,
         cursor: Option<IndexEntry>,
@@ -569,6 +578,16 @@ pub trait PersistenceReader: Send + Sync + 'static {
         &self,
         key: PersistenceGlobalKey,
     ) -> anyhow::Result<Option<JsonValue>>;
+
+    /// Reads global key-value data under an arbitrary persistence-global key.
+    async fn get_persistence_global_raw(&self, key: &str) -> anyhow::Result<Option<JsonValue>>;
+
+    /// Lists global key-value data whose key starts with `prefix`, ordered by
+    /// key. Callers should reserve feature-specific prefixes.
+    async fn list_persistence_globals_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, JsonValue)>>;
 
     /// Performs a single point get using an index.
     async fn index_get(

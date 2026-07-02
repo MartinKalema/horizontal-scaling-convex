@@ -150,7 +150,27 @@ impl Persistence for TestPersistence {
         key: PersistenceGlobalKey,
         value: JsonValue,
     ) -> anyhow::Result<()> {
-        self.inner.lock().persistence_globals.insert(key, value);
+        self.inner
+            .lock()
+            .persistence_globals
+            .insert(String::from(key), value);
+        Ok(())
+    }
+
+    async fn write_persistence_global_raw(
+        &self,
+        key: &str,
+        value: JsonValue,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .persistence_globals
+            .insert(key.to_string(), value);
+        Ok(())
+    }
+
+    async fn delete_persistence_global_raw(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.lock().persistence_globals.remove(key);
         Ok(())
     }
 
@@ -434,7 +454,25 @@ impl PersistenceReader for TestPersistence {
         &self,
         key: PersistenceGlobalKey,
     ) -> anyhow::Result<Option<JsonValue>> {
-        Ok(self.inner.lock().persistence_globals.get(&key).cloned())
+        self.get_persistence_global_raw(&String::from(key)).await
+    }
+
+    async fn get_persistence_global_raw(&self, key: &str) -> anyhow::Result<Option<JsonValue>> {
+        Ok(self.inner.lock().persistence_globals.get(key).cloned())
+    }
+
+    async fn list_persistence_globals_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, JsonValue)>> {
+        Ok(self
+            .inner
+            .lock()
+            .persistence_globals
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
     }
 
     fn version(&self) -> PersistenceVersion {
@@ -446,7 +484,7 @@ struct Inner {
     is_fresh: bool,
     log: BTreeMap<(Timestamp, InternalDocumentId), (Option<ResolvedDocument>, Option<Timestamp>)>,
     index: BTreeMap<IndexId, BTreeMap<(IndexKeyBytes, Timestamp), Option<InternalDocumentId>>>,
-    persistence_globals: BTreeMap<PersistenceGlobalKey, JsonValue>,
+    persistence_globals: BTreeMap<String, JsonValue>,
 }
 
 impl Inner {

@@ -198,9 +198,24 @@ use crate::{
 const INITIAL_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
 const RAFT_NATS_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
+const RAFT_NATS_OUTBOX_KEY_PREFIX: &str = "raft_nats_outbox/";
 
-type RaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
+type LegacyRaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
 pub(crate) type AppliedDataDeltaIds = BTreeMap<crate::partition::PartitionId, BTreeSet<Timestamp>>;
+
+#[derive(Debug)]
+struct RaftNatsOutboxRecord {
+    key: String,
+    ts: Timestamp,
+    value: serde_json::Value,
+    storage: RaftNatsOutboxRecordStorage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RaftNatsOutboxRecordStorage {
+    LegacyBlob,
+    PerEntry,
+}
 
 /// State held for a 2PC-prepared transaction awaiting commit/rollback.
 struct PreparedTransaction {
@@ -2693,45 +2708,90 @@ impl<RT: Runtime> Committer<RT> {
         u64::from(ts).to_string()
     }
 
+    fn raft_nats_outbox_entry_key(delta: &CommitDelta) -> anyhow::Result<String> {
+        let source_partition = delta.source_partition.with_context(|| {
+            format!(
+                "Raft->NATS outbox delta at ts={} did not include a source partition",
+                u64::from(delta.ts)
+            )
+        })?;
+        Ok(format!(
+            "{RAFT_NATS_OUTBOX_KEY_PREFIX}{:020}/{:020}",
+            source_partition.0,
+            u64::from(delta.ts)
+        ))
+    }
+
+    fn parse_raft_nats_outbox_entry_key(key: &str) -> anyhow::Result<Timestamp> {
+        let (_, ts) = key
+            .strip_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+            .and_then(|suffix| suffix.rsplit_once('/'))
+            .with_context(|| format!("Failed to parse Raft->NATS outbox key {key:?}"))?;
+        ts.parse::<u64>()
+            .with_context(|| format!("Failed to parse Raft->NATS outbox timestamp in {key:?}"))
+            .and_then(Timestamp::try_from)
+    }
+
     async fn load_raft_nats_outbox_records(
         persistence: Arc<dyn Persistence>,
-    ) -> anyhow::Result<RaftNatsOutboxRecords> {
+    ) -> anyhow::Result<Vec<RaftNatsOutboxRecord>> {
+        let mut records = Vec::new();
+        for (key, value) in persistence
+            .reader()
+            .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+            .await?
+        {
+            let ts = Self::parse_raft_nats_outbox_entry_key(&key)?;
+            records.push(RaftNatsOutboxRecord {
+                key,
+                ts,
+                value,
+                storage: RaftNatsOutboxRecordStorage::PerEntry,
+            });
+        }
+
         let Some(value) = persistence
             .reader()
             .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
             .await?
         else {
-            return Ok(BTreeMap::new());
+            records.sort_by_key(|record| record.ts);
+            return Ok(records);
         };
-        serde_json::from_value(value).context("Failed to parse Raft->NATS outbox records")
-    }
-
-    async fn write_raft_nats_outbox_records(
-        persistence: Arc<dyn Persistence>,
-        records: &RaftNatsOutboxRecords,
-    ) -> anyhow::Result<()> {
-        persistence
-            .write_persistence_global(
-                PersistenceGlobalKey::RaftNatsOutbox,
-                serde_json::to_value(records)
-                    .context("Failed to serialize Raft->NATS outbox records")?,
-            )
-            .await
+        let legacy_records: LegacyRaftNatsOutboxRecords =
+            serde_json::from_value(value).context("Failed to parse Raft->NATS outbox records")?;
+        for (key, value) in legacy_records {
+            let ts = key
+                .parse::<u64>()
+                .with_context(|| format!("Failed to parse Raft->NATS outbox key {key:?}"))
+                .and_then(Timestamp::try_from)?;
+            if records.iter().any(|record| record.ts == ts) {
+                continue;
+            }
+            records.push(RaftNatsOutboxRecord {
+                key,
+                ts,
+                value,
+                storage: RaftNatsOutboxRecordStorage::LegacyBlob,
+            });
+        }
+        records.sort_by_key(|record| record.ts);
+        Ok(records)
     }
 
     async fn add_raft_nats_outbox_delta(
         persistence: Arc<dyn Persistence>,
         delta: &CommitDelta,
     ) -> anyhow::Result<()> {
-        let mut records = Self::load_raft_nats_outbox_records(persistence.clone()).await?;
         let envelope = DeltaEnvelope::from_delta(delta, "", None)
             .context("Failed to encode Raft->NATS outbox delta")?;
-        records.insert(
-            Self::raft_nats_outbox_key(delta.ts),
-            serde_json::to_value(envelope)
-                .context("Failed to serialize Raft->NATS outbox delta")?,
-        );
-        Self::write_raft_nats_outbox_records(persistence, &records).await
+        persistence
+            .write_persistence_global_raw(
+                &Self::raft_nats_outbox_entry_key(delta)?,
+                serde_json::to_value(envelope)
+                    .context("Failed to serialize Raft->NATS outbox delta")?,
+            )
+            .await
     }
 
     async fn record_raft_nats_outbox_delta(
@@ -2747,43 +2807,52 @@ impl<RT: Runtime> Committer<RT> {
         result
     }
 
-    async fn delete_raft_nats_outbox_delta(
+    async fn delete_legacy_raft_nats_outbox_delta(
         persistence: Arc<dyn Persistence>,
         ts: Timestamp,
     ) -> anyhow::Result<()> {
-        let mut records = Self::load_raft_nats_outbox_records(persistence.clone()).await?;
+        let Some(value) = persistence
+            .reader()
+            .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+            .await?
+        else {
+            return Ok(());
+        };
+        let mut records: LegacyRaftNatsOutboxRecords =
+            serde_json::from_value(value).context("Failed to parse Raft->NATS outbox records")?;
         records.remove(&Self::raft_nats_outbox_key(ts));
-        Self::write_raft_nats_outbox_records(persistence, &records).await
+        if records.is_empty() {
+            return persistence
+                .delete_persistence_global_raw(&String::from(PersistenceGlobalKey::RaftNatsOutbox))
+                .await;
+        }
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::RaftNatsOutbox,
+                serde_json::to_value(records)
+                    .context("Failed to serialize Raft->NATS outbox records")?,
+            )
+            .await
     }
 
-    async fn clear_raft_nats_outbox_delta(
+    async fn clear_raft_nats_outbox_record(
         persistence: Arc<dyn Persistence>,
-        ts: Timestamp,
+        record: &RaftNatsOutboxRecord,
         path: &'static str,
     ) -> anyhow::Result<()> {
         let timer = metrics::commit_hot_path_stage_timer(path, "raft_nats_outbox_clear");
-        let result = Self::delete_raft_nats_outbox_delta(persistence, ts).await;
+        let result = match record.storage {
+            RaftNatsOutboxRecordStorage::LegacyBlob => {
+                Self::delete_legacy_raft_nats_outbox_delta(persistence, record.ts).await
+            },
+            RaftNatsOutboxRecordStorage::PerEntry => {
+                persistence.delete_persistence_global_raw(&record.key).await
+            },
+        };
         if result.is_ok() {
             timer.finish();
         }
         result
-    }
-
-    fn sorted_raft_nats_outbox_records(
-        records: RaftNatsOutboxRecords,
-    ) -> anyhow::Result<Vec<(Timestamp, serde_json::Value)>> {
-        let mut sorted = records
-            .into_iter()
-            .map(|(key, value)| {
-                let ts = key
-                    .parse::<u64>()
-                    .with_context(|| format!("Failed to parse Raft->NATS outbox key {key:?}"))
-                    .and_then(Timestamp::try_from)?;
-                Ok((ts, value))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        sorted.sort_by_key(|(ts, _)| *ts);
-        Ok(sorted)
     }
 
     async fn replay_raft_nats_outbox_once(
@@ -2792,23 +2861,25 @@ impl<RT: Runtime> Committer<RT> {
     ) -> anyhow::Result<usize> {
         let records = Self::load_raft_nats_outbox_records(persistence.clone()).await?;
         let mut replayed = 0usize;
-        for (delta_ts, value) in Self::sorted_raft_nats_outbox_records(records)? {
-            let envelope: DeltaEnvelope = serde_json::from_value(value)
-                .with_context(|| format!("Failed to parse Raft->NATS outbox delta {delta_ts}"))?;
-            let delta = envelope
-                .to_delta()
-                .with_context(|| format!("Failed to decode Raft->NATS outbox delta {delta_ts}"))?;
+        for record in records {
+            let envelope: DeltaEnvelope = serde_json::from_value(record.value.clone())
+                .with_context(|| {
+                    format!("Failed to parse Raft->NATS outbox delta {}", record.ts)
+                })?;
+            let delta = envelope.to_delta().with_context(|| {
+                format!("Failed to decode Raft->NATS outbox delta {}", record.ts)
+            })?;
             anyhow::ensure!(
-                delta.ts == delta_ts,
+                delta.ts == record.ts,
                 "Raft->NATS outbox key {} did not match encoded delta ts {}",
-                u64::from(delta_ts),
+                u64::from(record.ts),
                 u64::from(delta.ts),
             );
             Self::publish_commit_delta(distributed_log.clone(), delta, "raft_nats_outbox_replay")
                 .await?;
-            Self::clear_raft_nats_outbox_delta(
+            Self::clear_raft_nats_outbox_record(
                 persistence.clone(),
-                delta_ts,
+                &record,
                 "raft_nats_outbox_replay",
             )
             .await?;
@@ -6172,7 +6243,10 @@ mod tests {
             DocumentUpdate,
             ResolvedDocument,
         },
-        persistence::Persistence,
+        persistence::{
+            Persistence,
+            PersistenceGlobalKey,
+        },
         testing::TestPersistence,
         types::{
             GenericIndexName,
@@ -6197,6 +6271,8 @@ mod tests {
         remap_index_metadata_update,
         replica_delta_timestamps,
         Committer,
+        RaftNatsOutboxRecordStorage,
+        RAFT_NATS_OUTBOX_KEY_PREFIX,
     };
     use crate::{
         commit_delta::{
@@ -6204,6 +6280,7 @@ mod tests {
             DistributedLog,
             ReplicationMessage,
         },
+        nats_distributed_log::DeltaEnvelope,
         partition::PartitionId,
         raft_node::RaftProposalResult,
         write_log::WriteSource,
@@ -6526,6 +6603,133 @@ mod tests {
             Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
                 .await?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_records_use_per_entry_globals() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let ts_2 = Timestamp::must(2);
+        let ts_10 = Timestamp::must(10);
+
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts_10),
+        )
+        .await?;
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts_2),
+        )
+        .await?;
+
+        assert!(
+            persistence
+                .reader()
+                .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+                .await?
+                .is_none(),
+            "new outbox records should not rewrite the legacy aggregate blob",
+        );
+        let records = Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence).await?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].ts, ts_2);
+        assert_eq!(records[1].ts, ts_10);
+        assert!(records.iter().all(|record| {
+            record.storage == RaftNatsOutboxRecordStorage::PerEntry
+                && record.key.starts_with(RAFT_NATS_OUTBOX_KEY_PREFIX)
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_backlog_stays_per_entry() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let backlog_len = 256;
+
+        for ts in 1..=backlog_len {
+            Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+                persistence.clone(),
+                &test_outbox_delta(Timestamp::must(ts)),
+            )
+            .await?;
+        }
+
+        let raw_records = persistence
+            .reader()
+            .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+            .await?;
+        assert_eq!(raw_records.len(), backlog_len as usize);
+        assert!(
+            persistence
+                .reader()
+                .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+                .await?
+                .is_none(),
+            "a large backlog should not recreate the legacy aggregate blob",
+        );
+
+        let records =
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence.clone()).await?;
+        assert_eq!(records.len(), backlog_len as usize);
+        assert_eq!(records.first().unwrap().ts, Timestamp::must(1));
+        assert_eq!(records.last().unwrap().ts, Timestamp::must(backlog_len));
+
+        let key_to_clear = records[127].key.clone();
+        Committer::<TestRuntime>::clear_raft_nats_outbox_record(
+            persistence.clone(),
+            &records[127],
+            "test",
+        )
+        .await?;
+
+        let raw_records_after_clear = persistence
+            .reader()
+            .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+            .await?;
+        assert_eq!(raw_records_after_clear.len(), backlog_len as usize - 1);
+        assert!(
+            raw_records_after_clear
+                .iter()
+                .all(|(key, _)| key != &key_to_clear),
+            "clearing one outbox entry should delete only that per-entry row",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_replays_and_clears_legacy_blob() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let log = Arc::new(RecordingDistributedLog::default());
+        let ts = Timestamp::must(12);
+        let envelope = DeltaEnvelope::from_delta(&test_outbox_delta(ts), "", None)?;
+        let legacy_records = BTreeMap::from([(
+            Committer::<TestRuntime>::raft_nats_outbox_key(ts),
+            serde_json::to_value(envelope)?,
+        )]);
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::RaftNatsOutbox,
+                serde_json::to_value(legacy_records)?,
+            )
+            .await?;
+
+        let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+            persistence.clone(),
+            log.clone(),
+        )
+        .await?;
+
+        assert_eq!(replayed, 1);
+        assert_eq!(log.published(), vec![ts]);
+        assert!(
+            persistence
+                .reader()
+                .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+                .await?
+                .is_none(),
+            "legacy aggregate blob should be deleted after its final record replays",
         );
         Ok(())
     }

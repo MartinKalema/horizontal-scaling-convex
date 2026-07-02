@@ -518,8 +518,23 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
         value: JsonValue,
     ) -> anyhow::Result<()> {
         let timer = write_persistence_global_timer(self.read_pool.cluster_name(), key);
+        let result = self
+            .write_persistence_global_raw(&String::from(key), value)
+            .await;
+        if result.is_ok() {
+            timer.finish();
+        }
+        result
+    }
+
+    async fn write_persistence_global_raw(
+        &self,
+        key: &str,
+        value: JsonValue,
+    ) -> anyhow::Result<()> {
         let multitenant = self.multitenant;
         let instance_name = mysql_async::Value::from(&self.instance_name.raw);
+        let key = key.to_string();
         self.lease
             .transact(async move |tx| {
                 let stmt = sql::write_persistence_global(multitenant);
@@ -528,13 +543,29 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
                 } else {
                     vec![]
                 };
-                params.extend([String::from(key).into(), value.into()]);
+                params.extend([key.into(), value.into()]);
                 tx.exec_drop(stmt, params).await?;
                 Ok(())
             })
             .await?;
-        timer.finish();
         Ok(())
+    }
+
+    async fn delete_persistence_global_raw(&self, key: &str) -> anyhow::Result<()> {
+        let multitenant = self.multitenant;
+        let instance_name = mysql_async::Value::from(&self.instance_name.raw);
+        let key = key.to_string();
+        self.lease
+            .transact(async move |tx| {
+                let mut params = vec![key.into()];
+                if multitenant {
+                    params.push(instance_name);
+                }
+                tx.exec_drop(sql::delete_persistence_global(multitenant), params)
+                    .await?;
+                Ok(())
+            })
+            .await
     }
 
     async fn load_index_chunk(
@@ -1546,14 +1577,19 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
         &self,
         key: PersistenceGlobalKey,
     ) -> anyhow::Result<Option<JsonValue>> {
+        self.get_persistence_global_raw(&String::from(key)).await
+    }
+
+    async fn get_persistence_global_raw(&self, key: &str) -> anyhow::Result<Option<JsonValue>> {
         let mut client = self
             .read_pool
             .acquire("get_persistence_global", &self.db_name)
             .await?;
-        let mut params = vec![String::from(key).into()];
+        let mut params = vec![key.into()];
         if self.multitenant {
             params.push(self.instance_name.to_string().into());
         }
+        let key = key.to_string();
         let rows = client
             .query_collect(sql::get_persistence_global(self.multitenant), params, 1, Ok)
             .await?;
@@ -1569,6 +1605,41 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
             Ok(json_value)
         });
         value.transpose()
+    }
+
+    async fn list_persistence_globals_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, JsonValue)>> {
+        let mut client = self
+            .read_pool
+            .acquire("list_persistence_globals_with_prefix", &self.db_name)
+            .await?;
+        let mut params = vec![format!("{prefix}%").into()];
+        if self.multitenant {
+            params.push(self.instance_name.to_string().into());
+        }
+        let rows = client
+            .query_collect(
+                sql::list_persistence_globals_with_prefix(self.multitenant),
+                params,
+                usize::MAX,
+                Ok,
+            )
+            .await?;
+        rows.into_iter()
+            .map(|r| {
+                let key = String::from_utf8(bytes_col(&r, 0)?.to_vec())
+                    .context("Persistence global key was not UTF-8")?;
+                let binary_value = bytes_col(&r, 1)?;
+                let mut json_deserializer = serde_json::Deserializer::from_slice(binary_value);
+                json_deserializer.disable_recursion_limit();
+                let json_value = JsonValue::deserialize(&mut json_deserializer)
+                    .with_context(|| format!("Invalid JSON at persistence key {key:?}"))?;
+                json_deserializer.end()?;
+                Ok((key, json_value))
+            })
+            .collect()
     }
 
     fn version(&self) -> PersistenceVersion {

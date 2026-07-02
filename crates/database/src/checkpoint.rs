@@ -155,6 +155,18 @@ impl Persistence for CheckpointPersistence {
         anyhow::bail!("CheckpointPersistence is read-only")
     }
 
+    async fn write_persistence_global_raw(
+        &self,
+        _key: &str,
+        _value: JsonValue,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("CheckpointPersistence is read-only")
+    }
+
+    async fn delete_persistence_global_raw(&self, _key: &str) -> anyhow::Result<()> {
+        anyhow::bail!("CheckpointPersistence is read-only")
+    }
+
     async fn load_index_chunk(
         &self,
         _cursor: Option<common::index::IndexEntry>,
@@ -311,8 +323,25 @@ impl PersistenceReader for CheckpointPersistence {
         &self,
         key: PersistenceGlobalKey,
     ) -> anyhow::Result<Option<JsonValue>> {
+        self.get_persistence_global_raw(&String::from(key)).await
+    }
+
+    async fn get_persistence_global_raw(&self, key: &str) -> anyhow::Result<Option<JsonValue>> {
         let inner = self.inner.lock();
-        Ok(inner.globals.get(&String::from(key)).cloned())
+        Ok(inner.globals.get(key).cloned())
+    }
+
+    async fn list_persistence_globals_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, JsonValue)>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .globals
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
     }
 
     fn version(&self) -> PersistenceVersion {
