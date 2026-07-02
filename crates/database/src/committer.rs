@@ -1067,54 +1067,34 @@ impl<RT: Runtime> Committer<RT> {
                             }
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
-                            if use_raft_nats_outbox
-                                && let Err(err) = Self::record_raft_nats_outbox_delta(
+                            if use_raft_nats_outbox {
+                                if let Err(err) = Self::record_and_replay_raft_nats_outbox_delta(
                                     self.persistence.clone(),
+                                    self.distributed_log.clone(),
                                     &published_commit.delta,
                                     "local",
                                 )
                                 .await
-                            {
-                                return Self::fail_committed_write(
-                                    result,
-                                    commit_ts,
-                                    "record committed write in Raft->NATS outbox",
-                                    err,
-                                );
-                            }
-                            if let Err(err) = Self::publish_commit_delta(
+                                {
+                                    return Self::fail_committed_write(
+                                        result,
+                                        commit_ts,
+                                        "record committed write in Raft->NATS outbox",
+                                        err,
+                                    );
+                                }
+                            } else if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta.clone(),
                                 "local",
                             )
                             .await
                             {
-                                if use_raft_nats_outbox {
-                                    tracing::error!(
-                                        "Failed to publish committed write at ts={} to replication \
-                                         log; leaving Raft->NATS outbox entry for replay: {err:#}",
-                                        u64::from(commit_ts),
-                                    );
-                                } else {
-                                    return Self::fail_committed_write(
-                                        result,
-                                        commit_ts,
-                                        "publish committed write to replication log",
-                                        err,
-                                    );
-                                }
-                            } else if use_raft_nats_outbox
-                                && let Err(err) = Self::clear_raft_nats_outbox_delta(
-                                    self.persistence.clone(),
+                                return Self::fail_committed_write(
+                                    result,
                                     commit_ts,
-                                    "local",
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Published committed write at ts={} to replication log but \
-                                     failed to clear Raft->NATS outbox entry: {err:#}",
-                                    u64::from(commit_ts),
+                                    "publish committed write to replication log",
+                                    err,
                                 );
                             }
                             let _ = result.send(Ok(CommitOutcome {
@@ -1204,55 +1184,34 @@ impl<RT: Runtime> Committer<RT> {
                             }
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
-                            if use_raft_nats_outbox
-                                && let Err(err) = Self::record_raft_nats_outbox_delta(
+                            if use_raft_nats_outbox {
+                                if let Err(err) = Self::record_and_replay_raft_nats_outbox_delta(
                                     self.persistence.clone(),
+                                    self.distributed_log.clone(),
                                     &published_commit.delta,
                                     "2pc_participant",
                                 )
                                 .await
-                            {
-                                return self.fail_prepared_committed_write(
-                                    &transaction_id,
-                                    commit_ts,
-                                    "record prepared committed write in Raft->NATS outbox",
-                                    err,
-                                );
-                            }
-                            if let Err(err) = Self::publish_commit_delta(
+                                {
+                                    return self.fail_prepared_committed_write(
+                                        &transaction_id,
+                                        commit_ts,
+                                        "record prepared committed write in Raft->NATS outbox",
+                                        err,
+                                    );
+                                }
+                            } else if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta.clone(),
                                 "2pc_participant",
                             )
                             .await
                             {
-                                if use_raft_nats_outbox {
-                                    tracing::error!(
-                                        "Failed to publish prepared committed write at ts={} to \
-                                         replication log; leaving Raft->NATS outbox entry for \
-                                         replay: {err:#}",
-                                        u64::from(commit_ts),
-                                    );
-                                } else {
-                                    return self.fail_prepared_committed_write(
-                                        &transaction_id,
-                                        commit_ts,
-                                        "publish prepared committed write to replication log",
-                                        err,
-                                    );
-                                }
-                            } else if use_raft_nats_outbox
-                                && let Err(err) = Self::clear_raft_nats_outbox_delta(
-                                    self.persistence.clone(),
+                                return self.fail_prepared_committed_write(
+                                    &transaction_id,
                                     commit_ts,
-                                    "2pc_participant",
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Published prepared committed write at ts={} to replication log \
-                                     but failed to clear Raft->NATS outbox entry: {err:#}",
-                                    u64::from(commit_ts),
+                                    "publish prepared committed write to replication log",
+                                    err,
                                 );
                             }
                             if let Err(err) = Self::delete_two_phase_redo(
@@ -2804,19 +2763,41 @@ impl<RT: Runtime> Committer<RT> {
         result
     }
 
+    fn sorted_raft_nats_outbox_records(
+        records: RaftNatsOutboxRecords,
+    ) -> anyhow::Result<Vec<(Timestamp, serde_json::Value)>> {
+        let mut sorted = records
+            .into_iter()
+            .map(|(key, value)| {
+                let ts = key
+                    .parse::<u64>()
+                    .with_context(|| format!("Failed to parse Raft->NATS outbox key {key:?}"))
+                    .and_then(Timestamp::try_from)?;
+                Ok((ts, value))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        sorted.sort_by_key(|(ts, _)| *ts);
+        Ok(sorted)
+    }
+
     async fn replay_raft_nats_outbox_once(
         persistence: Arc<dyn Persistence>,
         distributed_log: Arc<dyn DistributedLog>,
     ) -> anyhow::Result<usize> {
         let records = Self::load_raft_nats_outbox_records(persistence.clone()).await?;
         let mut replayed = 0usize;
-        for (key, value) in records {
+        for (delta_ts, value) in Self::sorted_raft_nats_outbox_records(records)? {
             let envelope: DeltaEnvelope = serde_json::from_value(value)
-                .with_context(|| format!("Failed to parse Raft->NATS outbox delta {key}"))?;
+                .with_context(|| format!("Failed to parse Raft->NATS outbox delta {delta_ts}"))?;
             let delta = envelope
                 .to_delta()
-                .with_context(|| format!("Failed to decode Raft->NATS outbox delta {key}"))?;
-            let delta_ts = delta.ts;
+                .with_context(|| format!("Failed to decode Raft->NATS outbox delta {delta_ts}"))?;
+            anyhow::ensure!(
+                delta.ts == delta_ts,
+                "Raft->NATS outbox key {} did not match encoded delta ts {}",
+                u64::from(delta_ts),
+                u64::from(delta.ts),
+            );
             Self::publish_commit_delta(distributed_log.clone(), delta, "raft_nats_outbox_replay")
                 .await?;
             Self::clear_raft_nats_outbox_delta(
@@ -2828,6 +2809,23 @@ impl<RT: Runtime> Committer<RT> {
             replayed += 1;
         }
         Ok(replayed)
+    }
+
+    async fn record_and_replay_raft_nats_outbox_delta(
+        persistence: Arc<dyn Persistence>,
+        distributed_log: Arc<dyn DistributedLog>,
+        delta: &CommitDelta,
+        path: &'static str,
+    ) -> anyhow::Result<()> {
+        Self::record_raft_nats_outbox_delta(persistence.clone(), delta, path).await?;
+        if let Err(err) = Self::replay_raft_nats_outbox_once(persistence, distributed_log).await {
+            tracing::error!(
+                "Failed to publish committed write at ts={} to replication log through ordered \
+                 Raft->NATS outbox; leaving outbox entries for replay: {err:#}",
+                u64::from(delta.ts),
+            );
+        }
+        Ok(())
     }
 
     fn should_record_raft_nats_outbox_delta(delta: &CommitDelta) -> bool {
@@ -6210,6 +6208,24 @@ mod tests {
         published: parking_lot::Mutex<Vec<Timestamp>>,
     }
 
+    struct FailTimestampDistributedLog {
+        fail_ts: Timestamp,
+        published: parking_lot::Mutex<Vec<Timestamp>>,
+    }
+
+    impl FailTimestampDistributedLog {
+        fn new(fail_ts: Timestamp) -> Self {
+            Self {
+                fail_ts,
+                published: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn published(&self) -> Vec<Timestamp> {
+            self.published.lock().clone()
+        }
+    }
+
     impl RecordingDistributedLog {
         fn failing() -> Self {
             Self {
@@ -6232,6 +6248,24 @@ mod tests {
         async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
             if self.fail_publishes.load(Ordering::SeqCst) {
                 anyhow::bail!("injected publish failure");
+            }
+            self.published.lock().push(delta.ts);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _from_ts: Timestamp,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    #[async_trait]
+    impl DistributedLog for FailTimestampDistributedLog {
+        async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+            if delta.ts == self.fail_ts {
+                anyhow::bail!("injected publish failure at {}", u64::from(delta.ts));
             }
             self.published.lock().push(delta.ts);
             Ok(())
@@ -6451,6 +6485,81 @@ mod tests {
             Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
                 .await?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_replay_uses_numeric_timestamp_order() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let log = Arc::new(RecordingDistributedLog::default());
+        let ts_2 = Timestamp::must(2);
+        let ts_10 = Timestamp::must(10);
+
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts_10),
+        )
+        .await?;
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts_2),
+        )
+        .await?;
+
+        let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+            persistence.clone(),
+            log.clone(),
+        )
+        .await?;
+
+        assert_eq!(replayed, 2);
+        assert_eq!(log.published(), vec![ts_2, ts_10]);
+        assert!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_replay_does_not_bypass_failed_older_delta() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let older_ts = Timestamp::must(2);
+        let newer_ts = Timestamp::must(10);
+        let log = Arc::new(FailTimestampDistributedLog::new(older_ts));
+
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(newer_ts),
+        )
+        .await?;
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(older_ts),
+        )
+        .await?;
+
+        let err = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+            persistence.clone(),
+            log.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("injected publish failure"));
+        assert_eq!(
+            log.published(),
+            Vec::<Timestamp>::new(),
+            "newer deltas must not publish while an older outbox entry is unresolved",
+        );
+        assert_eq!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
+                .await?
+                .len(),
+            2,
+            "both entries should remain for ordered replay",
         );
         Ok(())
     }
