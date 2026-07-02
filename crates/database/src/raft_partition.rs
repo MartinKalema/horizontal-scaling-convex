@@ -60,6 +60,7 @@ use crate::{
         RaftNode,
         RaftNodeConfig,
     },
+    timestamp_oracle::TimestampOracle,
 };
 
 /// Shared state for a Raft-enabled partition, accessible from the Committer
@@ -179,6 +180,7 @@ impl RaftPartitionManager {
         engine: Arc<raft_engine::Engine>,
         peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
         snapshot_provider: Option<Arc<dyn crate::raft_storage::RaftSnapshotProvider>>,
+        timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
     ) -> anyhow::Result<Self> {
         let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel();
 
@@ -200,9 +202,13 @@ impl RaftPartitionManager {
         let serving_lease_refresh = leader_serving_lease_valid_until.clone();
         let serving_lease_duration_refresh = leader_serving_lease_duration;
         let partition_id = config.partition_id;
+        let tso_became_leader = timestamp_oracle.clone();
 
         node.set_leadership_callbacks(LeadershipCallbacks {
             on_became_leader: Box::new(move || {
+                if let Some(tso) = tso_became_leader.as_ref() {
+                    tso.discard_reserved_batch();
+                }
                 is_leader_cb.store(true, Ordering::SeqCst);
                 metrics::log_raft_is_leader(partition_id, true);
                 tracing::info!(
@@ -214,7 +220,11 @@ impl RaftPartitionManager {
                 let is_leader_lost = is_leader.clone();
                 let serving_lease_lost = leader_serving_lease_valid_until.clone();
                 let partition_id_lost = partition_id;
+                let tso_lost_leadership = timestamp_oracle.clone();
                 move || {
+                    if let Some(tso) = tso_lost_leadership.as_ref() {
+                        tso.discard_reserved_batch();
+                    }
                     is_leader_lost.store(false, Ordering::SeqCst);
                     *serving_lease_lost.lock() = None;
                     metrics::log_raft_is_leader(partition_id_lost, false);
@@ -286,8 +296,42 @@ impl RaftPartitionManager {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
+        Arc,
+    };
+
+    use async_trait::async_trait;
+    use common::types::Timestamp;
+
     use super::*;
     use crate::raft_storage::ConvexRaftStorage;
+
+    struct RecordingTimestampOracle {
+        discards: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TimestampOracle for RecordingTimestampOracle {
+        async fn next_ts_at_or_after(&self, _min_ts: Timestamp) -> anyhow::Result<Timestamp> {
+            Ok(Timestamp::must(1))
+        }
+
+        async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
+            Ok(Timestamp::MIN)
+        }
+
+        async fn advance_committed_ts(&self, _ts: Timestamp) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn discard_reserved_batch(&self) {
+            self.discards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn test_engine() -> Arc<raft_engine::Engine> {
         let dir = tempfile::tempdir().unwrap();
@@ -305,7 +349,7 @@ mod tests {
         };
 
         let manager =
-            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None).unwrap();
+            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None, None).unwrap();
         let state = manager.state();
 
         assert!(!state.is_leader());
@@ -324,7 +368,7 @@ mod tests {
         };
 
         let mut manager =
-            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None).unwrap();
+            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None, None).unwrap();
         let state = manager.state();
 
         assert!(!state.is_leader());
@@ -346,6 +390,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_became_leader_discards_tso_reserved_batch() {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+        let discards = Arc::new(AtomicUsize::new(0));
+        let tso = Arc::new(RecordingTimestampOracle {
+            discards: discards.clone(),
+        });
+
+        let mut manager =
+            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None, Some(tso))
+                .unwrap();
+
+        let mut node = manager.take_node().unwrap();
+        for _ in 0..20 {
+            node.raw_node.tick();
+        }
+        node.process_ready_test();
+
+        assert_eq!(discards.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn test_send_proposal() {
         let config = RaftNodeConfig {
@@ -356,7 +427,7 @@ mod tests {
         };
 
         let manager =
-            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None).unwrap();
+            RaftPartitionManager::new(config, test_engine(), HashMap::new(), None, None).unwrap();
         let state = manager.state();
 
         // Should be able to send without error (node exists).
