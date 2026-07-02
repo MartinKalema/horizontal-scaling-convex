@@ -136,10 +136,21 @@ pub struct UdfArgsQuery {
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct ReadAfterWriteFenceToken {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_partition: Option<u32>,
+    pub ts: SerializedTs,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadAfterWriteToken {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_partition: Option<u32>,
     pub ts: SerializedTs,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participant_fences: Vec<ReadAfterWriteFenceToken>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -222,23 +233,52 @@ impl UdfResponse {
 
 fn mutation_read_after_write_token(
     source_partition: Option<PartitionId>,
+    read_after_write_partitions: &[PartitionId],
     ts: Timestamp,
 ) -> ReadAfterWriteToken {
+    let should_emit_participant_fences = read_after_write_partitions.len() > 1
+        || read_after_write_partitions
+            .first()
+            .is_some_and(|partition| Some(*partition) != source_partition);
     ReadAfterWriteToken {
         source_partition: source_partition.map(|partition| partition.0),
         ts: ts.into(),
+        participant_fences: should_emit_participant_fences
+            .then(|| {
+                read_after_write_partitions
+                    .iter()
+                    .map(|partition| ReadAfterWriteFenceToken {
+                        source_partition: Some(partition.0),
+                        ts: ts.into(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
-fn read_after_write_fence(
+fn read_after_write_fences(
     token: Option<ReadAfterWriteToken>,
-) -> anyhow::Result<Option<ReadAfterWriteFence>> {
+) -> anyhow::Result<Option<Vec<ReadAfterWriteFence>>> {
     token
         .map(|token| {
-            Ok(ReadAfterWriteFence {
-                source_partition: token.source_partition.map(PartitionId),
-                ts: Timestamp::try_from(token.ts)?,
-            })
+            if !token.participant_fences.is_empty() {
+                token
+                    .participant_fences
+                    .into_iter()
+                    .map(|fence| {
+                        Ok(ReadAfterWriteFence {
+                            source_partition: fence.source_partition.map(PartitionId),
+                            ts: Timestamp::try_from(fence.ts)?,
+                        })
+                    })
+                    .collect()
+            } else {
+                Ok(vec![ReadAfterWriteFence {
+                    source_partition: token.source_partition.map(PartitionId),
+                    ts: Timestamp::try_from(token.ts)?,
+                }])
+            }
         })
         .transpose()
 }
@@ -364,6 +404,11 @@ async fn maybe_forward_public_mutation(
         Some(pb::replication::forward_mutation_response::Result::Success(success)) => {
             let commit_ts = Timestamp::try_from(success.ts)?;
             let source_partition = success.source_partition.map(PartitionId);
+            let read_after_write_partitions: Vec<_> = success
+                .read_after_write_fences
+                .iter()
+                .filter_map(|fence| fence.source_partition.map(PartitionId))
+                .collect();
             if matches!(forwarding_mode, ForwardingMode::RaftFollower(_)) {
                 wait_for_local_mutation_visibility(st, commit_ts, source_partition).await?;
             }
@@ -377,6 +422,7 @@ async fn maybe_forward_public_mutation(
                 value: export_value(packed.unpack()?, value_format, client_version.clone())?,
                 read_after_write: Some(mutation_read_after_write_token(
                     source_partition,
+                    &read_after_write_partitions,
                     commit_ts,
                 )),
                 log_lines: RedactedLogLines::from_vec(success.log_lines),
@@ -616,7 +662,7 @@ pub async fn public_query_get(
             req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::Latest,
-            read_after_write_fence(req.read_after_write)?,
+            read_after_write_fences(req.read_after_write)?,
             journal,
         )
         .await?;
@@ -672,7 +718,7 @@ pub async fn public_query_post(
             req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::Latest,
-            read_after_write_fence(req.read_after_write)?,
+            read_after_write_fences(req.read_after_write)?,
             journal,
         )
         .await?;
@@ -748,7 +794,7 @@ pub async fn public_query_at_ts_post(
             req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::At(ts),
-            read_after_write_fence(req.read_after_write)?,
+            read_after_write_fences(req.read_after_write)?,
             journal,
         )
         .await?;
@@ -801,10 +847,12 @@ pub async fn public_query_batch_post(
         .await?;
     let queries = req_batch.queries;
     for req in &queries {
-        if let Some(fence) = read_after_write_fence(req.read_after_write.clone())? {
-            st.database
-                .wait_for_read_after_write_fence(fence.source_partition, fence.ts)
-                .await?;
+        if let Some(fences) = read_after_write_fences(req.read_after_write.clone())? {
+            for fence in fences {
+                st.database
+                    .wait_for_read_after_write_fence(fence.source_partition, fence.ts)
+                    .await?;
+            }
         }
     }
     // All queries execute at the same timestamp, after any portable freshness
@@ -908,6 +956,7 @@ pub async fn public_mutation_post(
                 value: export_value(write_return.value.unpack()?, value_format, client_version)?,
                 read_after_write: Some(mutation_read_after_write_token(
                     write_return.source_partition,
+                    &write_return.read_after_write_partitions,
                     write_return.ts,
                 )),
                 log_lines: write_return.log_lines,
@@ -1012,6 +1061,7 @@ mod tests {
         api::{
             ApplicationApi,
             ExecuteQueryTimestamp,
+            ReadAfterWriteFence,
         },
         test_helpers::ApplicationTestExt,
     };
@@ -1068,6 +1118,7 @@ mod tests {
         router::router,
         test_helpers::setup_backend_for_test,
         two_phase_service::TwoPhaseCommitGrpcService,
+        SharedNodeAddresses,
         MAX_CONCURRENT_REQUESTS,
     };
 
@@ -1228,10 +1279,69 @@ mod tests {
 
     #[test]
     fn test_mutation_read_after_write_token_uses_commit_source_partition() -> anyhow::Result<()> {
-        let token =
-            super::mutation_read_after_write_token(Some(PartitionId(7)), Timestamp::must(123));
+        let token = super::mutation_read_after_write_token(
+            Some(PartitionId(7)),
+            &[PartitionId(7)],
+            Timestamp::must(123),
+        );
         assert_eq!(token.source_partition, Some(7));
         assert_eq!(Timestamp::try_from(token.ts)?, Timestamp::must(123));
+        assert!(token.participant_fences.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_mutation_read_after_write_token_records_two_phase_participants() -> anyhow::Result<()> {
+        let token = super::mutation_read_after_write_token(
+            None,
+            &[PartitionId(0), PartitionId(1)],
+            Timestamp::must(456),
+        );
+
+        assert_eq!(token.source_partition, None);
+        assert_eq!(Timestamp::try_from(token.ts.clone())?, Timestamp::must(456));
+        assert_eq!(token.participant_fences.len(), 2);
+        assert_eq!(token.participant_fences[0].source_partition, Some(0));
+        assert_eq!(token.participant_fences[1].source_partition, Some(1));
+
+        let fences = super::read_after_write_fences(Some(token))?
+            .context("participant token should parse into fences")?;
+        assert_eq!(
+            fences,
+            vec![
+                ReadAfterWriteFence {
+                    source_partition: Some(PartitionId(0)),
+                    ts: Timestamp::must(456),
+                },
+                ReadAfterWriteFence {
+                    source_partition: Some(PartitionId(1)),
+                    ts: Timestamp::must(456),
+                },
+            ],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_after_write_participant_fences_override_legacy_scalar() -> anyhow::Result<()> {
+        let token = super::ReadAfterWriteToken {
+            source_partition: Some(9),
+            ts: Timestamp::must(100).into(),
+            participant_fences: vec![super::ReadAfterWriteFenceToken {
+                source_partition: Some(1),
+                ts: Timestamp::must(200).into(),
+            }],
+        };
+
+        let fences = super::read_after_write_fences(Some(token))?
+            .context("participant fences should be authoritative")?;
+        assert_eq!(
+            fences,
+            vec![ReadAfterWriteFence {
+                source_partition: Some(PartitionId(1)),
+                ts: Timestamp::must(200),
+            }],
+        );
         Ok(())
     }
 
@@ -1607,7 +1717,7 @@ mod tests {
             selective.st.application.database().clone(),
             false,
             Some(PartitionId(1)),
-            Some(NodeAddresses::from_config(&format!("0={grpc_addr}"))),
+            SharedNodeAddresses::new(Some(NodeAddresses::from_config(&format!("0={grpc_addr}")))),
             None,
             None,
             None,
@@ -1683,7 +1793,7 @@ mod tests {
             follower.st.application.database().clone(),
             false,
             Some(PartitionId(0)),
-            None,
+            SharedNodeAddresses::default(),
             Some(RaftPartitionState::new_for_test(
                 false,
                 3,
@@ -1727,7 +1837,7 @@ mod tests {
             backend.st.application.database().clone(),
             false,
             Some(PartitionId(1)),
-            None,
+            SharedNodeAddresses::default(),
             None,
             None,
             None,
@@ -1813,7 +1923,7 @@ mod tests {
             backend.st.application.database().clone(),
             true,
             None,
-            None,
+            SharedNodeAddresses::default(),
             None,
             None,
             None,
@@ -1856,7 +1966,7 @@ mod tests {
             backend.st.application.database().clone(),
             false,
             Some(PartitionId(1)),
-            None,
+            SharedNodeAddresses::default(),
             None,
             None,
             None,
@@ -1930,7 +2040,7 @@ mod tests {
             backend.st.application.database().clone(),
             true,
             None,
-            None,
+            SharedNodeAddresses::default(),
             None,
             None,
             None,

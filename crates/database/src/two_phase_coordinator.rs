@@ -1122,6 +1122,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                 return Ok(CommitOutcome {
                     ts: prepare_ts,
                     source_partition,
+                    read_after_write_partitions: prepared_participants.clone(),
                 });
             },
             TwoPhaseCommitMode::ParallelEarlyAck => {
@@ -1157,6 +1158,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                 return Ok(CommitOutcome {
                     ts: prepare_ts,
                     source_partition,
+                    read_after_write_partitions: prepared_participants.clone(),
                 });
             },
         }

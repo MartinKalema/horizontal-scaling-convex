@@ -123,7 +123,7 @@ pub trait ApplicationApi: Send + Sync {
         args: SerializedArgs,
         caller: FunctionCaller,
         ts: ExecuteQueryTimestamp,
-        read_after_write: Option<ReadAfterWriteFence>,
+        read_after_write: Option<Vec<ReadAfterWriteFence>>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<RedactedQueryReturn>;
 
@@ -302,17 +302,19 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         args: SerializedArgs,
         caller: FunctionCaller,
         ts: ExecuteQueryTimestamp,
-        read_after_write: Option<ReadAfterWriteFence>,
+        read_after_write: Option<Vec<ReadAfterWriteFence>>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<RedactedQueryReturn> {
         anyhow::ensure!(
             caller.allowed_visibility() == AllowedVisibility::PublicOnly,
             "This method should not be used by internal callers."
         );
-        if let Some(fence) = read_after_write {
-            self.database
-                .wait_for_read_after_write_fence(fence.source_partition, fence.ts)
-                .await?;
+        if let Some(fences) = read_after_write {
+            for fence in fences {
+                self.database
+                    .wait_for_read_after_write_fence(fence.source_partition, fence.ts)
+                    .await?;
+            }
         }
         let ts = match ts {
             ExecuteQueryTimestamp::Latest => *self.now_ts_for_reads(),

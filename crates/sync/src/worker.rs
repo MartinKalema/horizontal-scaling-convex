@@ -969,10 +969,10 @@ impl<RT: Runtime> SyncWorker<RT> {
                                             caller.clone(),
                                             ExecuteQueryTimestamp::At(new_ts),
                                             query.read_after_write.as_ref().map(|token| {
-                                                ReadAfterWriteFence::from_source_partition(
+                                                vec![ReadAfterWriteFence::from_source_partition(
                                                     token.source_partition,
                                                     token.ts,
-                                                )
+                                                )]
                                             }),
                                             query.journal.clone(),
                                         )
