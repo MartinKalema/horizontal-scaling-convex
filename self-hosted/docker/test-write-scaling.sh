@@ -1448,6 +1448,9 @@ echo -e "${BOLD}Test 9g: 2PC Atomicity During Participant Restart${NC}"
 # Race a cross-partition mutation with a partition-1 participant restart. The
 # client result may be ambiguous, but the persisted result must not be torn.
 
+FAILURE_WINDOW_RUN="failure-window-2pc-$(date +%s)-$$"
+PARTICIPANT_RESTART_TEXT="$FAILURE_WINDOW_RUN-participant-restart-msg"
+PARTICIPANT_RESTART_TASK="$FAILURE_WINDOW_RUN-participant-restart-task"
 PRE_RESTART_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_RESTART_2PC_M=$(jval messages "$PRE_RESTART_2PC")
 PRE_RESTART_2PC_T=$(jval tasks "$PRE_RESTART_2PC")
@@ -1456,7 +1459,7 @@ RESTART_2PC_RESPONSE_FILE=$(mktemp)
 (curl --max-time 20 -s "$NODE_A_URL/api/mutation" \
     -H "Authorization: Convex $NODE_A_KEY" \
     -H "Content-Type: application/json" \
-    -d '{"path":"messages:crossPartitionWrite","args":{"text":"2pc-participant-restart","taskTitle":"2pc-participant-restart-task"}}' \
+    -d "{\"path\":\"messages:crossPartitionWrite\",\"args\":{\"text\":\"$PARTICIPANT_RESTART_TEXT\",\"taskTitle\":\"$PARTICIPANT_RESTART_TASK\"}}" \
     > "$RESTART_2PC_RESPONSE_FILE" || echo '{"status":"transport_error"}' > "$RESTART_2PC_RESPONSE_FILE") &
 RESTART_2PC_PID=$!
 sleep 0.05
@@ -1480,8 +1483,8 @@ RESTART_2PC_DT=$((POST_RESTART_2PC_T - PRE_RESTART_2PC_T))
 RESTART_2PC_RESPONSE=$(cat "$RESTART_2PC_RESPONSE_FILE")
 rm -f "$RESTART_2PC_RESPONSE_FILE"
 FAILURE_WINDOW_2PC_LABELS+=("participant-restart")
-FAILURE_WINDOW_2PC_TEXTS+=("2pc-participant-restart")
-FAILURE_WINDOW_2PC_TASKS+=("2pc-participant-restart-task")
+FAILURE_WINDOW_2PC_TEXTS+=("$PARTICIPANT_RESTART_TEXT")
+FAILURE_WINDOW_2PC_TASKS+=("$PARTICIPANT_RESTART_TASK")
 FAILURE_WINDOW_2PC_RESPONSES+=("$RESTART_2PC_RESPONSE")
 
 if [ "$RESTART_2PC_DM" -eq "$RESTART_2PC_DT" ] && { [ "$RESTART_2PC_DM" -eq 0 ] || [ "$RESTART_2PC_DM" -eq 1 ]; }; then
@@ -1502,6 +1505,8 @@ echo -e "${BOLD}Test 9h: 2PC Atomicity During Coordinator Restart${NC}"
 # is the coordinator-crash window: after staging/decision work starts, the
 # persisted outcome must still be either fully absent or fully present.
 
+COORD_RESTART_TEXT="$FAILURE_WINDOW_RUN-coordinator-restart-msg"
+COORD_RESTART_TASK="$FAILURE_WINDOW_RUN-coordinator-restart-task"
 PRE_COORD_RESTART_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_COORD_RESTART_2PC_M=$(jval messages "$PRE_COORD_RESTART_2PC")
 PRE_COORD_RESTART_2PC_T=$(jval tasks "$PRE_COORD_RESTART_2PC")
@@ -1510,7 +1515,7 @@ COORD_RESTART_2PC_RESPONSE_FILE=$(mktemp)
 (curl --max-time 20 -s "$NODE_A_URL/api/mutation" \
     -H "Authorization: Convex $NODE_A_KEY" \
     -H "Content-Type: application/json" \
-    -d '{"path":"messages:crossPartitionWrite","args":{"text":"2pc-coordinator-restart","taskTitle":"2pc-coordinator-restart-task"}}' \
+    -d "{\"path\":\"messages:crossPartitionWrite\",\"args\":{\"text\":\"$COORD_RESTART_TEXT\",\"taskTitle\":\"$COORD_RESTART_TASK\"}}" \
     > "$COORD_RESTART_2PC_RESPONSE_FILE" || echo '{"status":"transport_error"}' > "$COORD_RESTART_2PC_RESPONSE_FILE") &
 COORD_RESTART_2PC_PID=$!
 sleep 0.05
@@ -1534,8 +1539,8 @@ COORD_RESTART_2PC_DT=$((POST_COORD_RESTART_2PC_T - PRE_COORD_RESTART_2PC_T))
 COORD_RESTART_2PC_RESPONSE=$(cat "$COORD_RESTART_2PC_RESPONSE_FILE")
 rm -f "$COORD_RESTART_2PC_RESPONSE_FILE"
 FAILURE_WINDOW_2PC_LABELS+=("coordinator-restart")
-FAILURE_WINDOW_2PC_TEXTS+=("2pc-coordinator-restart")
-FAILURE_WINDOW_2PC_TASKS+=("2pc-coordinator-restart-task")
+FAILURE_WINDOW_2PC_TEXTS+=("$COORD_RESTART_TEXT")
+FAILURE_WINDOW_2PC_TASKS+=("$COORD_RESTART_TASK")
 FAILURE_WINDOW_2PC_RESPONSES+=("$COORD_RESTART_2PC_RESPONSE")
 
 if [ "$COORD_RESTART_2PC_DM" -eq "$COORD_RESTART_2PC_DT" ] && { [ "$COORD_RESTART_2PC_DM" -eq 0 ] || [ "$COORD_RESTART_2PC_DM" -eq 1 ]; }; then

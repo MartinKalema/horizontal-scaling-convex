@@ -626,7 +626,7 @@ pub async fn make_app(
         static_node_addresses.clone(),
         two_phase_decision_log,
         Some(cluster_grpc_auth.clone()),
-        timestamp_oracle,
+        timestamp_oracle.clone(),
         table_number_allocator,
         None, // raft_state: set after Raft node starts, not during Database::load
     )
@@ -1236,6 +1236,7 @@ pub async fn make_app(
             raft_engine,
             peer_senders,
             Some(snapshot_provider),
+            timestamp_oracle.clone(),
         )?;
         let raft_state = manager.state();
         raft_state_for_app = Some(raft_state.clone());

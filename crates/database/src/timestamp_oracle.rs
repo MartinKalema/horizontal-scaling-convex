@@ -61,6 +61,15 @@ pub trait TimestampOracle: Send + Sync + 'static {
 
     /// Advance the max committed timestamp. Called after a successful commit.
     async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()>;
+
+    /// Discard any node-local timestamp reservation after a leadership epoch
+    /// change.
+    ///
+    /// Batch-based TSOs must not carry an old local reservation across Raft
+    /// leadership changes. A re-elected leader should fence itself against the
+    /// latest global counter and committed floor before assigning more commit
+    /// timestamps.
+    fn discard_reserved_batch(&self) {}
 }
 
 /// Local timestamp oracle for single-node deployments.
@@ -140,6 +149,9 @@ struct BatchState {
     upper_bound: u64,
     /// Maximum committed timestamp seen.
     max_committed: Timestamp,
+    /// Force the next assignment to refresh the global committed floor before
+    /// reserving or consuming any batch.
+    refresh_committed_floor: bool,
 }
 
 const TSO_COUNTER_KEY: &str = "tso_counter";
@@ -165,6 +177,23 @@ fn should_read_committed_floor_before_assignment(
     local_min_next: u64,
 ) -> bool {
     next_ts_from_reserved_batch(current, upper_bound, local_min_next).is_some()
+}
+
+fn local_min_next_from_floor(min_ts: Timestamp, max_committed: Timestamp) -> anyhow::Result<u64> {
+    Ok(u64::from(std::cmp::max(min_ts, max_committed.succ()?)))
+}
+
+fn discard_batch_state_for_leadership_change(state: &mut BatchState) {
+    state.current = 0;
+    state.upper_bound = 0;
+    state.refresh_committed_floor = true;
+}
+
+fn refresh_committed_floor(state: &mut BatchState, committed_floor: Timestamp) {
+    if committed_floor > state.max_committed {
+        state.max_committed = committed_floor;
+    }
+    state.refresh_committed_floor = false;
 }
 
 impl BatchTimestampOracle {
@@ -215,6 +244,7 @@ impl BatchTimestampOracle {
                 current: 0,
                 upper_bound: 0,
                 max_committed: Timestamp::MIN,
+                refresh_committed_floor: false,
             }),
         })
     }
@@ -295,9 +325,15 @@ impl TimestampOracle for BatchTimestampOracle {
         let timer = metrics::tso_operation_timer("next_ts_at_or_after");
         let result = async {
             loop {
+                if self.state.lock().refresh_committed_floor {
+                    let committed_floor = self.max_committed_ts().await?;
+                    let mut state = self.state.lock();
+                    refresh_committed_floor(&mut state, committed_floor);
+                }
+
                 let local_min_next = {
                     let state = self.state.lock();
-                    u64::from(std::cmp::max(min_ts, state.max_committed.succ()?))
+                    local_min_next_from_floor(min_ts, state.max_committed)?
                 };
 
                 let reserved_batch_can_satisfy_local_floor = {
@@ -441,6 +477,11 @@ impl TimestampOracle for BatchTimestampOracle {
         }
         result
     }
+
+    fn discard_reserved_batch(&self) {
+        let mut state = self.state.lock();
+        discard_batch_state_for_leadership_change(&mut state);
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -495,10 +536,16 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use common::types::Timestamp;
+
     use super::{
         batch_lower_bound,
+        discard_batch_state_for_leadership_change,
+        local_min_next_from_floor,
         next_ts_from_reserved_batch,
+        refresh_committed_floor,
         should_read_committed_floor_before_assignment,
+        BatchState,
     };
 
     #[test]
@@ -544,5 +591,46 @@ mod tests {
         assert!(!should_read_committed_floor_before_assignment(
             100, 200, 250
         ));
+    }
+
+    #[test]
+    fn leadership_change_discards_reserved_batch() {
+        let mut state = BatchState {
+            current: 150,
+            upper_bound: 200,
+            max_committed: Timestamp::must(120),
+            refresh_committed_floor: false,
+        };
+
+        discard_batch_state_for_leadership_change(&mut state);
+
+        assert_eq!(state.current, 0);
+        assert_eq!(state.upper_bound, 0);
+        assert_eq!(state.max_committed, Timestamp::must(120));
+        assert!(state.refresh_committed_floor);
+    }
+
+    #[test]
+    fn leadership_floor_refresh_prevents_stale_batch_reuse() -> anyhow::Result<()> {
+        let mut state = BatchState {
+            current: 150,
+            upper_bound: 200,
+            max_committed: Timestamp::must(120),
+            refresh_committed_floor: false,
+        };
+
+        discard_batch_state_for_leadership_change(&mut state);
+        refresh_committed_floor(&mut state, Timestamp::must(250));
+
+        let min_next = local_min_next_from_floor(Timestamp::MIN, state.max_committed)?;
+
+        assert_eq!(min_next, 251);
+        assert!(!state.refresh_committed_floor);
+        assert!(
+            next_ts_from_reserved_batch(state.current, state.upper_bound, min_next).is_none(),
+            "a re-elected leader must not assign from the old leadership epoch's local batch",
+        );
+        assert_eq!(batch_lower_bound(200, min_next), 251);
+        Ok(())
     }
 }
