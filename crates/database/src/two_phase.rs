@@ -632,17 +632,6 @@ pub mod testing {
 
     #[async_trait]
     impl TwoPhaseDecisionLog for InMemoryTwoPhaseDecisionLog {
-        async fn write_decision(
-            &self,
-            transaction_id: &TwoPhaseTransactionId,
-            decision: &TwoPhaseDecision,
-        ) -> anyhow::Result<()> {
-            self.decisions
-                .lock()
-                .insert(transaction_id.0.clone(), decision.clone());
-            Ok(())
-        }
-
         async fn write_decision_if_absent(
             &self,
             transaction_id: &TwoPhaseTransactionId,
@@ -733,26 +722,41 @@ pub fn two_phase_decision_key(transaction_id: &TwoPhaseTransactionId) -> String 
 
 #[async_trait]
 pub trait TwoPhaseDecisionLog: Send + Sync + 'static {
-    async fn write_decision(
-        &self,
-        transaction_id: &TwoPhaseTransactionId,
-        decision: &TwoPhaseDecision,
-    ) -> anyhow::Result<()>;
-
     async fn write_decision_if_absent(
         &self,
         transaction_id: &TwoPhaseTransactionId,
         decision: &TwoPhaseDecision,
-    ) -> anyhow::Result<bool> {
-        self.write_decision(transaction_id, decision).await?;
-        Ok(true)
-    }
+    ) -> anyhow::Result<bool>;
 
     async fn get_decision(
         &self,
         _transaction_id: &TwoPhaseTransactionId,
     ) -> anyhow::Result<Option<TwoPhaseDecision>> {
         Ok(None)
+    }
+
+    async fn write_decision(
+        &self,
+        transaction_id: &TwoPhaseTransactionId,
+        decision: &TwoPhaseDecision,
+    ) -> anyhow::Result<()> {
+        if self
+            .write_decision_if_absent(transaction_id, decision)
+            .await?
+        {
+            return Ok(());
+        }
+        let existing = self.get_decision(transaction_id).await?.with_context(|| {
+            format!("2PC: decision for {transaction_id} already existed but could not be read")
+        })?;
+        anyhow::ensure!(
+            existing == *decision,
+            "2PC: durable decision for {} is already {:?}, cannot overwrite with {:?}",
+            transaction_id,
+            existing,
+            decision,
+        );
+        Ok(())
     }
 
     async fn mark_participant_resolved(
@@ -779,14 +783,6 @@ pub struct NoopTwoPhaseDecisionLog;
 
 #[async_trait]
 impl TwoPhaseDecisionLog for NoopTwoPhaseDecisionLog {
-    async fn write_decision(
-        &self,
-        _transaction_id: &TwoPhaseTransactionId,
-        _decision: &TwoPhaseDecision,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
     async fn write_decision_if_absent(
         &self,
         _transaction_id: &TwoPhaseTransactionId,
@@ -862,20 +858,6 @@ fn parse_nats_decision_entry(
 
 #[async_trait]
 impl TwoPhaseDecisionLog for NatsTwoPhaseDecisionLog {
-    async fn write_decision(
-        &self,
-        transaction_id: &TwoPhaseTransactionId,
-        decision: &TwoPhaseDecision,
-    ) -> anyhow::Result<()> {
-        let payload = serde_json::to_vec(decision)
-            .with_context(|| format!("2PC: Failed to serialize decision for {transaction_id}"))?;
-        self.kv
-            .put(two_phase_decision_key(transaction_id), payload.into())
-            .await
-            .with_context(|| format!("2PC: Failed to write decision for {transaction_id}"))?;
-        Ok(())
-    }
-
     async fn write_decision_if_absent(
         &self,
         transaction_id: &TwoPhaseTransactionId,
@@ -2086,6 +2068,42 @@ mod tests {
                 .await
                 .unwrap());
             assert_eq!(log.get_decision(&txn_id).await.unwrap(), Some(staging));
+        });
+    }
+
+    #[test]
+    fn test_decision_log_write_decision_is_idempotent_for_same_decision() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("same-decision-idempotent".to_string());
+            let decision = TwoPhaseDecision::committed(12345, vec![0, 1]);
+
+            log.write_decision(&txn_id, &decision).await.unwrap();
+            log.write_decision(&txn_id, &decision).await.unwrap();
+
+            assert_eq!(log.get_decision(&txn_id).await.unwrap(), Some(decision));
+        });
+    }
+
+    #[test]
+    fn test_decision_log_write_decision_rejects_conflicting_existing_decision() {
+        futures::executor::block_on(async {
+            let log = testing::InMemoryTwoPhaseDecisionLog::new();
+            let txn_id = TwoPhaseTransactionId("commit-after-timeout-rollback".to_string());
+            let rollback =
+                TwoPhaseDecision::rolled_back("prepare timed out".to_string(), vec![0, 1]);
+            let committed = TwoPhaseDecision::committed(12345, vec![0, 1]);
+
+            log.write_decision(&txn_id, &rollback).await.unwrap();
+            let err = log
+                .write_decision(&txn_id, &committed)
+                .await
+                .expect_err("a final commit must not overwrite an existing rollback");
+            assert!(
+                format!("{err:#}").contains("cannot overwrite"),
+                "unexpected error: {err:#}",
+            );
+            assert_eq!(log.get_decision(&txn_id).await.unwrap(), Some(rollback));
         });
     }
 
