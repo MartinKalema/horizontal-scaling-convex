@@ -8,9 +8,9 @@
 //!
 //! A central counter is stored in NATS KV. Each node reserves a batch of
 //! timestamps (e.g., 1000 at a time). Within the batch, the local counter can
-//! advance without reserving a new range, while still checking the global
-//! committed-timestamp floor before assignment. When the batch is exhausted,
-//! the node reserves another batch from the central counter.
+//! advance without reserving a new range or reading the global
+//! committed-timestamp floor. The oracle refreshes that floor when leadership
+//! changes or when reserving a new batch from the central counter.
 //!
 //! This gives the performance of local timestamp assignment with the
 //! correctness of global ordering.
@@ -127,8 +127,10 @@ impl<RT: Runtime> TimestampOracle for LocalTimestampOracle<RT> {
 ///
 /// Reserves ranges of timestamps from a central NATS KV counter.
 /// Within a range, timestamps can advance without reserving a new range.
-/// Each allocation still reads the global committed-timestamp floor so a node
-/// with an older reserved batch does not continue below the cluster watermark.
+/// Each batch reservation refreshes the global committed-timestamp floor so a
+/// node fences stale leadership epochs and starts new ranges above the latest
+/// known cluster watermark. Once a batch is reserved, allocation within the
+/// range is local.
 ///
 /// Example with batch_size=1000:
 /// - Node A reserves [1000, 1999]
@@ -171,7 +173,7 @@ fn batch_lower_bound(counter_value: u64, min_next: u64) -> u64 {
     std::cmp::max(counter_value, min_next)
 }
 
-fn should_read_committed_floor_before_assignment(
+fn reserved_batch_can_satisfy_local_floor(
     current: u64,
     upper_bound: u64,
     local_min_next: u64,
@@ -336,32 +338,34 @@ impl TimestampOracle for BatchTimestampOracle {
                     local_min_next_from_floor(min_ts, state.max_committed)?
                 };
 
-                let reserved_batch_can_satisfy_local_floor = {
+                let can_assign_from_reserved_batch = {
                     let state = self.state.lock();
-                    should_read_committed_floor_before_assignment(
+                    reserved_batch_can_satisfy_local_floor(
                         state.current,
                         state.upper_bound,
                         local_min_next,
                     )
                 };
 
-                if !reserved_batch_can_satisfy_local_floor {
-                    let (lower, upper) = self.reserve_batch_at_or_above(local_min_next).await?;
-                    return self.assign_from_reserved_batch(lower, upper, local_min_next);
-                }
+                if !can_assign_from_reserved_batch {
+                    let committed_floor = self.max_committed_ts().await?;
+                    let min_next = {
+                        let mut state = self.state.lock();
+                        refresh_committed_floor(&mut state, committed_floor);
+                        u64::from(std::cmp::max(min_ts, state.max_committed.succ()?))
+                    };
 
-                let committed_floor = self.max_committed_ts().await?;
-                let min_next_ts = std::cmp::max(min_ts, committed_floor.succ()?);
-                let min_next = u64::from(min_next_ts);
+                    let (lower, upper) = self.reserve_batch_at_or_above(min_next).await?;
+                    return self.assign_from_reserved_batch(lower, upper, min_next);
+                }
 
                 let candidate = {
                     let mut state = self.state.lock();
-                    if committed_floor > state.max_committed {
-                        state.max_committed = committed_floor;
-                    }
-                    if let Some((ts, next_current)) =
-                        next_ts_from_reserved_batch(state.current, state.upper_bound, min_next)
-                    {
+                    if let Some((ts, next_current)) = next_ts_from_reserved_batch(
+                        state.current,
+                        state.upper_bound,
+                        local_min_next,
+                    ) {
                         state.current = next_current;
                         Some(ts)
                     } else {
@@ -373,8 +377,7 @@ impl TimestampOracle for BatchTimestampOracle {
                     return Timestamp::try_from(ts);
                 }
 
-                let (lower, upper) = self.reserve_batch_at_or_above(min_next).await?;
-                return self.assign_from_reserved_batch(lower, upper, min_next);
+                continue;
             }
         }
         .await;
@@ -544,7 +547,7 @@ mod tests {
         local_min_next_from_floor,
         next_ts_from_reserved_batch,
         refresh_committed_floor,
-        should_read_committed_floor_before_assignment,
+        reserved_batch_can_satisfy_local_floor,
         BatchState,
     };
 
@@ -578,19 +581,15 @@ mod tests {
     }
 
     #[test]
-    fn committed_floor_read_is_needed_before_using_existing_batch() {
-        assert!(should_read_committed_floor_before_assignment(100, 200, 150));
+    fn reserved_batch_can_assign_locally_when_it_satisfies_floor() {
+        assert!(reserved_batch_can_satisfy_local_floor(100, 200, 150));
     }
 
     #[test]
-    fn committed_floor_read_is_not_needed_before_reserving_new_batch() {
-        assert!(!should_read_committed_floor_before_assignment(0, 0, 1));
-        assert!(!should_read_committed_floor_before_assignment(
-            100, 200, 200
-        ));
-        assert!(!should_read_committed_floor_before_assignment(
-            100, 200, 250
-        ));
+    fn reserved_batch_cannot_assign_locally_when_missing_or_exhausted() {
+        assert!(!reserved_batch_can_satisfy_local_floor(0, 0, 1));
+        assert!(!reserved_batch_can_satisfy_local_floor(100, 200, 200));
+        assert!(!reserved_batch_can_satisfy_local_floor(100, 200, 250));
     }
 
     #[test]

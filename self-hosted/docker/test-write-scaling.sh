@@ -1401,6 +1401,7 @@ FAILURE_WINDOW_2PC_LABELS=()
 FAILURE_WINDOW_2PC_TEXTS=()
 FAILURE_WINDOW_2PC_TASKS=()
 FAILURE_WINDOW_2PC_RESPONSES=()
+FAILURE_WINDOW_RUN="failure-window-2pc-$(date +%s)-$$"
 
 # ============================================================
 echo ""
@@ -1412,35 +1413,36 @@ echo -e "${BOLD}Test 9f: 2PC Atomicity During NATS Outage${NC}"
 PRE_NATS_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 PRE_NATS_2PC_M=$(jval messages "$PRE_NATS_2PC")
 PRE_NATS_2PC_T=$(jval tasks "$PRE_NATS_2PC")
+NATS_2PC_TEXT="$FAILURE_WINDOW_RUN-nats-outage-msg"
+NATS_2PC_TASK="$FAILURE_WINDOW_RUN-nats-outage-task"
 
 echo "  Pausing NATS and attempting one cross-partition mutation..."
 docker pause docker-nats-1 > /dev/null 2>&1
 NATS_2PC_RESPONSE=$(curl --max-time 10 -s "$NODE_A_URL/api/mutation" \
     -H "Authorization: Convex $NODE_A_KEY" \
     -H "Content-Type: application/json" \
-    -d '{"path":"messages:crossPartitionWrite","args":{"text":"2pc-nats-outage","taskTitle":"2pc-nats-outage-task"}}' \
+    -d "{\"path\":\"messages:crossPartitionWrite\",\"args\":{\"text\":\"$NATS_2PC_TEXT\",\"taskTitle\":\"$NATS_2PC_TASK\"}}" \
     || echo '{"status":"transport_error"}')
 sleep 2
 docker unpause docker-nats-1 > /dev/null 2>&1
 echo "  NATS resumed."
 FAILURE_WINDOW_2PC_LABELS+=("nats-outage")
-FAILURE_WINDOW_2PC_TEXTS+=("2pc-nats-outage")
-FAILURE_WINDOW_2PC_TASKS+=("2pc-nats-outage-task")
+FAILURE_WINDOW_2PC_TEXTS+=("$NATS_2PC_TEXT")
+FAILURE_WINDOW_2PC_TASKS+=("$NATS_2PC_TASK")
 FAILURE_WINDOW_2PC_RESPONSES+=("$NATS_2PC_RESPONSE")
 
-sleep 6
+NATS_2PC_COUNTS=$(wait_for_2pc_pair_exactness "$NATS_2PC_TEXT" "$NATS_2PC_TASK" "$NATS_2PC_RESPONSE" || true)
+read -r NATS_2PC_MSG_A NATS_2PC_MSG_B NATS_2PC_TASK_A NATS_2PC_TASK_B <<< "$NATS_2PC_COUNTS"
+
+if two_pc_counts_match_response "$NATS_2PC_RESPONSE" "$NATS_2PC_MSG_A" "$NATS_2PC_MSG_B" "$NATS_2PC_TASK_A" "$NATS_2PC_TASK_B"; then
+    pass "2PC under NATS outage was atomic/fail-closed (msgA=$NATS_2PC_MSG_A msgB=$NATS_2PC_MSG_B taskA=$NATS_2PC_TASK_A taskB=$NATS_2PC_TASK_B)"
+else
+    fail "2PC under NATS outage produced torn/non-idempotent result" "response=$NATS_2PC_RESPONSE msgA=$NATS_2PC_MSG_A msgB=$NATS_2PC_MSG_B taskA=$NATS_2PC_TASK_A taskB=$NATS_2PC_TASK_B"
+fi
+
 POST_NATS_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
 POST_NATS_2PC_M=$(jval messages "$POST_NATS_2PC")
 POST_NATS_2PC_T=$(jval tasks "$POST_NATS_2PC")
-NATS_2PC_DM=$((POST_NATS_2PC_M - PRE_NATS_2PC_M))
-NATS_2PC_DT=$((POST_NATS_2PC_T - PRE_NATS_2PC_T))
-
-if [ "$NATS_2PC_DM" -eq "$NATS_2PC_DT" ] && { [ "$NATS_2PC_DM" -eq 0 ] || [ "$NATS_2PC_DM" -eq 1 ]; }; then
-    pass "2PC under NATS outage was atomic/fail-closed (msgs +$NATS_2PC_DM tasks +$NATS_2PC_DT)"
-else
-    fail "2PC under NATS outage produced torn/non-idempotent result" "response=$NATS_2PC_RESPONSE msgs +$NATS_2PC_DM tasks +$NATS_2PC_DT"
-fi
-
 POST_NATS_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
 POST_NATS_2PC_BM=$(jval messages "$POST_NATS_2PC_B")
 POST_NATS_2PC_BT=$(jval tasks "$POST_NATS_2PC_B")
@@ -1455,7 +1457,6 @@ echo -e "${BOLD}Test 9g: 2PC Atomicity During Participant Restart${NC}"
 # Race a cross-partition mutation with a partition-1 participant restart. The
 # client result may be ambiguous, but the persisted result must not be torn.
 
-FAILURE_WINDOW_RUN="failure-window-2pc-$(date +%s)-$$"
 PARTICIPANT_RESTART_TEXT="$FAILURE_WINDOW_RUN-participant-restart-msg"
 PARTICIPANT_RESTART_TASK="$FAILURE_WINDOW_RUN-participant-restart-task"
 PRE_RESTART_2PC=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
@@ -1485,19 +1486,19 @@ NODE_B_KEY="$NODE_P1A_KEY"
 sleep 8
 POST_RESTART_2PC_COUNTS=$(wait_dashboard_message_task_convergence || true)
 read -r POST_RESTART_2PC_M POST_RESTART_2PC_T POST_RESTART_2PC_BM POST_RESTART_2PC_BT <<< "$POST_RESTART_2PC_COUNTS"
-RESTART_2PC_DM=$((POST_RESTART_2PC_M - PRE_RESTART_2PC_M))
-RESTART_2PC_DT=$((POST_RESTART_2PC_T - PRE_RESTART_2PC_T))
 RESTART_2PC_RESPONSE=$(cat "$RESTART_2PC_RESPONSE_FILE")
 rm -f "$RESTART_2PC_RESPONSE_FILE"
 FAILURE_WINDOW_2PC_LABELS+=("participant-restart")
 FAILURE_WINDOW_2PC_TEXTS+=("$PARTICIPANT_RESTART_TEXT")
 FAILURE_WINDOW_2PC_TASKS+=("$PARTICIPANT_RESTART_TASK")
 FAILURE_WINDOW_2PC_RESPONSES+=("$RESTART_2PC_RESPONSE")
+RESTART_2PC_COUNTS=$(wait_for_2pc_pair_exactness "$PARTICIPANT_RESTART_TEXT" "$PARTICIPANT_RESTART_TASK" "$RESTART_2PC_RESPONSE" || true)
+read -r RESTART_2PC_MSG_A RESTART_2PC_MSG_B RESTART_2PC_TASK_A RESTART_2PC_TASK_B <<< "$RESTART_2PC_COUNTS"
 
-if [ "$RESTART_2PC_DM" -eq "$RESTART_2PC_DT" ] && { [ "$RESTART_2PC_DM" -eq 0 ] || [ "$RESTART_2PC_DM" -eq 1 ]; }; then
-    pass "2PC during participant restart was atomic (msgs +$RESTART_2PC_DM tasks +$RESTART_2PC_DT)"
+if two_pc_counts_match_response "$RESTART_2PC_RESPONSE" "$RESTART_2PC_MSG_A" "$RESTART_2PC_MSG_B" "$RESTART_2PC_TASK_A" "$RESTART_2PC_TASK_B"; then
+    pass "2PC during participant restart was atomic (msgA=$RESTART_2PC_MSG_A msgB=$RESTART_2PC_MSG_B taskA=$RESTART_2PC_TASK_A taskB=$RESTART_2PC_TASK_B)"
 else
-    fail "2PC during participant restart produced torn/non-idempotent result" "response=$RESTART_2PC_RESPONSE msgs +$RESTART_2PC_DM tasks +$RESTART_2PC_DT"
+    fail "2PC during participant restart produced torn/non-idempotent result" "response=$RESTART_2PC_RESPONSE msgA=$RESTART_2PC_MSG_A msgB=$RESTART_2PC_MSG_B taskA=$RESTART_2PC_TASK_A taskB=$RESTART_2PC_TASK_B"
 fi
 
 [ "$POST_RESTART_2PC_M" -eq "$POST_RESTART_2PC_BM" ] && [ "$POST_RESTART_2PC_T" -eq "$POST_RESTART_2PC_BT" ] \
@@ -1541,19 +1542,19 @@ NODE_A_KEY="$NODE_P0A_KEY"
 sleep 8
 POST_COORD_RESTART_2PC_COUNTS=$(wait_dashboard_message_task_convergence || true)
 read -r POST_COORD_RESTART_2PC_M POST_COORD_RESTART_2PC_T POST_COORD_RESTART_2PC_BM POST_COORD_RESTART_2PC_BT <<< "$POST_COORD_RESTART_2PC_COUNTS"
-COORD_RESTART_2PC_DM=$((POST_COORD_RESTART_2PC_M - PRE_COORD_RESTART_2PC_M))
-COORD_RESTART_2PC_DT=$((POST_COORD_RESTART_2PC_T - PRE_COORD_RESTART_2PC_T))
 COORD_RESTART_2PC_RESPONSE=$(cat "$COORD_RESTART_2PC_RESPONSE_FILE")
 rm -f "$COORD_RESTART_2PC_RESPONSE_FILE"
 FAILURE_WINDOW_2PC_LABELS+=("coordinator-restart")
 FAILURE_WINDOW_2PC_TEXTS+=("$COORD_RESTART_TEXT")
 FAILURE_WINDOW_2PC_TASKS+=("$COORD_RESTART_TASK")
 FAILURE_WINDOW_2PC_RESPONSES+=("$COORD_RESTART_2PC_RESPONSE")
+COORD_RESTART_2PC_COUNTS=$(wait_for_2pc_pair_exactness "$COORD_RESTART_TEXT" "$COORD_RESTART_TASK" "$COORD_RESTART_2PC_RESPONSE" || true)
+read -r COORD_RESTART_2PC_MSG_A COORD_RESTART_2PC_MSG_B COORD_RESTART_2PC_TASK_A COORD_RESTART_2PC_TASK_B <<< "$COORD_RESTART_2PC_COUNTS"
 
-if [ "$COORD_RESTART_2PC_DM" -eq "$COORD_RESTART_2PC_DT" ] && { [ "$COORD_RESTART_2PC_DM" -eq 0 ] || [ "$COORD_RESTART_2PC_DM" -eq 1 ]; }; then
-    pass "2PC during coordinator restart was atomic (msgs +$COORD_RESTART_2PC_DM tasks +$COORD_RESTART_2PC_DT)"
+if two_pc_counts_match_response "$COORD_RESTART_2PC_RESPONSE" "$COORD_RESTART_2PC_MSG_A" "$COORD_RESTART_2PC_MSG_B" "$COORD_RESTART_2PC_TASK_A" "$COORD_RESTART_2PC_TASK_B"; then
+    pass "2PC during coordinator restart was atomic (msgA=$COORD_RESTART_2PC_MSG_A msgB=$COORD_RESTART_2PC_MSG_B taskA=$COORD_RESTART_2PC_TASK_A taskB=$COORD_RESTART_2PC_TASK_B)"
 else
-    fail "2PC during coordinator restart produced torn/non-idempotent result" "response=$COORD_RESTART_2PC_RESPONSE msgs +$COORD_RESTART_2PC_DM tasks +$COORD_RESTART_2PC_DT"
+    fail "2PC during coordinator restart produced torn/non-idempotent result" "response=$COORD_RESTART_2PC_RESPONSE msgA=$COORD_RESTART_2PC_MSG_A msgB=$COORD_RESTART_2PC_MSG_B taskA=$COORD_RESTART_2PC_TASK_A taskB=$COORD_RESTART_2PC_TASK_B"
 fi
 
 [ "$POST_COORD_RESTART_2PC_M" -eq "$POST_COORD_RESTART_2PC_BM" ] && [ "$POST_COORD_RESTART_2PC_T" -eq "$POST_COORD_RESTART_2PC_BT" ] \
