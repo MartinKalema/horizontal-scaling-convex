@@ -1256,9 +1256,12 @@ pub async fn make_app(
             let committer = database.committer_client();
             let raft_state_for_apply = raft_state.clone();
             runtime.spawn_background("raft_node", async move {
+                let committer_for_entries = committer.clone();
+                let raft_state_for_entries = raft_state_for_apply.clone();
+                let committer_for_snapshots = committer.clone();
                 if let Err(e) = node
                     .run(
-                        |data| {
+                        move |data| {
                             match RaftStateMachineEntry::from_bytes(data)? {
                                 RaftStateMachineEntry::CommitDelta { envelope } => {
                                     let proposed_locally =
@@ -1270,22 +1273,18 @@ pub async fn make_app(
                                          proposed_locally={}, leader_now={}",
                                         u64::from(delta.ts),
                                         proposed_locally,
-                                        raft_state_for_apply.is_leader(),
+                                        raft_state_for_entries.is_leader(),
                                     );
-                                    // apply_replica_delta is async — use block_in_place
-                                    // since we're in the Raft loop's sync callback.
-                                    let committer = committer.clone();
-                                    common::runtime::block_in_place(|| {
-                                        let rt = tokio::runtime::Handle::current();
-                                        rt.block_on(async {
-                                            committer.apply_raft_commit_delta(delta).await.map_err(
-                                                |e| {
-                                                    anyhow::anyhow!(
-                                                        "Raft state-machine apply failed: {e:#}"
-                                                    )
-                                                },
-                                            )
-                                        })
+                                    let committer = committer_for_entries.clone();
+                                    let rt = tokio::runtime::Handle::current();
+                                    rt.block_on(async {
+                                        committer.apply_raft_commit_delta(delta).await.map_err(
+                                            |e| {
+                                                anyhow::anyhow!(
+                                                    "Raft state-machine apply failed: {e:#}"
+                                                )
+                                            },
+                                        )
                                     })?;
                                 },
                                 RaftStateMachineEntry::TwoPhasePrepare { redo } => {
@@ -1293,38 +1292,34 @@ pub async fn make_app(
                                         "Applying committed Raft 2PC prepare locally: txn={}, \
                                          leader_now={}",
                                         redo.transaction_id,
-                                        raft_state_for_apply.is_leader(),
+                                        raft_state_for_entries.is_leader(),
                                     );
-                                    let committer = committer.clone();
-                                    common::runtime::block_in_place(|| {
-                                        let rt = tokio::runtime::Handle::current();
-                                        rt.block_on(async {
-                                            committer.apply_raft_prepared_redo(redo).await.map_err(
-                                                |e| {
-                                                    anyhow::anyhow!(
-                                                        "Raft 2PC prepare apply failed: {e:#}"
-                                                    )
-                                                },
-                                            )
-                                        })
+                                    let committer = committer_for_entries.clone();
+                                    let rt = tokio::runtime::Handle::current();
+                                    rt.block_on(async {
+                                        committer.apply_raft_prepared_redo(redo).await.map_err(
+                                            |e| {
+                                                anyhow::anyhow!(
+                                                    "Raft 2PC prepare apply failed: {e:#}"
+                                                )
+                                            },
+                                        )
                                     })?;
                                 },
                             }
 
                             Ok(())
                         },
-                        |snapshot_bytes| {
+                        move |snapshot_bytes| {
                             let checkpoint =
                                 database::snapshot_checkpointer::checkpoint_from_bytes(
                                     snapshot_bytes,
                                 )?;
-                            let committer = committer.clone();
-                            common::runtime::block_in_place(|| {
-                                let rt = tokio::runtime::Handle::current();
-                                rt.block_on(async {
-                                    committer.install_snapshot(checkpoint).await?;
-                                    Ok::<_, anyhow::Error>(())
-                                })
+                            let committer = committer_for_snapshots.clone();
+                            let rt = tokio::runtime::Handle::current();
+                            rt.block_on(async {
+                                committer.install_snapshot(checkpoint).await?;
+                                Ok::<_, anyhow::Error>(())
                             })
                         },
                     )
