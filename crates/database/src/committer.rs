@@ -947,7 +947,14 @@ impl<RT: Runtime> Committer<RT> {
         let mut commit_id = 0;
         // Keep track of the commit_id that is currently being traced.
         let mut span_commit_id = None;
+        let mut deferred_prepares = VecDeque::new();
         loop {
+            if self.pending_writes.min_ts().is_none()
+                && let Some(deferred_prepare) = deferred_prepares.pop_front()
+            {
+                self.handle_deferred_prepare(deferred_prepare).await;
+                continue;
+            }
             let bump_fut = if let Some(wait) = &next_bump_wait {
                 Either::Left(
                     self.runtime
@@ -981,6 +988,11 @@ impl<RT: Runtime> Committer<RT> {
                             .saturating_sub(last_raft_nats_outbox_replay.elapsed()),
                     ),
                 )
+            } else {
+                Either::Right(std::future::pending())
+            };
+            let receive_message_fut = if deferred_prepares.is_empty() {
+                Either::Left(rx.recv())
             } else {
                 Either::Right(std::future::pending())
             };
@@ -1492,7 +1504,7 @@ impl<RT: Runtime> Committer<RT> {
                             }
                         }
                 }
-                maybe_message = rx.recv().fuse() => {
+                maybe_message = receive_message_fut.fuse() => {
                     match maybe_message {
                         None => {
                             tracing::info!("All clients have gone away, shutting down committer...");
@@ -1547,8 +1559,19 @@ impl<RT: Runtime> Committer<RT> {
                             }
                         },
                         Some(CommitterMessage::ApplyRaftPreparedRedo { redo, result }) => {
-                            let r = self.handle_raft_prepared_redo(redo);
-                            let _ = result.send(r);
+                            let deferred_prepare = DeferredPrepare::ApplyRaftPreparedRedo {
+                                redo,
+                                result,
+                            };
+                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                                Self::defer_prepare_admission(
+                                    &mut deferred_prepares,
+                                    deferred_prepare,
+                                    min_pending_ts,
+                                );
+                            } else {
+                                self.handle_deferred_prepare(deferred_prepare).await;
+                            }
                         },
                         Some(CommitterMessage::SetRaftState { raft_state, result }) => {
                             tracing::info!(
@@ -1605,10 +1628,21 @@ impl<RT: Runtime> Committer<RT> {
                             write_source,
                             result,
                         }) => {
-                            let r = self
-                                .handle_prepare(transaction_id, transaction, write_source)
-                                .await;
-                            let _ = result.send(r);
+                            let deferred_prepare = DeferredPrepare::Prepare {
+                                transaction_id,
+                                transaction,
+                                write_source,
+                                result,
+                            };
+                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                                Self::defer_prepare_admission(
+                                    &mut deferred_prepares,
+                                    deferred_prepare,
+                                    min_pending_ts,
+                                );
+                            } else {
+                                self.handle_deferred_prepare(deferred_prepare).await;
+                            }
                         },
                         Some(CommitterMessage::PrepareRemote {
                             transaction_id,
@@ -1618,15 +1652,23 @@ impl<RT: Runtime> Committer<RT> {
                             participants,
                             result,
                         }) => {
-                            let r = self.handle_prepare_remote(
+                            let deferred_prepare = DeferredPrepare::PrepareRemote {
                                 transaction_id,
                                 transaction,
                                 write_source,
                                 prepare_ts,
                                 participants,
-                            )
-                            .await;
-                            let _ = result.send(r);
+                                result,
+                            };
+                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                                Self::defer_prepare_admission(
+                                    &mut deferred_prepares,
+                                    deferred_prepare,
+                                    min_pending_ts,
+                                );
+                            } else {
+                                self.handle_deferred_prepare(deferred_prepare).await;
+                            }
                         },
                         Some(CommitterMessage::ValidateRemoteReads {
                             transaction_id,
@@ -4685,6 +4727,60 @@ impl<RT: Runtime> Committer<RT> {
         Ok(result)
     }
 
+    fn defer_prepare_admission(
+        deferred_prepares: &mut VecDeque<DeferredPrepare>,
+        deferred_prepare: DeferredPrepare,
+        min_pending_ts: Timestamp,
+    ) {
+        tracing::debug!(
+            transaction_id = %deferred_prepare.transaction_id(),
+            kind = deferred_prepare.kind(),
+            min_pending_ts = u64::from(min_pending_ts),
+            deferred_prepares = deferred_prepares.len() + 1,
+            "Deferring 2PC prepare admission behind older pending write",
+        );
+        deferred_prepares.push_back(deferred_prepare);
+    }
+
+    async fn handle_deferred_prepare(&mut self, deferred_prepare: DeferredPrepare) {
+        match deferred_prepare {
+            DeferredPrepare::ApplyRaftPreparedRedo { redo, result } => {
+                let r = self.handle_raft_prepared_redo(redo);
+                let _ = result.send(r);
+            },
+            DeferredPrepare::Prepare {
+                transaction_id,
+                transaction,
+                write_source,
+                result,
+            } => {
+                let r = self
+                    .handle_prepare(transaction_id, transaction, write_source)
+                    .await;
+                let _ = result.send(r);
+            },
+            DeferredPrepare::PrepareRemote {
+                transaction_id,
+                transaction,
+                write_source,
+                prepare_ts,
+                participants,
+                result,
+            } => {
+                let r = self
+                    .handle_prepare_remote(
+                        transaction_id,
+                        transaction,
+                        write_source,
+                        prepare_ts,
+                        participants,
+                    )
+                    .await;
+                let _ = result.send(r);
+            },
+        }
+    }
+
     fn handle_validate_remote_reads(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
@@ -6208,6 +6304,46 @@ enum CommitterMessage {
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
         result: oneshot::Sender<anyhow::Result<()>>,
     },
+}
+
+enum DeferredPrepare {
+    ApplyRaftPreparedRedo {
+        redo: crate::two_phase::TwoPhaseRedoEntry,
+        result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
+    },
+    Prepare {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: FinalTransaction,
+        write_source: WriteSource,
+        result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
+    },
+    PrepareRemote {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        transaction: crate::two_phase::ParticipantTransaction,
+        write_source: WriteSource,
+        prepare_ts: Timestamp,
+        participants: Vec<crate::partition::PartitionId>,
+        result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
+    },
+}
+
+impl DeferredPrepare {
+    fn transaction_id(&self) -> crate::two_phase::TwoPhaseTransactionId {
+        match self {
+            Self::ApplyRaftPreparedRedo { redo, .. } => redo.transaction_id(),
+            Self::Prepare { transaction_id, .. } | Self::PrepareRemote { transaction_id, .. } => {
+                transaction_id.clone()
+            },
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::ApplyRaftPreparedRedo { .. } => "raft_prepared_redo",
+            Self::Prepare { .. } => "local_prepare",
+            Self::PrepareRemote { .. } => "remote_prepare",
+        }
+    }
 }
 
 fn is_retryable_system_generated_id_conflict(
