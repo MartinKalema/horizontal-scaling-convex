@@ -146,6 +146,8 @@ pub enum TwoPhaseDecision {
         staged_at_unix_millis: Option<u64>,
         #[serde(default)]
         resolved_participants: Vec<u32>,
+        #[serde(default)]
+        fully_resolved_at_unix_millis: Option<u64>,
     },
     /// All participants prepared successfully. Commit.
     Committed {
@@ -153,6 +155,8 @@ pub enum TwoPhaseDecision {
         participants: Vec<u32>,
         #[serde(default)]
         resolved_participants: Vec<u32>,
+        #[serde(default)]
+        fully_resolved_at_unix_millis: Option<u64>,
     },
     /// A participant failed to prepare, or coordinator timed out. Rollback.
     RolledBack {
@@ -160,6 +164,8 @@ pub enum TwoPhaseDecision {
         participants: Vec<u32>,
         #[serde(default)]
         resolved_participants: Vec<u32>,
+        #[serde(default)]
+        fully_resolved_at_unix_millis: Option<u64>,
     },
 }
 
@@ -228,6 +234,7 @@ impl TwoPhaseDecision {
             transaction_digest,
             staged_at_unix_millis: Some(now_unix_millis()),
             resolved_participants: Vec::new(),
+            fully_resolved_at_unix_millis: None,
         }
     }
 
@@ -236,6 +243,7 @@ impl TwoPhaseDecision {
             commit_ts,
             participants,
             resolved_participants: Vec::new(),
+            fully_resolved_at_unix_millis: None,
         }
     }
 
@@ -244,6 +252,7 @@ impl TwoPhaseDecision {
             reason,
             participants,
             resolved_participants: Vec::new(),
+            fully_resolved_at_unix_millis: None,
         }
     }
 
@@ -272,6 +281,23 @@ impl TwoPhaseDecision {
         }
     }
 
+    pub fn fully_resolved_at_unix_millis(&self) -> Option<u64> {
+        match self {
+            Self::Staging {
+                fully_resolved_at_unix_millis,
+                ..
+            }
+            | Self::Committed {
+                fully_resolved_at_unix_millis,
+                ..
+            }
+            | Self::RolledBack {
+                fully_resolved_at_unix_millis,
+                ..
+            } => *fully_resolved_at_unix_millis,
+        }
+    }
+
     pub fn is_staging(&self) -> bool {
         matches!(self, Self::Staging { .. })
     }
@@ -296,24 +322,41 @@ impl TwoPhaseDecision {
     }
 
     pub fn mark_participant_resolved(&mut self, participant: PartitionId) {
-        let resolved = match self {
+        let (participants, resolved, fully_resolved_at_unix_millis) = match self {
             Self::Staging {
+                participants,
                 resolved_participants,
+                fully_resolved_at_unix_millis,
                 ..
             }
             | Self::Committed {
+                participants,
                 resolved_participants,
+                fully_resolved_at_unix_millis,
                 ..
             }
             | Self::RolledBack {
+                participants,
                 resolved_participants,
+                fully_resolved_at_unix_millis,
                 ..
-            } => resolved_participants,
+            } => (
+                participants,
+                resolved_participants,
+                fully_resolved_at_unix_millis,
+            ),
         };
         if !resolved.contains(&participant.0) {
             resolved.push(participant.0);
             resolved.sort_unstable();
             resolved.dedup();
+        }
+        if fully_resolved_at_unix_millis.is_none()
+            && participants
+                .iter()
+                .all(|participant| resolved.contains(participant))
+        {
+            *fully_resolved_at_unix_millis = Some(now_unix_millis());
         }
     }
 
@@ -323,11 +366,13 @@ impl TwoPhaseDecision {
                 commit_ts,
                 participants,
                 resolved_participants,
+                fully_resolved_at_unix_millis,
                 ..
             } if self.all_participants_staged() => Some(Self::Committed {
                 commit_ts: *commit_ts,
                 participants: participants.clone(),
                 resolved_participants: resolved_participants.clone(),
+                fully_resolved_at_unix_millis: *fully_resolved_at_unix_millis,
             }),
             _ => None,
         }
@@ -401,6 +446,17 @@ impl TwoPhaseDecision {
         self.participants()
             .iter()
             .all(|participant| self.resolved_participants().contains(participant))
+    }
+
+    pub fn fully_resolved_age(&self) -> Option<Duration> {
+        let resolved_at = self.fully_resolved_at_unix_millis()?;
+        let now = now_unix_millis();
+        Some(Duration::from_millis(now.saturating_sub(resolved_at)))
+    }
+
+    pub fn ready_for_gc(&self, grace: Duration) -> bool {
+        self.all_participants_resolved()
+            && self.fully_resolved_age().is_some_and(|age| age >= grace)
     }
 
     pub fn staged_read_policy(&self) -> StagedTransactionReadPolicy {
@@ -1784,10 +1840,12 @@ mod tests {
                 commit_ts,
                 participants,
                 resolved_participants,
+                fully_resolved_at_unix_millis,
             } => {
                 assert_eq!(commit_ts, 12345);
                 assert_eq!(participants, vec![0, 1]);
                 assert_eq!(resolved_participants, vec![0]);
+                assert_eq!(fully_resolved_at_unix_millis, None);
             },
             _ => panic!("Wrong variant"),
         }
@@ -1825,6 +1883,7 @@ mod tests {
                 transaction_digest,
                 staged_at_unix_millis,
                 resolved_participants,
+                fully_resolved_at_unix_millis,
             } => {
                 assert_eq!(commit_ts, 12345);
                 assert_eq!(participants, vec![0, 1]);
@@ -1838,6 +1897,7 @@ mod tests {
                 assert_eq!(Some(&transaction_digest), decision.transaction_digest(),);
                 assert!(staged_at_unix_millis.is_some());
                 assert!(resolved_participants.is_empty());
+                assert_eq!(fully_resolved_at_unix_millis, None);
             },
             _ => panic!("Wrong variant"),
         }
@@ -1941,6 +2001,26 @@ mod tests {
         assert!(!decision.all_participants_resolved());
         decision.mark_participant_resolved(PartitionId(1));
         assert!(decision.all_participants_resolved());
+    }
+
+    #[test]
+    fn test_decision_records_fully_resolved_time_for_gc() {
+        let mut decision = TwoPhaseDecision::committed(12345, vec![0, 1]);
+
+        assert!(!decision.all_participants_resolved());
+        assert_eq!(decision.fully_resolved_at_unix_millis(), None);
+        assert!(!decision.ready_for_gc(Duration::ZERO));
+
+        decision.mark_participant_resolved(PartitionId(0));
+        assert!(!decision.all_participants_resolved());
+        assert_eq!(decision.fully_resolved_at_unix_millis(), None);
+        assert!(!decision.ready_for_gc(Duration::ZERO));
+
+        decision.mark_participant_resolved(PartitionId(1));
+        assert!(decision.all_participants_resolved());
+        assert!(decision.fully_resolved_at_unix_millis().is_some());
+        assert!(decision.ready_for_gc(Duration::ZERO));
+        assert!(!decision.ready_for_gc(Duration::from_secs(60)));
     }
 
     #[test]
@@ -2182,6 +2262,7 @@ mod tests {
                 commit_ts,
                 participants,
                 resolved_participants,
+                ..
             }) = result
             else {
                 panic!("expected committed recovery");

@@ -6915,6 +6915,57 @@ async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
     Ok(())
 }
 
+#[test]
+fn test_watcher_gc_deletes_only_fully_resolved_decisions_after_grace() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    td.run_until(async move {
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+        let partial_txn = TwoPhaseTransactionId("partial-gc-test".to_string());
+        let full_txn = TwoPhaseTransactionId("full-gc-test".to_string());
+
+        let mut partial = TwoPhaseDecision::committed(100, vec![0, 1]);
+        partial.mark_participant_resolved(PartitionId(0));
+        decision_log.write_decision(&partial_txn, &partial).await?;
+
+        let mut full = TwoPhaseDecision::committed(200, vec![0, 1]);
+        full.mark_participant_resolved(PartitionId(0));
+        full.mark_participant_resolved(PartitionId(1));
+        assert!(full.ready_for_gc(Duration::ZERO));
+        decision_log.write_decision(&full_txn, &full).await?;
+
+        assert!(
+            !crate::two_phase_watcher::garbage_collect_resolved_decision(
+                decision_log.as_ref(),
+                &partial_txn,
+                &partial,
+                Duration::ZERO,
+            )
+            .await?,
+            "partial decisions must remain recoverable",
+        );
+        assert!(
+            crate::two_phase_watcher::garbage_collect_resolved_decision(
+                decision_log.as_ref(),
+                &full_txn,
+                &full,
+                Duration::ZERO,
+            )
+            .await?,
+            "fully resolved decisions should be removed after the grace period",
+        );
+
+        assert!(
+            decision_log.get_decision(&partial_txn).await?.is_some(),
+            "unresolved decisions must stay in the decision log",
+        );
+        assert!(
+            decision_log.get_decision(&full_txn).await?.is_none(),
+            "fully resolved decisions should be deleted",
+        );
+        Ok(())
+    })
+}
+
 #[convex_macro::test_runtime]
 async fn test_watcher_commits_prepared_redo_when_final_decision_was_already_resolved(
     rt: TestRuntime,

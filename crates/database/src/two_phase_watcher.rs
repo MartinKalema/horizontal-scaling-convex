@@ -22,12 +22,15 @@ use crate::{
     two_phase::{
         StagingRecoveryResult,
         TwoPhaseDecision,
+        TwoPhaseDecisionLog,
         TwoPhaseTransactionId,
         PREPARE_TIMEOUT_SECS,
         TWO_PHASE_KV_BUCKET,
         TWO_PHASE_KV_PREFIX,
     },
 };
+
+const RESOLVED_DECISION_GC_GRACE: Duration = Duration::from_secs(60);
 
 async fn apply_final_decision_for_local_partition(
     committer: &CommitterClient,
@@ -100,6 +103,24 @@ async fn apply_final_decision_for_local_partition(
     }
 }
 
+pub async fn garbage_collect_resolved_decision(
+    decision_log: &dyn TwoPhaseDecisionLog,
+    txn_id: &TwoPhaseTransactionId,
+    decision: &TwoPhaseDecision,
+    grace: Duration,
+) -> anyhow::Result<bool> {
+    if !decision.ready_for_gc(grace) {
+        return Ok(false);
+    }
+    decision_log.delete_decision(txn_id).await?;
+    tracing::info!(
+        "2PC Watcher: deleted fully resolved decision for txn={} after {:?} grace",
+        txn_id,
+        grace,
+    );
+    Ok(true)
+}
+
 /// Apply an existing durable 2PC decision to this local participant.
 pub async fn resolve_decision_for_local_partition(
     committer: &CommitterClient,
@@ -166,10 +187,20 @@ pub async fn resolve_decision_for_local_partition(
             .await?
             && updated.all_participants_resolved()
         {
-            tracing::info!(
-                "2PC Watcher: fully resolved decision for txn={} retained for follower recovery",
-                txn_id,
-            );
+            if !garbage_collect_resolved_decision(
+                decision_log.as_ref(),
+                &txn_id,
+                &updated,
+                RESOLVED_DECISION_GC_GRACE,
+            )
+            .await?
+            {
+                tracing::info!(
+                    "2PC Watcher: fully resolved decision for txn={} retained for follower \
+                     recovery grace",
+                    txn_id,
+                );
+            }
         }
     }
     Ok(resolved)
