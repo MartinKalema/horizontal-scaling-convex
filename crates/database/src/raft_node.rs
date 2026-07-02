@@ -109,6 +109,22 @@ pub enum RaftMessage {
     Shutdown,
 }
 
+struct StateMachineApplyJob {
+    index: u64,
+    data: Vec<u8>,
+}
+
+struct StateMachineApplyResult {
+    index: u64,
+    result: anyhow::Result<()>,
+}
+
+enum CommittedEntryAction {
+    WaitForLocalApply,
+    MarkApplied(u64),
+    Apply(StateMachineApplyJob),
+}
+
 /// Callbacks for leadership changes.
 /// TiKV's pattern: the Raft node notifies the application when this node
 /// becomes leader or loses leadership, so the application can start/stop
@@ -280,15 +296,10 @@ impl RaftNode {
         Ok(())
     }
 
-    fn process_committed_entry(
-        &mut self,
-        entry: Entry,
-        on_committed: &mut impl FnMut(&[u8]) -> anyhow::Result<()>,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
+    fn classify_committed_entry(&mut self, entry: Entry) -> anyhow::Result<CommittedEntryAction> {
         let index = entry.index;
         if entry.data.is_empty() {
-            self.record_applied_index(index)?;
-            return Ok(None);
+            return Ok(CommittedEntryAction::MarkApplied(index));
         }
 
         match entry.get_entry_type() {
@@ -301,13 +312,12 @@ impl RaftNode {
                         return Err(e);
                     }
                 }
-                self.record_applied_index(index)?;
-                Ok(None)
+                Ok(CommittedEntryAction::MarkApplied(index))
             },
             EntryType::EntryNormal => {
                 if let Some(tx) = self.pending_proposals.remove(&index) {
                     if tx.send(RaftProposalResult::Committed { index }).is_ok() {
-                        return Ok(None);
+                        return Ok(CommittedEntryAction::WaitForLocalApply);
                     }
                     tracing::warn!(
                         "Local Raft proposal at index {index} was committed but waiter dropped; \
@@ -315,11 +325,24 @@ impl RaftNode {
                     );
                 }
 
-                on_committed(&entry.data)?;
-                self.record_applied_index(index)?;
-                Ok(Some(entry.data.to_vec()))
+                Ok(CommittedEntryAction::Apply(StateMachineApplyJob {
+                    index,
+                    data: entry.data.to_vec(),
+                }))
             },
         }
+    }
+
+    fn finish_state_machine_apply(
+        &mut self,
+        applied: StateMachineApplyResult,
+        pending_state_machine_applies: &mut BTreeSet<u64>,
+    ) -> anyhow::Result<()> {
+        pending_state_machine_applies.remove(&applied.index);
+        applied.result?;
+        self.record_applied_index(applied.index)?;
+        self.raw_node.advance_apply_to(self.durable_applied_index);
+        Ok(())
     }
 
     fn process_mailbox_message(
@@ -327,6 +350,7 @@ impl RaftNode {
         msg: RaftMessage,
         recent_peer_responses: &mut HashMap<u64, Instant>,
         leader_serving_lease_duration: Duration,
+        pending_local_applies: &mut BTreeSet<u64>,
     ) -> anyhow::Result<bool> {
         match msg {
             RaftMessage::Raft(msg) => {
@@ -368,6 +392,10 @@ impl RaftNode {
             },
             RaftMessage::MarkApplied { index, result_tx } => {
                 let result = self.record_applied_index(index);
+                if result.is_ok() {
+                    pending_local_applies.remove(&index);
+                    self.raw_node.advance_apply_to(self.durable_applied_index);
+                }
                 let _ = result_tx.send(result);
                 Ok(false)
             },
@@ -390,13 +418,35 @@ impl RaftNode {
     /// tick → receive messages → propose → process ready → advance.
     pub async fn run(
         &mut self,
-        mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()>,
+        mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()> + Send + 'static,
         mut on_snapshot: impl FnMut(&[u8]) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let tick_interval = RaftNodeConfig::TICK_INTERVAL;
         let leader_serving_lease_duration = self.config.leader_serving_lease_duration();
         let mut recent_peer_responses = HashMap::new();
         let mut last_tick = Instant::now();
+        let mut pending_state_machine_applies = BTreeSet::new();
+        let mut pending_local_applies = BTreeSet::new();
+        let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<StateMachineApplyJob>();
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<StateMachineApplyResult>();
+        let _apply_worker = tokio::task::spawn_blocking(move || {
+            while let Some(job) = apply_rx.blocking_recv() {
+                let result = on_committed(&job.data);
+                let should_stop = result.is_err();
+                if applied_tx
+                    .send(StateMachineApplyResult {
+                        index: job.index,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if should_stop {
+                    break;
+                }
+            }
+        });
 
         loop {
             // Receive all pending messages (non-blocking).
@@ -409,6 +459,7 @@ impl RaftNode {
                             msg,
                             &mut recent_peer_responses,
                             leader_serving_lease_duration,
+                            &mut pending_local_applies,
                         )? {
                             return Ok(());
                         }
@@ -421,6 +472,31 @@ impl RaftNode {
                 }
             }
 
+            let mut handled_apply_result = false;
+            loop {
+                match applied_rx.try_recv() {
+                    Ok(applied) => {
+                        handled_apply_result = true;
+                        if let Err(e) = self
+                            .finish_state_machine_apply(applied, &mut pending_state_machine_applies)
+                        {
+                            tracing::error!("Failed to finish state-machine apply: {e}");
+                            return Err(e);
+                        }
+                    },
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        if pending_state_machine_applies.is_empty() {
+                            break;
+                        }
+                        anyhow::bail!(
+                            "Raft state-machine apply worker stopped with {} pending applies",
+                            pending_state_machine_applies.len(),
+                        );
+                    },
+                }
+            }
+
             let should_tick = last_tick.elapsed() >= tick_interval;
             if should_tick {
                 self.tick_election_and_heartbeat(&mut last_tick);
@@ -428,6 +504,9 @@ impl RaftNode {
 
             let mut processed_ready = false;
             while self.raw_node.has_ready() {
+                if !pending_state_machine_applies.is_empty() || !pending_local_applies.is_empty() {
+                    break;
+                }
                 processed_ready = true;
 
                 let replication_health = {
@@ -605,16 +684,28 @@ impl RaftNode {
                     }
                 }
 
-                // 6. Apply committed entries to state machine.
+                let mut applied_indexes = Vec::new();
+                let mut apply_jobs = Vec::new();
+
+                // 6. Classify committed entries. Entries that require Convex
+                // state-machine work are offloaded after append/persist progress
+                // has advanced.
                 for entry in ready.take_committed_entries() {
-                    if let Err(e) = self.process_committed_entry(entry, &mut on_committed) {
-                        tracing::error!("Failed to apply committed entry: {e}");
-                        return Err(e);
+                    let index = entry.index;
+                    match self.classify_committed_entry(entry)? {
+                        CommittedEntryAction::WaitForLocalApply => {
+                            pending_local_applies.insert(index);
+                        },
+                        CommittedEntryAction::MarkApplied(index) => applied_indexes.push(index),
+                        CommittedEntryAction::Apply(job) => apply_jobs.push(job),
                     }
                 }
 
-                // 7. Advance the Raft state.
-                let mut light_rd = self.raw_node.advance(ready);
+                // 7. Advance append/persist state without claiming
+                // state-machine apply completion. `advance_apply_to` is called
+                // only when local MarkApplied or the apply worker records a
+                // durable applied index.
+                let mut light_rd = self.raw_node.advance_append(ready);
 
                 // Update commit index in persisted hard state.
                 if let Some(commit) = light_rd.commit_index() {
@@ -634,18 +725,33 @@ impl RaftNode {
                     }
                 }
 
-                // Apply remaining committed entries.
+                // Classify remaining committed entries.
                 for entry in light_rd.take_committed_entries() {
-                    if let Err(e) = self.process_committed_entry(entry, &mut on_committed) {
-                        tracing::error!("Failed to apply light committed entry: {e}");
-                        return Err(e);
+                    let index = entry.index;
+                    match self.classify_committed_entry(entry)? {
+                        CommittedEntryAction::WaitForLocalApply => {
+                            pending_local_applies.insert(index);
+                        },
+                        CommittedEntryAction::MarkApplied(index) => applied_indexes.push(index),
+                        CommittedEntryAction::Apply(job) => apply_jobs.push(job),
                     }
                 }
 
-                self.raw_node.advance_apply();
+                for index in applied_indexes {
+                    self.record_applied_index(index)?;
+                }
+                if !apply_jobs.is_empty() {
+                    for job in apply_jobs {
+                        pending_state_machine_applies.insert(job.index);
+                        if apply_tx.send(job).is_err() {
+                            anyhow::bail!("Raft state-machine apply worker stopped");
+                        }
+                    }
+                }
+                self.raw_node.advance_apply_to(self.durable_applied_index);
             }
 
-            if handled_message || should_tick || processed_ready {
+            if handled_message || handled_apply_result || should_tick || processed_ready {
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -661,8 +767,27 @@ impl RaftNode {
                         msg,
                         &mut recent_peer_responses,
                         leader_serving_lease_duration,
+                        &mut pending_local_applies,
                     )? {
                         return Ok(());
+                    }
+                }
+                maybe_applied = applied_rx.recv() => {
+                    let Some(applied) = maybe_applied else {
+                        if pending_state_machine_applies.is_empty() {
+                            continue;
+                        }
+                        anyhow::bail!(
+                            "Raft state-machine apply worker stopped with {} pending applies",
+                            pending_state_machine_applies.len(),
+                        );
+                    };
+                    if let Err(e) = self.finish_state_machine_apply(
+                        applied,
+                        &mut pending_state_machine_applies,
+                    ) {
+                        tracing::error!("Failed to finish state-machine apply: {e}");
+                        return Err(e);
                     }
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_tick)) => {
@@ -736,18 +861,37 @@ impl RaftNode {
         } else {
             self.storage.append_entries(ready.entries())?;
         }
+        let mut applied_indexes = Vec::new();
+        let mut apply_jobs = Vec::new();
         for entry in ready.take_committed_entries() {
-            if let Some(data) = self.process_committed_entry(entry, &mut on_committed)? {
-                committed.push(data);
+            match self.classify_committed_entry(entry)? {
+                CommittedEntryAction::WaitForLocalApply => {},
+                CommittedEntryAction::MarkApplied(index) => applied_indexes.push(index),
+                CommittedEntryAction::Apply(job) => apply_jobs.push(job),
             }
         }
-        let mut light_rd = self.raw_node.advance(ready);
+        let mut light_rd = self.raw_node.advance_append(ready);
+        if let Some(commit) = light_rd.commit_index() {
+            let mut hs = self.storage.hard_state().unwrap_or_default();
+            hs.set_commit(commit);
+            self.storage.set_hardstate(&hs)?;
+        }
         for entry in light_rd.take_committed_entries() {
-            if let Some(data) = self.process_committed_entry(entry, &mut on_committed)? {
-                committed.push(data);
+            match self.classify_committed_entry(entry)? {
+                CommittedEntryAction::WaitForLocalApply => {},
+                CommittedEntryAction::MarkApplied(index) => applied_indexes.push(index),
+                CommittedEntryAction::Apply(job) => apply_jobs.push(job),
             }
         }
-        self.raw_node.advance_apply();
+        for index in applied_indexes {
+            self.record_applied_index(index)?;
+        }
+        for job in apply_jobs {
+            on_committed(&job.data)?;
+            self.record_applied_index(job.index)?;
+            committed.push(job.data);
+        }
+        self.raw_node.advance_apply_to(self.durable_applied_index);
         Ok(committed)
     }
 
@@ -872,6 +1016,68 @@ mod tests {
 
         tx.send(RaftMessage::Shutdown)?;
         run_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_loop_handles_mailbox_while_state_machine_apply_is_blocked(
+    ) -> anyhow::Result<()> {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+
+        let engine = test_engine();
+        {
+            let storage =
+                ConvexRaftStorage::new(PartitionId(0), engine.clone(), 1, vec![1], None).unwrap();
+            let mut entry = Entry::default();
+            entry.set_index(1);
+            entry.set_term(1);
+            entry.set_data(b"blocked apply".to_vec().into());
+
+            let mut hs = HardState::default();
+            hs.set_term(1);
+            hs.set_commit(1);
+            storage.append_entries_and_hardstate(&[entry], &hs).unwrap();
+            assert_eq!(storage.applied_index().unwrap(), 0);
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel();
+        let run_task = tokio::spawn(async move {
+            let mut entered_tx = Some(entered_tx);
+            node.run(
+                move |_| {
+                    if let Some(entered_tx) = entered_tx.take() {
+                        let _ = entered_tx.send(());
+                    }
+                    unblock_rx.recv().map_err(|_| {
+                        anyhow::anyhow!("blocked apply test unblock channel closed")
+                    })?;
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("state-machine apply callback did not start"))??;
+        tx.send(RaftMessage::Shutdown)?;
+
+        tokio::time::timeout(Duration::from_secs(1), run_task)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("Raft run loop did not process shutdown while apply blocked")
+            })???;
+        unblock_tx.send(())?;
         Ok(())
     }
 
