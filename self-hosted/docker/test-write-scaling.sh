@@ -494,12 +494,97 @@ query_with_args() {
 jval() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']['$1']))" <<< "$2"; }
 jtotal() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" <<< "$1"; }
 
+dashboard_message_task_counts_on_nodes() {
+    local dash_a
+    local dash_b
+    dash_a=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+    dash_b=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
+    echo "$(jval messages "$dash_a") $(jval tasks "$dash_a") $(jval messages "$dash_b") $(jval tasks "$dash_b")"
+}
+
+wait_dashboard_message_task_convergence() {
+    local attempts="${1:-30}"
+    local counts="0 0 0 0"
+    local msg_a
+    local task_a
+    local msg_b
+    local task_b
+
+    for _ in $(seq 1 "$attempts"); do
+        counts=$(dashboard_message_task_counts_on_nodes 2>/dev/null || echo "$counts")
+        read -r msg_a task_a msg_b task_b <<< "$counts"
+        if [ "$msg_a" -eq "$msg_b" ] && [ "$task_a" -eq "$task_b" ]; then
+            echo "$counts"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "$counts"
+    return 1
+}
+
 count_message_text() {
     jtotal "$(query_with_args "$1" "$2" "messages:countMessagesByText" "{\"text\":\"$3\"}")"
 }
 
 count_task_title() {
     jtotal "$(query_with_args "$1" "$2" "messages:countTasksByTitle" "{\"title\":\"$3\"}")"
+}
+
+count_2pc_pair_on_nodes() {
+    local text="$1"
+    local task="$2"
+    local msg_a
+    local msg_b
+    local task_a
+    local task_b
+    msg_a=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$text")
+    msg_b=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$text")
+    task_a=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$task")
+    task_b=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$task")
+    echo "$msg_a $msg_b $task_a $task_b"
+}
+
+two_pc_counts_match_response() {
+    local response="$1"
+    local msg_a="$2"
+    local msg_b="$3"
+    local task_a="$4"
+    local task_b="$5"
+
+    if echo "$response" | grep -q '"status":"success"'; then
+        [ "$msg_a" -eq 1 ] && [ "$msg_b" -eq 1 ] && [ "$task_a" -eq 1 ] && [ "$task_b" -eq 1 ]
+        return $?
+    fi
+
+    [ "$msg_a" -eq "$msg_b" ] && [ "$msg_a" -eq "$task_a" ] && [ "$msg_a" -eq "$task_b" ] \
+        && { [ "$msg_a" -eq 0 ] || [ "$msg_a" -eq 1 ]; }
+}
+
+wait_for_2pc_pair_exactness() {
+    local text="$1"
+    local task="$2"
+    local response="$3"
+    local attempts="${4:-30}"
+    local counts="0 0 0 0"
+    local msg_a
+    local msg_b
+    local task_a
+    local task_b
+
+    for _ in $(seq 1 "$attempts"); do
+        counts=$(count_2pc_pair_on_nodes "$text" "$task" 2>/dev/null || echo "$counts")
+        read -r msg_a msg_b task_a task_b <<< "$counts"
+        if two_pc_counts_match_response "$response" "$msg_a" "$msg_b" "$task_a" "$task_b"; then
+            echo "$counts"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "$counts"
+    return 1
 }
 
 latest_membership_log() {
@@ -1388,12 +1473,8 @@ NODE_B_KEY="$NODE_P1A_KEY"
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
 
 sleep 8
-POST_RESTART_2PC_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
-POST_RESTART_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
-POST_RESTART_2PC_M=$(jval messages "$POST_RESTART_2PC_A")
-POST_RESTART_2PC_T=$(jval tasks "$POST_RESTART_2PC_A")
-POST_RESTART_2PC_BM=$(jval messages "$POST_RESTART_2PC_B")
-POST_RESTART_2PC_BT=$(jval tasks "$POST_RESTART_2PC_B")
+POST_RESTART_2PC_COUNTS=$(wait_dashboard_message_task_convergence || true)
+read -r POST_RESTART_2PC_M POST_RESTART_2PC_T POST_RESTART_2PC_BM POST_RESTART_2PC_BT <<< "$POST_RESTART_2PC_COUNTS"
 RESTART_2PC_DM=$((POST_RESTART_2PC_M - PRE_RESTART_2PC_M))
 RESTART_2PC_DT=$((POST_RESTART_2PC_T - PRE_RESTART_2PC_T))
 RESTART_2PC_RESPONSE=$(cat "$RESTART_2PC_RESPONSE_FILE")
@@ -1446,12 +1527,8 @@ NODE_A_KEY="$NODE_P0A_KEY"
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
 
 sleep 8
-POST_COORD_RESTART_2PC_A=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
-POST_COORD_RESTART_2PC_B=$(query_api "$NODE_B_URL" "$NODE_B_KEY" "messages:dashboard")
-POST_COORD_RESTART_2PC_M=$(jval messages "$POST_COORD_RESTART_2PC_A")
-POST_COORD_RESTART_2PC_T=$(jval tasks "$POST_COORD_RESTART_2PC_A")
-POST_COORD_RESTART_2PC_BM=$(jval messages "$POST_COORD_RESTART_2PC_B")
-POST_COORD_RESTART_2PC_BT=$(jval tasks "$POST_COORD_RESTART_2PC_B")
+POST_COORD_RESTART_2PC_COUNTS=$(wait_dashboard_message_task_convergence || true)
+read -r POST_COORD_RESTART_2PC_M POST_COORD_RESTART_2PC_T POST_COORD_RESTART_2PC_BM POST_COORD_RESTART_2PC_BT <<< "$POST_COORD_RESTART_2PC_COUNTS"
 COORD_RESTART_2PC_DM=$((POST_COORD_RESTART_2PC_M - PRE_COORD_RESTART_2PC_M))
 COORD_RESTART_2PC_DT=$((POST_COORD_RESTART_2PC_T - PRE_COORD_RESTART_2PC_T))
 COORD_RESTART_2PC_RESPONSE=$(cat "$COORD_RESTART_2PC_RESPONSE_FILE")
@@ -1487,20 +1564,15 @@ for i in "${!FAILURE_WINDOW_2PC_LABELS[@]}"; do
     task="${FAILURE_WINDOW_2PC_TASKS[$i]}"
     response="${FAILURE_WINDOW_2PC_RESPONSES[$i]}"
 
-    MSG_A=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$text")
-    MSG_B=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$text")
-    TASK_A=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$task")
-    TASK_B=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$task")
-    if echo "$response" | grep -q '"status":"success"'; then
-        if [ "$MSG_A" -ne 1 ] || [ "$MSG_B" -ne 1 ] || [ "$TASK_A" -ne 1 ] || [ "$TASK_B" -ne 1 ]; then
-            FAILURE_EXACTNESS_OK=false
-            FAILURE_EXACTNESS_DETAILS="$FAILURE_EXACTNESS_DETAILS [$label success msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
-        fi
-    elif [ "$MSG_A" -eq "$MSG_B" ] && [ "$MSG_A" -eq "$TASK_A" ] && [ "$MSG_A" -eq "$TASK_B" ] && { [ "$MSG_A" -eq 0 ] || [ "$MSG_A" -eq 1 ]; }; then
-        :
-    else
+    COUNTS=$(wait_for_2pc_pair_exactness "$text" "$task" "$response" || true)
+    read -r MSG_A MSG_B TASK_A TASK_B <<< "$COUNTS"
+    if ! two_pc_counts_match_response "$response" "$MSG_A" "$MSG_B" "$TASK_A" "$TASK_B"; then
         FAILURE_EXACTNESS_OK=false
-        FAILURE_EXACTNESS_DETAILS="$FAILURE_EXACTNESS_DETAILS [$label ambiguous msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B response=$response]"
+        if echo "$response" | grep -q '"status":"success"'; then
+            FAILURE_EXACTNESS_DETAILS="$FAILURE_EXACTNESS_DETAILS [$label success msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
+        else
+            FAILURE_EXACTNESS_DETAILS="$FAILURE_EXACTNESS_DETAILS [$label ambiguous msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B response=$response]"
+        fi
     fi
 done
 
@@ -1580,20 +1652,15 @@ for i in "${!NATS_FLAP_LABELS[@]}"; do
     task="${NATS_FLAP_TASKS[$i]}"
     response="${NATS_FLAP_RESPONSES[$i]}"
 
-    MSG_A=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$text")
-    MSG_B=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$text")
-    TASK_A=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$task")
-    TASK_B=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$task")
-    if echo "$response" | grep -q '"status":"success"'; then
-        if [ "$MSG_A" -ne 1 ] || [ "$MSG_B" -ne 1 ] || [ "$TASK_A" -ne 1 ] || [ "$TASK_B" -ne 1 ]; then
-            NATS_FLAP_EXACTNESS_OK=false
-            NATS_FLAP_EXACTNESS_DETAILS="$NATS_FLAP_EXACTNESS_DETAILS [$label success msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
-        fi
-    elif [ "$MSG_A" -eq "$MSG_B" ] && [ "$MSG_A" -eq "$TASK_A" ] && [ "$MSG_A" -eq "$TASK_B" ] && { [ "$MSG_A" -eq 0 ] || [ "$MSG_A" -eq 1 ]; }; then
-        :
-    else
+    COUNTS=$(wait_for_2pc_pair_exactness "$text" "$task" "$response" || true)
+    read -r MSG_A MSG_B TASK_A TASK_B <<< "$COUNTS"
+    if ! two_pc_counts_match_response "$response" "$MSG_A" "$MSG_B" "$TASK_A" "$TASK_B"; then
         NATS_FLAP_EXACTNESS_OK=false
-        NATS_FLAP_EXACTNESS_DETAILS="$NATS_FLAP_EXACTNESS_DETAILS [$label ambiguous msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B response=$response]"
+        if echo "$response" | grep -q '"status":"success"'; then
+            NATS_FLAP_EXACTNESS_DETAILS="$NATS_FLAP_EXACTNESS_DETAILS [$label success msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
+        else
+            NATS_FLAP_EXACTNESS_DETAILS="$NATS_FLAP_EXACTNESS_DETAILS [$label ambiguous msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B response=$response]"
+        fi
     fi
 done
 
@@ -1646,10 +1713,8 @@ NODE_B_KEY="$NODE_P1A_KEY"
 (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
 
 sleep 8
-POST_ACK_MSG_A=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$POST_ACK_TEXT")
-POST_ACK_MSG_B=$(count_message_text "$NODE_B_URL" "$NODE_B_KEY" "$POST_ACK_TEXT")
-POST_ACK_TASK_A=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$POST_ACK_TASK")
-POST_ACK_TASK_B=$(count_task_title "$NODE_B_URL" "$NODE_B_KEY" "$POST_ACK_TASK")
+POST_ACK_COUNTS=$(wait_for_2pc_pair_exactness "$POST_ACK_TEXT" "$POST_ACK_TASK" "$POST_ACK_RESPONSE" || true)
+read -r POST_ACK_MSG_A POST_ACK_MSG_B POST_ACK_TASK_A POST_ACK_TASK_B <<< "$POST_ACK_COUNTS"
 
 [ "$POST_ACK_MSG_A" -eq 1 ] && [ "$POST_ACK_MSG_B" -eq 1 ] && \
     [ "$POST_ACK_TASK_A" -eq 1 ] && [ "$POST_ACK_TASK_B" -eq 1 ] \
