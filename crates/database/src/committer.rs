@@ -200,6 +200,7 @@ const INITIAL_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
 const RAFT_NATS_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 const RAFT_NATS_OUTBOX_KEY_PREFIX: &str = "raft_nats_outbox/";
+const MAX_APPLIED_DATA_ORIGIN_TIMESTAMPS_PER_PARTITION: usize = 1024;
 
 type LegacyRaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
 
@@ -275,6 +276,27 @@ impl AppliedDataDeltaIds {
     fn insert_transport_id(&mut self, transport_id: ReplicationTransportId) {
         self.transport_stream_sequences
             .insert(transport_id.stream_sequence());
+    }
+
+    fn prune_origin_timestamps_below_watermarks(
+        &mut self,
+        watermarks: &BTreeMap<crate::partition::PartitionId, Timestamp>,
+    ) {
+        self.origin_timestamps.retain(|partition, timestamps| {
+            let Some(watermark) = watermarks.get(partition).copied() else {
+                return !timestamps.is_empty();
+            };
+            while timestamps.len() > MAX_APPLIED_DATA_ORIGIN_TIMESTAMPS_PER_PARTITION {
+                let Some(oldest) = timestamps.first().copied() else {
+                    break;
+                };
+                if oldest > watermark {
+                    break;
+                }
+                timestamps.remove(&oldest);
+            }
+            !timestamps.is_empty()
+        });
     }
 }
 
@@ -983,6 +1005,9 @@ impl<RT: Runtime> Committer<RT> {
         applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         applied_data_delta_ids: AppliedDataDeltaIds,
     ) -> CommitterClient {
+        let mut applied_data_delta_ids = applied_data_delta_ids;
+        applied_data_delta_ids
+            .prune_origin_timestamps_below_watermarks(&applied_data_delta_watermarks);
         let persistence_reader = persistence.reader();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
         let snapshot_reader = snapshot_manager.reader();
@@ -1488,6 +1513,10 @@ impl<RT: Runtime> Committer<RT> {
                                     &self.applied_data_delta_ids,
                                     applied_ids,
                                 );
+                                self.applied_data_delta_ids
+                                    .prune_origin_timestamps_below_watermarks(
+                                        &self.applied_data_delta_watermarks,
+                                    );
                                 let applied_data_delta_ids_json =
                                     applied_data_delta_ids_to_json(&self.applied_data_delta_ids);
                                 self.persistence
@@ -4105,6 +4134,11 @@ impl<RT: Runtime> Committer<RT> {
                 if let Some(transport_id) = transport_id {
                     ids.insert_transport_id(transport_id);
                 }
+                ids.prune_origin_timestamps_below_watermarks(
+                    updated_applied_data_delta_watermarks
+                        .as_ref()
+                        .unwrap_or(&self.applied_data_delta_watermarks),
+                );
                 ids
             });
         if let Some(source_partition) = delta.source_partition {
@@ -4131,6 +4165,8 @@ impl<RT: Runtime> Committer<RT> {
             self.applied_data_delta_ids
                 .insert_transport_id(transport_id);
         }
+        self.applied_data_delta_ids
+            .prune_origin_timestamps_below_watermarks(&self.applied_data_delta_watermarks);
         let raft_nats_outbox_delta = (mode == ReplicaDeltaApplyMode::FullRaftState
             && delta.source_partition.is_some())
         .then(|| delta.clone());
@@ -6519,7 +6555,10 @@ fn is_retryable_system_generated_id_conflict(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{
+            BTreeMap,
+            BTreeSet,
+        },
         str::FromStr,
         sync::{
             atomic::{
@@ -6569,8 +6608,11 @@ mod tests {
         is_retryable_system_generated_id_conflict,
         remap_index_metadata_update,
         replica_delta_timestamps,
+        AppliedDataDeltaIds,
         Committer,
+        OrderedDedupeState,
         RaftNatsOutboxRecordStorage,
+        MAX_APPLIED_DATA_ORIGIN_TIMESTAMPS_PER_PARTITION,
         RAFT_NATS_OUTBOX_KEY_PREFIX,
     };
     use crate::{
@@ -6578,6 +6620,7 @@ mod tests {
             CommitDelta,
             DistributedLog,
             ReplicationMessage,
+            ReplicationTransportId,
         },
         nats_distributed_log::DeltaEnvelope,
         partition::PartitionId,
@@ -6624,6 +6667,80 @@ mod tests {
         fn published(&self) -> Vec<Timestamp> {
             self.published.lock().clone()
         }
+    }
+
+    #[test]
+    fn ordered_dedupe_state_compacts_contiguous_stream_sequences() {
+        let mut state = OrderedDedupeState::default();
+
+        state.insert(1);
+        state.insert(3);
+        assert_eq!(state.compacted_watermark, 1);
+        assert_eq!(state.exact_ids, BTreeSet::from([3]));
+
+        state.insert(2);
+        assert_eq!(state.compacted_watermark, 3);
+        assert!(state.exact_ids.is_empty());
+        assert!(state.contains(1));
+        assert!(state.contains(3));
+
+        state.insert(5);
+        assert_eq!(state.compacted_watermark, 3);
+        assert_eq!(state.exact_ids, BTreeSet::from([5]));
+
+        state.insert(4);
+        assert_eq!(state.compacted_watermark, 5);
+        assert!(state.exact_ids.is_empty());
+        assert!(state.contains(5));
+    }
+
+    #[test]
+    fn applied_data_delta_origin_ids_prune_below_watermark_with_bounded_tail() -> anyhow::Result<()>
+    {
+        let mut ids = AppliedDataDeltaIds::default();
+        let partition = PartitionId(1);
+        let count = MAX_APPLIED_DATA_ORIGIN_TIMESTAMPS_PER_PARTITION + 128;
+        for ts in 1..=count {
+            ids.insert_origin_timestamp(partition, Timestamp::try_from(ts as u64)?);
+        }
+
+        let mut watermarks = BTreeMap::new();
+        watermarks.insert(partition, Timestamp::try_from(count as u64)?);
+        ids.prune_origin_timestamps_below_watermarks(&watermarks);
+
+        let retained = ids
+            .origin_timestamps
+            .get(&partition)
+            .expect("partition should keep bounded origin dedupe tail");
+        assert_eq!(
+            retained.len(),
+            MAX_APPLIED_DATA_ORIGIN_TIMESTAMPS_PER_PARTITION
+        );
+        assert_eq!(
+            retained.first().copied(),
+            Some(Timestamp::try_from(129u64)?),
+            "oldest origin IDs below the watermark should be pruned first",
+        );
+        assert_eq!(
+            retained.last().copied(),
+            Some(Timestamp::try_from(count as u64)?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applied_data_delta_transport_ids_stay_bounded_after_sequential_apply() {
+        let mut ids = AppliedDataDeltaIds::default();
+
+        for sequence in 1..=10_000 {
+            ids.insert_transport_id(ReplicationTransportId::new(sequence));
+        }
+
+        assert_eq!(ids.transport_stream_sequences.compacted_watermark, 10_000);
+        assert!(
+            ids.transport_stream_sequences.exact_ids.is_empty(),
+            "sequential transport deliveries should compact fully into the watermark",
+        );
     }
 
     #[async_trait]
