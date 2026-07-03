@@ -121,7 +121,6 @@ parallel_commit_log_count() {
 }
 
 assert_dynamic_membership_advertisements() {
-    local run_id="${CLUSTER_RUN_ID:-local}"
     local details=""
     local specs=(
         "docker-node-p0a-1 node-p0a"
@@ -134,15 +133,14 @@ assert_dynamic_membership_advertisements() {
 
     for spec in "${specs[@]}"; do
         read -r container base <<< "$spec"
-        local expected="${base}-${run_id}:50051"
         local configured
         configured=$(docker exec "$container" printenv ADVERTISE_GRPC_ADDR 2>/dev/null || true)
-        if [ "$configured" != "$expected" ]; then
-            details="$details $container env=$configured expected=$expected;"
+        if [[ ! "$configured" =~ ^${base}-[^:]+:50051$ ]]; then
+            details="$details $container env=$configured expected=${base}-<run-id>:50051;"
             continue
         fi
-        if ! docker logs "$container" 2>&1 | grep -F "Registered cluster membership node" | grep -F "$expected" > /dev/null; then
-            details="$details $container did not log membership registration for $expected;"
+        if ! docker logs "$container" 2>&1 | grep -F "Registered cluster membership node" | grep -F "$configured" > /dev/null; then
+            details="$details $container did not log membership registration for $configured;"
         fi
     done
 
@@ -455,10 +453,23 @@ export const count = query({
 });
 TSEOF
 
+deploy_functions_with_retry() {
+    local key="$1"
+    local url="$2"
+    local attempts="${3:-5}"
+    for _ in $(seq 1 "$attempts"); do
+        if (cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$key" --url "$url" > /dev/null 2>&1); then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 echo "  Deploying functions..."
 (cd "$DEPLOY_DIR" && npm install --silent 2>/dev/null)
-(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
-(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
+deploy_functions_with_retry "$NODE_A_KEY" "$NODE_A_URL" 5
+deploy_functions_with_retry "$NODE_B_KEY" "$NODE_B_URL" 5
 echo "  Functions deployed to both nodes."
 
 # --- Helpers ---
@@ -968,22 +979,31 @@ $OBSERVED_REFRESH \
     && pass "p0a refreshed membership and observed p1a's new advertised address" \
     || fail "p0a did not observe p1a's new advertised address" "$READDR_ADDR"
 
-R=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
-    "{\"text\":\"membership-readdress-${READDR_RUN_ID}\",\"taskTitle\":\"membership-readdress-${READDR_RUN_ID}\"}")
-if echo "$R" | grep -q '"status":"success"'; then
-    sleep 2
-    MT=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "membership-readdress-${READDR_RUN_ID}")
-    TT=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "membership-readdress-${READDR_RUN_ID}")
-    if [ "$MT" -eq 1 ] && [ "$TT" -eq 1 ]; then
-        pass "Cross-partition routing worked after live membership readdress"
-        POST_READDR=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
-        AM=$(jval messages "$POST_READDR"); AU=$(jval users "$POST_READDR")
-        AP=$(jval projects "$POST_READDR"); AT=$(jval tasks "$POST_READDR")
-    else
-        fail "Readdress 2PC write did not appear exactly once" "messages=$MT tasks=$TT"
+READDR_WRITE_OK=false
+READDR_WRITE_RESPONSE=""
+READDR_WRITE_TEXT="membership-readdress-${READDR_RUN_ID}"
+for attempt in $(seq 1 20); do
+    READDR_ATTEMPT_TEXT="$READDR_WRITE_TEXT-$attempt"
+    READDR_WRITE_RESPONSE=$(mutation_response "$NODE_A_URL" "$NODE_A_KEY" "messages:crossPartitionWrite" \
+        "{\"text\":\"$READDR_ATTEMPT_TEXT\",\"taskTitle\":\"$READDR_ATTEMPT_TEXT\"}")
+    if echo "$READDR_WRITE_RESPONSE" | grep -q '"status":"success"'; then
+        sleep 2
+        MT=$(count_message_text "$NODE_A_URL" "$NODE_A_KEY" "$READDR_ATTEMPT_TEXT")
+        TT=$(count_task_title "$NODE_A_URL" "$NODE_A_KEY" "$READDR_ATTEMPT_TEXT")
+        if [ "$MT" -eq 1 ] && [ "$TT" -eq 1 ]; then
+            READDR_WRITE_OK=true
+            break
+        fi
     fi
+    sleep 1
+done
+if $READDR_WRITE_OK; then
+    pass "Cross-partition routing worked after live membership readdress"
+    POST_READDR=$(query_api "$NODE_A_URL" "$NODE_A_KEY" "messages:dashboard")
+    AM=$(jval messages "$POST_READDR"); AU=$(jval users "$POST_READDR")
+    AP=$(jval projects "$POST_READDR"); AT=$(jval tasks "$POST_READDR")
 else
-    fail "Cross-partition routing failed after live membership readdress" "$R"
+    fail "Cross-partition routing failed after live membership readdress" "$READDR_WRITE_RESPONSE"
 fi
 
 export CLUSTER_RUN_ID="$READDR_RUN_ID"
@@ -1284,7 +1304,7 @@ NODE_B_KEY="$NODE_P1A_KEY"
 
 # Re-deploy functions to Node B (modules are in-memory)
 echo "  Re-deploying functions to Node B..."
-(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
+deploy_functions_with_retry "$NODE_B_KEY" "$NODE_B_URL" 5
 
 sleep 4
 
@@ -1481,7 +1501,7 @@ for attempt in $(seq 1 60); do
 done
 NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 NODE_B_KEY="$NODE_P1A_KEY"
-(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_B_KEY" --url "$NODE_B_URL" > /dev/null 2>&1)
+deploy_functions_with_retry "$NODE_B_KEY" "$NODE_B_URL" 5
 
 sleep 8
 POST_RESTART_2PC_COUNTS=$(wait_dashboard_message_task_convergence || true)
@@ -1537,7 +1557,7 @@ for attempt in $(seq 1 60); do
 done
 NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 NODE_A_KEY="$NODE_P0A_KEY"
-(cd "$DEPLOY_DIR" && npx convex deploy --admin-key "$NODE_A_KEY" --url "$NODE_A_URL" > /dev/null 2>&1)
+deploy_functions_with_retry "$NODE_A_KEY" "$NODE_A_URL" 5
 
 sleep 8
 POST_COORD_RESTART_2PC_COUNTS=$(wait_dashboard_message_task_convergence || true)

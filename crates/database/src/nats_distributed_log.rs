@@ -40,6 +40,7 @@ use crate::{
         DistributedLog,
         ReplicationAck,
         ReplicationMessage,
+        ReplicationTransportId,
     },
     metrics,
     partition::PartitionId,
@@ -218,7 +219,7 @@ impl NatsDistributedLog {
                             "consume",
                             msg.payload.len(),
                         );
-                        match msg.info() {
+                        let transport_id = match msg.info() {
                             Ok(info) => {
                                 metrics::log_replication_transport_pending_messages(info.pending);
                                 metrics::log_replication_transport_stream_sequence(
@@ -238,11 +239,13 @@ impl NatsDistributedLog {
                                         (now_ns - published_ns) as f64 / 1_000_000_000.0,
                                     );
                                 }
+                                Some(ReplicationTransportId::new(info.stream_sequence))
                             },
                             Err(e) => {
                                 tracing::debug!("Failed to parse JetStream message info: {e}");
+                                None
                             },
-                        }
+                        };
                         let envelope: DeltaEnvelope = match serde_json::from_slice(&msg.payload) {
                             Ok(e) => e,
                             Err(e) => {
@@ -296,10 +299,13 @@ impl NatsDistributedLog {
                                 return Some(Err(e));
                             },
                         };
-                        Some(Ok(ReplicationMessage::new(
-                            delta,
-                            Box::new(NatsReplicationAck { msg }),
-                        )))
+                        let ack = Box::new(NatsReplicationAck { msg });
+                        Some(Ok(match transport_id {
+                            Some(transport_id) => {
+                                ReplicationMessage::new_with_transport_id(delta, transport_id, ack)
+                            },
+                            None => ReplicationMessage::new(delta, ack),
+                        }))
                     },
                     Err(e) => {
                         tracing::error!("NATS message error: {e}");

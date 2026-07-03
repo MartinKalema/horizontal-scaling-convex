@@ -967,7 +967,7 @@ pub async fn make_app(
                         while let Some(result) = futures::StreamExt::next(&mut stream).await {
                             match result {
                                 Ok(message) => {
-                                    let (delta, ack) = message.into_parts();
+                                    let (delta, _transport_id, ack) = message.into_parts();
                                     database::log_selective_delivery_shadow_receive();
                                     tracing::debug!(
                                         "Selective-delivery shadow delta observed for {} at ts={}",

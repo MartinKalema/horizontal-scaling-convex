@@ -1076,7 +1076,7 @@ impl<RT: Runtime> Database<RT> {
             .await?
         {
             Some(value) => crate::committer::applied_data_delta_ids_from_json(value)?,
-            None => BTreeMap::new(),
+            None => crate::committer::AppliedDataDeltaIds::default(),
         };
 
         let snapshot_manager = SnapshotManager::new(
