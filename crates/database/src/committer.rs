@@ -145,6 +145,7 @@ use crate::{
     commit_delta::{
         CommitDelta,
         DistributedLog,
+        ReplicationTransportId,
         RetryableReplicaApplyError,
     },
     database::{
@@ -201,7 +202,81 @@ const RAFT_NATS_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 const RAFT_NATS_OUTBOX_KEY_PREFIX: &str = "raft_nats_outbox/";
 
 type LegacyRaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
-pub(crate) type AppliedDataDeltaIds = BTreeMap<crate::partition::PartitionId, BTreeSet<Timestamp>>;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OrderedDedupeState {
+    compacted_watermark: u64,
+    exact_ids: BTreeSet<u64>,
+}
+
+impl OrderedDedupeState {
+    fn contains(&self, id: u64) -> bool {
+        id <= self.compacted_watermark || self.exact_ids.contains(&id)
+    }
+
+    fn insert(&mut self, id: u64) {
+        if id <= self.compacted_watermark {
+            return;
+        }
+        self.exact_ids.insert(id);
+        while self
+            .exact_ids
+            .remove(&self.compacted_watermark.saturating_add(1))
+        {
+            self.compacted_watermark = self.compacted_watermark.saturating_add(1);
+        }
+    }
+
+    fn merge(&mut self, proposed: OrderedDedupeState) {
+        if proposed.compacted_watermark > self.compacted_watermark {
+            self.exact_ids
+                .retain(|id| *id > proposed.compacted_watermark);
+            self.compacted_watermark = proposed.compacted_watermark;
+        }
+        for id in proposed.exact_ids {
+            self.insert(id);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AppliedDataDeltaIds {
+    origin_timestamps: BTreeMap<crate::partition::PartitionId, BTreeSet<Timestamp>>,
+    transport_stream_sequences: OrderedDedupeState,
+}
+
+impl AppliedDataDeltaIds {
+    fn contains_origin_timestamp(
+        &self,
+        source_partition: crate::partition::PartitionId,
+        ts: Timestamp,
+    ) -> bool {
+        self.origin_timestamps
+            .get(&source_partition)
+            .is_some_and(|timestamps| timestamps.contains(&ts))
+    }
+
+    fn insert_origin_timestamp(
+        &mut self,
+        source_partition: crate::partition::PartitionId,
+        ts: Timestamp,
+    ) {
+        self.origin_timestamps
+            .entry(source_partition)
+            .or_default()
+            .insert(ts);
+    }
+
+    fn contains_transport_id(&self, transport_id: ReplicationTransportId) -> bool {
+        self.transport_stream_sequences
+            .contains(transport_id.stream_sequence())
+    }
+
+    fn insert_transport_id(&mut self, transport_id: ReplicationTransportId) {
+        self.transport_stream_sequences
+            .insert(transport_id.stream_sequence());
+    }
+}
 
 #[derive(Debug)]
 struct RaftNatsOutboxRecord {
@@ -400,16 +475,23 @@ fn merge_applied_data_delta_ids(
     proposed: AppliedDataDeltaIds,
 ) -> AppliedDataDeltaIds {
     let mut merged = current.clone();
-    for (partition, timestamps) in proposed {
-        merged.entry(partition).or_default().extend(timestamps);
+    for (partition, timestamps) in proposed.origin_timestamps {
+        merged
+            .origin_timestamps
+            .entry(partition)
+            .or_default()
+            .extend(timestamps);
     }
+    merged
+        .transport_stream_sequences
+        .merge(proposed.transport_stream_sequences);
     merged
 }
 
 fn applied_data_delta_ids_to_json(ids: &AppliedDataDeltaIds) -> serde_json::Value {
-    let mut object = serde_json::Map::new();
-    for (partition, timestamps) in ids {
-        object.insert(
+    let mut origin_timestamps = serde_json::Map::new();
+    for (partition, timestamps) in &ids.origin_timestamps {
+        origin_timestamps.insert(
             partition.0.to_string(),
             serde_json::Value::Array(
                 timestamps
@@ -419,7 +501,18 @@ fn applied_data_delta_ids_to_json(ids: &AppliedDataDeltaIds) -> serde_json::Valu
             ),
         );
     }
-    serde_json::Value::Object(object)
+    serde_json::json!({
+        "origin_timestamps": origin_timestamps,
+        "transport_stream_sequences": {
+            "compacted_watermark": ids.transport_stream_sequences.compacted_watermark,
+            "exact_ids": ids.transport_stream_sequences
+                .exact_ids
+                .iter()
+                .copied()
+                .map(serde_json::Value::from)
+                .collect::<Vec<_>>(),
+        },
+    })
 }
 
 pub(crate) fn applied_data_delta_ids_from_json(
@@ -428,8 +521,15 @@ pub(crate) fn applied_data_delta_ids_from_json(
     let object = value
         .as_object()
         .context("applied data delta ids should be an object")?;
-    let mut ids = AppliedDataDeltaIds::new();
-    for (partition, timestamps) in object {
+    let origin_value = object.get("origin_timestamps").unwrap_or(&value);
+    let origin_object = origin_value
+        .as_object()
+        .context("applied data delta origin timestamps should be an object")?;
+    let mut ids = AppliedDataDeltaIds::default();
+    for (partition, timestamps) in origin_object {
+        if partition == "transport_stream_sequences" {
+            continue;
+        }
         let partition_id = partition
             .parse::<u32>()
             .with_context(|| format!("invalid applied data delta ids partition {partition:?}"))?;
@@ -444,7 +544,31 @@ pub(crate) fn applied_data_delta_ids_from_json(
                 Timestamp::try_from(ts)
             })
             .collect::<anyhow::Result<BTreeSet<_>>>()?;
-        ids.insert(crate::partition::PartitionId(partition_id), timestamps);
+        ids.origin_timestamps
+            .insert(crate::partition::PartitionId(partition_id), timestamps);
+    }
+    if let Some(transport_value) = object.get("transport_stream_sequences") {
+        let transport_object = transport_value
+            .as_object()
+            .context("applied data transport ids should be an object")?;
+        ids.transport_stream_sequences.compacted_watermark = transport_object
+            .get("compacted_watermark")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        ids.transport_stream_sequences.exact_ids = transport_object
+            .get("exact_ids")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .context("applied data transport id should be a u64")
+            })
+            .collect::<anyhow::Result<BTreeSet<_>>>()?;
+        ids.transport_stream_sequences
+            .exact_ids
+            .retain(|id| *id > ids.transport_stream_sequences.compacted_watermark);
     }
     Ok(ids)
 }
@@ -1548,11 +1672,16 @@ impl<RT: Runtime> Committer<RT> {
                         Some(CommitterMessage::ApplyReplicaDelta {
                             delta,
                             mode,
+                            transport_id,
                             result,
                         }) => {
-                            if let Err(e) =
-                                self.apply_replica_delta(delta, mode, result, commit_id)
-                            {
+                            if let Err(e) = self.apply_replica_delta(
+                                delta,
+                                mode,
+                                transport_id,
+                                result,
+                                commit_id,
+                            ) {
                                 tracing::error!("Failed to queue replica delta for apply: {e:#}");
                             } else {
                                 commit_id += 1;
@@ -3421,6 +3550,7 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        transport_id: Option<ReplicationTransportId>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> anyhow::Result<()> {
@@ -3706,17 +3836,25 @@ impl<RT: Runtime> Committer<RT> {
             return Ok(());
         }
 
-        if let Some(source_partition) = delta.source_partition
-            && local_prepared_commit_ts.is_none()
-            && self
-                .applied_data_delta_ids
-                .get(&source_partition)
-                .is_some_and(|timestamps| timestamps.contains(&remote_ts))
+        let duplicate_transport_delivery = transport_id.is_some_and(|transport_id| {
+            self.applied_data_delta_ids
+                .contains_transport_id(transport_id)
+        });
+        let duplicate_origin_delta = delta.source_partition.is_some_and(|source_partition| {
+            self.applied_data_delta_ids
+                .contains_origin_timestamp(source_partition, remote_ts)
+        });
+        if local_prepared_commit_ts.is_none()
+            && (duplicate_transport_delivery || duplicate_origin_delta)
         {
             tracing::info!(
-                "Skipping duplicate non-empty replica delta: source_partition={}, remote_ts={}",
-                source_partition.0,
+                "Skipping duplicate non-empty replica delta: source_partition={:?}, remote_ts={}, \
+                 transport_stream_sequence={:?}, duplicate_transport={}, duplicate_origin={}",
+                delta.source_partition.map(|partition| partition.0),
                 u64::from(remote_ts),
+                transport_id.map(ReplicationTransportId::stream_sequence),
+                duplicate_transport_delivery,
+                duplicate_origin_delta,
             );
             let _ = result.send(Ok(remote_ts));
             return Ok(());
@@ -3958,11 +4096,17 @@ impl<RT: Runtime> Committer<RT> {
                 }
                 frontiers
             });
-        let updated_applied_data_delta_ids = delta.source_partition.map(|source_partition| {
-            let mut ids = self.applied_data_delta_ids.clone();
-            ids.entry(source_partition).or_default().insert(remote_ts);
-            ids
-        });
+        let updated_applied_data_delta_ids =
+            (delta.source_partition.is_some() || transport_id.is_some()).then(|| {
+                let mut ids = self.applied_data_delta_ids.clone();
+                if let Some(source_partition) = delta.source_partition {
+                    ids.insert_origin_timestamp(source_partition, remote_ts);
+                }
+                if let Some(transport_id) = transport_id {
+                    ids.insert_transport_id(transport_id);
+                }
+                ids
+            });
         if let Some(source_partition) = delta.source_partition {
             if self
                 .applied_delta_watermarks
@@ -3981,9 +4125,11 @@ impl<RT: Runtime> Committer<RT> {
                     .insert(source_partition, remote_ts);
             }
             self.applied_data_delta_ids
-                .entry(source_partition)
-                .or_default()
-                .insert(remote_ts);
+                .insert_origin_timestamp(source_partition, remote_ts);
+        }
+        if let Some(transport_id) = transport_id {
+            self.applied_data_delta_ids
+                .insert_transport_id(transport_id);
         }
         let raft_nats_outbox_delta = (mode == ReplicaDeltaApplyMode::FullRaftState
             && delta.source_partition.is_some())
@@ -5608,8 +5754,21 @@ impl CommitterClient {
     /// node-local system tables that are not part of cross-partition read
     /// replication.
     pub async fn apply_replica_delta(&self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
-        self.apply_delta_with_mode(delta, ReplicaDeltaApplyMode::CrossPartitionReplica)
+        self.apply_delta_with_mode(delta, ReplicaDeltaApplyMode::CrossPartitionReplica, None)
             .await
+    }
+
+    pub async fn apply_replica_delta_with_transport_id(
+        &self,
+        delta: CommitDelta,
+        transport_id: ReplicationTransportId,
+    ) -> anyhow::Result<Timestamp> {
+        self.apply_delta_with_mode(
+            delta,
+            ReplicaDeltaApplyMode::CrossPartitionReplica,
+            Some(transport_id),
+        )
+        .await
     }
 
     /// Apply a same-partition Raft commit delta through the Committer's apply
@@ -5617,7 +5776,7 @@ impl CommitterClient {
     /// copies that can become leader, so this path applies full partition
     /// state including system tables.
     pub async fn apply_raft_commit_delta(&self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
-        self.apply_delta_with_mode(delta, ReplicaDeltaApplyMode::FullRaftState)
+        self.apply_delta_with_mode(delta, ReplicaDeltaApplyMode::FullRaftState, None)
             .await
     }
 
@@ -5625,11 +5784,13 @@ impl CommitterClient {
         &self,
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        transport_id: Option<ReplicationTransportId>,
     ) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::ApplyReplicaDelta {
             delta,
             mode,
+            transport_id,
             result: tx,
         };
         self.sender.try_send(message).map_err(|e| match e {
@@ -6236,6 +6397,7 @@ enum CommitterMessage {
     ApplyReplicaDelta {
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        transport_id: Option<ReplicationTransportId>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     ApplyRaftPreparedRedo {

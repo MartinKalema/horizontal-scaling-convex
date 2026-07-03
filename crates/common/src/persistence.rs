@@ -173,9 +173,9 @@ pub enum PersistenceGlobalKey {
     /// transport lag/diagnostics, not exact redelivery idempotency.
     AppliedDataDeltaWatermarks,
 
-    /// Exact set of non-empty data delta origin timestamps durably applied per
-    /// source partition. This is separate from the max watermark because
-    /// Raft->NATS outbox recovery can replay older deltas after newer ones.
+    /// Exact non-empty data delta identities durably applied. This stores
+    /// origin timestamps for logical duplicate fanout plus ordered transport
+    /// stream sequences for compact redelivery detection.
     AppliedDataDeltaIds,
 
     /// Latest snapshot of all tables' summaries, cached to speed up startup.

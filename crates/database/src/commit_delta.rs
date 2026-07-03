@@ -49,7 +49,8 @@ pub struct CommitDelta {
     ///
     /// Receivers may translate this into a later local apply timestamp for
     /// their own MVCC/write-log state, but this value remains the origin
-    /// timestamp used for source-partition watermarks and redelivery dedup.
+    /// timestamp used for source-partition freshness watermarks. Exact
+    /// redelivery idempotency uses [`ReplicationTransportId`] instead.
     pub ts: Timestamp,
 
     /// Document writes for persistence replay. Contains document ID, new value,
@@ -117,23 +118,79 @@ impl Error for RetryableReplicaApplyError {}
 
 pub struct ReplicationMessage {
     pub delta: CommitDelta,
+    transport_id: Option<ReplicationTransportId>,
     ack: Box<dyn ReplicationAck>,
+}
+
+/// Durable identity for one transport delivery of a replication message.
+///
+/// This is intentionally separate from [`CommitDelta::ts`]. The origin commit
+/// timestamp is a visibility/freshness watermark. A transport id is the thing
+/// that lets a replica distinguish a redelivered old JetStream message from a
+/// first-time late replay of an older origin timestamp.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ReplicationTransportId {
+    stream_sequence: u64,
+}
+
+impl ReplicationTransportId {
+    pub fn new(stream_sequence: u64) -> Self {
+        Self { stream_sequence }
+    }
+
+    pub fn stream_sequence(self) -> u64 {
+        self.stream_sequence
+    }
 }
 
 impl ReplicationMessage {
     pub fn new(delta: CommitDelta, ack: Box<dyn ReplicationAck>) -> Self {
-        Self { delta, ack }
+        Self {
+            delta,
+            transport_id: None,
+            ack,
+        }
+    }
+
+    pub fn new_with_transport_id(
+        delta: CommitDelta,
+        transport_id: ReplicationTransportId,
+        ack: Box<dyn ReplicationAck>,
+    ) -> Self {
+        Self {
+            delta,
+            transport_id: Some(transport_id),
+            ack,
+        }
     }
 
     pub fn noop_ack(delta: CommitDelta) -> Self {
         Self {
             delta,
+            transport_id: None,
             ack: Box::new(NoopReplicationAck),
         }
     }
 
-    pub fn into_parts(self) -> (CommitDelta, Box<dyn ReplicationAck>) {
-        (self.delta, self.ack)
+    pub fn noop_ack_with_transport_id(
+        delta: CommitDelta,
+        transport_id: ReplicationTransportId,
+    ) -> Self {
+        Self {
+            delta,
+            transport_id: Some(transport_id),
+            ack: Box::new(NoopReplicationAck),
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        CommitDelta,
+        Option<ReplicationTransportId>,
+        Box<dyn ReplicationAck>,
+    ) {
+        (self.delta, self.transport_id, self.ack)
     }
 }
 

@@ -116,6 +116,7 @@ use crate::{
         CommitDelta,
         DistributedLog,
         ReplicationMessage,
+        ReplicationTransportId,
     },
     committer::{
         CommitterClient,
@@ -3437,6 +3438,163 @@ async fn test_late_outbox_replay_data_delta_not_deduped_by_newer_data_watermark(
         *target.now_ts_for_reads(),
         snapshot_ts_before_duplicate,
         "post-restart duplicate must not publish a new snapshot",
+    );
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_ordered_transport_ids_skip_redelivery_after_origin_ids_pruned(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let target_persistence = Arc::new(TestPersistence::new());
+    let table_numbers = Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_table_number_allocator(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        table_numbers.clone(),
+    )
+    .await?;
+    let mut target = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        target_persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_numbers.clone(),
+    )
+    .await?;
+
+    insert_doc(&source, "projects", assert_obj!("name" => "schema-seed")).await?;
+    let schema_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    target
+        .committer_for_test()
+        .apply_replica_delta_with_transport_id(schema_delta, ReplicationTransportId::new(1))
+        .await?;
+
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "late-transport-replay"),
+    )
+    .await?;
+    let older_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    let older_origin_ts = older_delta.ts;
+    insert_doc(
+        &source,
+        "projects",
+        assert_obj!("name" => "newer-transport-replay"),
+    )
+    .await?;
+    let newer_delta = latest_delta_for_partition(&log, PartitionId(1))?;
+    anyhow::ensure!(
+        older_delta.ts < newer_delta.ts,
+        "test setup should create an older origin delta before the newer one",
+    );
+
+    target
+        .committer_for_test()
+        .apply_replica_delta_with_transport_id(newer_delta.clone(), ReplicationTransportId::new(3))
+        .await?;
+    let older_apply_ts = target
+        .committer_for_test()
+        .apply_replica_delta_with_transport_id(older_delta.clone(), ReplicationTransportId::new(2))
+        .await?;
+    assert!(
+        older_apply_ts > newer_delta.ts,
+        "older origin delta should still apply when its transport id is first seen",
+    );
+
+    let persisted_ids = target_persistence
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::AppliedDataDeltaIds)
+        .await?
+        .context("ordered transport dedupe state should be persisted")?;
+    assert_eq!(
+        persisted_ids["transport_stream_sequences"]["compacted_watermark"],
+        serde_json::json!(3),
+        "contiguous transport ids should compact into a durable watermark",
+    );
+    assert_eq!(
+        persisted_ids["transport_stream_sequences"]["exact_ids"],
+        serde_json::json!([]),
+        "contiguous transport ids should not leave exact-id metadata behind",
+    );
+
+    let projects = run_query(
+        target.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    for name in [
+        "schema-seed",
+        "late-transport-replay",
+        "newer-transport-replay",
+    ] {
+        let matches = projects
+            .iter()
+            .filter(|project| project.value().0.get("name") == Some(&assert_val!(name)))
+            .count();
+        assert_eq!(
+            matches, 1,
+            "replicated project {name:?} should appear exactly once",
+        );
+    }
+
+    // Simulate the follow-up #243 pruning behavior: origin timestamp exact IDs
+    // below the compacted ordered-delivery watermark are gone, but the
+    // transport watermark remains. A redelivery of stream sequence 2 must
+    // still be recognized as already applied.
+    target_persistence
+        .write_persistence_global(
+            PersistenceGlobalKey::AppliedDataDeltaIds,
+            serde_json::json!({
+                "origin_timestamps": {},
+                "transport_stream_sequences": {
+                    "compacted_watermark": 3,
+                    "exact_ids": [],
+                },
+            }),
+        )
+        .await?;
+    target.shutdown().await?;
+    target = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        target_persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+        table_numbers,
+    )
+    .await?;
+
+    let document_log_count_before_duplicate =
+        persisted_document_log_count(&target_persistence).await?;
+    let snapshot_ts_before_duplicate = *target.now_ts_for_reads();
+    let duplicate_apply_ts = target
+        .committer_for_test()
+        .apply_replica_delta_with_transport_id(older_delta, ReplicationTransportId::new(2))
+        .await?;
+    assert_eq!(
+        duplicate_apply_ts, older_origin_ts,
+        "redelivery skipped by compacted transport watermark should ACK at the origin timestamp",
+    );
+    assert_eq!(
+        persisted_document_log_count(&target_persistence).await?,
+        document_log_count_before_duplicate,
+        "transport redelivery after origin-id pruning must not append document log entries",
+    );
+    assert_eq!(
+        *target.now_ts_for_reads(),
+        snapshot_ts_before_duplicate,
+        "transport redelivery after origin-id pruning must not publish a new snapshot",
     );
 
     Ok(())

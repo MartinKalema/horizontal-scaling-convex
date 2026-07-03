@@ -25,6 +25,7 @@ use crate::{
         CommitDelta,
         DistributedLog,
         ReplicationMessage,
+        ReplicationTransportId,
         RetryableReplicaApplyError,
     },
     committer::CommitterClient,
@@ -37,9 +38,18 @@ pub async fn apply_replication_message(
     message: ReplicationMessage,
 ) -> anyhow::Result<(common::types::Timestamp, usize)> {
     let committer = committer.clone();
-    apply_replication_message_with(message, move |delta| {
+    apply_replication_message_with(message, move |delta, transport_id| {
         let committer = committer.clone();
-        async move { committer.apply_replica_delta(delta).await }
+        async move {
+            match transport_id {
+                Some(transport_id) => {
+                    committer
+                        .apply_replica_delta_with_transport_id(delta, transport_id)
+                        .await
+                },
+                None => committer.apply_replica_delta(delta).await,
+            }
+        }
     })
     .await
 }
@@ -93,15 +103,15 @@ async fn apply_replication_message_with<F, Fut>(
     mut apply: F,
 ) -> anyhow::Result<(common::types::Timestamp, usize)>
 where
-    F: FnMut(CommitDelta) -> Fut,
+    F: FnMut(CommitDelta, Option<ReplicationTransportId>) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<common::types::Timestamp>>,
 {
-    let (delta, ack) = message.into_parts();
+    let (delta, transport_id, ack) = message.into_parts();
     let ts = delta.ts;
     let num_updates = delta.document_updates.len();
 
     loop {
-        match apply(delta.clone()).await {
+        match apply(delta.clone(), transport_id).await {
             Ok(applied_ts) => {
                 ack.ack().await.with_context(|| {
                     format!(
@@ -304,11 +314,11 @@ mod tests {
     async fn apply_replication_message_acks_after_success() -> anyhow::Result<()> {
         let counts = Arc::new(AckCounts::default());
         let ts = Timestamp::try_from(42u64)?;
-        let (applied_ts, num_updates) =
-            apply_replication_message_with(test_message(ts, counts.clone()), |delta| async move {
-                Ok(delta.ts)
-            })
-            .await?;
+        let (applied_ts, num_updates) = apply_replication_message_with(
+            test_message(ts, counts.clone()),
+            |delta, _transport_id| async move { Ok(delta.ts) },
+        )
+        .await?;
 
         assert_eq!(applied_ts, ts);
         assert_eq!(num_updates, 0);
@@ -323,12 +333,12 @@ mod tests {
     async fn apply_replication_message_naks_after_apply_failure() -> anyhow::Result<()> {
         let counts = Arc::new(AckCounts::default());
         let ts = Timestamp::try_from(42u64)?;
-        let err =
-            apply_replication_message_with(test_message(ts, counts.clone()), |_delta| async move {
-                anyhow::bail!("forced apply failure")
-            })
-            .await
-            .unwrap_err();
+        let err = apply_replication_message_with(
+            test_message(ts, counts.clone()),
+            |_delta, _transport_id| async move { anyhow::bail!("forced apply failure") },
+        )
+        .await
+        .unwrap_err();
 
         let message = format!("{err:#}");
         assert!(
@@ -352,7 +362,7 @@ mod tests {
         let (applied_ts, num_updates) =
             apply_replication_message_with(test_message(ts, counts.clone()), {
                 let attempts = attempts.clone();
-                move |delta| {
+                move |delta, _transport_id| {
                     let attempts = attempts.clone();
                     async move {
                         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -382,20 +392,20 @@ mod tests {
         let counts = Arc::new(AckCounts::default());
         let ts = Timestamp::try_from(42u64)?;
 
-        let first_attempt =
-            apply_replication_message_with(test_message(ts, counts.clone()), |_delta| async move {
-                anyhow::bail!("transient apply failure")
-            })
-            .await;
+        let first_attempt = apply_replication_message_with(
+            test_message(ts, counts.clone()),
+            |_delta, _transport_id| async move { anyhow::bail!("transient apply failure") },
+        )
+        .await;
         assert!(first_attempt.is_err());
         assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
 
-        let (applied_ts, _) =
-            apply_replication_message_with(test_message(ts, counts.clone()), |delta| async move {
-                Ok(delta.ts)
-            })
-            .await?;
+        let (applied_ts, _) = apply_replication_message_with(
+            test_message(ts, counts.clone()),
+            |delta, _transport_id| async move { Ok(delta.ts) },
+        )
+        .await?;
         assert_eq!(applied_ts, ts);
         assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
@@ -422,7 +432,7 @@ mod tests {
             move |message| {
                 let attempts = attempts.clone();
                 async move {
-                    apply_replication_message_with(message, |delta| {
+                    apply_replication_message_with(message, |delta, _transport_id| {
                         let attempts = attempts.clone();
                         async move {
                             if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
