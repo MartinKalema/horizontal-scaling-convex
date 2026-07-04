@@ -23,6 +23,7 @@ use common::{
     assert_obj,
     bootstrap_model::index::{
         database_index::IndexedFields,
+        IndexMetadata,
         INDEX_TABLE,
     },
     document::{
@@ -2231,6 +2232,87 @@ async fn test_prepare_waits_behind_pending_local_commit(
     tokio::time::timeout(Duration::from_secs(1), local_commit).await???;
     tokio::time::timeout(Duration::from_secs(1), prepare_while_pending).await???;
     node.committer_for_test().rollback_prepared(txn_id).await?;
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_pending_index_metadata_blocks_later_document_commit(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, None).await?;
+    insert_doc(
+        &node,
+        "messages",
+        assert_obj!("text" => "seed-before-index"),
+    )
+    .await?;
+
+    let hold_guard = pause.hold(AFTER_PENDING_WRITE_SNAPSHOT);
+    let node_for_index = node.clone();
+    let index_commit = tokio::spawn(async move {
+        let mut tx = node_for_index.begin(Identity::system()).await?;
+        let begin_ts = *tx.begin_timestamp();
+        let index_name = IndexName::new(
+            "messages".parse()?,
+            IndexDescriptor::new("by_pending_text")?,
+        )?;
+        IndexModel::new(&mut tx)
+            .add_application_index(
+                TableNamespace::test_user(),
+                IndexMetadata::new_backfilling(
+                    begin_ts,
+                    index_name,
+                    vec!["text".parse()?].try_into()?,
+                ),
+            )
+            .await?;
+        node_for_index.commit(tx).await
+    });
+
+    let pause_guard = hold_guard.wait_for_blocked().await;
+    let err = insert_doc(
+        &node,
+        "messages",
+        assert_obj!("text" => "must-wait-for-index-metadata"),
+    )
+    .await
+    .expect_err("document commit must retry behind unresolved index metadata");
+    assert!(
+        format!("{err:#}").contains("unresolved _tables/_index metadata write"),
+        "unexpected error: {err:#}",
+    );
+
+    if let Some(guard) = pause_guard {
+        guard.unpause();
+    }
+    tokio::time::timeout(Duration::from_secs(1), index_commit).await???;
+
+    insert_doc(
+        &node,
+        "messages",
+        assert_obj!("text" => "after-index-metadata"),
+    )
+    .await?;
+
+    let messages = run_query(
+        node,
+        TableNamespace::test_user(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    let texts: Vec<_> = messages
+        .iter()
+        .filter_map(|message| message.value().0.get("text"))
+        .collect();
+    assert!(texts.contains(&&assert_val!("seed-before-index")));
+    assert!(texts.contains(&&assert_val!("after-index-metadata")));
+    assert!(
+        !texts.contains(&&assert_val!("must-wait-for-index-metadata")),
+        "failed commit must not leak while metadata is pending",
+    );
 
     Ok(())
 }
