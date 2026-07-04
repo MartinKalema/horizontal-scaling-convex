@@ -167,8 +167,18 @@ one deployment must use the same `INSTANCE_SECRET` or
 
 This is a cluster peer authentication layer, not a replacement for network
 isolation. Keep the gRPC port on private networking only, restrict security
-groups/firewall rules to cluster members, and rotate the shared secret by
-rolling every node together.
+groups/firewall rules to cluster members, and treat per-node certificates or
+mTLS as the long-term production direction.
+
+To rotate the shared credential without splitting the cluster:
+
+1. Deploy every node with the new `INSTANCE_SECRET` and the old secret in
+   `CLUSTER_GRPC_PREVIOUS_INSTANCE_SECRET` or
+   `CLUSTER_GRPC_PREVIOUS_INSTANCE_SECRET_PATH`.
+2. Wait until all nodes are healthy on the new current secret. Nodes send only
+   the current token but accept both current and previous tokens during this
+   phase.
+3. Deploy again with the previous-secret setting removed.
 
 ## Managed Database (PostgreSQL)
 

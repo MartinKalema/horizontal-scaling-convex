@@ -570,8 +570,14 @@ pub async fn make_app(
         };
 
     let instance_secret = config.secret()?;
-    let cluster_grpc_auth =
-        common::grpc::ClusterGrpcAuth::from_shared_secret(instance_secret.as_bytes())?;
+    let previous_cluster_grpc_secret = config.previous_cluster_grpc_secret()?;
+    let cluster_grpc_auth = match previous_cluster_grpc_secret.as_ref() {
+        Some(previous_secret) => common::grpc::ClusterGrpcAuth::from_shared_secret_with_previous(
+            instance_secret.as_bytes(),
+            previous_secret.as_bytes(),
+        )?,
+        None => common::grpc::ClusterGrpcAuth::from_shared_secret(instance_secret.as_bytes())?,
+    };
     let mutation_forwarder_pool =
         mutation_forwarder::MutationForwarderGrpcClientPool::new(Some(cluster_grpc_auth.clone()));
 
