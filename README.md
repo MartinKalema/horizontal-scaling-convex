@@ -230,7 +230,8 @@ npx convex deploy --url http://127.0.0.1:3210 --admin-key <KEY>
 | `NUM_PARTITIONS` | Number of table partitions | `2` |
 | `NATS_URL` | NATS JetStream connection | `nats://nats:4222` |
 | `NODE_ADDRESSES` | Partition owner gRPC addresses for forwarding and 2PC | `0=node-a:50051,1=node-b:50051` |
-| `INSTANCE_SECRET` / `SHARED_INSTANCE_SECRET_PATH` | Shared deployment secret; also derives the internal cluster gRPC auth token | `$(cat /run/secrets/convex_instance_secret)` |
+| `INSTANCE_SECRET` / `SHARED_INSTANCE_SECRET_PATH` | Shared deployment secret; also derives the current internal cluster gRPC auth token | `$(cat /run/secrets/convex_instance_secret)` |
+| `CLUSTER_GRPC_PREVIOUS_INSTANCE_SECRET` / `CLUSTER_GRPC_PREVIOUS_INSTANCE_SECRET_PATH` | Previous deployment secret accepted only for rolling internal gRPC credential rotation | `$(cat /run/secrets/convex_instance_secret.previous)` |
 | `INSTANCE_NAME` | Unique node identifier | `convex-node-a` |
 | `REPLICATION_MODE` | Node role for primary/replica mode | `primary` |
 | `REMOTE_READ_FRONTIER_HEARTBEAT_INTERVAL_MS` | Idle heartbeat interval for remote-read frontier progress | `1000` |

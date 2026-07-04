@@ -582,6 +582,29 @@ own for distributed changes.
   - `cargo test -p local_backend test_internal_grpc_services_reject_missing_cluster_auth -- --nocapture`
   - `cargo test -p local_backend test_http_mutation_forwards_when_replica_mode -- --nocapture`
 
+### 2026-07 — Hardened internal gRPC auth comparison and rotation
+
+- **Status:** complete
+- **Related issue:** `#256`
+- **What this fixes:** internal forwarding, 2PC, and Raft gRPC services already
+  required a shared deployment secret-derived token, but rotation was an
+  all-at-once operation and server-side verification compared the presented
+  metadata value directly.
+- **Behavior:** nodes still send only the current token, but operators can set
+  `CLUSTER_GRPC_PREVIOUS_INSTANCE_SECRET` or
+  `CLUSTER_GRPC_PREVIOUS_INSTANCE_SECRET_PATH` during a rolling credential
+  rotation. Servers accept the current and previous tokens, compare fixed-size
+  token digests in constant time, and continue returning generic
+  `Unauthenticated` errors without logging token material.
+- **Operational note:** this remains a shared-key peer-auth layer for the
+  private cluster network. The documented production direction is per-node
+  credentials or mTLS.
+- **Validation:**
+  - `cargo test -p common grpc::auth::tests -- --nocapture`
+  - `cargo test -p local_backend test_internal_grpc_services_reject_missing_cluster_auth -- --nocapture`
+  - `cargo test -p database test_raft_transport_rejects_missing_cluster_auth -- --nocapture`
+  - `cargo check -p local_backend`
+
 ### 2026-06 — Separated 2PC prepared intents from the commit publish queue
 
 - **Status:** complete

@@ -1072,6 +1072,7 @@ mod tests {
             ComponentId,
             ComponentPath,
         },
+        grpc::ClusterGrpcAuth,
         http::{
             ConvexHttpService,
             NoopRouteMapper,
@@ -1491,11 +1492,8 @@ mod tests {
         rt: ProdRuntime,
     ) -> anyhow::Result<()> {
         let backend = setup_backend_for_test(rt.clone()).await?;
-        let auth = backend
-            .st
-            .cluster_grpc_auth
-            .clone()
-            .context("test backend should have cluster gRPC auth")?;
+        let auth = ClusterGrpcAuth::for_test_with_previous("current-internal-token", "old-token")?;
+        let previous_auth = ClusterGrpcAuth::for_test("old-token")?;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let grpc_addr = listener.local_addr()?;
@@ -1509,7 +1507,7 @@ mod tests {
             None,
             None,
             None,
-            Some(auth),
+            Some(auth.clone()),
         );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _server_handle = rt.spawn("test_internal_grpc_auth", async move {
@@ -1543,6 +1541,15 @@ mod tests {
             .await
             .expect_err("2PC Prepare without cluster auth must be rejected");
         assert_eq!(prepare_err.code(), tonic::Code::Unauthenticated);
+
+        let mut rotated_request =
+            tonic::Request::new(pb::replication::ForwardMutationRequest::default());
+        previous_auth.attach(&mut rotated_request);
+        let rotated_err = mutation_client
+            .forward_mutation(rotated_request)
+            .await
+            .expect_err("previous rotation token should pass auth but fail payload validation");
+        assert_eq!(rotated_err.code(), tonic::Code::InvalidArgument);
 
         let _ = shutdown_tx.send(());
         Ok(())
