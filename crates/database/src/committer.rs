@@ -2586,6 +2586,19 @@ impl<RT: Runtime> Committer<RT> {
                 self.prepared_writes.len(),
             )));
         }
+        if let Some(pending_ts) =
+            self.pending_bootstrap_metadata_write_ts(&transaction.table_mapping)
+        {
+            let metadata = ErrorMetadata::system_occ(
+                Some(u64::from(*transaction.begin_timestamp)),
+                write_source.as_str().map(|source| source.to_string()),
+            );
+            anyhow::bail!(anyhow::anyhow!(metadata).context(format!(
+                "Commit blocked by unresolved _tables/_index metadata write at ts={}; retry after \
+                 the metadata write publishes",
+                u64::from(pending_ts),
+            )));
+        }
 
         // Partition ownership check: verify that all authoritative writes for
         // this operation target tables owned by this node. Deploy metadata
@@ -2685,6 +2698,24 @@ impl<RT: Runtime> Committer<RT> {
             document_writes,
             pending_write,
         })
+    }
+
+    fn pending_bootstrap_metadata_write_ts(
+        &self,
+        table_mapping: &TableMapping,
+    ) -> Option<Timestamp> {
+        let bootstrap_tables = BootstrapTableIds::new(table_mapping);
+        self.pending_writes
+            .iter(Timestamp::MIN, Timestamp::MAX)
+            .find_map(|(ts, writes, _)| {
+                writes
+                    .into_iter()
+                    .any(|(id, _)| {
+                        bootstrap_tables.is_tables_table(id.tablet_id)
+                            || bootstrap_tables.is_index_table(id.tablet_id)
+                    })
+                    .then_some(*ts)
+            })
     }
 
     #[fastrace::trace]
