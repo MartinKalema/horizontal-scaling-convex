@@ -6120,13 +6120,16 @@ impl CommitterClient {
             .placement_state
             .as_ref()
             .map(|placement_state| placement_state.partition_map());
-        let transaction_classification = partition_map.as_ref().map(|partition_map| {
-            crate::two_phase_coordinator::classify_transaction(
-                &transaction,
-                partition_map,
-                &write_source,
-            )
-        });
+        let transaction_classification = partition_map
+            .as_ref()
+            .map(|partition_map| {
+                crate::two_phase_coordinator::classify_transaction(
+                    &transaction,
+                    partition_map,
+                    &write_source,
+                )
+            })
+            .transpose()?;
 
         // Note that we do a best effort validation for memory index sizes. We
         // use the latest snapshot instead of the transaction base snapshot. This
