@@ -117,8 +117,8 @@ pub fn classify_transaction(
     transaction: &FinalTransaction,
     partition_map: &PartitionMap,
     write_source: &WriteSource,
-) -> TransactionClassification {
-    let partitions = participant_write_indexes(transaction, partition_map, write_source);
+) -> anyhow::Result<TransactionClassification> {
+    let partitions = participant_write_indexes(transaction, partition_map, write_source)?;
     let mut prepare_participants: BTreeSet<_> = partitions.keys().copied().collect();
     prepare_participants.extend(participant_read_owners(
         transaction,
@@ -126,7 +126,7 @@ pub fn classify_transaction(
         write_source,
     ));
 
-    if partitions.is_empty() {
+    Ok(if partitions.is_empty() {
         TransactionClassification::SinglePartition
     } else if prepare_participants.len() == 1 {
         let owner = *prepare_participants
@@ -140,19 +140,19 @@ pub fn classify_transaction(
         }
     } else {
         TransactionClassification::CrossPartition { partitions }
-    }
+    })
 }
 
 pub(crate) fn participant_write_indexes(
     transaction: &FinalTransaction,
     partition_map: &PartitionMap,
     write_source: &WriteSource,
-) -> BTreeMap<PartitionId, Vec<usize>> {
+) -> anyhow::Result<BTreeMap<PartitionId, Vec<usize>>> {
     let mut participant_indexes: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
 
     for (index, write) in transaction.writes.coalesced_writes().enumerate() {
         let Some(participant) =
-            routed_partition_for_write(transaction, write, partition_map, write_source)
+            routed_partition_for_write(transaction, write, partition_map, write_source)?
         else {
             continue;
         };
@@ -163,22 +163,22 @@ pub(crate) fn participant_write_indexes(
     }
 
     participant_indexes.retain(|_, indexes| !indexes.is_empty());
-    participant_indexes
+    Ok(participant_indexes)
 }
 
 pub(crate) fn participant_prepare_indexes(
     transaction: &FinalTransaction,
     partition_map: &PartitionMap,
     write_source: &WriteSource,
-) -> BTreeMap<PartitionId, Vec<usize>> {
+) -> anyhow::Result<BTreeMap<PartitionId, Vec<usize>>> {
     let mut participant_indexes =
-        participant_write_indexes(transaction, partition_map, write_source);
+        participant_write_indexes(transaction, partition_map, write_source)?;
 
     for participant in participant_read_owners(transaction, partition_map, write_source) {
         participant_indexes.entry(participant).or_default();
     }
 
-    participant_indexes
+    Ok(participant_indexes)
 }
 
 fn participant_read_owners(
@@ -213,13 +213,16 @@ fn routed_partition_for_write(
     write: &DocumentUpdateWithPrevTs,
     partition_map: &PartitionMap,
     write_source: &WriteSource,
-) -> Option<PartitionId> {
-    let table_name = transaction
+) -> anyhow::Result<Option<PartitionId>> {
+    let Some(table_name) = transaction
         .table_mapping
         .tablet_name(write.id.tablet_id)
-        .ok()?;
+        .ok()
+    else {
+        return Ok(None);
+    };
     if let Some(partition) = routed_partition_for_table(&table_name, partition_map, write_source) {
-        return Some(partition);
+        return Ok(Some(partition));
     }
     routed_partition_for_catalog_write(transaction, write, partition_map)
 }
@@ -228,35 +231,69 @@ fn routed_partition_for_catalog_write(
     transaction: &FinalTransaction,
     write: &DocumentUpdateWithPrevTs,
     partition_map: &PartitionMap,
-) -> Option<PartitionId> {
-    let catalog_table = transaction
+) -> anyhow::Result<Option<PartitionId>> {
+    let Some(catalog_table) = transaction
         .table_mapping
         .tablet_name(write.id.tablet_id)
-        .ok()?;
+        .ok()
+    else {
+        return Ok(None);
+    };
     if &catalog_table != &*TABLES_TABLE && &catalog_table != &*INDEX_TABLE {
-        return None;
+        return Ok(None);
     }
-    let document = write
+    let Some(document) = write
         .new_document
         .as_ref()
-        .or_else(|| write.old_document.as_ref().map(|(document, _)| document))?;
+        .or_else(|| write.old_document.as_ref().map(|(document, _)| document))
+    else {
+        return Ok(None);
+    };
     let user_table = if &catalog_table == &*TABLES_TABLE {
-        catalog_write_user_table(document)?
+        catalog_write_user_table(document).with_context(|| {
+            format!(
+                "failed to parse _tables catalog metadata while routing write {:?}",
+                write.id
+            )
+        })?
     } else {
-        let index: common::document::ParsedDocument<TabletIndexMetadata> = document.parse().ok()?;
+        let index: common::document::ParsedDocument<TabletIndexMetadata> =
+            document.parse().with_context(|| {
+                format!(
+                    "failed to parse _index catalog metadata while routing write {:?}",
+                    write.id
+                )
+            })?;
         let index = index.into_value();
         let indexed_tablet = *index.name.table();
-        transaction.table_mapping.tablet_name(indexed_tablet).ok()?
+        transaction
+            .table_mapping
+            .tablet_name(indexed_tablet)
+            .with_context(|| {
+                format!(
+                    "_index catalog metadata for write {:?} references unknown tablet {:?}",
+                    write.id, indexed_tablet
+                )
+            })?
     };
     if user_table.is_system() {
-        return None;
+        return Ok(None);
     }
-    Some(partition_map.partition_for_table(&user_table))
+    Ok(Some(partition_map.partition_for_table(&user_table)))
 }
 
-fn catalog_write_user_table(document: &ResolvedDocument) -> Option<value::TableName> {
-    let metadata: common::document::ParsedDocument<TableMetadata> = document.parse().ok()?;
-    Some(metadata.into_value().name)
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn routed_partition_for_catalog_write_for_test(
+    transaction: &FinalTransaction,
+    write: &DocumentUpdateWithPrevTs,
+    partition_map: &PartitionMap,
+) -> anyhow::Result<Option<PartitionId>> {
+    routed_partition_for_catalog_write(transaction, write, partition_map)
+}
+
+fn catalog_write_user_table(document: &ResolvedDocument) -> anyhow::Result<value::TableName> {
+    let metadata: common::document::ParsedDocument<TableMetadata> = document.parse()?;
+    Ok(metadata.into_value().name)
 }
 
 async fn prepare_participant(
@@ -925,7 +962,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
     commit_mode: TwoPhaseCommitMode,
 ) -> anyhow::Result<CommitOutcome> {
     let timer = metrics::two_phase_coordinator_timer();
-    let source_partition = match classify_transaction(&transaction, partition_map, &write_source) {
+    let source_partition = match classify_transaction(&transaction, partition_map, &write_source)? {
         TransactionClassification::SinglePartition => {
             anyhow::bail!("2PC coordinator called for a local single-partition transaction");
         },
@@ -940,7 +977,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
     };
 
     let participant_indexes =
-        participant_prepare_indexes(&transaction, partition_map, &write_source);
+        participant_prepare_indexes(&transaction, partition_map, &write_source)?;
     let node_addresses = local_committer.node_addresses();
     let participants: Vec<_> = participant_indexes
         .iter()

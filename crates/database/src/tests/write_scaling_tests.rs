@@ -27,6 +27,7 @@ use common::{
         INDEX_TABLE,
     },
     document::{
+        DocumentUpdateWithPrevTs,
         ResolvedDocument,
         ID_FIELD,
     },
@@ -1646,7 +1647,7 @@ async fn test_prepare_participants_include_remote_read_owner(
         &final_tx,
         &partition_map,
         &write_source,
-    );
+    )?;
     assert!(
         matches!(
             classification,
@@ -1660,7 +1661,7 @@ async fn test_prepare_participants_include_remote_read_owner(
         &final_tx,
         &partition_map,
         &write_source,
-    );
+    )?;
     assert_eq!(
         participant_indexes.keys().copied().collect::<Vec<_>>(),
         vec![PartitionId(0), PartitionId(1)],
@@ -1745,7 +1746,7 @@ async fn test_read_owner_validation_rejects_conflicting_owner_write(
         &final_tx,
         &source_map,
         &write_source,
-    );
+    )?;
     let read_owner_tx = ParticipantTransaction::from_final_transaction(
         &final_tx,
         PartitionId(1),
@@ -1822,7 +1823,7 @@ async fn test_read_owner_validate_reads_is_retry_safe(rt: TestRuntime) -> anyhow
         &final_tx,
         &source_map,
         &write_source,
-    );
+    )?;
     let read_owner_tx = ParticipantTransaction::from_final_transaction(
         &final_tx,
         PartitionId(1),
@@ -1902,7 +1903,7 @@ async fn test_read_owner_validation_rejects_timestamp_below_local_floor(
         &final_tx,
         &source_map,
         &write_source,
-    );
+    )?;
     let read_owner_tx = ParticipantTransaction::from_final_transaction(
         &final_tx,
         PartitionId(1),
@@ -4391,7 +4392,7 @@ async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
         &final_tx,
         &source_map,
         &write_source,
-    );
+    )?;
     let owner_writes = participant_indexes
         .get(&PartitionId(1))
         .expect("projects writes and catalog metadata should route to partition 1");
@@ -4433,6 +4434,58 @@ async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
     )
     .await?;
     assert_eq!(projects.len(), 1);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_catalog_write_routing_fails_loud_on_malformed_index_metadata(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let source = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+
+    let mut tx = source.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"projects".parse()?, assert_obj!("name" => "catalog"))
+        .await?;
+    let final_tx = tx.finalize()?;
+    let index_write = final_tx
+        .writes
+        .coalesced_writes()
+        .find(|write| {
+            final_tx
+                .table_mapping
+                .tablet_name(write.id.tablet_id)
+                .is_ok_and(|table| table == *INDEX_TABLE)
+        })
+        .context("project insert should include _index metadata")?;
+    let malformed_document = index_write
+        .new_document
+        .as_ref()
+        .context("_index metadata write should insert a document")?
+        .replace_value(assert_obj!("not" => "index metadata"))?;
+    let malformed_write = DocumentUpdateWithPrevTs {
+        id: index_write.id,
+        old_document: index_write.old_document.clone(),
+        new_document: Some(malformed_document),
+    };
+
+    let err = crate::two_phase_coordinator::routed_partition_for_catalog_write_for_test(
+        &final_tx,
+        &malformed_write,
+        &partitioned_map(PartitionId(0)),
+    )
+    .expect_err("malformed _index metadata must not classify as an unrouted local write");
+    let err = format!("{err:#}");
+    assert!(
+        err.contains("failed to parse _index catalog metadata"),
+        "error should explain the malformed _index metadata routing failure, got {err}",
+    );
+    assert!(
+        err.contains("missing field"),
+        "error should include parser context for the malformed catalog document, got {err}",
+    );
+
     Ok(())
 }
 

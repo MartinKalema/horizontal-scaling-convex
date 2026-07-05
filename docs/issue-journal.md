@@ -895,6 +895,31 @@ own for distributed changes.
   - `cargo test -p database test_parallel_early_ack_recovers_staging_before_async_cleanup -- --nocapture`
   - `cargo test -p database test_cross_partition_commit_uses_remote_prepare_over_grpc -- --nocapture`
 
+### 2026-07 — Failed loud on malformed catalog metadata during write routing
+
+- **Status:** complete
+- **Related issue:** `#253`
+- **What this fixes:** catalog write routing for `_tables` and `_index`
+  metadata used `Option` fallthroughs while deciding which partition owned a
+  user-table catalog update. A malformed catalog document could therefore be
+  misclassified as an unrouted local/system write instead of surfacing the
+  corruption at the commit boundary.
+- **Behavior:** transaction classification and participant indexing now return
+  `anyhow::Result`. True non-catalog writes can still be unrouted, but catalog
+  metadata parse failures and `_index` references to unknown tablets include
+  explicit routing context and abort the commit path.
+- **Validation:**
+  - `cargo test -p database test_catalog_write_routing_fails_loud_on_malformed_index_metadata -- --nocapture`
+  - `cargo test -p database test_remote_table_catalog_writes_follow_owner_prepare_redo -- --nocapture`
+  - `cargo test -p database test_prepare_participants_include_remote_read_owner -- --nocapture`
+  - `cargo test -p database test_read_owner_validation_rejects_conflicting_owner_write -- --nocapture`
+  - `cargo check -p database`
+  - Built `ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest`
+    and verified all six backend containers ran local image
+    `sha256:35cd189d525742316633558d2c20de3d4d7d6682f1e9796feb840eaf88bb8f22`
+  - `BACKEND_PULL_POLICY=never bash self-hosted/docker/test.sh`
+    passed write-scaling `146/146`, Raft failover `24/24`, `ALL SUITES PASSED`
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current
