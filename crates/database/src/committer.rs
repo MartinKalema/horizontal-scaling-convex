@@ -144,6 +144,7 @@ use vector::VectorIndexWriteSize;
 use crate::{
     bootstrap_model::defaults::BootstrapTableIds,
     checkpoint::{
+        create_checkpoint,
         CheckpointData,
         CheckpointPersistence,
     },
@@ -167,6 +168,13 @@ use crate::{
     },
     nats_distributed_log::DeltaEnvelope,
     raft_node::RaftProposalResult,
+    raft_snapshot::{
+        encode_snapshot as encode_raft_snapshot,
+        load_state_machine_index,
+        state_machine_index_persistence_write,
+        RaftSnapshotTemporarilyUnavailable,
+        RAFT_STATE_MACHINE_INDEX_KEY,
+    },
     raft_state_machine::RaftStateMachineEntry,
     reads::ReadSet,
     search_index_bootstrap::{
@@ -478,6 +486,7 @@ enum PersistenceWrite {
         applied_data_delta_ids: Option<AppliedDataDeltaIds>,
         raft_apply_marker: Option<RaftApplyMarker>,
         raft_nats_outbox_delta: Option<CommitDelta>,
+        raft_state_machine_index: Option<u64>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -487,6 +496,7 @@ enum PersistenceWrite {
     RaftReplayRecovery {
         marker: RaftApplyMarker,
         delta: CommitDelta,
+        raft_state_machine_index: u64,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -498,6 +508,7 @@ enum PersistenceWrite {
         commit_id: usize,
     },
     InstallSnapshot {
+        source: SnapshotInstallSource,
         snapshot_ts: Timestamp,
         snapshot: Snapshot,
         replication_frontiers: BTreeMap<crate::partition::PartitionId, Timestamp>,
@@ -507,6 +518,301 @@ enum PersistenceWrite {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotInstallSource {
+    Bootstrap,
+    Raft,
+}
+
+struct RaftSnapshotRequest {
+    raft_index: u64,
+    raft_term: u64,
+    result: oneshot::Sender<anyhow::Result<Vec<u8>>>,
+}
+
+struct SnapshotInstallRequest {
+    checkpoint: CheckpointData,
+    source: SnapshotInstallSource,
+    result: oneshot::Sender<anyhow::Result<Timestamp>>,
+}
+
+struct PreparedCheckpointInstall {
+    snapshot_ts: Timestamp,
+    compacted_documents: Vec<DocumentLogEntry>,
+    index_entries: Vec<PersistenceIndexEntry>,
+    snapshot: Snapshot,
+    replication_frontiers: BTreeMap<crate::partition::PartitionId, Timestamp>,
+    applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+    applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
+    applied_data_delta_ids: AppliedDataDeltaIds,
+}
+
+async fn prepare_checkpoint_install<RT: Runtime>(
+    runtime: RT,
+    persistence: Arc<dyn Persistence>,
+    virtual_system_mapping: VirtualSystemMapping,
+    partition_map: Option<crate::partition::PartitionMap>,
+    checkpoint: &CheckpointData,
+) -> anyhow::Result<PreparedCheckpointInstall> {
+    let snapshot_ts = checkpoint.timestamp;
+    let compacted_documents = compact_checkpoint_documents(checkpoint);
+    let checkpoint_persistence = Arc::new(CheckpointPersistence::from_checkpoint(
+        CheckpointData {
+            timestamp: checkpoint.timestamp,
+            documents: compacted_documents.clone(),
+            globals: checkpoint.globals.clone(),
+        },
+        persistence.reader().version(),
+    ));
+    let repeatable_ts =
+        RepeatableTimestamp::new_validated(snapshot_ts, RepeatableReason::SnapshotManagerLatest);
+    let mut db_snapshot = DatabaseSnapshot::load(
+        runtime,
+        checkpoint_persistence,
+        repeatable_ts,
+        Arc::new(NoopRetentionValidator),
+        virtual_system_mapping,
+    )
+    .await?;
+
+    if let Some(value) = checkpoint
+        .globals
+        .get(&String::from(PersistenceGlobalKey::TableSummary))
+    {
+        let summary_snapshot = TableSummarySnapshot::try_from(value.clone())?;
+        let table_summaries = TableSummaries::new(
+            summary_snapshot,
+            db_snapshot.table_registry().table_mapping(),
+            &db_snapshot.snapshot.virtual_system_mapping,
+        )?;
+        db_snapshot.snapshot.table_summaries = Some(table_summaries);
+    }
+
+    let index_entries = checkpoint_index_entries(&db_snapshot.snapshot, &compacted_documents);
+    let replication_frontiers = checkpoint
+        .globals
+        .get(&String::from(PersistenceGlobalKey::ReplicationFrontiers))
+        .map(|value| crate::snapshot_manager::replication_frontiers_from_json(value.clone()))
+        .transpose()?
+        .unwrap_or_else(|| {
+            partition_map
+                .as_ref()
+                .map(|map| {
+                    map.all_partitions()
+                        .into_iter()
+                        .filter(|partition| *partition != map.local_partition())
+                        .map(|partition| (partition, Timestamp::MIN))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+    let applied_delta_watermarks = checkpoint
+        .globals
+        .get(&String::from(PersistenceGlobalKey::AppliedDeltaWatermarks))
+        .map(|value| partition_timestamp_map_from_json(value.clone(), "applied delta watermarks"))
+        .transpose()?
+        .unwrap_or_default();
+    let applied_data_delta_watermarks = checkpoint
+        .globals
+        .get(&String::from(
+            PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+        ))
+        .map(|value| {
+            partition_timestamp_map_from_json(value.clone(), "applied data delta watermarks")
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let applied_data_delta_ids = checkpoint
+        .globals
+        .get(&String::from(PersistenceGlobalKey::AppliedDataDeltaIds))
+        .map(|value| applied_data_delta_ids_from_json(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(PreparedCheckpointInstall {
+        snapshot_ts,
+        compacted_documents,
+        index_entries,
+        snapshot: db_snapshot.snapshot,
+        replication_frontiers,
+        applied_delta_watermarks,
+        applied_data_delta_watermarks,
+        applied_data_delta_ids,
+    })
+}
+
+async fn persist_checkpoint_install(
+    persistence: Arc<dyn Persistence>,
+    checkpoint: &CheckpointData,
+    prepared: &PreparedCheckpointInstall,
+    source: SnapshotInstallSource,
+) -> anyhow::Result<()> {
+    let reader = persistence.reader();
+    let mut existing_documents = Vec::new();
+    let mut document_stream = reader.load_documents(
+        TimestampRange::all(),
+        Order::Asc,
+        1024,
+        Arc::new(NoopRetentionValidator),
+    );
+    while let Some(entry) = document_stream.try_next().await? {
+        existing_documents.push((entry.ts, entry.id));
+    }
+    if !existing_documents.is_empty() {
+        persistence.delete(existing_documents).await?;
+    }
+
+    let mut cursor = None;
+    loop {
+        let chunk = persistence.load_index_chunk(cursor.clone(), 1024).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        cursor = chunk.last().cloned();
+        persistence.delete_index_entries(chunk).await?;
+    }
+
+    for chunk in prepared.compacted_documents.chunks(1024) {
+        persistence
+            .write(chunk, &[], ConflictStrategy::Overwrite)
+            .await?;
+    }
+    for chunk in prepared.index_entries.chunks(1024) {
+        persistence
+            .write(&[], chunk, ConflictStrategy::Overwrite)
+            .await?;
+    }
+
+    for prefix in [RAFT_NATS_OUTBOX_KEY_PREFIX, RAFT_APPLY_MARKER_KEY_PREFIX] {
+        for (key, _) in reader.list_persistence_globals_with_prefix(prefix).await? {
+            persistence.delete_persistence_global_raw(&key).await?;
+        }
+    }
+
+    let mut copied_keys = PersistenceGlobalKey::checkpoint_keys();
+    if source == SnapshotInstallSource::Raft {
+        copied_keys.extend([
+            PersistenceGlobalKey::TwoPhaseRedoRecords,
+            PersistenceGlobalKey::RaftNatsOutbox,
+        ]);
+    }
+    for key in copied_keys {
+        let raw_key = String::from(key);
+        if let Some(value) = checkpoint.globals.get(&raw_key) {
+            persistence
+                .write_persistence_global(key, value.clone())
+                .await?;
+        } else {
+            persistence.delete_persistence_global_raw(&raw_key).await?;
+        }
+    }
+
+    if source == SnapshotInstallSource::Raft {
+        if !checkpoint
+            .globals
+            .contains_key(&String::from(PersistenceGlobalKey::TwoPhaseRedoRecords))
+        {
+            persistence
+                .write_persistence_global(
+                    PersistenceGlobalKey::TwoPhaseRedoRecords,
+                    serde_json::json!({}),
+                )
+                .await?;
+        }
+        for (key, value) in checkpoint.globals.iter().filter(|(key, _)| {
+            key.starts_with(RAFT_NATS_OUTBOX_KEY_PREFIX)
+                || key.as_str() == RAFT_STATE_MACHINE_INDEX_KEY
+        }) {
+            persistence
+                .write_persistence_global_raw(key, value.clone())
+                .await?;
+        }
+    } else {
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::TwoPhaseRedoRecords,
+                serde_json::json!({}),
+            )
+            .await?;
+        persistence
+            .delete_persistence_global_raw(RAFT_STATE_MACHINE_INDEX_KEY)
+            .await?;
+    }
+
+    if !checkpoint.globals.contains_key(&String::from(
+        PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+    )) {
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+                serde_json::json!({}),
+            )
+            .await?;
+    }
+    if !checkpoint
+        .globals
+        .contains_key(&String::from(PersistenceGlobalKey::AppliedDataDeltaIds))
+    {
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::AppliedDataDeltaIds,
+                serde_json::json!({}),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn recover_staged_raft_snapshot_install<RT: Runtime>(
+    engine: Arc<raft_engine::Engine>,
+    partition_id: crate::partition::PartitionId,
+    persistence: Arc<dyn Persistence>,
+    runtime: RT,
+    virtual_system_mapping: VirtualSystemMapping,
+    partition_map: Option<crate::partition::PartitionMap>,
+) -> anyhow::Result<bool> {
+    let Some(pending) =
+        crate::raft_storage::ConvexRaftStorage::pending_snapshot_install_for_engine(
+            &engine,
+            partition_id,
+        )?
+    else {
+        return Ok(false);
+    };
+    let metadata = pending.snapshot.get_metadata();
+    let decoded = crate::raft_snapshot::decode_snapshot(
+        pending.snapshot.get_data(),
+        metadata.index,
+        metadata.term,
+    )?;
+    let prepared = prepare_checkpoint_install(
+        runtime,
+        persistence.clone(),
+        virtual_system_mapping,
+        partition_map,
+        &decoded.checkpoint,
+    )
+    .await?;
+    persist_checkpoint_install(
+        persistence,
+        &decoded.checkpoint,
+        &prepared,
+        SnapshotInstallSource::Raft,
+    )
+    .await?;
+    crate::raft_storage::ConvexRaftStorage::commit_pending_snapshot_install_for_engine(
+        &engine,
+        partition_id,
+    )?;
+    tracing::info!(
+        "Recovered staged Raft snapshot install for partition {} at index {} and ts={}",
+        partition_id.0,
+        decoded.raft_index,
+        u64::from(decoded.checkpoint.timestamp),
+    );
+    Ok(true)
 }
 
 impl PersistenceWrite {
@@ -1214,14 +1520,45 @@ impl<RT: Runtime> Committer<RT> {
         // Keep track of the commit_id that is currently being traced.
         let mut span_commit_id = None;
         let mut deferred_prepares = VecDeque::new();
+        let mut pending_raft_snapshot: Option<RaftSnapshotRequest> = None;
+        let mut pending_snapshot_install: Option<SnapshotInstallRequest> = None;
+        let mut snapshot_install_in_progress = false;
         loop {
-            if self.pending_writes.min_ts().is_none()
+            if let Some(request) = pending_snapshot_install.take() {
+                if self.persistence_writes.is_empty() {
+                    self.install_snapshot(
+                        request.checkpoint,
+                        request.source,
+                        request.result,
+                        commit_id,
+                    )?;
+                    commit_id += 1;
+                    snapshot_install_in_progress = true;
+                    continue;
+                }
+                pending_snapshot_install = Some(request);
+            }
+            if let Some(request) = pending_raft_snapshot.take() {
+                if self.persistence_writes.is_empty() {
+                    let result = self
+                        .build_raft_snapshot_bytes(request.raft_index, request.raft_term)
+                        .await;
+                    let _ = request.result.send(result);
+                    continue;
+                }
+                pending_raft_snapshot = Some(request);
+            }
+            let snapshot_barrier_active = pending_raft_snapshot.is_some()
+                || pending_snapshot_install.is_some()
+                || snapshot_install_in_progress;
+            if !snapshot_barrier_active
+                && self.pending_writes.min_ts().is_none()
                 && let Some(deferred_prepare) = deferred_prepares.pop_front()
             {
                 self.handle_deferred_prepare(deferred_prepare).await;
                 continue;
             }
-            let bump_fut = if let Some(wait) = &next_bump_wait {
+            let bump_fut = if !snapshot_barrier_active && let Some(wait) = &next_bump_wait {
                 Either::Left(
                     self.runtime
                         .wait(wait.saturating_sub(last_bumped_repeatable_ts.elapsed())),
@@ -1229,10 +1566,11 @@ impl<RT: Runtime> Committer<RT> {
             } else {
                 Either::Right(std::future::pending())
             };
-            let remote_read_frontier_heartbeat_fut = if self
-                .placement_state
-                .as_ref()
-                .is_some_and(|placement_state| placement_state.num_partitions() > 1)
+            let remote_read_frontier_heartbeat_fut = if !snapshot_barrier_active
+                && self
+                    .placement_state
+                    .as_ref()
+                    .is_some_and(|placement_state| placement_state.num_partitions() > 1)
             {
                 Either::Left(
                     self.runtime.wait(
@@ -1243,10 +1581,11 @@ impl<RT: Runtime> Committer<RT> {
             } else {
                 Either::Right(std::future::pending())
             };
-            let raft_nats_outbox_replay_fut = if self
-                .placement_state
-                .as_ref()
-                .is_some_and(|placement_state| placement_state.num_partitions() > 1)
+            let raft_nats_outbox_replay_fut = if !snapshot_barrier_active
+                && self
+                    .placement_state
+                    .as_ref()
+                    .is_some_and(|placement_state| placement_state.num_partitions() > 1)
             {
                 Either::Left(
                     self.runtime.wait(
@@ -1257,7 +1596,7 @@ impl<RT: Runtime> Committer<RT> {
             } else {
                 Either::Right(std::future::pending())
             };
-            let receive_message_fut = if deferred_prepares.is_empty() {
+            let receive_message_fut = if deferred_prepares.is_empty() && !snapshot_barrier_active {
                 Either::Left(rx.recv())
             } else {
                 Either::Right(std::future::pending())
@@ -1629,6 +1968,7 @@ impl<RT: Runtime> Committer<RT> {
                             applied_data_delta_ids,
                             raft_apply_marker,
                             raft_nats_outbox_delta,
+                            raft_state_machine_index,
                             result,
                             ..
                         } => {
@@ -1699,6 +2039,19 @@ impl<RT: Runtime> Committer<RT> {
                                     .delete_persistence_global_raw(&marker.key())
                                     .await?;
                                 self.raft_apply_markers.remove(&marker);
+                            }
+                            if let Some(raft_state_machine_index) = raft_state_machine_index {
+                                let durable_index = load_state_machine_index(
+                                    self.persistence.reader().as_ref(),
+                                )
+                                .await?;
+                                anyhow::ensure!(
+                                    durable_index >= raft_state_machine_index,
+                                    "Raft apply at index {} persisted without its state-machine \
+                                     binding (durable index {})",
+                                    raft_state_machine_index,
+                                    durable_index,
+                                );
                             }
                             if let Some(delta) = raft_nats_outbox_delta.as_ref() {
                                 Self::add_raft_nats_outbox_delta(
@@ -1772,10 +2125,22 @@ impl<RT: Runtime> Committer<RT> {
                         PersistenceWrite::RaftReplayRecovery {
                             marker,
                             delta,
+                            raft_state_machine_index,
                             result,
                             ..
                         } => {
                             let recovery_result = async {
+                                let durable_index = load_state_machine_index(
+                                    self.persistence.reader().as_ref(),
+                                )
+                                .await?;
+                                anyhow::ensure!(
+                                    durable_index >= raft_state_machine_index,
+                                    "Raft replay at index {} found state without its durable \
+                                     state-machine binding (durable index {})",
+                                    raft_state_machine_index,
+                                    durable_index,
+                                );
                                 if self.raft_apply_markers.contains(&marker) {
                                     self.consolidate_raft_apply_marker(marker).await?;
                                 }
@@ -1832,6 +2197,7 @@ impl<RT: Runtime> Committer<RT> {
                             let _ = result.send(Ok(commit_ts));
                         },
                         PersistenceWrite::InstallSnapshot {
+                            source,
                             snapshot_ts,
                             snapshot,
                             replication_frontiers,
@@ -1856,6 +2222,11 @@ impl<RT: Runtime> Committer<RT> {
                                 replication_frontiers,
                                 applied_delta_watermarks,
                             );
+                            self.raft_apply_markers.clear();
+                            if source == SnapshotInstallSource::Raft {
+                                self.recover_two_phase_redo_records().await?;
+                            }
+                            snapshot_install_in_progress = false;
                             let _ = result.send(Ok(snapshot_ts));
                         },
                     }
@@ -1914,12 +2285,14 @@ impl<RT: Runtime> Committer<RT> {
                         Some(CommitterMessage::ApplyReplicaDelta {
                             delta,
                             mode,
+                            raft_state_machine_index,
                             transport_id,
                             result,
                         }) => {
                             if let Err(e) = self.apply_replica_delta(
                                 delta,
                                 mode,
+                                raft_state_machine_index,
                                 transport_id,
                                 result,
                                 commit_id,
@@ -1929,8 +2302,13 @@ impl<RT: Runtime> Committer<RT> {
                                 commit_id += 1;
                             }
                         },
-                        Some(CommitterMessage::ApplyRaftPreparedRedo { redo, result }) => {
+                        Some(CommitterMessage::ApplyRaftPreparedRedo {
+                            raft_state_machine_index,
+                            redo,
+                            result,
+                        }) => {
                             let deferred_prepare = DeferredPrepare::ApplyRaftPreparedRedo {
+                                raft_state_machine_index,
                                 redo,
                                 result,
                             };
@@ -1955,8 +2333,47 @@ impl<RT: Runtime> Committer<RT> {
                             let _ = result.send(());
                         },
                         Some(CommitterMessage::InstallSnapshot { checkpoint, result }) => {
-                            self.install_snapshot(checkpoint, result, commit_id)?;
-                            commit_id += 1;
+                            anyhow::ensure!(
+                                pending_snapshot_install.is_none(),
+                                "multiple snapshot installs were admitted concurrently",
+                            );
+                            pending_snapshot_install = Some(SnapshotInstallRequest {
+                                checkpoint,
+                                source: SnapshotInstallSource::Bootstrap,
+                                result,
+                            });
+                        },
+                        Some(CommitterMessage::InstallRaftSnapshot { checkpoint, result }) => {
+                            anyhow::ensure!(
+                                pending_snapshot_install.is_none(),
+                                "multiple snapshot installs were admitted concurrently",
+                            );
+                            pending_snapshot_install = Some(SnapshotInstallRequest {
+                                checkpoint,
+                                source: SnapshotInstallSource::Raft,
+                                result,
+                            });
+                        },
+                        Some(CommitterMessage::BuildRaftSnapshot {
+                            raft_index,
+                            raft_term,
+                            result,
+                        }) => {
+                            anyhow::ensure!(
+                                pending_raft_snapshot.is_none(),
+                                "multiple Raft snapshot barriers were admitted concurrently",
+                            );
+                            if self.persistence_writes.is_empty() {
+                                pending_raft_snapshot = Some(RaftSnapshotRequest {
+                                    raft_index,
+                                    raft_term,
+                                    result,
+                                });
+                            } else {
+                                let _ = result.send(Err(
+                                    RaftSnapshotTemporarilyUnavailable.into(),
+                                ));
+                            }
                         },
                         #[cfg(any(test, feature = "testing"))]
                         Some(CommitterMessage::BumpMaxRepeatableTs { result }) => {
@@ -3004,11 +3421,13 @@ impl<RT: Runtime> Committer<RT> {
         write_source: WriteSource,
         raft_apply_marker: Option<RaftApplyMarker>,
         raft_nats_outbox_delta: Option<CommitDelta>,
+        raft_state_machine_index: Option<u64>,
     ) -> anyhow::Result<()> {
         let timer = metrics::commit_persistence_write_timer();
         let raft_apply_writes = Self::raft_apply_persistence_writes(
             raft_apply_marker,
             raft_nats_outbox_delta.as_ref(),
+            raft_state_machine_index,
         )?;
         persistence
             .write_with_persistence_globals(
@@ -3199,11 +3618,12 @@ impl<RT: Runtime> Committer<RT> {
     fn raft_apply_persistence_writes(
         marker: Option<RaftApplyMarker>,
         delta: Option<&CommitDelta>,
+        raft_state_machine_index: Option<u64>,
     ) -> anyhow::Result<Vec<PersistenceGlobalWrite>> {
         let Some(marker) = marker else {
             anyhow::ensure!(
-                delta.is_none(),
-                "Raft outbox delta supplied without an atomic apply marker",
+                delta.is_none() && raft_state_machine_index.is_none(),
+                "Raft apply metadata supplied without an atomic apply marker",
             );
             return Ok(Vec::new());
         };
@@ -3212,9 +3632,12 @@ impl<RT: Runtime> Committer<RT> {
             marker == RaftApplyMarker::from_delta(delta)?,
             "Raft apply marker did not match its committed delta",
         );
+        let raft_state_machine_index = raft_state_machine_index
+            .context("Raft apply marker supplied without a state-machine index")?;
         Ok(vec![
             marker.persistence_write()?,
             Self::raft_nats_outbox_persistence_write(delta)?,
+            state_machine_index_persistence_write(raft_state_machine_index),
         ])
     }
 
@@ -3692,9 +4115,100 @@ impl<RT: Runtime> Committer<RT> {
         })
     }
 
+    /// Capture one stable Convex generation for the exact Raft prefix the
+    /// storage layer is snapshotting. The committer loop admits no later work
+    /// while this method runs, and all earlier persistence futures have
+    /// already drained.
+    fn build_raft_snapshot_bytes(
+        &self,
+        raft_index: u64,
+        raft_term: u64,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<u8>>> {
+        let (checkpoint_ts, replication_frontiers, table_summary_snapshot) = {
+            let snapshot_manager = self.snapshot_manager.read();
+            let (ts, snapshot) = snapshot_manager.latest();
+            let table_summary_snapshot =
+                snapshot
+                    .table_summaries
+                    .as_ref()
+                    .map(|summaries| TableSummarySnapshot {
+                        tables: summaries
+                            .tables
+                            .iter()
+                            .map(|(key, value)| (*key, value.clone()))
+                            .collect(),
+                        ts: *ts,
+                    });
+            (
+                *ts,
+                snapshot_manager.replication_frontiers(),
+                table_summary_snapshot,
+            )
+        };
+        let persistence = self.persistence.clone();
+        let retention_validator = self.retention_validator.clone();
+        async move {
+            let reader = persistence.reader();
+            let state_machine_index = load_state_machine_index(reader.as_ref()).await?;
+            anyhow::ensure!(
+                state_machine_index <= raft_index,
+                "Convex state includes Raft index {state_machine_index}, beyond requested \
+                 snapshot index {raft_index}",
+            );
+            anyhow::ensure!(
+                reader
+                    .list_persistence_globals_with_prefix(RAFT_APPLY_MARKER_KEY_PREFIX)
+                    .await?
+                    .is_empty(),
+                "Cannot generate a Raft snapshot while an apply marker is unresolved",
+            );
+
+            let mut checkpoint =
+                create_checkpoint(reader.as_ref(), checkpoint_ts, retention_validator).await?;
+
+            let mut globals = BTreeMap::new();
+            for key in PersistenceGlobalKey::checkpoint_keys().into_iter().chain([
+                PersistenceGlobalKey::TwoPhaseRedoRecords,
+                PersistenceGlobalKey::RaftNatsOutbox,
+            ]) {
+                if let Some(value) = reader.get_persistence_global(key).await? {
+                    globals.insert(String::from(key), value);
+                }
+            }
+            for (key, value) in reader
+                .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+                .await?
+            {
+                globals.insert(key, value);
+            }
+            globals.insert(
+                RAFT_STATE_MACHINE_INDEX_KEY.to_string(),
+                state_machine_index.into(),
+            );
+            globals.insert(
+                String::from(PersistenceGlobalKey::MaxRepeatableTimestamp),
+                serde_json::Value::from(u64::from(checkpoint_ts)),
+            );
+            globals.insert(
+                String::from(PersistenceGlobalKey::ReplicationFrontiers),
+                replication_frontiers_to_json(&replication_frontiers),
+            );
+            if let Some(table_summary_snapshot) = table_summary_snapshot {
+                globals.insert(
+                    String::from(PersistenceGlobalKey::TableSummary),
+                    serde_json::Value::from(&table_summary_snapshot),
+                );
+            }
+            checkpoint.globals = globals;
+            encode_raft_snapshot(raft_index, raft_term, state_machine_index, &checkpoint)
+        }
+        .boxed()
+    }
+
     fn install_snapshot(
         &mut self,
         checkpoint: CheckpointData,
+        source: SnapshotInstallSource,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> anyhow::Result<()> {
@@ -3705,174 +4219,27 @@ impl<RT: Runtime> Committer<RT> {
             .placement_state
             .as_ref()
             .map(|placement_state| placement_state.partition_map());
-        let persistence_version = persistence.reader().version();
 
         self.persistence_writes.push_back(
             async move {
-                let checkpoint_ts = checkpoint.timestamp;
-                let compacted_documents = compact_checkpoint_documents(&checkpoint);
-                let checkpoint_persistence = Arc::new(CheckpointPersistence::from_checkpoint(
-                    CheckpointData {
-                        timestamp: checkpoint.timestamp,
-                        documents: compacted_documents.clone(),
-                        globals: checkpoint.globals.clone(),
-                    },
-                    persistence_version,
-                ));
-                let repeatable_ts = RepeatableTimestamp::new_validated(
-                    checkpoint_ts,
-                    RepeatableReason::SnapshotManagerLatest,
-                );
-                let retention_validator = Arc::new(NoopRetentionValidator);
-                let mut db_snapshot = DatabaseSnapshot::load(
+                let prepared = prepare_checkpoint_install(
                     runtime,
-                    checkpoint_persistence,
-                    repeatable_ts,
-                    retention_validator,
+                    persistence.clone(),
                     virtual_system_mapping,
+                    partition_map,
+                    &checkpoint,
                 )
                 .await?;
-
-                if let Some(value) = checkpoint
-                    .globals
-                    .get(&String::from(PersistenceGlobalKey::TableSummary))
-                {
-                    let summary_snapshot = TableSummarySnapshot::try_from(value.clone())?;
-                    let table_summaries = TableSummaries::new(
-                        summary_snapshot,
-                        db_snapshot.table_registry().table_mapping(),
-                        &db_snapshot.snapshot.virtual_system_mapping,
-                    )?;
-                    db_snapshot.snapshot.table_summaries = Some(table_summaries);
-                }
-
-                let index_entries =
-                    checkpoint_index_entries(&db_snapshot.snapshot, &compacted_documents);
-
-                let mut existing_documents = Vec::new();
-                let persistence_reader = persistence.reader();
-                let mut document_stream = persistence_reader.load_documents(
-                    TimestampRange::all(),
-                    Order::Asc,
-                    1024,
-                    Arc::new(NoopRetentionValidator),
-                );
-                while let Some(entry) = document_stream.try_next().await? {
-                    existing_documents.push((entry.ts, entry.id));
-                }
-                if !existing_documents.is_empty() {
-                    persistence.delete(existing_documents).await?;
-                }
-
-                let mut cursor = None;
-                loop {
-                    let chunk = persistence.load_index_chunk(cursor.clone(), 1024).await?;
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    cursor = chunk.last().cloned();
-                    persistence.delete_index_entries(chunk).await?;
-                }
-
-                for chunk in compacted_documents.chunks(1024) {
-                    persistence
-                        .write(chunk, &[], ConflictStrategy::Overwrite)
-                        .await?;
-                }
-                for chunk in index_entries.chunks(1024) {
-                    persistence
-                        .write(&[], chunk, ConflictStrategy::Overwrite)
-                        .await?;
-                }
-                for key in PersistenceGlobalKey::checkpoint_keys() {
-                    if let Some(value) = checkpoint.globals.get(&String::from(key)) {
-                        persistence
-                            .write_persistence_global(key, value.clone())
-                            .await?;
-                    }
-                }
-                persistence
-                    .write_persistence_global(
-                        PersistenceGlobalKey::TwoPhaseRedoRecords,
-                        serde_json::json!({}),
-                    )
-                    .await?;
-                if !checkpoint.globals.contains_key(&String::from(
-                    PersistenceGlobalKey::AppliedDataDeltaWatermarks,
-                )) {
-                    persistence
-                        .write_persistence_global(
-                            PersistenceGlobalKey::AppliedDataDeltaWatermarks,
-                            serde_json::json!({}),
-                        )
-                        .await?;
-                }
-                if !checkpoint
-                    .globals
-                    .contains_key(&String::from(PersistenceGlobalKey::AppliedDataDeltaIds))
-                {
-                    persistence
-                        .write_persistence_global(
-                            PersistenceGlobalKey::AppliedDataDeltaIds,
-                            serde_json::json!({}),
-                        )
-                        .await?;
-                }
-
-                let replication_frontiers = checkpoint
-                    .globals
-                    .get(&String::from(PersistenceGlobalKey::ReplicationFrontiers))
-                    .map(|value| {
-                        crate::snapshot_manager::replication_frontiers_from_json(value.clone())
-                    })
-                    .transpose()?
-                    .unwrap_or_else(|| {
-                        partition_map
-                            .as_ref()
-                            .map(|map| {
-                                map.all_partitions()
-                                    .into_iter()
-                                    .filter(|partition| *partition != map.local_partition())
-                                    .map(|partition| (partition, Timestamp::MIN))
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    });
-                let applied_delta_watermarks = checkpoint
-                    .globals
-                    .get(&String::from(PersistenceGlobalKey::AppliedDeltaWatermarks))
-                    .map(|value| {
-                        partition_timestamp_map_from_json(value.clone(), "applied delta watermarks")
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-                let applied_data_delta_watermarks = checkpoint
-                    .globals
-                    .get(&String::from(
-                        PersistenceGlobalKey::AppliedDataDeltaWatermarks,
-                    ))
-                    .map(|value| {
-                        partition_timestamp_map_from_json(
-                            value.clone(),
-                            "applied data delta watermarks",
-                        )
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-                let applied_data_delta_ids = checkpoint
-                    .globals
-                    .get(&String::from(PersistenceGlobalKey::AppliedDataDeltaIds))
-                    .map(|value| applied_data_delta_ids_from_json(value.clone()))
-                    .transpose()?
-                    .unwrap_or_default();
+                persist_checkpoint_install(persistence, &checkpoint, &prepared, source).await?;
 
                 Ok(PersistenceWrite::InstallSnapshot {
-                    snapshot_ts: checkpoint_ts,
-                    snapshot: db_snapshot.snapshot,
-                    replication_frontiers,
-                    applied_delta_watermarks,
-                    applied_data_delta_watermarks,
-                    applied_data_delta_ids,
+                    source,
+                    snapshot_ts: prepared.snapshot_ts,
+                    snapshot: prepared.snapshot,
+                    replication_frontiers: prepared.replication_frontiers,
+                    applied_delta_watermarks: prepared.applied_delta_watermarks,
+                    applied_data_delta_watermarks: prepared.applied_data_delta_watermarks,
+                    applied_data_delta_ids: prepared.applied_data_delta_ids,
                     result,
                     commit_id,
                 })
@@ -3899,6 +4266,7 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        raft_state_machine_index: Option<u64>,
         transport_id: Option<ReplicationTransportId>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
@@ -3922,6 +4290,8 @@ impl<RT: Runtime> Committer<RT> {
         if let Some(marker) = raft_apply_marker
             && self.raft_apply_markers.contains(&marker)
         {
+            let raft_state_machine_index = raft_state_machine_index
+                .context("full-state Raft replay did not include its committed log index")?;
             tracing::info!(
                 "Recovering already-installed Raft delta without reapplying: partition={}, \
                  origin_ts={}",
@@ -3933,6 +4303,7 @@ impl<RT: Runtime> Committer<RT> {
                     Ok(PersistenceWrite::RaftReplayRecovery {
                         marker,
                         delta,
+                        raft_state_machine_index,
                         result,
                         commit_id,
                     })
@@ -4226,6 +4597,8 @@ impl<RT: Runtime> Committer<RT> {
             let marker = raft_apply_marker.context(
                 "non-empty full-state Raft replay should have a stable apply marker identity",
             )?;
+            let raft_state_machine_index = raft_state_machine_index
+                .context("full-state Raft replay did not include its committed log index")?;
             tracing::info!(
                 "Repairing side effects for durably deduplicated Raft replay: partition={}, \
                  origin_ts={}",
@@ -4237,6 +4610,7 @@ impl<RT: Runtime> Committer<RT> {
                     Ok(PersistenceWrite::RaftReplayRecovery {
                         marker,
                         delta,
+                        raft_state_machine_index,
                         result,
                         commit_id,
                     })
@@ -4548,6 +4922,7 @@ impl<RT: Runtime> Committer<RT> {
         let raft_apply_writes = Self::raft_apply_persistence_writes(
             raft_apply_marker,
             raft_nats_outbox_delta.as_ref(),
+            raft_state_machine_index,
         )?;
         self.enqueue_snapshot(commit_id, commit_ts, snapshot.clone());
 
@@ -4603,6 +4978,7 @@ impl<RT: Runtime> Committer<RT> {
                     applied_data_delta_ids,
                     raft_apply_marker,
                     raft_nats_outbox_delta,
+                    raft_state_machine_index,
                     result,
                     commit_id,
                 })
@@ -4657,6 +5033,32 @@ impl<RT: Runtime> Committer<RT> {
         let mut records = Self::load_two_phase_redo_records(persistence.clone()).await?;
         records.insert(entry.transaction_id.clone(), entry);
         Self::write_two_phase_redo_records(persistence, &records).await
+    }
+
+    async fn persist_two_phase_redo_with_state_machine_index(
+        persistence: Arc<dyn Persistence>,
+        entry: crate::two_phase::TwoPhaseRedoEntry,
+        raft_state_machine_index: u64,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_two_phase_redo_records(persistence.clone()).await?;
+        records.insert(entry.transaction_id.clone(), entry);
+        let redo_value = serde_json::to_value(records)
+            .context("2PC: Failed to serialize Raft-applied redo records")?;
+        persistence
+            .write_with_persistence_globals(
+                &[],
+                &[],
+                ConflictStrategy::Overwrite,
+                &[
+                    PersistenceGlobalWrite::new(
+                        String::from(PersistenceGlobalKey::TwoPhaseRedoRecords),
+                        redo_value,
+                    ),
+                    state_machine_index_persistence_write(raft_state_machine_index),
+                ],
+            )
+            .await
+            .context("2PC: Failed to atomically persist redo and Raft state-machine index")
     }
 
     async fn delete_two_phase_redo(
@@ -5178,6 +5580,12 @@ impl<RT: Runtime> Committer<RT> {
             },
         };
         if let Some(raft_applied_index) = raft_applied_index {
+            Self::persist_two_phase_redo_with_state_machine_index(
+                self.persistence.clone(),
+                redo,
+                raft_applied_index,
+            )
+            .await?;
             let Some(raft_state) = self.raft_state.as_ref() else {
                 anyhow::bail!(
                     "2PC Prepare txn={} returned Raft applied index {} without Raft state",
@@ -5283,6 +5691,12 @@ impl<RT: Runtime> Committer<RT> {
             },
         };
         if let Some(raft_applied_index) = raft_applied_index {
+            Self::persist_two_phase_redo_with_state_machine_index(
+                self.persistence.clone(),
+                redo,
+                raft_applied_index,
+            )
+            .await?;
             let Some(raft_state) = self.raft_state.as_ref() else {
                 anyhow::bail!(
                     "2PC Prepare txn={} returned Raft applied index {} without Raft state",
@@ -5312,8 +5726,12 @@ impl<RT: Runtime> Committer<RT> {
 
     async fn handle_deferred_prepare(&mut self, deferred_prepare: DeferredPrepare) {
         match deferred_prepare {
-            DeferredPrepare::ApplyRaftPreparedRedo { redo, result } => {
-                let r = self.handle_raft_prepared_redo(redo);
+            DeferredPrepare::ApplyRaftPreparedRedo {
+                raft_state_machine_index,
+                redo,
+                result,
+            } => {
+                let r = self.handle_raft_prepared_redo(raft_state_machine_index, redo);
                 let _ = result.send(r);
             },
             DeferredPrepare::Prepare {
@@ -5529,6 +5947,7 @@ impl<RT: Runtime> Committer<RT> {
                             delta.write_source.clone(),
                             raft_apply_marker,
                             raft_apply_marker.map(|_| delta.clone()),
+                            raft_applied_index,
                         )
                         .in_span(Span::enter_with_local_parent(name)),
                     ));
@@ -5680,6 +6099,7 @@ impl<RT: Runtime> Committer<RT> {
 
     fn handle_raft_prepared_redo(
         &mut self,
+        raft_state_machine_index: u64,
         redo: crate::two_phase::TwoPhaseRedoEntry,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
         let transaction_id = redo.transaction_id();
@@ -5695,10 +6115,13 @@ impl<RT: Runtime> Committer<RT> {
             .with_context(|| {
                 format!("2PC Raft Prepare Apply: failed to stage txn={transaction_id}")
             })?;
-        if let Err(err) = Self::block_on_current_runtime(Self::persist_two_phase_redo(
-            self.persistence.clone(),
-            redo,
-        )) {
+        if let Err(err) =
+            Self::block_on_current_runtime(Self::persist_two_phase_redo_with_state_machine_index(
+                self.persistence.clone(),
+                redo,
+                raft_state_machine_index,
+            ))
+        {
             if let Err(rollback_err) = self.handle_rollback_prepared(transaction_id.clone()) {
                 tracing::error!(
                     "2PC Raft Prepare Apply: failed to rollback in-memory txn={} after redo \
@@ -5889,6 +6312,7 @@ impl<RT: Runtime> Committer<RT> {
                             delta.write_source.clone(),
                             raft_apply_marker,
                             raft_apply_marker.map(|_| delta.clone()),
+                            raft_applied_index,
                         )
                         .in_span(Span::enter_with_local_parent(name)),
                     ));
@@ -6194,8 +6618,13 @@ impl CommitterClient {
     /// node-local system tables that are not part of cross-partition read
     /// replication.
     pub async fn apply_replica_delta(&self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
-        self.apply_delta_with_mode(delta, ReplicaDeltaApplyMode::CrossPartitionReplica, None)
-            .await
+        self.apply_delta_with_mode(
+            delta,
+            ReplicaDeltaApplyMode::CrossPartitionReplica,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn apply_replica_delta_with_transport_id(
@@ -6206,6 +6635,7 @@ impl CommitterClient {
         self.apply_delta_with_mode(
             delta,
             ReplicaDeltaApplyMode::CrossPartitionReplica,
+            None,
             Some(transport_id),
         )
         .await
@@ -6215,21 +6645,32 @@ impl CommitterClient {
     /// loop. Unlike cross-partition NATS replication, Raft followers are HA
     /// copies that can become leader, so this path applies full partition
     /// state including system tables.
-    pub async fn apply_raft_commit_delta(&self, delta: CommitDelta) -> anyhow::Result<Timestamp> {
-        self.apply_delta_with_mode(delta, ReplicaDeltaApplyMode::FullRaftState, None)
-            .await
+    pub async fn apply_raft_commit_delta(
+        &self,
+        raft_state_machine_index: u64,
+        delta: CommitDelta,
+    ) -> anyhow::Result<Timestamp> {
+        self.apply_delta_with_mode(
+            delta,
+            ReplicaDeltaApplyMode::FullRaftState,
+            Some(raft_state_machine_index),
+            None,
+        )
+        .await
     }
 
     async fn apply_delta_with_mode(
         &self,
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        raft_state_machine_index: Option<u64>,
         transport_id: Option<ReplicationTransportId>,
     ) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::ApplyReplicaDelta {
             delta,
             mode,
+            raft_state_machine_index,
             transport_id,
             result: tx,
         };
@@ -6246,10 +6687,15 @@ impl CommitterClient {
     /// safely finish or roll back the transaction.
     pub async fn apply_raft_prepared_redo(
         &self,
+        raft_state_machine_index: u64,
         redo: crate::two_phase::TwoPhaseRedoEntry,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
         let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::ApplyRaftPreparedRedo { redo, result: tx };
+        let message = CommitterMessage::ApplyRaftPreparedRedo {
+            raft_state_machine_index,
+            redo,
+            result: tx,
+        };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -6736,6 +7182,40 @@ impl CommitterClient {
         result
     }
 
+    pub async fn install_raft_snapshot(
+        &self,
+        checkpoint: CheckpointData,
+    ) -> anyhow::Result<Timestamp> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::InstallRaftSnapshot {
+            checkpoint,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
+    pub async fn build_raft_snapshot(
+        &self,
+        raft_index: u64,
+        raft_term: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::BuildRaftSnapshot {
+            raft_index,
+            raft_term,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
     #[cfg(any(test, feature = "testing"))]
     pub async fn bump_max_repeatable_ts(&self) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
@@ -6840,10 +7320,12 @@ enum CommitterMessage {
     ApplyReplicaDelta {
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        raft_state_machine_index: Option<u64>,
         transport_id: Option<ReplicationTransportId>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     ApplyRaftPreparedRedo {
+        raft_state_machine_index: u64,
         redo: crate::two_phase::TwoPhaseRedoEntry,
         result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
     },
@@ -6854,6 +7336,15 @@ enum CommitterMessage {
     InstallSnapshot {
         checkpoint: CheckpointData,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
+    },
+    InstallRaftSnapshot {
+        checkpoint: CheckpointData,
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+    },
+    BuildRaftSnapshot {
+        raft_index: u64,
+        raft_term: u64,
+        result: oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
     #[cfg(any(test, feature = "testing"))]
     BumpMaxRepeatableTs { result: oneshot::Sender<Timestamp> },
@@ -6914,6 +7405,7 @@ enum CommitterMessage {
 
 enum DeferredPrepare {
     ApplyRaftPreparedRedo {
+        raft_state_machine_index: u64,
         redo: crate::two_phase::TwoPhaseRedoEntry,
         result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
     },

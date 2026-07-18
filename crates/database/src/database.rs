@@ -194,7 +194,6 @@ use crate::{
     },
     schema_registry::SchemaRegistry,
     search_index_bootstrap::SearchIndexBootstrapWorker,
-    snapshot_checkpointer::checkpoint_to_bytes,
     snapshot_manager::{
         partition_timestamp_map_from_json,
         replication_frontiers_from_json,
@@ -2130,11 +2129,6 @@ impl<RT: Runtime> Database<RT> {
 
         checkpoint.globals = globals;
         Ok(checkpoint)
-    }
-
-    pub async fn build_raft_snapshot_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        let checkpoint = self.build_raft_snapshot_checkpoint().await?;
-        checkpoint_to_bytes(&checkpoint)
     }
 
     pub fn check_write_throughput_limit(&self) -> anyhow::Result<()> {
