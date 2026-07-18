@@ -1078,6 +1078,7 @@ impl<RT: Runtime> Database<RT> {
             Some(value) => crate::committer::applied_data_delta_ids_from_json(value)?,
             None => crate::committer::AppliedDataDeltaIds::default(),
         };
+        let raft_apply_markers = crate::committer::load_raft_apply_markers(reader.clone()).await?;
 
         let snapshot_manager = SnapshotManager::new(
             *ts,
@@ -1143,6 +1144,7 @@ impl<RT: Runtime> Database<RT> {
             applied_delta_watermarks,
             applied_data_delta_watermarks,
             applied_data_delta_ids,
+            raft_apply_markers,
         );
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");

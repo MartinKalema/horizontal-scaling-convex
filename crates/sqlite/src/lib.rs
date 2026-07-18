@@ -37,6 +37,7 @@ use common::{
         LatestDocument,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceGlobalWrite,
         PersistenceIndexEntry,
         PersistenceReader,
         RetentionValidator,
@@ -253,11 +254,12 @@ impl Persistence for SqlitePersistence {
         })
     }
 
-    async fn write<'a>(
+    async fn write_with_persistence_globals<'a>(
         &self,
         documents: &'a [DocumentLogEntry],
         indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
+        persistence_globals: &'a [PersistenceGlobalWrite],
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
         let tx = inner.connection.transaction()?;
@@ -317,6 +319,13 @@ impl Persistence for SqlitePersistence {
             };
         }
         drop(insert_index_query);
+
+        let mut write_global_query = tx.prepare_cached(WRITE_PERSISTENCE_GLOBAL)?;
+        for write in persistence_globals {
+            let json_value = serde_json::to_string(&write.value)?;
+            write_global_query.execute(params![&write.key, &json_value])?;
+        }
+        drop(write_global_query);
 
         tx.commit()?;
         Ok(())

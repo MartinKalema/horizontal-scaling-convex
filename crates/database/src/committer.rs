@@ -63,6 +63,7 @@ use common::{
         NoopRetentionValidator,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceGlobalWrite,
         PersistenceIndexEntry,
         PersistenceReader,
         RepeatablePersistence,
@@ -116,6 +117,10 @@ use rand::Rng;
 use search::{
     query::tokenize,
     TextIndexWriteSize,
+};
+use serde::{
+    Deserialize,
+    Serialize,
 };
 use tokio::sync::{
     mpsc::{
@@ -199,10 +204,99 @@ use crate::{
 const INITIAL_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
 const RAFT_NATS_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
-const RAFT_NATS_OUTBOX_KEY_PREFIX: &str = "raft_nats_outbox/";
+pub(crate) const RAFT_NATS_OUTBOX_KEY_PREFIX: &str = "raft_nats_outbox/";
+pub(crate) const RAFT_APPLY_MARKER_KEY_PREFIX: &str = "raft_apply_marker/";
 const MAX_APPLIED_DATA_ORIGIN_TIMESTAMPS_PER_PARTITION: usize = 1024;
 
 type LegacyRaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
+
+/// Stable identity journaled in the same persistence transaction as a
+/// Raft-applied Convex write. The raw marker bridges the crash window until
+/// the identity is consolidated into `AppliedDataDeltaIds`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RaftApplyMarker {
+    source_partition: crate::partition::PartitionId,
+    origin_ts: Timestamp,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RaftApplyMarkerValue {
+    source_partition: u32,
+    origin_ts: u64,
+}
+
+impl RaftApplyMarker {
+    fn from_delta(delta: &CommitDelta) -> anyhow::Result<Self> {
+        let source_partition = delta.source_partition.with_context(|| {
+            format!(
+                "Raft apply delta at ts={} did not include a source partition",
+                u64::from(delta.ts),
+            )
+        })?;
+        Ok(Self {
+            source_partition,
+            origin_ts: delta.ts,
+        })
+    }
+
+    fn key(self) -> String {
+        format!(
+            "{RAFT_APPLY_MARKER_KEY_PREFIX}{:020}/{:020}",
+            self.source_partition.0,
+            u64::from(self.origin_ts),
+        )
+    }
+
+    fn persistence_write(self) -> anyhow::Result<PersistenceGlobalWrite> {
+        Ok(PersistenceGlobalWrite::new(
+            self.key(),
+            serde_json::to_value(RaftApplyMarkerValue {
+                source_partition: self.source_partition.0,
+                origin_ts: u64::from(self.origin_ts),
+            })?,
+        ))
+    }
+
+    fn from_record(key: &str, value: serde_json::Value) -> anyhow::Result<Self> {
+        let suffix = key
+            .strip_prefix(RAFT_APPLY_MARKER_KEY_PREFIX)
+            .with_context(|| format!("Invalid Raft apply marker key {key:?}"))?;
+        let (partition, origin_ts) = suffix
+            .split_once('/')
+            .with_context(|| format!("Invalid Raft apply marker key {key:?}"))?;
+        let marker = Self {
+            source_partition: crate::partition::PartitionId(
+                partition
+                    .parse::<u32>()
+                    .with_context(|| format!("Invalid Raft apply marker partition in {key:?}"))?,
+            ),
+            origin_ts: Timestamp::try_from(
+                origin_ts
+                    .parse::<u64>()
+                    .with_context(|| format!("Invalid Raft apply marker timestamp in {key:?}"))?,
+            )?,
+        };
+        let persisted: RaftApplyMarkerValue = serde_json::from_value(value)
+            .with_context(|| format!("Invalid Raft apply marker value for {key:?}"))?;
+        anyhow::ensure!(
+            persisted.source_partition == marker.source_partition.0
+                && persisted.origin_ts == u64::from(marker.origin_ts),
+            "Raft apply marker key/value identity mismatch for {key:?}",
+        );
+        Ok(marker)
+    }
+}
+
+pub(crate) async fn load_raft_apply_markers(
+    reader: Arc<dyn PersistenceReader>,
+) -> anyhow::Result<BTreeSet<RaftApplyMarker>> {
+    reader
+        .list_persistence_globals_with_prefix(RAFT_APPLY_MARKER_KEY_PREFIX)
+        .await?
+        .into_iter()
+        .map(|(key, value)| RaftApplyMarker::from_record(&key, value))
+        .collect()
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct OrderedDedupeState {
@@ -340,6 +434,7 @@ enum PersistenceWrite {
         commit_id: usize,
         delta: CommitDelta,
         raft_applied_index: Option<u64>,
+        raft_apply_marker: Option<RaftApplyMarker>,
     },
     RejectedBeforePersistence {
         pending_write: PendingWriteHandle,
@@ -353,6 +448,7 @@ enum PersistenceWrite {
         commit_id: usize,
         delta: CommitDelta,
         raft_applied_index: Option<u64>,
+        raft_apply_marker: Option<RaftApplyMarker>,
     },
     PreparedRejectedBeforePersistence {
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
@@ -380,7 +476,17 @@ enum PersistenceWrite {
         applied_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
         applied_data_delta_watermarks: Option<BTreeMap<crate::partition::PartitionId, Timestamp>>,
         applied_data_delta_ids: Option<AppliedDataDeltaIds>,
+        raft_apply_marker: Option<RaftApplyMarker>,
         raft_nats_outbox_delta: Option<CommitDelta>,
+        result: oneshot::Sender<anyhow::Result<Timestamp>>,
+        commit_id: usize,
+    },
+    /// A crash left an atomic Raft apply marker next to already-installed
+    /// Convex revisions. Consolidate the identity and ACK replay without
+    /// publishing another logical write.
+    RaftReplayRecovery {
+        marker: RaftApplyMarker,
+        delta: CommitDelta,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     },
@@ -412,6 +518,7 @@ impl PersistenceWrite {
             Self::PreparedRejectedBeforePersistence { commit_id, .. } => *commit_id,
             Self::MaxRepeatableTimestamp { commit_id, .. } => *commit_id,
             Self::ReplicaDelta { commit_id, .. } => *commit_id,
+            Self::RaftReplayRecovery { commit_id, .. } => *commit_id,
             Self::RemoteReadFrontierHeartbeat { commit_id, .. } => *commit_id,
             Self::InstallSnapshot { commit_id, .. } => *commit_id,
         }
@@ -419,6 +526,9 @@ impl PersistenceWrite {
 }
 
 pub const AFTER_PENDING_WRITE_SNAPSHOT: &str = "after_pending_write_snapshot";
+pub const AFTER_RAFT_CONVEX_PERSISTENCE: &str = "after_raft_convex_persistence";
+pub const AFTER_RAFT_SNAPSHOT_PUBLICATION: &str = "after_raft_snapshot_publication";
+pub const AFTER_RAFT_APPLIED_INDEX_PERSISTENCE: &str = "after_raft_applied_index_persistence";
 
 fn remote_read_partitions(
     reads: &ReadSet,
@@ -925,6 +1035,11 @@ pub struct Committer<RT: Runtime> {
     // source partition and origin commit timestamp.
     applied_data_delta_ids: AppliedDataDeltaIds,
 
+    // Raft data writes that reached Convex persistence atomically but had not
+    // yet been consolidated into `applied_data_delta_ids` when the process
+    // stopped. Replay must repair bookkeeping without installing them again.
+    raft_apply_markers: BTreeSet<RaftApplyMarker>,
+
     // Sender for requeueing internal work that must wait for earlier state
     // machine timestamps to become visible without blocking the committer loop.
     sender: mpsc::Sender<CommitterMessage>,
@@ -1004,6 +1119,7 @@ impl<RT: Runtime> Committer<RT> {
         applied_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         applied_data_delta_watermarks: BTreeMap<crate::partition::PartitionId, Timestamp>,
         applied_data_delta_ids: AppliedDataDeltaIds,
+        raft_apply_markers: BTreeSet<RaftApplyMarker>,
     ) -> CommitterClient {
         let mut applied_data_delta_ids = applied_data_delta_ids;
         applied_data_delta_ids
@@ -1037,6 +1153,7 @@ impl<RT: Runtime> Committer<RT> {
             applied_delta_watermarks,
             applied_data_delta_watermarks,
             applied_data_delta_ids,
+            raft_apply_markers,
             sender: tx.clone(),
         };
         let handle = runtime.spawn("committer", async move {
@@ -1195,12 +1312,23 @@ impl<RT: Runtime> Committer<RT> {
                             parent_trace,
                             delta,
                             raft_applied_index,
+                            raft_apply_marker,
                             ..
                         } => {
+                            let commit_ts = pending_write.must_commit_ts();
+                            if let Some(marker) = raft_apply_marker
+                                && let Err(err) = self.consolidate_raft_apply_marker(marker).await
+                            {
+                                return Self::fail_committed_write(
+                                    result,
+                                    commit_ts,
+                                    "consolidate atomic Raft apply marker",
+                                    err,
+                                );
+                            }
                             let parent_span = initialize_root_from_parent("Committer::publish_commit", parent_trace);
                             let publish_commit_span = committer_span.as_ref().map(|root| Span::enter_with_parents("publish_commit", [root, &parent_span])).unwrap_or_else(|| parent_span);
                             let _guard = publish_commit_span.set_local_parent();
-                            let commit_ts = pending_write.must_commit_ts();
                             self.dequeue_snapshot(pending_commit_id);
                             let published_commit = match self.publish_commit(
                                 pending_write, delta,
@@ -1216,6 +1344,12 @@ impl<RT: Runtime> Committer<RT> {
                                 },
                             };
                             drop(_guard);
+                            if raft_applied_index.is_some() {
+                                self.runtime
+                                    .pause_client()
+                                    .wait(AFTER_RAFT_SNAPSHOT_PUBLICATION)
+                                    .await;
+                            }
                             if let Some(raft_applied_index) = raft_applied_index {
                                 let raft_mark_timer =
                                     metrics::commit_hot_path_stage_timer("local", "raft_mark_applied");
@@ -1241,6 +1375,10 @@ impl<RT: Runtime> Committer<RT> {
                                     );
                                 }
                                 raft_mark_timer.finish();
+                                self.runtime
+                                    .pause_client()
+                                    .wait(AFTER_RAFT_APPLIED_INDEX_PERSISTENCE)
+                                    .await;
                             }
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
@@ -1316,9 +1454,20 @@ impl<RT: Runtime> Committer<RT> {
                             transaction_id,
                             delta,
                             raft_applied_index,
+                            raft_apply_marker,
                             ..
                         } => {
                             let commit_ts = delta.ts;
+                            if let Some(marker) = raft_apply_marker
+                                && let Err(err) = self.consolidate_raft_apply_marker(marker).await
+                            {
+                                return self.fail_prepared_committed_write(
+                                    &transaction_id,
+                                    commit_ts,
+                                    "consolidate atomic Raft apply marker",
+                                    err,
+                                );
+                            }
                             let published_commit = match self.publish_prepared_commit(
                                 transaction_id.clone(),
                                 delta,
@@ -1334,6 +1483,12 @@ impl<RT: Runtime> Committer<RT> {
                                     );
                                 },
                             };
+                            if published_commit.raft_applied_index.is_some() {
+                                self.runtime
+                                    .pause_client()
+                                    .wait(AFTER_RAFT_SNAPSHOT_PUBLICATION)
+                                    .await;
+                            }
                             if let Some(raft_applied_index) = published_commit.raft_applied_index {
                                 let raft_mark_timer = metrics::commit_hot_path_stage_timer(
                                     "2pc_participant",
@@ -1363,6 +1518,10 @@ impl<RT: Runtime> Committer<RT> {
                                     );
                                 }
                                 raft_mark_timer.finish();
+                                self.runtime
+                                    .pause_client()
+                                    .wait(AFTER_RAFT_APPLIED_INDEX_PERSISTENCE)
+                                    .await;
                             }
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
@@ -1468,6 +1627,7 @@ impl<RT: Runtime> Committer<RT> {
                             applied_delta_watermarks,
                             applied_data_delta_watermarks,
                             applied_data_delta_ids,
+                            raft_apply_marker,
                             raft_nats_outbox_delta,
                             result,
                             ..
@@ -1525,6 +1685,20 @@ impl<RT: Runtime> Committer<RT> {
                                         applied_data_delta_ids_json,
                                     )
                                     .await?;
+                            }
+                            if let Some(marker) = raft_apply_marker {
+                                anyhow::ensure!(
+                                    self.applied_data_delta_ids.contains_origin_timestamp(
+                                        marker.source_partition,
+                                        marker.origin_ts,
+                                    ),
+                                    "Raft apply marker {} was not consolidated before cleanup",
+                                    marker.key(),
+                                );
+                                self.persistence
+                                    .delete_persistence_global_raw(&marker.key())
+                                    .await?;
+                                self.raft_apply_markers.remove(&marker);
                             }
                             if let Some(delta) = raft_nats_outbox_delta.as_ref() {
                                 Self::add_raft_nats_outbox_delta(
@@ -1587,7 +1761,46 @@ impl<RT: Runtime> Committer<RT> {
                                     );
                                 }
                             }
+                            if raft_apply_marker.is_some() {
+                                self.runtime
+                                    .pause_client()
+                                    .wait(AFTER_RAFT_SNAPSHOT_PUBLICATION)
+                                    .await;
+                            }
                             let _ = result.send(Ok(commit_ts));
+                        },
+                        PersistenceWrite::RaftReplayRecovery {
+                            marker,
+                            delta,
+                            result,
+                            ..
+                        } => {
+                            let recovery_result = async {
+                                if self.raft_apply_markers.contains(&marker) {
+                                    self.consolidate_raft_apply_marker(marker).await?;
+                                }
+                                if Self::should_record_raft_nats_outbox_delta(&delta) {
+                                    Self::add_raft_nats_outbox_delta(
+                                        self.persistence.clone(),
+                                        &delta,
+                                    )
+                                    .await?;
+                                }
+                                if delta.source_partition
+                                    == Some(self.local_partition_for_two_phase())
+                                    && let Some(transaction_id) = self
+                                        .remove_prepared_transaction_at_origin_ts(delta.ts)?
+                                {
+                                    Self::delete_two_phase_redo(
+                                        self.persistence.clone(),
+                                        &transaction_id,
+                                    )
+                                    .await?;
+                                }
+                                anyhow::Ok(marker.origin_ts)
+                            }
+                            .await;
+                            let _ = result.send(recovery_result);
                         },
                         PersistenceWrite::RemoteReadFrontierHeartbeat {
                             commit_ts,
@@ -2789,13 +3002,20 @@ impl<RT: Runtime> Committer<RT> {
         index_writes: Arc<Vec<PersistenceIndexEntry>>,
         document_writes: Arc<Vec<DocumentLogEntry>>,
         write_source: WriteSource,
+        raft_apply_marker: Option<RaftApplyMarker>,
+        raft_nats_outbox_delta: Option<CommitDelta>,
     ) -> anyhow::Result<()> {
         let timer = metrics::commit_persistence_write_timer();
+        let raft_apply_writes = Self::raft_apply_persistence_writes(
+            raft_apply_marker,
+            raft_nats_outbox_delta.as_ref(),
+        )?;
         persistence
-            .write(
+            .write_with_persistence_globals(
                 document_writes.as_slice(),
                 &index_writes,
                 ConflictStrategy::Error,
+                &raft_apply_writes,
             )
             .await
             .with_context(|| format!("Commit ({write_source:?}) failed to write to persistence"))?;
@@ -2935,6 +3155,69 @@ impl<RT: Runtime> Committer<RT> {
         result
     }
 
+    async fn consolidate_raft_apply_marker(
+        &mut self,
+        marker: RaftApplyMarker,
+    ) -> anyhow::Result<()> {
+        let mut data_watermarks = self.applied_data_delta_watermarks.clone();
+        if data_watermarks
+            .get(&marker.source_partition)
+            .is_none_or(|current| *current < marker.origin_ts)
+        {
+            data_watermarks.insert(marker.source_partition, marker.origin_ts);
+        }
+
+        let mut applied_ids = self.applied_data_delta_ids.clone();
+        applied_ids.insert_origin_timestamp(marker.source_partition, marker.origin_ts);
+        applied_ids.prune_origin_timestamps_below_watermarks(&data_watermarks);
+
+        // The raw marker remains the crash-safe source of truth until both
+        // compact durable summaries have been written. Deleting it last makes
+        // every interruption point recoverable.
+        self.persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::AppliedDataDeltaWatermarks,
+                partition_timestamp_map_to_json(&data_watermarks),
+            )
+            .await?;
+        self.persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::AppliedDataDeltaIds,
+                applied_data_delta_ids_to_json(&applied_ids),
+            )
+            .await?;
+        self.persistence
+            .delete_persistence_global_raw(&marker.key())
+            .await?;
+
+        self.applied_data_delta_watermarks = data_watermarks;
+        self.applied_data_delta_ids = applied_ids;
+        self.raft_apply_markers.remove(&marker);
+        Ok(())
+    }
+
+    fn raft_apply_persistence_writes(
+        marker: Option<RaftApplyMarker>,
+        delta: Option<&CommitDelta>,
+    ) -> anyhow::Result<Vec<PersistenceGlobalWrite>> {
+        let Some(marker) = marker else {
+            anyhow::ensure!(
+                delta.is_none(),
+                "Raft outbox delta supplied without an atomic apply marker",
+            );
+            return Ok(Vec::new());
+        };
+        let delta = delta.context("Raft apply marker supplied without its committed delta")?;
+        anyhow::ensure!(
+            marker == RaftApplyMarker::from_delta(delta)?,
+            "Raft apply marker did not match its committed delta",
+        );
+        Ok(vec![
+            marker.persistence_write()?,
+            Self::raft_nats_outbox_persistence_write(delta)?,
+        ])
+    }
+
     fn raft_nats_outbox_key(ts: Timestamp) -> String {
         u64::from(ts).to_string()
     }
@@ -3014,15 +3297,21 @@ impl<RT: Runtime> Committer<RT> {
         persistence: Arc<dyn Persistence>,
         delta: &CommitDelta,
     ) -> anyhow::Result<()> {
+        let PersistenceGlobalWrite { key, value } =
+            Self::raft_nats_outbox_persistence_write(delta)?;
+        persistence.write_persistence_global_raw(&key, value).await
+    }
+
+    fn raft_nats_outbox_persistence_write(
+        delta: &CommitDelta,
+    ) -> anyhow::Result<PersistenceGlobalWrite> {
         let envelope = DeltaEnvelope::from_delta(delta, "", None)
             .context("Failed to encode Raft->NATS outbox delta")?;
-        persistence
-            .write_persistence_global_raw(
-                &Self::raft_nats_outbox_entry_key(delta)?,
-                serde_json::to_value(envelope)
-                    .context("Failed to serialize Raft->NATS outbox delta")?,
-            )
-            .await
+        Ok(PersistenceGlobalWrite::new(
+            Self::raft_nats_outbox_entry_key(delta)?,
+            serde_json::to_value(envelope)
+                .context("Failed to serialize Raft->NATS outbox delta")?,
+        ))
     }
 
     async fn record_raft_nats_outbox_delta(
@@ -3626,6 +3915,33 @@ impl<RT: Runtime> Committer<RT> {
         };
         use value::ResolvedDocumentId;
 
+        let raft_apply_marker = (mode == ReplicaDeltaApplyMode::FullRaftState
+            && !delta.document_updates.is_empty())
+        .then(|| RaftApplyMarker::from_delta(&delta))
+        .transpose()?;
+        if let Some(marker) = raft_apply_marker
+            && self.raft_apply_markers.contains(&marker)
+        {
+            tracing::info!(
+                "Recovering already-installed Raft delta without reapplying: partition={}, \
+                 origin_ts={}",
+                marker.source_partition.0,
+                u64::from(marker.origin_ts),
+            );
+            self.persistence_writes.push_back(
+                async move {
+                    Ok(PersistenceWrite::RaftReplayRecovery {
+                        marker,
+                        delta,
+                        result,
+                        commit_id,
+                    })
+                }
+                .boxed(),
+            );
+            return Ok(());
+        }
+
         // Apply replica deltas in the same timestamp domain as the leader's
         // commit. Followers should never "forget" a higher remote commit
         // timestamp and then hand out a lower local one for a future 2PC
@@ -3904,6 +4220,31 @@ impl<RT: Runtime> Committer<RT> {
             self.applied_data_delta_ids
                 .contains_origin_timestamp(source_partition, remote_ts)
         });
+        if mode == ReplicaDeltaApplyMode::FullRaftState
+            && (duplicate_transport_delivery || duplicate_origin_delta)
+        {
+            let marker = raft_apply_marker.context(
+                "non-empty full-state Raft replay should have a stable apply marker identity",
+            )?;
+            tracing::info!(
+                "Repairing side effects for durably deduplicated Raft replay: partition={}, \
+                 origin_ts={}",
+                marker.source_partition.0,
+                u64::from(marker.origin_ts),
+            );
+            self.persistence_writes.push_back(
+                async move {
+                    Ok(PersistenceWrite::RaftReplayRecovery {
+                        marker,
+                        delta,
+                        result,
+                        commit_id,
+                    })
+                }
+                .boxed(),
+            );
+            return Ok(());
+        }
         if local_prepared_commit_ts.is_none()
             && (duplicate_transport_delivery || duplicate_origin_delta)
         {
@@ -4203,6 +4544,11 @@ impl<RT: Runtime> Committer<RT> {
         .then(|| delta.clone());
 
         let persistence = self.persistence.clone();
+        let pause_client = self.runtime.pause_client();
+        let raft_apply_writes = Self::raft_apply_persistence_writes(
+            raft_apply_marker,
+            raft_nats_outbox_delta.as_ref(),
+        )?;
         self.enqueue_snapshot(commit_id, commit_ts, snapshot.clone());
 
         self.persistence_writes.push_back({
@@ -4216,8 +4562,16 @@ impl<RT: Runtime> Committer<RT> {
             async move {
                 // Write to persistence (so function runner can load modules).
                 persistence
-                    .write(&doc_writes, &idx_writes, ConflictStrategy::Overwrite)
+                    .write_with_persistence_globals(
+                        &doc_writes,
+                        &idx_writes,
+                        ConflictStrategy::Overwrite,
+                        &raft_apply_writes,
+                    )
                     .await?;
+                if raft_apply_marker.is_some() {
+                    pause_client.wait(AFTER_RAFT_CONVEX_PERSISTENCE).await;
+                }
 
                 // Advance max_repeatable_ts in persistence.
                 persistence
@@ -4247,6 +4601,7 @@ impl<RT: Runtime> Committer<RT> {
                     applied_delta_watermarks,
                     applied_data_delta_watermarks,
                     applied_data_delta_ids,
+                    raft_apply_marker,
                     raft_nats_outbox_delta,
                     result,
                     commit_id,
@@ -5154,6 +5509,9 @@ impl<RT: Runtime> Committer<RT> {
                         });
                     },
                 };
+                let raft_apply_marker = raft_applied_index
+                    .map(|_| RaftApplyMarker::from_delta(&delta))
+                    .transpose()?;
                 let persistence_stage_timer =
                     metrics::commit_hot_path_stage_timer("2pc_participant", "persistence_write");
                 let mut backoff = Backoff::new(
@@ -5169,6 +5527,8 @@ impl<RT: Runtime> Committer<RT> {
                             delta.index_writes.clone(),
                             delta.document_writes.clone(),
                             delta.write_source.clone(),
+                            raft_apply_marker,
+                            raft_apply_marker.map(|_| delta.clone()),
                         )
                         .in_span(Span::enter_with_local_parent(name)),
                     ));
@@ -5184,6 +5544,9 @@ impl<RT: Runtime> Committer<RT> {
                             return Err(e);
                         }
                     } else {
+                        if raft_apply_marker.is_some() {
+                            pause_client.wait(AFTER_RAFT_CONVEX_PERSISTENCE).await;
+                        }
                         pause_client.wait(AFTER_PENDING_WRITE_SNAPSHOT).await;
                         persistence_stage_timer.finish();
                         return Ok(PersistenceWrite::PreparedCommit {
@@ -5191,6 +5554,7 @@ impl<RT: Runtime> Committer<RT> {
                             commit_id,
                             delta,
                             raft_applied_index,
+                            raft_apply_marker,
                         });
                     }
                 }
@@ -5504,6 +5868,9 @@ impl<RT: Runtime> Committer<RT> {
                         });
                     },
                 };
+                let raft_apply_marker = raft_applied_index
+                    .map(|_| RaftApplyMarker::from_delta(&delta))
+                    .transpose()?;
                 let persistence_stage_timer =
                     metrics::commit_hot_path_stage_timer("local", "persistence_write");
                 let mut backoff = Backoff::new(
@@ -5520,6 +5887,8 @@ impl<RT: Runtime> Committer<RT> {
                             delta.index_writes.clone(),
                             delta.document_writes.clone(),
                             delta.write_source.clone(),
+                            raft_apply_marker,
+                            raft_apply_marker.map(|_| delta.clone()),
                         )
                         .in_span(Span::enter_with_local_parent(name)),
                     ));
@@ -5535,6 +5904,9 @@ impl<RT: Runtime> Committer<RT> {
                             return Err(e);
                         }
                     } else {
+                        if raft_apply_marker.is_some() {
+                            pause_client.wait(AFTER_RAFT_CONVEX_PERSISTENCE).await;
+                        }
                         pause_client.wait(AFTER_PENDING_WRITE_SNAPSHOT).await;
                         persistence_stage_timer.finish();
                         return Ok(PersistenceWrite::Commit {
@@ -5545,6 +5917,7 @@ impl<RT: Runtime> Committer<RT> {
                             commit_id,
                             delta,
                             raft_applied_index,
+                            raft_apply_marker,
                         });
                     }
                 }
