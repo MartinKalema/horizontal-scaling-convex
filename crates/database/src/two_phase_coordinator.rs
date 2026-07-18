@@ -282,7 +282,7 @@ fn routed_partition_for_catalog_write(
     Ok(Some(partition_map.partition_for_table(&user_table)))
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub(crate) fn routed_partition_for_catalog_write_for_test(
     transaction: &FinalTransaction,
     write: &DocumentUpdateWithPrevTs,

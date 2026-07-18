@@ -85,8 +85,13 @@ impl TwoPhaseCommitGrpcService {
         let Some(raft_state) = self.raft_state.as_ref() else {
             return Ok(None);
         };
-        if raft_state.is_leader() {
+        if raft_state.is_leader_ready() {
             return Ok(None);
+        }
+        if raft_state.is_leader() {
+            return Err(Status::unavailable(
+                "Raft leader is still applying its current-term barrier",
+            ));
         }
         let leader_id = raft_state.leader_id();
         if leader_id == 0 {

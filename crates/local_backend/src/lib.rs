@@ -453,8 +453,9 @@ fn should_run_cluster_singleton_workers(
     if partition_id != route_authority::CLUSTER_COORDINATOR_PARTITION {
         return false;
     }
-    raft_state
-        .is_none_or(|raft_state| raft_state.is_leader() && raft_state.has_leader_serving_lease())
+    raft_state.is_none_or(|raft_state| {
+        raft_state.is_leader_ready() && raft_state.has_leader_serving_lease()
+    })
 }
 
 fn start_cluster_singleton_worker_supervisor(

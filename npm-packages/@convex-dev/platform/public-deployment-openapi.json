@@ -326,6 +326,50 @@
           }
         }
       },
+      "ReadAfterWriteFenceToken": {
+        "type": "object",
+        "required": [
+          "ts"
+        ],
+        "properties": {
+          "sourcePartition": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "ts": {
+            "$ref": "#/components/schemas/SerializedTs"
+          }
+        }
+      },
+      "ReadAfterWriteToken": {
+        "type": "object",
+        "required": [
+          "ts"
+        ],
+        "properties": {
+          "participantFences": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReadAfterWriteFenceToken"
+            }
+          },
+          "sourcePartition": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "ts": {
+            "$ref": "#/components/schemas/SerializedTs"
+          }
+        }
+      },
       "SerializedTs": {
         "type": "string"
       },
@@ -358,6 +402,16 @@
           },
           "path": {
             "type": "string"
+          },
+          "readAfterWrite": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReadAfterWriteToken"
+              }
+            ]
           }
         }
       },
@@ -426,6 +480,16 @@
           "path": {
             "type": "string"
           },
+          "readAfterWrite": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReadAfterWriteToken"
+              }
+            ]
+          },
           "ts": {
             "$ref": "#/components/schemas/SerializedTs"
           }
@@ -445,6 +509,16 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "readAfterWrite": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReadAfterWriteToken"
+                  }
+                ]
               },
               "status": {
                 "type": "string",
