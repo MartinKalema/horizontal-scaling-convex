@@ -12,7 +12,13 @@ use std::{
     },
     error::Error,
     fmt,
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
     time::Duration,
 };
 
@@ -267,6 +273,47 @@ impl DistributedLog for NoopDistributedLog {
     }
 }
 
+/// Suppresses bootstrap-candidate deltas until canonical cluster genesis has
+/// been confirmed. Candidate state is intentionally local and must never enter
+/// the shared replication stream.
+pub struct ClusterGenesisGatedDistributedLog {
+    inner: Arc<dyn DistributedLog>,
+    ready: Arc<AtomicBool>,
+}
+
+impl ClusterGenesisGatedDistributedLog {
+    pub fn new(inner: Arc<dyn DistributedLog>, ready: Arc<AtomicBool>) -> Self {
+        Self { inner, ready }
+    }
+}
+
+#[async_trait]
+impl DistributedLog for ClusterGenesisGatedDistributedLog {
+    async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.inner.publish(delta).await
+    }
+
+    async fn subscribe(
+        &self,
+        from_ts: Timestamp,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+        self.inner.subscribe(from_ts).await
+    }
+
+    async fn subscribe_filtered(
+        &self,
+        from_ts: Timestamp,
+        source_partitions: Option<Vec<PartitionId>>,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+        self.inner
+            .subscribe_filtered(from_ts, source_partitions)
+            .await
+    }
+}
+
 impl CommitDelta {
     pub fn touched_table_names(&self) -> BTreeSet<TableName> {
         self.tablet_id_to_table_name.values().cloned().collect()
@@ -361,16 +408,54 @@ pub mod testing {
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::Arc,
+        sync::{
+            atomic::{
+                AtomicBool,
+                Ordering,
+            },
+            Arc,
+        },
     };
 
     use common::types::Timestamp;
     use value::TableName;
 
     use crate::{
-        commit_delta::CommitDelta,
+        commit_delta::{
+            testing::InMemoryDistributedLog,
+            ClusterGenesisGatedDistributedLog,
+            CommitDelta,
+            DistributedLog,
+        },
         write_log::WriteSource,
     };
+
+    fn test_delta() -> CommitDelta {
+        CommitDelta {
+            ts: Timestamp::MIN,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_name: BTreeMap::new(),
+            source_partition: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_genesis_gate_suppresses_candidate_deltas() {
+        let inner = Arc::new(InMemoryDistributedLog::new());
+        let ready = Arc::new(AtomicBool::new(false));
+        let gated = ClusterGenesisGatedDistributedLog::new(inner.clone(), ready.clone());
+
+        gated.publish(test_delta()).await.unwrap();
+        assert!(inner.deltas().is_empty());
+
+        ready.store(true, Ordering::SeqCst);
+        gated.publish(test_delta()).await.unwrap();
+        assert_eq!(inner.deltas().len(), 1);
+    }
 
     #[test]
     fn touched_table_names_collects_unique_tables() {

@@ -150,6 +150,7 @@ use crate::{
         TimestampOracle,
     },
     two_phase::{
+        prepare_timestamp_too_low,
         testing::InMemoryTwoPhaseDecisionLog,
         NodeAddresses,
         NoopTwoPhaseDecisionLog,
@@ -475,6 +476,7 @@ struct TestTwoPhaseCommitGrpcService {
     committer: CommitterClient,
     prepare_calls: Arc<AtomicUsize>,
     validate_reads_calls: Arc<AtomicUsize>,
+    forced_prepare_floor: Mutex<Option<Timestamp>>,
 }
 
 impl TestTwoPhaseCommitGrpcService {
@@ -495,6 +497,20 @@ impl TestTwoPhaseCommitGrpcService {
             committer,
             prepare_calls,
             validate_reads_calls,
+            forced_prepare_floor: Mutex::new(None),
+        }
+    }
+
+    fn rejecting_first_prepare_below(
+        committer: CommitterClient,
+        prepare_calls: Arc<AtomicUsize>,
+        forced_prepare_floor: Timestamp,
+    ) -> Self {
+        Self {
+            committer,
+            prepare_calls,
+            validate_reads_calls: Arc::new(AtomicUsize::new(0)),
+            forced_prepare_floor: Mutex::new(Some(forced_prepare_floor)),
         }
     }
 }
@@ -517,6 +533,14 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
             .prepare_ts
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("Invalid prepare timestamp: {e:#}")))?;
+        if let Some(required_ts) = self.forced_prepare_floor.lock().take() {
+            if prepare_ts < required_ts {
+                return Ok(Response::new(TwoPcPrepareResponse {
+                    prepare_ts: u64::from(prepare_ts),
+                    required_prepare_ts: Some(u64::from(required_ts)),
+                }));
+            }
+        }
         self.committer
             .ensure_placement_version(PlacementVersion::from(req.placement_version))
             .map_err(|e| Status::failed_precondition(format!("Prepare rejected: {e:#}")))?;
@@ -530,11 +554,24 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
                 prepare_ts,
                 req.participants.iter().copied().map(PartitionId).collect(),
             )
-            .await
-            .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
+            .await;
+
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                if let Some(retry) = prepare_timestamp_too_low(&err) {
+                    return Ok(Response::new(TwoPcPrepareResponse {
+                        prepare_ts: u64::from(retry.proposed_ts),
+                        required_prepare_ts: Some(u64::from(retry.required_ts)),
+                    }));
+                }
+                return Err(Status::internal(format!("Prepare failed: {err:#}")));
+            },
+        };
 
         Ok(Response::new(TwoPcPrepareResponse {
             prepare_ts: u64::from(result.prepare_ts),
+            required_prepare_ts: None,
         }))
     }
 
@@ -558,12 +595,23 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
             .ensure_placement_version(PlacementVersion::from(req.placement_version))
             .map_err(|e| Status::failed_precondition(format!("ValidateReads rejected: {e:#}")))?;
 
-        self.committer
+        let result = self
+            .committer
             .validate_remote_reads(txn_id, transaction, req.write_source.into(), validate_ts)
-            .await
-            .map_err(|e| Status::internal(format!("ValidateReads failed: {e:#}")))?;
+            .await;
 
-        Ok(Response::new(TwoPcValidateReadsResponse {}))
+        if let Err(err) = result {
+            if let Some(retry) = prepare_timestamp_too_low(&err) {
+                return Ok(Response::new(TwoPcValidateReadsResponse {
+                    required_prepare_ts: Some(u64::from(retry.required_ts)),
+                }));
+            }
+            return Err(Status::internal(format!("ValidateReads failed: {err:#}")));
+        }
+
+        Ok(Response::new(TwoPcValidateReadsResponse {
+            required_prepare_ts: None,
+        }))
     }
 
     async fn commit_prepared(
@@ -881,6 +929,7 @@ impl TwoPhaseCommitService for FailingCommitAfterLocalPrepareGrpcService {
             .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
         Ok(Response::new(TwoPcPrepareResponse {
             prepare_ts: u64::from(result.prepare_ts),
+            required_prepare_ts: None,
         }))
     }
 
@@ -983,6 +1032,7 @@ impl TwoPhaseCommitService for FailingRollbackAfterPrepareGrpcService {
             .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
         Ok(Response::new(TwoPcPrepareResponse {
             prepare_ts: u64::from(result.prepare_ts),
+            required_prepare_ts: None,
         }))
     }
 
@@ -6292,6 +6342,104 @@ fn test_cross_partition_commit_uses_remote_prepare_over_grpc() -> anyhow::Result
             assert_obj!("name" => "follow-up-remote"),
         )
         .await?;
+
+        server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_cross_partition_prepare_retry_jumps_to_participant_timestamp_floor() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let node_b = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(Arc::new(InMemoryTimestampOracle::new())),
+        )
+        .await?;
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let remote_seed_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        let forced_prepare_floor = Timestamp::try_from(
+            u64::from(remote_seed_delta.ts)
+                .checked_add(1_000_000_000_000)
+                .context("forced prepare floor overflow")?,
+        )?;
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let server = start_two_pc_server(
+            TestTwoPhaseCommitGrpcService::rejecting_first_prepare_below(
+                node_b.committer_for_test(),
+                prepare_calls.clone(),
+                forced_prepare_floor,
+            ),
+        )
+        .await?;
+
+        let coordinator_tso = Arc::new(RecordingTimestampOracle::new());
+        let node_a = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(coordinator_tso.clone()),
+        )
+        .await?;
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(remote_seed_delta)
+            .await?;
+        insert_doc(&node_a, "messages", assert_obj!("text" => "seed")).await?;
+
+        let initial_delta_count = log.deltas().len();
+        let mut tx = node_a.begin(Identity::system()).await?;
+        let mut model = TestFacingModel::new(&mut tx);
+        model
+            .insert(
+                &"messages".parse()?,
+                assert_obj!("text" => "local-after-floor-retry"),
+            )
+            .await?;
+        model
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "remote-after-floor-retry"),
+            )
+            .await?;
+        let commit_ts = node_a.commit(tx).await?;
+
+        assert!(
+            commit_ts >= forced_prepare_floor,
+            "2PC commit ts {commit_ts} must jump to participant floor {forced_prepare_floor}",
+        );
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst),
+            2,
+            "the participant should reject once and accept the floor-aware retry",
+        );
+        assert!(
+            coordinator_tso
+                .requested_floors()
+                .iter()
+                .any(|floor| *floor >= forced_prepare_floor),
+            "coordinator TSO was never asked to reserve at the participant floor",
+        );
+        let committed_halves = log.deltas()[initial_delta_count..]
+            .iter()
+            .filter(|delta| delta.ts == commit_ts)
+            .count();
+        assert_eq!(
+            committed_halves, 2,
+            "the retried 2PC transaction should publish both halves exactly once",
+        );
 
         server.shutdown().await?;
         Ok(())

@@ -267,6 +267,11 @@ async fn run_sync_socket(
                 }
             }
             if let Some(raft_state) = st.raft_state.as_ref() {
+                if !raft_state.is_cluster_genesis_ready() {
+                    anyhow::bail!(
+                        "Sync socket authority lost: canonical cluster genesis is not ready"
+                    );
+                }
                 if !raft_state.is_leader() {
                     anyhow::bail!(
                         "Sync socket authority lost: coordinator partition is a Raft follower"

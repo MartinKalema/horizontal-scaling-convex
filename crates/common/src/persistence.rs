@@ -190,6 +190,18 @@ pub enum PersistenceGlobalKey {
     /// copied into checkpoints.
     RaftNatsOutbox,
 
+    /// Identity of the canonical cluster genesis installed through every
+    /// partition's Raft state machine. This is cluster-global and must be
+    /// copied into checkpoints so fresh and snapshot-restored voters retain
+    /// the same genesis authority.
+    ClusterGenesis,
+
+    /// Node-local evidence that this persistence applied cluster genesis from
+    /// its partition's Raft log. Unlike `ClusterGenesis`, this must not be
+    /// copied into checkpoints because each voter proves Raft application
+    /// independently.
+    ClusterGenesisRaftApplied,
+
     /// Internal id of _tables.by_id index, for bootstrapping.
     TablesByIdIndex,
     /// Internal id of _tables table, for bootstrapping.
@@ -225,6 +237,10 @@ impl From<PersistenceGlobalKey> for String {
             PersistenceGlobalKey::TableSummary => "table_summary".to_string(),
             PersistenceGlobalKey::TwoPhaseRedoRecords => "two_phase_redo_records".to_string(),
             PersistenceGlobalKey::RaftNatsOutbox => "raft_nats_outbox".to_string(),
+            PersistenceGlobalKey::ClusterGenesis => "cluster_genesis".to_string(),
+            PersistenceGlobalKey::ClusterGenesisRaftApplied => {
+                "cluster_genesis_raft_applied".to_string()
+            },
             PersistenceGlobalKey::TablesByIdIndex => "tables_by_id".to_string(),
             PersistenceGlobalKey::IndexByIdIndex => "index_by_id".to_string(),
             // NB: For compatibility, these are referred to as "table_id"s, not "tablet_id"s.
@@ -250,6 +266,8 @@ impl FromStr for PersistenceGlobalKey {
             "table_summary" => Ok(Self::TableSummary),
             "two_phase_redo_records" => Ok(Self::TwoPhaseRedoRecords),
             "raft_nats_outbox" => Ok(Self::RaftNatsOutbox),
+            "cluster_genesis" => Ok(Self::ClusterGenesis),
+            "cluster_genesis_raft_applied" => Ok(Self::ClusterGenesisRaftApplied),
             "tables_by_id" => Ok(Self::TablesByIdIndex),
             "tables_table_id" => Ok(Self::TablesTabletId),
             "index_by_id" => Ok(Self::IndexByIdIndex),
@@ -267,7 +285,14 @@ impl PersistenceGlobalKey {
     pub fn checkpoint_keys() -> Vec<Self> {
         Self::all_keys()
             .into_iter()
-            .filter(|key| !matches!(key, Self::TwoPhaseRedoRecords | Self::RaftNatsOutbox))
+            .filter(|key| {
+                !matches!(
+                    key,
+                    Self::TwoPhaseRedoRecords
+                        | Self::RaftNatsOutbox
+                        | Self::ClusterGenesisRaftApplied
+                )
+            })
             .collect()
     }
 }

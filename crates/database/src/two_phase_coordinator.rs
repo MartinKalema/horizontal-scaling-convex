@@ -57,6 +57,7 @@ use crate::{
     },
     transaction::FinalTransaction,
     two_phase::{
+        prepare_timestamp_too_low,
         NodeAddresses,
         ParticipantTransaction,
         StagingRecoveryResult,
@@ -283,7 +284,7 @@ fn routed_partition_for_catalog_write(
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub(crate) fn routed_partition_for_catalog_write_for_test(
+pub fn routed_partition_for_catalog_write_for_test(
     transaction: &FinalTransaction,
     write: &DocumentUpdateWithPrevTs,
     partition_map: &PartitionMap,
@@ -861,9 +862,12 @@ async fn mark_participant_resolved(
     Ok(())
 }
 
+fn required_prepare_ts(err: &anyhow::Error) -> Option<Timestamp> {
+    prepare_timestamp_too_low(err).map(|retry| retry.required_ts)
+}
+
 fn is_retryable_prepare_ts_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.to_string().contains("2PC Prepare assigned ts="))
+    required_prepare_ts(err).is_some()
 }
 
 fn is_ambiguous_prepare_error(err: &anyhow::Error) -> bool {
@@ -1009,10 +1013,13 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
 
     let mut last_retryable_error = None;
     let mut prepare_attempts = 0usize;
+    let mut min_prepare_ts = Timestamp::MIN;
     for attempt in 0..MAX_PREPARE_TS_RETRIES {
         let txn_id = TwoPhaseTransactionId::new();
         prepare_attempts = attempt + 1;
-        let prepare_ts = local_committer.allocate_commit_ts().await?;
+        let prepare_ts = local_committer
+            .allocate_commit_ts_at_or_after(min_prepare_ts)
+            .await?;
         tracing::info!(
             "2PC Coordinator: starting txn={}, participants={:?}, prepare_ts={}, attempt={}",
             txn_id,
@@ -1057,6 +1064,10 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
             let all_failures_retryable = failures
                 .iter()
                 .all(|failure| is_retryable_prepare_ts_error(&failure.err));
+            let required_retry_floor = failures
+                .iter()
+                .filter_map(|failure| required_prepare_ts(&failure.err))
+                .max();
             let selected_failure_index = failures
                 .iter()
                 .position(|failure| !is_retryable_prepare_ts_error(&failure.err))
@@ -1088,11 +1099,14 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                 && attempt + 1 < MAX_PREPARE_TS_RETRIES
                 && all_failures_retryable;
             if retryable_prepare_ts_error {
+                min_prepare_ts = required_retry_floor
+                    .expect("all retryable timestamp failures must include a required floor");
                 metrics::log_two_phase_prepare_retry();
                 tracing::info!(
-                    "2PC Coordinator: retrying txn={} with a newer prepare timestamp after \
-                     participant {} rejected ts on attempt {}",
+                    "2PC Coordinator: retrying txn={} at or above ts={} after participant {} \
+                     rejected ts on attempt {}",
                     txn_id,
+                    u64::from(min_prepare_ts),
                     selected_failure.participant,
                     attempt + 1,
                 );
@@ -1232,6 +1246,7 @@ mod tests {
         reads::ReadSet,
         two_phase::{
             ParticipantTransaction,
+            PrepareTimestampTooLow,
             TwoPhaseDecision,
             TwoPhaseParticipantIntent,
             TwoPhaseRedoEntry,
@@ -1250,17 +1265,27 @@ mod tests {
     }
 
     #[test]
-    fn retryable_prepare_ts_error_detects_wrapped_grpc_status() {
-        let err = anyhow::anyhow!(
-            "Prepare failed: 2PC Prepare assigned ts=10 but this participant requires ts>=20"
-        )
+    fn retryable_prepare_ts_error_detects_wrapped_structured_floor() -> anyhow::Result<()> {
+        let err = anyhow::Error::new(PrepareTimestampTooLow {
+            proposed_ts: Timestamp::try_from(10u64)?,
+            required_ts: Timestamp::try_from(20u64)?,
+        })
         .context("gRPC Prepare failed");
         assert!(is_retryable_prepare_ts_error(&err));
+        assert_eq!(super::required_prepare_ts(&err), Some(20u64.try_into()?));
+        Ok(())
     }
 
     #[test]
     fn retryable_prepare_ts_error_rejects_unrelated_errors() {
         let err = anyhow::anyhow!("gRPC Prepare failed");
+        assert!(!is_retryable_prepare_ts_error(&err));
+    }
+
+    #[test]
+    fn retryable_prepare_ts_error_rejects_matching_text_without_structured_floor() {
+        let err =
+            anyhow::anyhow!("2PC Prepare assigned ts=10 but this participant requires ts>=20");
         assert!(!is_retryable_prepare_ts_error(&err));
     }
 

@@ -79,6 +79,8 @@ pub struct RaftPartitionState {
     node_id: u64,
     /// Local serving lease for coordinator-owned reads/subscriptions.
     leader_serving_lease_valid_until: Arc<Mutex<Option<Instant>>>,
+    /// Cluster-wide genesis has been installed by every configured partition.
+    cluster_genesis_ready: Arc<AtomicBool>,
 }
 
 impl RaftPartitionState {
@@ -94,6 +96,18 @@ impl RaftPartitionState {
         self.leader_serving_lease_valid_until
             .lock()
             .is_some_and(|valid_until| valid_until > Instant::now())
+    }
+
+    pub fn is_cluster_genesis_ready(&self) -> bool {
+        self.cluster_genesis_ready.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_cluster_genesis_ready(&self) {
+        self.cluster_genesis_ready.store(true, Ordering::SeqCst);
+    }
+
+    pub fn can_serve_as_leader(&self) -> bool {
+        self.is_cluster_genesis_ready() && self.is_leader() && self.has_leader_serving_lease()
     }
 
     /// Get the current leader's node ID.
@@ -151,12 +165,18 @@ impl RaftPartitionState {
             } else {
                 None
             })),
+            cluster_genesis_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn expire_leader_serving_lease_for_test(&self) {
         *self.leader_serving_lease_valid_until.lock() = Some(Instant::now());
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn mark_cluster_genesis_unready_for_test(&self) {
+        self.cluster_genesis_ready.store(false, Ordering::SeqCst);
     }
 }
 
@@ -181,6 +201,24 @@ impl RaftPartitionManager {
         peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
         snapshot_provider: Option<Arc<dyn crate::raft_storage::RaftSnapshotProvider>>,
         timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_cluster_genesis_gate(
+            config,
+            engine,
+            peer_senders,
+            snapshot_provider,
+            timestamp_oracle,
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    pub fn new_with_cluster_genesis_gate(
+        config: RaftNodeConfig,
+        engine: Arc<raft_engine::Engine>,
+        peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
+        snapshot_provider: Option<Arc<dyn crate::raft_storage::RaftSnapshotProvider>>,
+        timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
+        cluster_genesis_ready: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel();
 
@@ -265,6 +303,7 @@ impl RaftPartitionManager {
             partition_id: config.partition_id,
             node_id: config.node_id,
             leader_serving_lease_valid_until,
+            cluster_genesis_ready,
         };
         metrics::log_raft_is_leader(config.partition_id, false);
         metrics::log_raft_leader_id(config.partition_id, 0);

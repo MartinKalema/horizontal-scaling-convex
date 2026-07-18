@@ -1843,10 +1843,10 @@ impl<RT: Runtime> Committer<RT> {
                             );
                             let _ = result.send(r);
                         },
-                        Some(CommitterMessage::AllocateCommitTs { result }) => {
+                        Some(CommitterMessage::AllocateCommitTs { min_ts, result }) => {
                             let r = self
                                 .ensure_leader_for_writes()
-                                .and_then(|_| self.next_commit_ts());
+                                .and_then(|_| self.next_commit_ts_at_or_after(min_ts));
                             let _ = result.send(r);
                         },
                         Some(CommitterMessage::CommitPrepared {
@@ -2215,7 +2215,7 @@ impl<RT: Runtime> Committer<RT> {
         if self
             .raft_state
             .as_ref()
-            .is_some_and(|raft_state| !raft_state.is_leader())
+            .is_none_or(|raft_state| !raft_state.can_serve_as_leader())
         {
             return;
         }
@@ -2252,7 +2252,7 @@ impl<RT: Runtime> Committer<RT> {
         if self
             .raft_state
             .as_ref()
-            .is_some_and(|raft_state| !raft_state.is_leader())
+            .is_none_or(|raft_state| !raft_state.can_serve_as_leader())
         {
             return Ok(None);
         }
@@ -2262,6 +2262,11 @@ impl<RT: Runtime> Committer<RT> {
 
     fn ensure_leader_for_writes(&self) -> anyhow::Result<()> {
         if let Some(ref raft) = self.raft_state {
+            anyhow::ensure!(
+                raft.is_cluster_genesis_ready(),
+                "Cluster genesis is not ready for partition {}; retry after bootstrap completes",
+                raft.partition_id(),
+            );
             if !raft.is_leader() {
                 let leader = raft.leader_id();
                 metrics::log_write_rejected_not_leader(raft.partition_id());
@@ -2452,11 +2457,11 @@ impl<RT: Runtime> Committer<RT> {
                 );
                 local_commit_floor
             } else {
-                anyhow::bail!(
-                    "2PC Prepare assigned ts={} but this participant requires ts>={}",
-                    commit_ts,
-                    local_commit_floor,
-                );
+                return Err(crate::two_phase::PrepareTimestampTooLow {
+                    proposed_ts: commit_ts,
+                    required_ts: local_commit_floor,
+                }
+                .into());
             };
             (commit_ts, local_commit_ts)
         } else {
@@ -3149,7 +3154,7 @@ impl<RT: Runtime> Committer<RT> {
         }
         self.raft_state
             .as_ref()
-            .is_none_or(|raft_state| raft_state.is_leader())
+            .is_some_and(|raft_state| raft_state.can_serve_as_leader())
     }
 
     fn propose_commit_to_raft_state(
@@ -3159,6 +3164,11 @@ impl<RT: Runtime> Committer<RT> {
         let Some(raft) = raft_state else {
             return Ok(None);
         };
+        anyhow::ensure!(
+            raft.is_cluster_genesis_ready(),
+            "Cluster genesis is not ready for partition {}",
+            raft.partition_id(),
+        );
         if !raft.is_leader() {
             anyhow::bail!(
                 "Raft leadership lost before proposing commit at ts={} for partition {}",
@@ -3202,6 +3212,11 @@ impl<RT: Runtime> Committer<RT> {
         let Some(raft) = self.raft_state.as_ref() else {
             return Ok(None);
         };
+        anyhow::ensure!(
+            raft.is_cluster_genesis_ready(),
+            "Cluster genesis is not ready for partition {}",
+            raft.partition_id(),
+        );
         if !raft.is_leader() {
             anyhow::bail!(
                 "Raft leadership lost before proposing 2PC prepare for txn={} on partition {}",
@@ -4457,11 +4472,11 @@ impl<RT: Runtime> Committer<RT> {
             metrics::log_two_phase_resolver_validation(local_partition, "timestamp_floor");
             metrics::log_two_phase_resolver_timestamp_floor_rejection(local_partition);
             timer.finish_with("timestamp_floor");
-            anyhow::bail!(
-                "2PC Prepare assigned ts={} but this participant requires ts>={}",
-                validate_ts,
-                local_commit_floor,
-            );
+            return Err(crate::two_phase::PrepareTimestampTooLow {
+                proposed_ts: validate_ts,
+                required_ts: local_commit_floor,
+            }
+            .into());
         }
 
         let stale_timer = metrics::commit_is_stale_timer();
@@ -5661,8 +5676,15 @@ impl<RT: Runtime> Committer<RT> {
     }
 
     fn next_commit_ts(&mut self) -> anyhow::Result<Timestamp> {
+        self.next_commit_ts_at_or_after(Timestamp::MIN)
+    }
+
+    fn next_commit_ts_at_or_after(
+        &mut self,
+        requested_floor: Timestamp,
+    ) -> anyhow::Result<Timestamp> {
         let _timer = next_commit_ts_seconds();
-        let local_floor = self.local_commit_floor()?;
+        let local_floor = cmp::max(self.local_commit_floor()?, requested_floor);
         let timestamp_stage_path = if self.timestamp_oracle.is_some() {
             "tso"
         } else {
@@ -6239,8 +6261,15 @@ impl CommitterClient {
     }
 
     pub async fn allocate_commit_ts(&self) -> anyhow::Result<Timestamp> {
+        self.allocate_commit_ts_at_or_after(Timestamp::MIN).await
+    }
+
+    pub async fn allocate_commit_ts_at_or_after(
+        &self,
+        min_ts: Timestamp,
+    ) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::AllocateCommitTs { result: tx };
+        let message = CommitterMessage::AllocateCommitTs { min_ts, result: tx };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -6523,6 +6552,7 @@ enum CommitterMessage {
         result: oneshot::Sender<anyhow::Result<()>>,
     },
     AllocateCommitTs {
+        min_ts: Timestamp,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     /// 2PC CommitPrepared: finalize a previously prepared transaction.

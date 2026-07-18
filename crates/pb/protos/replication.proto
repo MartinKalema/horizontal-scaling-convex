@@ -171,8 +171,13 @@ message TwoPcPrepareRequest {
 }
 
 message TwoPcPrepareResponse {
-  // The prepare timestamp assigned by the participant's TSO.
+  // The coordinator timestamp accepted by the participant.
   uint64 prepare_ts = 1;
+
+  // Set when the participant cannot accept prepare_ts because its committed
+  // state has already advanced. The coordinator must allocate a new global
+  // timestamp at or above this floor and retry the whole prepare attempt.
+  optional uint64 required_prepare_ts = 2;
 }
 
 message TwoPcValidateReadsRequest {
@@ -196,6 +201,10 @@ message TwoPcValidateReadsRequest {
 }
 
 message TwoPcValidateReadsResponse {
+  // Set when validate_ts is behind the read owner's committed state. The
+  // coordinator must allocate a new global timestamp at or above this floor
+  // and retry the whole prepare attempt.
+  optional uint64 required_prepare_ts = 1;
 }
 
 message TwoPcParticipantTransaction {

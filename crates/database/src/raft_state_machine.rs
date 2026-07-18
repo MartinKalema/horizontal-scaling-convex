@@ -11,6 +11,10 @@ use serde::{
 };
 
 use crate::{
+    cluster_genesis::{
+        CanonicalGenesisPayload,
+        ClusterGenesisManifest,
+    },
     commit_delta::CommitDelta,
     nats_distributed_log::DeltaEnvelope,
     two_phase::TwoPhaseRedoEntry,
@@ -20,8 +24,16 @@ use crate::{
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RaftStateMachineEntry {
-    CommitDelta { envelope: DeltaEnvelope },
-    TwoPhasePrepare { redo: TwoPhaseRedoEntry },
+    CommitDelta {
+        envelope: DeltaEnvelope,
+    },
+    TwoPhasePrepare {
+        redo: TwoPhaseRedoEntry,
+    },
+    ClusterGenesis {
+        manifest: ClusterGenesisManifest,
+        checkpoint_base64: String,
+    },
 }
 
 impl RaftStateMachineEntry {
@@ -33,6 +45,13 @@ impl RaftStateMachineEntry {
 
     pub fn two_phase_prepare(redo: TwoPhaseRedoEntry) -> Self {
         Self::TwoPhasePrepare { redo }
+    }
+
+    pub fn cluster_genesis(payload: &CanonicalGenesisPayload) -> Self {
+        Self::ClusterGenesis {
+            manifest: payload.manifest.clone(),
+            checkpoint_base64: base64::encode(&payload.checkpoint_bytes),
+        }
     }
 
     pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
@@ -86,6 +105,9 @@ mod tests {
             RaftStateMachineEntry::TwoPhasePrepare { .. } => {
                 panic!("expected commit delta entry")
             },
+            RaftStateMachineEntry::ClusterGenesis { .. } => {
+                panic!("expected commit delta entry")
+            },
         }
         Ok(())
     }
@@ -112,6 +134,31 @@ mod tests {
             RaftStateMachineEntry::TwoPhasePrepare { .. } => {
                 panic!("expected commit delta entry")
             },
+            RaftStateMachineEntry::ClusterGenesis { .. } => {
+                panic!("expected commit delta entry")
+            },
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_genesis_entry_roundtrips() -> anyhow::Result<()> {
+        let payload =
+            crate::cluster_genesis::canonicalize_checkpoint(crate::checkpoint::CheckpointData {
+                timestamp: Timestamp::must(9),
+                documents: Vec::new(),
+                globals: Default::default(),
+            })?;
+        let bytes = RaftStateMachineEntry::cluster_genesis(&payload).to_bytes()?;
+        match RaftStateMachineEntry::from_bytes(&bytes)? {
+            RaftStateMachineEntry::ClusterGenesis {
+                manifest,
+                checkpoint_base64,
+            } => {
+                assert_eq!(manifest, payload.manifest);
+                assert_eq!(base64::decode(checkpoint_base64)?, payload.checkpoint_bytes);
+            },
+            _ => panic!("expected cluster genesis entry"),
         }
         Ok(())
     }

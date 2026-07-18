@@ -98,6 +98,7 @@ BACKEND_CONTAINERS=(
     docker-node-p1b-1
     docker-node-p1c-1
 )
+CANONICAL_GENESIS_ID=""
 
 pass() {
     PASSED=$((PASSED + 1))
@@ -151,6 +152,76 @@ assert_dynamic_membership_advertisements() {
     fi
 }
 
+read_persistence_global() {
+    local database_name="$1"
+    local key="$2"
+    docker exec docker-postgres-1 psql -U postgres -d "$database_name" -Atc \
+        "SELECT convert_from(json_value, 'UTF8') FROM persistence_globals WHERE key = '$key'" \
+        2>/dev/null || true
+}
+
+genesis_id_from_json() {
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["genesis_id"])'
+}
+
+wait_for_persistence_global() {
+    local database_name="$1"
+    local key="$2"
+    local value=""
+    for _ in $(seq 1 90); do
+        value=$(read_persistence_global "$database_name" "$key")
+        if [ -n "$value" ]; then
+            printf '%s' "$value"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+assert_canonical_cluster_genesis() {
+    local details=""
+    local expected=""
+    local specs=(
+        "convex_node_p0a docker-node-p0a-1"
+        "convex_node_p0b docker-node-p0b-1"
+        "convex_node_p0c docker-node-p0c-1"
+        "convex_node_p1a docker-node-p1a-1"
+        "convex_node_p1b docker-node-p1b-1"
+        "convex_node_p1c docker-node-p1c-1"
+    )
+
+    for spec in "${specs[@]}"; do
+        read -r database_name container <<< "$spec"
+        local marker
+        local applied
+        marker=$(wait_for_persistence_global "$database_name" cluster_genesis || true)
+        applied=$(wait_for_persistence_global "$database_name" cluster_genesis_raft_applied || true)
+        if [ -z "$marker" ] || [ -z "$applied" ]; then
+            details="$details $container marker=${marker:-missing} raft_applied=${applied:-missing};"
+            continue
+        fi
+        local marker_id
+        local applied_id
+        marker_id=$(genesis_id_from_json <<< "$marker" 2>/dev/null || true)
+        applied_id=$(genesis_id_from_json <<< "$applied" 2>/dev/null || true)
+        if [ -z "$expected" ]; then
+            expected="$marker_id"
+        fi
+        if [ -z "$marker_id" ] || [ "$marker_id" != "$expected" ] || [ "$applied_id" != "$expected" ]; then
+            details="$details $container marker=$marker_id raft_applied=$applied_id expected=$expected;"
+        fi
+    done
+
+    if [ -z "$details" ] && [ -n "$expected" ]; then
+        CANONICAL_GENESIS_ID="$expected"
+        pass "All six nodes installed one canonical Convex genesis"
+        pass "Every node applied canonical genesis through its partition Raft log"
+    else
+        fail "Cluster genesis state diverged" "$details"
+    fi
+}
+
 # --- Preflight ---
 
 echo ""
@@ -166,6 +237,7 @@ done
 echo "  Containers running."
 
 assert_dynamic_membership_advertisements
+assert_canonical_cluster_genesis
 
 if [ "${EXPECT_PARALLEL_2PC_EARLY_ACK:-false}" = "true" ]; then
     EARLY_ACK_ENV_OK=true
@@ -1301,6 +1373,19 @@ done
 # Re-generate Node B key (may have changed on restart)
 NODE_P1A_KEY=$(docker exec docker-node-p1a-1 ./generate_admin_key.sh 2>&1 | tail -1)
 NODE_B_KEY="$NODE_P1A_KEY"
+
+RESTART_GENESIS=$(wait_for_persistence_global convex_node_p1a cluster_genesis || true)
+RESTART_RAFT_GENESIS=$(wait_for_persistence_global convex_node_p1a cluster_genesis_raft_applied || true)
+RESTART_GENESIS_ID=$(genesis_id_from_json <<< "$RESTART_GENESIS" 2>/dev/null || true)
+RESTART_RAFT_GENESIS_ID=$(genesis_id_from_json <<< "$RESTART_RAFT_GENESIS" 2>/dev/null || true)
+if [ -n "$CANONICAL_GENESIS_ID" ] \
+    && [ "$RESTART_GENESIS_ID" = "$CANONICAL_GENESIS_ID" ] \
+    && [ "$RESTART_RAFT_GENESIS_ID" = "$CANONICAL_GENESIS_ID" ]; then
+    pass "Restarted node retained canonical Raft-applied genesis identity"
+else
+    fail "Restarted node lost canonical genesis identity" \
+        "canonical=$CANONICAL_GENESIS_ID marker=$RESTART_GENESIS_ID raft_applied=$RESTART_RAFT_GENESIS_ID"
+fi
 
 # Re-deploy functions to Node B (modules are in-memory)
 echo "  Re-deploying functions to Node B..."

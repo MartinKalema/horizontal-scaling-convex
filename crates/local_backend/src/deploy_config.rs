@@ -161,6 +161,10 @@ async fn raft_leader_origin(st: &DeployRouterState) -> anyhow::Result<Option<Str
     let Some(raft_state) = st.raft_state.as_ref() else {
         return Ok(None);
     };
+    anyhow::ensure!(
+        raft_state.is_cluster_genesis_ready(),
+        "Canonical cluster genesis is not Raft-confirmed by every partition"
+    );
     if raft_state.is_leader() {
         return Ok(None);
     }

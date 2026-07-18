@@ -12,6 +12,7 @@
 
 mod bootstrap_model;
 pub mod checkpoint;
+pub mod cluster_genesis;
 pub mod commit_client;
 pub mod commit_delta;
 mod committer;

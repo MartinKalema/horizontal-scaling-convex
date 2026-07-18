@@ -544,6 +544,34 @@ pub struct PrepareResult {
     pub prepare_ts: Timestamp,
 }
 
+/// A participant has advanced beyond the coordinator's proposed timestamp.
+///
+/// This is a normal 2PC retry signal, not an RPC failure. Keeping the required
+/// floor structured lets the coordinator jump across disjoint TSO batches in
+/// one retry instead of guessing from an error string.
+#[derive(Debug)]
+pub struct PrepareTimestampTooLow {
+    pub proposed_ts: Timestamp,
+    pub required_ts: Timestamp,
+}
+
+impl std::fmt::Display for PrepareTimestampTooLow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "2PC Prepare assigned ts={} but this participant requires ts>={}",
+            self.proposed_ts, self.required_ts,
+        )
+    }
+}
+
+impl std::error::Error for PrepareTimestampTooLow {}
+
+pub fn prepare_timestamp_too_low(err: &anyhow::Error) -> Option<&PrepareTimestampTooLow> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<PrepareTimestampTooLow>())
+}
+
 /// Redo log entry persisted during Prepare for crash recovery.
 /// If a node crashes after Prepare but before CommitPrepared/RollbackPrepared,
 /// the transaction watcher reads the redo log and resolves the transaction
@@ -1699,7 +1727,17 @@ impl TwoPhaseCommitGrpcClient {
             .prepare(self.request(request))
             .await
             .context("gRPC Prepare failed")?;
-        let TwoPcPrepareResponse { prepare_ts } = response.into_inner();
+        let TwoPcPrepareResponse {
+            prepare_ts,
+            required_prepare_ts,
+        } = response.into_inner();
+        if let Some(required_prepare_ts) = required_prepare_ts {
+            return Err(PrepareTimestampTooLow {
+                proposed_ts: prepare_ts.try_into()?,
+                required_ts: required_prepare_ts.try_into()?,
+            }
+            .into());
+        }
         Ok(PrepareResult {
             prepare_ts: prepare_ts.try_into()?,
         })
@@ -1720,11 +1758,19 @@ impl TwoPhaseCommitGrpcClient {
             validate_ts: u64::from(validate_ts),
             placement_version: u64::from(placement_version),
         };
-        self.client
+        let response = self
+            .client
             .clone()
             .validate_reads(self.request(request))
             .await
             .context("gRPC ValidateReads failed")?;
+        if let Some(required_prepare_ts) = response.into_inner().required_prepare_ts {
+            return Err(PrepareTimestampTooLow {
+                proposed_ts: validate_ts,
+                required_ts: required_prepare_ts.try_into()?,
+            }
+            .into());
+        }
         Ok(())
     }
 
