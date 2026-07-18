@@ -2,6 +2,11 @@ name: Semantic Conformance - Bounded PR Gate
 
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
   push:
     branches:
       - dev
