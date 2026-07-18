@@ -283,7 +283,7 @@ fn routed_partition_for_catalog_write(
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub(crate) fn routed_partition_for_catalog_write_for_test(
+pub fn routed_partition_for_catalog_write_for_test(
     transaction: &FinalTransaction,
     write: &DocumentUpdateWithPrevTs,
     partition_map: &PartitionMap,

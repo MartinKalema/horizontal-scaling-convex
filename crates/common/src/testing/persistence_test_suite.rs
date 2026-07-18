@@ -63,6 +63,7 @@ use crate::{
         NoopRetentionValidator,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceGlobalWrite,
         PersistenceIndexEntry,
         PersistenceReader,
         TimestampRange,
@@ -205,6 +206,13 @@ macro_rules! run_persistence_test_suite {
             let $db = $create_db;
             let p = $create_persistence;
             persistence_test_suite::persistence_global(::std::sync::Arc::new(p)).await
+        }
+
+        #[tokio::test]
+        async fn test_persistence_atomic_write_with_global() -> anyhow::Result<()> {
+            let $db = $create_db;
+            let p = $create_persistence;
+            persistence_test_suite::atomic_write_with_global(::std::sync::Arc::new(p)).await
         }
 
         #[tokio::test]
@@ -1540,6 +1548,71 @@ pub async fn persistence_global<P: Persistence>(p: Arc<P>) -> anyhow::Result<()>
     let value = very_nested_json(257);
     p.write_persistence_global(key, value.clone()).await?;
     assert_eq!(p.reader().get_persistence_global(key).await?, Some(value));
+    Ok(())
+}
+
+pub async fn atomic_write_with_global<P: Persistence>(p: Arc<P>) -> anyhow::Result<()> {
+    let mut id_generator = TestIdGenerator::new();
+    let table: TableName = "atomic_write".parse()?;
+    let document = doc(id_generator.user_generate(&table), 17, Some(42), None)?;
+    let marker = PersistenceGlobalWrite::new("test_atomic_marker", json!({"committed": 17}));
+    p.write_with_persistence_globals(
+        std::slice::from_ref(&document),
+        &[],
+        ConflictStrategy::Error,
+        std::slice::from_ref(&marker),
+    )
+    .await?;
+
+    let loaded = p
+        .reader()
+        .load_documents(
+            TimestampRange::at(Timestamp::must(17)),
+            Order::Asc,
+            16,
+            Arc::new(NoopRetentionValidator),
+        )
+        .try_collect::<Vec<_>>()
+        .await?;
+    assert_eq!(loaded, vec![document.clone()]);
+    assert_eq!(
+        p.reader()
+            .get_persistence_global_raw("test_atomic_marker")
+            .await?,
+        Some(marker.value),
+    );
+
+    let rejected_marker =
+        PersistenceGlobalWrite::new("test_rejected_atomic_marker", json!({"committed": false}));
+    let earlier_valid_document = doc(id_generator.user_generate(&table), 18, Some(43), None)?;
+    p.write_with_persistence_globals(
+        &[earlier_valid_document.clone(), document],
+        &[],
+        ConflictStrategy::Error,
+        std::slice::from_ref(&rejected_marker),
+    )
+    .await
+    .expect_err("duplicate document revision should reject the atomic batch");
+    assert_eq!(
+        p.reader()
+            .get_persistence_global_raw("test_rejected_atomic_marker")
+            .await?,
+        None,
+        "a failed document write must roll back its persistence-global marker",
+    );
+    assert!(
+        p.reader()
+            .load_documents(
+                TimestampRange::at(Timestamp::must(18)),
+                Order::Asc,
+                16,
+                Arc::new(NoopRetentionValidator),
+            )
+            .try_collect::<Vec<_>>()
+            .await?
+            .is_empty(),
+        "a conflict later in the batch must roll back earlier document rows",
+    );
     Ok(())
 }
 
