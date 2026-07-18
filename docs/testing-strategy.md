@@ -1,5 +1,10 @@
 # Testing Strategy for Primary-Replica Implementation
 
+> The executable release contract is maintained in
+> [Semantic Conformance Gate](semantic-conformance.md). This document explains
+> the broader testing toolbox; a test category counts as release proof only when
+> it is mapped to a required semantic dimension in the conformance matrix.
+
 How to verify that the primary-replica architecture works correctly without breaking Convex's guarantees.
 
 ---

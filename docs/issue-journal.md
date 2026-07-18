@@ -941,6 +941,32 @@ own for distributed changes.
   and mapped GitHub issue states were checked against the current repository
   and issue backlog.
 
+### 2026-07 — Added an executable semantic conformance release gate
+
+- **Status:** complete
+- **Related issue:** `#288`
+- **What this fixes:** protocol and cluster tests could pass independently
+  without answering whether the full clustered product still preserved normal
+  Convex behavior. There was no machine-readable definition of release
+  readiness and no automation that rejected unproven semantic dimensions.
+- **Behavior:** `scripts/semantic-conformance/matrix.json` maps twelve required
+  semantic dimensions to invariant IDs, owner issues, executable proofs,
+  current evidence, and explicit gaps. The runner validates the contract,
+  executes bounded PR and larger nightly proof tiers, retains replay artifacts,
+  and rejects release mode unless every required dimension is proven. GitHub
+  workflows wire PR, scheduled cluster, and reusable strict release gates.
+- **Current result:** release is deliberately blocked: zero dimensions are
+  proven, six are partial, and six are blocked. The gate prints the owner issues
+  rather than hiding missing work behind skipped tests.
+- **Validation:** 13/13 runner contract tests, 78/78 database write-scaling
+  tests, 16/16 Rust Raft failover tests, the seeded Elle history proof, and the
+  locally built six-node Docker suites (146/146 write scaling and 24/24 Raft)
+  pass. Image proof confirmed all six containers used
+  `sha256:23ac2aa51b948ac0386528a357eaccd941f91ad72adc8b47c88ef4e70d4bf8e7`.
+  The parent-base local-backend suite is 99/100: `test_api_specs_match`
+  generates the exact OpenAPI blob already committed in pending PR `#290`;
+  this branch deliberately does not duplicate that unrelated fixture change.
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

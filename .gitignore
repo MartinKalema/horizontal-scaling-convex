@@ -1,5 +1,6 @@
 node_modules/
 target/
+artifacts/semantic-conformance/
 convex_local_backend*.sqlite3
 convex_local_storage/
 .DS_Store

@@ -1,0 +1,90 @@
+name: Semantic Conformance - Nightly Cluster
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Optional replay seed
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semantic-nightly-cluster
+  cancel-in-progress: false
+
+jobs:
+  nightly-semantic-proof:
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - convex-cluster
+    timeout-minutes: 300
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      PROTOC: ${{ github.workspace }}/crates/pb_build/protoc/protoc-linux-x86_64
+      RUST_BACKTRACE: "1"
+      SEMANTIC_CONFORMANCE_SEED: ${{ inputs.seed }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify cluster runner prerequisites
+        run: |
+          docker version
+          docker compose version
+          cmake --version
+          rustup --version
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-02-18 --profile minimal
+
+      - name: Make bundled tools executable
+        run: |
+          chmod +x "$PROTOC"
+          chmod +x scripts/semantic-conformance/*.sh
+
+      - name: Build and verify the local cluster image
+        run: >-
+          scripts/semantic-conformance/prepare-cluster.sh
+          artifacts/semantic-conformance/cluster
+
+      - name: Run nightly semantic proofs
+        env:
+          SEMANTIC_CLUSTER_READY: "1"
+        run: >-
+          node scripts/semantic-conformance/run.mjs --mode nightly
+          --artifacts-dir artifacts/semantic-conformance
+
+      - name: Capture cluster state and logs
+        if: always()
+        run: >-
+          scripts/semantic-conformance/capture-cluster-state.sh
+          artifacts/semantic-conformance/cluster-state
+
+      - name: Upload replay artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: semantic-nightly-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/semantic-conformance
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Tear down cluster
+        if: always()
+        run: >-
+          docker compose --project-directory self-hosted/docker -f
+          self-hosted/docker/docker-compose.yml --profile cluster down -v
+          --remove-orphans
