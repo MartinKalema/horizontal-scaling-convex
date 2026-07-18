@@ -1,0 +1,282 @@
+{
+  "schemaVersion": 1,
+  "invariants": [
+    "INV-01",
+    "INV-02",
+    "INV-03",
+    "INV-04",
+    "INV-05",
+    "INV-06",
+    "INV-07",
+    "INV-08",
+    "INV-09",
+    "INV-10",
+    "INV-11",
+    "INV-12",
+    "INV-13",
+    "INV-14",
+    "INV-15",
+    "INV-16"
+  ],
+  "proofs": [
+    {
+      "id": "conformance-runner-contract",
+      "title": "Semantic matrix and runner contract tests",
+      "tier": "pr",
+      "kind": "contract",
+      "command": [
+        "node",
+        "--test",
+        "scripts/semantic-conformance/lib.test.mjs"
+      ],
+      "timeoutSeconds": 120
+    },
+    {
+      "id": "database-write-scaling",
+      "title": "Database write-scaling deterministic tests",
+      "tier": "pr",
+      "kind": "deterministic-fault",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "database",
+        "tests::write_scaling_tests",
+        "--lib",
+        "--",
+        "--nocapture"
+      ],
+      "timeoutSeconds": 5400
+    },
+    {
+      "id": "database-raft-failover",
+      "title": "Seeded Raft failover and nemesis tests",
+      "tier": "pr",
+      "kind": "deterministic-fault",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "database",
+        "tests::raft_failover_tests",
+        "--lib",
+        "--",
+        "--nocapture"
+      ],
+      "timeoutSeconds": 5400
+    },
+    {
+      "id": "local-backend-api-authority",
+      "title": "Local backend public API and authority tests",
+      "tier": "pr",
+      "kind": "unit",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "local_backend",
+        "--lib",
+        "--",
+        "--nocapture"
+      ],
+      "timeoutSeconds": 5400
+    },
+    {
+      "id": "simulation-elle-history",
+      "title": "Seeded Elle serializability model",
+      "tier": "nightly",
+      "kind": "history-checker",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "simulation",
+        "test_elle_model",
+        "--lib",
+        "--",
+        "--nocapture"
+      ],
+      "env": {
+        "ELLE_DOT_PATH": "${ARTIFACT_DIR}/elle-history.dot"
+      },
+      "timeoutSeconds": 5400
+    },
+    {
+      "id": "docker-cluster-harness",
+      "title": "Real six-node write-scaling and Raft failover harness",
+      "tier": "nightly",
+      "kind": "cluster",
+      "command": ["bash", "self-hosted/docker/test.sh"],
+      "requires": ["cluster"],
+      "timeoutSeconds": 10800
+    }
+  ],
+  "dimensions": [
+    {
+      "id": "serializable-mutations",
+      "title": "Serializable mutations with owner-side OCC validation",
+      "required": true,
+      "status": "partial",
+      "invariants": ["INV-03", "INV-05", "INV-06"],
+      "ownerIssues": [252, 278, 285, 288],
+      "proofs": [
+        "conformance-runner-contract",
+        "database-write-scaling",
+        "simulation-elle-history",
+        "docker-cluster-harness"
+      ],
+      "currentEvidence": "Owner-read races, bank/register invariants, retry behavior, and a seeded single-node Elle model are executable.",
+      "gap": "Elle is not yet driving the real multi-partition cluster, and node-local system-table writes can still bypass complete owner validation."
+    },
+    {
+      "id": "atomic-multi-partition-visibility",
+      "title": "Atomic visibility for multi-partition transactions and reads",
+      "required": true,
+      "status": "partial",
+      "invariants": ["INV-04", "INV-05", "INV-07"],
+      "ownerIssues": [278, 285, 288],
+      "proofs": ["database-write-scaling", "docker-cluster-harness"],
+      "currentEvidence": "2PC recovery, participant fencing, and cluster cross-partition mutation scenarios are executable.",
+      "gap": "The cluster does not yet derive one safe snapshot that proves all required owners have resolved through the same logical version."
+    },
+    {
+      "id": "portable-read-your-writes",
+      "title": "Portable read-after-write tokens and cursors across routing and failover",
+      "required": true,
+      "status": "partial",
+      "invariants": ["INV-04", "INV-05", "INV-07", "INV-15"],
+      "ownerIssues": [278, 280, 288],
+      "proofs": [
+        "database-write-scaling",
+        "local-backend-api-authority",
+        "docker-cluster-harness"
+      ],
+      "currentEvidence": "Participant-aware read-after-write token parsing, waiting, routing, and Docker continuity checks are executable.",
+      "gap": "Tokens are not yet backed by a cluster-wide safe snapshot proof that remains portable through every leader and placement change."
+    },
+    {
+      "id": "reactive-completeness",
+      "title": "Gap-free reactive invalidation and consistent subscription reruns",
+      "required": true,
+      "status": "blocked",
+      "invariants": ["INV-05", "INV-08", "INV-09"],
+      "ownerIssues": [132, 133, 288],
+      "proofs": [
+        "database-write-scaling",
+        "local-backend-api-authority",
+        "docker-cluster-harness"
+      ],
+      "currentEvidence": "Prepared-write invalidation timing and public subscription authority behavior have regression tests.",
+      "gap": "Owner-sharded dependency registration, registration-gap replay, common-snapshot reruns, and subscription failover are not implemented."
+    },
+    {
+      "id": "portable-document-identity",
+      "title": "Stable document and table identity across nodes and lifecycle events",
+      "required": true,
+      "status": "partial",
+      "invariants": ["INV-03", "INV-04", "INV-11", "INV-13"],
+      "ownerIssues": [104, 130, 287, 288],
+      "proofs": ["database-write-scaling", "docker-cluster-harness"],
+      "currentEvidence": "Global table-number allocation and embedded document-ID replication have executable tests.",
+      "gap": "Identity has not been proven through online placement movement, globally consistent backup, and restore."
+    },
+    {
+      "id": "topology-transparent-public-api",
+      "title": "Topology-transparent public APIs and equivalent errors",
+      "required": true,
+      "status": "partial",
+      "invariants": ["INV-01", "INV-14", "INV-15"],
+      "ownerIssues": [111, 280, 288],
+      "proofs": ["local-backend-api-authority", "docker-cluster-harness"],
+      "currentEvidence": "Route authority, mutation forwarding, leader routing, and fail-closed public API behavior are executable.",
+      "gap": "Several coordinator-owned surfaces still reject rather than transparently forward, and authority retry is not complete for every live candidate."
+    },
+    {
+      "id": "atomic-catalog-version",
+      "title": "One deployment, schema, component, and index catalog version per request",
+      "required": true,
+      "status": "blocked",
+      "invariants": ["INV-03", "INV-11", "INV-14"],
+      "ownerIssues": [286, 288],
+      "proofs": [
+        "database-write-scaling",
+        "local-backend-api-authority",
+        "docker-cluster-harness"
+      ],
+      "currentEvidence": "Catalog parse failures, owner routing, index metadata replication, and deploy smoke behavior have tests.",
+      "gap": "Catalog artifacts are not staged and activated as one immutable cluster-wide version."
+    },
+    {
+      "id": "fenced-background-effects",
+      "title": "Singleton and fenced background work across leadership handoff",
+      "required": true,
+      "status": "blocked",
+      "invariants": ["INV-10", "INV-12", "INV-14"],
+      "ownerIssues": [250, 282, 288],
+      "proofs": ["local-backend-api-authority", "docker-cluster-harness"],
+      "currentEvidence": "Worker startup policy and coordinator authority are executable for currently enabled surfaces.",
+      "gap": "Disabled workers lack ownership protocols, and scheduled external side effects are not fenced through leadership handoff."
+    },
+    {
+      "id": "fail-closed-recovery",
+      "title": "Fail-closed behavior for authority, apply, replication, and transaction gaps",
+      "required": true,
+      "status": "partial",
+      "invariants": ["INV-02", "INV-03", "INV-10", "INV-14", "INV-16"],
+      "ownerIssues": [274, 275, 276, 279, 288],
+      "proofs": [
+        "database-write-scaling",
+        "database-raft-failover",
+        "local-backend-api-authority",
+        "docker-cluster-harness"
+      ],
+      "currentEvidence": "No-quorum writes, Raft nemeses, NATS outage, authentication, redelivery, and several recovery windows have executable tests.",
+      "gap": "Canonical bootstrap, applied-prefix serving, crash-idempotent replay, bound snapshots, and poison-gap quarantine remain open."
+    },
+    {
+      "id": "consistent-backup-restore",
+      "title": "Globally consistent backup, export, and verified restore",
+      "required": true,
+      "status": "blocked",
+      "invariants": ["INV-05", "INV-07", "INV-11", "INV-13"],
+      "ownerIssues": [287, 288],
+      "proofs": [
+        "database-raft-failover",
+        "local-backend-api-authority",
+        "docker-cluster-harness"
+      ],
+      "currentEvidence": "Fresh-replica checkpoint bootstrap, snapshot catch-up, and import/export authority behavior have regression coverage.",
+      "gap": "There is no manifest that pins all partitions, placement, and catalog state to one safe snapshot and verifies restore equivalence."
+    },
+    {
+      "id": "dynamic-membership",
+      "title": "Safe node membership changes and replacement",
+      "required": true,
+      "status": "blocked",
+      "invariants": ["INV-01", "INV-10", "INV-13", "INV-16"],
+      "ownerIssues": [251, 283, 288],
+      "proofs": [
+        "database-write-scaling",
+        "database-raft-failover",
+        "docker-cluster-harness"
+      ],
+      "currentEvidence": "Membership refresh, failover, lagging-follower catch-up, and restart scenarios are executable.",
+      "gap": "Raft learner promotion, joint consensus, decommissioning, and clock-skew-safe liveness are not implemented."
+    },
+    {
+      "id": "online-placement-movement",
+      "title": "Versioned placement movement without split authority or topology leaks",
+      "required": true,
+      "status": "blocked",
+      "invariants": ["INV-01", "INV-05", "INV-13", "INV-14", "INV-15"],
+      "ownerIssues": [104, 130, 288],
+      "proofs": [
+        "database-write-scaling",
+        "local-backend-api-authority",
+        "docker-cluster-harness"
+      ],
+      "currentEvidence": "Static placement-version rejection, refresh, routing, and membership-address discovery have tests.",
+      "gap": "Snapshot-copy, catch-up, write fencing, atomic epoch switch, draining, splitting, and rebalancing are not implemented."
+    }
+  ]
+}

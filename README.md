@@ -44,6 +44,8 @@ What is implemented today:
 - route authority checks that fail closed for unsafe clustered routes;
 - write-owner mutation routing so clients do not have to hand-route simple writes;
 - selective-delivery groundwork for reducing replication fanout;
+- a machine-readable semantic conformance matrix with bounded PR, nightly
+  cluster, and strict release gates;
 - cluster observability metrics and an issue journal for validation history and open correctness work.
 
 Important work still remains:
@@ -164,6 +166,15 @@ The repository currently includes:
 - database unit tests for replica replay, NATS delivery, remote-read frontier behavior, partition enforcement, 2PC, and table-number allocation;
 - Docker cluster scripts under [self-hosted/docker](self-hosted/docker).
 
+The semantic release gate is intentionally blocked while required dimensions
+remain partial or unimplemented. Validate the matrix or inspect its blockers
+with:
+
+```sh
+node scripts/semantic-conformance/run.mjs --mode validate
+node scripts/semantic-conformance/run.mjs --mode release --dry-run
+```
+
 These tests are useful regression coverage and have caught real bugs. They complement, but do not replace, the longer-term validation roadmap: Jepsen/Elle workloads, network nemeses, cloud benchmarks, and deterministic simulation for the core replication/commit protocols.
 
 ### Run The Local Test Harness
@@ -253,6 +264,7 @@ Approximate local development guidance:
 | --- | --- |
 | [Project Goals](docs/project-goals.md) | The semantic guarantees this fork must preserve. |
 | [Distributed Correctness Model](docs/distributed-correctness-model.md) | Normative invariants, authority boundaries, failure behavior, audit map, and review requirements. |
+| [Semantic Conformance Gate](docs/semantic-conformance.md) | Machine-readable release matrix, CI tiers, replay artifacts, and current blockers. |
 | [Issue Journal](docs/issue-journal.md) | Regressions, root causes, fixes, and validation notes. |
 | [Cluster Authority Routing](docs/cluster-authority-routing.md) | Route authority classes and fail-closed behavior. |
 | [Dynamic Placement](docs/dynamic-placement.md) | Placement metadata and future rebalancing control plane. |

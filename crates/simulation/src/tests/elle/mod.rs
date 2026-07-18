@@ -44,6 +44,23 @@ type RegisterId = String;
 type WriteId = u32;
 type TxId = usize;
 
+fn semantic_conformance_seed(default: u64) -> (String, u64) {
+    let Ok(seed_input) = env::var("CONVEX_TEST_SEED") else {
+        return (default.to_string(), default);
+    };
+    if let Ok(seed) = seed_input.parse::<u64>() {
+        return (seed_input, seed);
+    }
+
+    // FNV-1a keeps arbitrary CI seed labels stable without adding a dependency.
+    let seed = seed_input
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    (seed_input, seed)
+}
+
 const SERVER_CLIENT_ID: ClientId = 3490524077;
 
 struct ElleSimulationTest {
@@ -269,7 +286,10 @@ fn test_elle_model() -> anyhow::Result<()> {
     let thread_handle = std::thread::Builder::new()
         .stack_size(*RUNTIME_STACK_SIZE)
         .spawn(|| {
-            let config = ElleConfig::default();
+            let mut config = ElleConfig::default();
+            let (seed_input, seed) = semantic_conformance_seed(config.seed);
+            config.seed = seed;
+            eprintln!("elle_seed_input={seed_input} elle_seed_u64={seed:#x}");
             let td = TestDriver::new_with_seed(config.seed);
             let future = SimulationTest::run(
                 td.rt(),

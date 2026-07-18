@@ -21,10 +21,13 @@ The invariant definitions live in
 - [ ] I identified the placement epoch, Raft term, catalog version, or
       transaction identity that fences stale work.
 - [ ] Public Convex APIs remain topology-transparent, or the path fails closed.
+- [ ] I updated the semantic conformance matrix/evidence when this change
+      affects a release guarantee.
 
 Affected invariants and authority:
 
 <!-- Example: INV-02, INV-03. Partition Raft log remains authoritative. -->
+<!-- For a non-correctness change, use "Not applicable: <concrete reason>". -->
 
 ### Visibility And Time
 
@@ -51,6 +54,7 @@ Visibility/acknowledgement point:
 Dangerous interleaving tested:
 
 <!-- Describe the exact crash/message/order window forced by a test. -->
+<!-- Correctness-sensitive PRs must name the executable proof here. -->
 
 ### Transactions And Reactivity
 
@@ -81,6 +85,7 @@ Dangerous interleaving tested:
 - [ ] Clean locally built Docker image verified on every backend container
 - [ ] Full write-scaling and Raft failover harness where applicable
 - [ ] Semantic/history/subscription trace checker where required
+- [ ] Bounded semantic conformance gate
 
 ## Remaining Risk
 

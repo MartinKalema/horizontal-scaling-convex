@@ -1,0 +1,82 @@
+name: Semantic Conformance - Bounded PR Gate
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semantic-pr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bounded-semantic-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      PROTOC: ${{ github.workspace }}/crates/pb_build/protoc/protoc-linux-x86_64
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: scripts/package-lock.json
+
+      - name: Install pinned Rush launcher
+        run: npm ci --prefix scripts --ignore-scripts
+
+      - name: Validate semantic declaration
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: node scripts/semantic-conformance/validate-pr-body.mjs
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libclang-dev
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-02-18 --profile minimal
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: semantic-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Make bundled protoc executable
+        run: chmod +x "$PROTOC"
+
+      - name: Run bounded semantic proofs
+        run: >-
+          node scripts/semantic-conformance/run.mjs --mode pr --artifacts-dir
+          artifacts/semantic-conformance
+
+      - name: Upload replay artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: semantic-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/semantic-conformance
+          if-no-files-found: warn
+          retention-days: 14
