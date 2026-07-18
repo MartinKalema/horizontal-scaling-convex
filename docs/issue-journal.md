@@ -920,6 +920,27 @@ own for distributed changes.
   - `BACKEND_PULL_POLICY=never bash self-hosted/docker/test.sh`
     passed write-scaling `146/146`, Raft failover `24/24`, `ALL SUITES PASSED`
 
+### 2026-07 — Published the invariant-first correctness architecture
+
+- **Status:** complete
+- **Related issue:** `#258`
+- **What this fixes:** distributed changes previously relied on several design
+  documents written at different project stages. They did not provide one
+  normative definition of authority, visibility, logical time, safe snapshots,
+  replay, reactivity, or permitted failure behavior.
+- **Behavior:** `docs/distributed-correctness-model.md` now defines stable
+  invariant IDs, source-of-truth boundaries, protocol contracts, rejected
+  shortcuts, required failure responses, evidence levels, and the audit map for
+  issues `#240` through `#256`. The repository pull-request template turns
+  those rules into an explicit review gate for distributed changes.
+- **Why:** horizontal scaling is successful only when a developer observes the
+  same Convex semantics. Performance and component availability cannot be used
+  as substitutes for serializability, atomic snapshots, complete reactivity,
+  portable identity, or topology-transparent APIs.
+- **Validation:** Markdown structure, repository links, invariant references,
+  and mapped GitHub issue states were checked against the current repository
+  and issue backlog.
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

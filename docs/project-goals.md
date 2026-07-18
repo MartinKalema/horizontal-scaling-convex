@@ -67,3 +67,7 @@ If a route, subscription path, write path, placement transition, or failover
 case cannot prove the same Convex semantics in a clustered deployment, it should
 fail closed, forward to an authority, or remain coordinator-owned until the
 distributed design is complete.
+
+The normative invariant definitions, authority boundaries, and proof
+requirements are maintained in
+[Distributed Correctness Model](distributed-correctness-model.md).

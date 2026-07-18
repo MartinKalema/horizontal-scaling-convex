@@ -1,5 +1,11 @@
 # What We Built: Horizontal Scaling for Convex
 
+> **Historical milestone narrative:** This document records components and
+> design influences from an earlier project stage. It is not a claim that the
+> full distributed correctness contract is complete. The normative target and
+> current gap map are in
+> [Distributed Correctness Model](distributed-correctness-model.md).
+
 We took the best engineering from five distributed databases — CockroachDB, TiDB, Vitess, YugabyteDB, and Google Spanner — and combined them into something none of them individually does: horizontal scaling for a reactive, real-time database with OCC, subscriptions, and in-memory snapshots.
 
 ## Why This Is New
