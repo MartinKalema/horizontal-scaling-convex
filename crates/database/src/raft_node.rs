@@ -17,6 +17,7 @@ use std::{
     collections::{
         BTreeSet,
         HashMap,
+        VecDeque,
     },
     sync::Arc,
     time::{
@@ -406,6 +407,45 @@ impl RaftNode {
         Ok(())
     }
 
+    fn schedule_next_committed_entry(
+        &mut self,
+        deferred_committed_entries: &mut VecDeque<Entry>,
+        pending_state_machine_applies: &mut BTreeSet<u64>,
+        pending_local_applies: &mut BTreeSet<u64>,
+        apply_tx: &mpsc::UnboundedSender<StateMachineApplyJob>,
+    ) -> anyhow::Result<bool> {
+        if !pending_state_machine_applies.is_empty() || !pending_local_applies.is_empty() {
+            return Ok(false);
+        }
+
+        let mut made_progress = false;
+        while let Some(entry) = deferred_committed_entries.pop_front() {
+            made_progress = true;
+            let index = entry.index;
+            match self.classify_committed_entry(entry)? {
+                CommittedEntryAction::WaitForLocalApply => {
+                    pending_local_applies.insert(index);
+                    break;
+                },
+                CommittedEntryAction::MarkApplied(index) => {
+                    self.record_applied_index(index)?;
+                },
+                CommittedEntryAction::Apply(job) => {
+                    pending_state_machine_applies.insert(job.index);
+                    if apply_tx.send(job).is_err() {
+                        anyhow::bail!("Raft state-machine apply worker stopped");
+                    }
+                    break;
+                },
+            }
+        }
+
+        if made_progress {
+            self.raw_node.advance_apply_to(self.durable_applied_index);
+        }
+        Ok(made_progress)
+    }
+
     fn process_mailbox_message(
         &mut self,
         msg: RaftMessage,
@@ -491,6 +531,7 @@ impl RaftNode {
         let mut last_tick = Instant::now();
         let mut pending_state_machine_applies = BTreeSet::new();
         let mut pending_local_applies = BTreeSet::new();
+        let mut deferred_committed_entries = VecDeque::new();
         let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<StateMachineApplyJob>();
         let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<StateMachineApplyResult>();
         let _apply_worker = tokio::task::spawn_blocking(move || {
@@ -573,7 +614,18 @@ impl RaftNode {
 
             let mut processed_ready = false;
             while self.raw_node.has_ready() {
-                if !pending_state_machine_applies.is_empty() || !pending_local_applies.is_empty() {
+                // Snapshot installation replaces the database state machine, so it must remain
+                // serialized with application work. Ordinary Ready processing must continue while
+                // apply is pending so leaders can send heartbeats and retain a healthy quorum.
+                let apply_pending = !pending_state_machine_applies.is_empty()
+                    || !pending_local_applies.is_empty()
+                    || !deferred_committed_entries.is_empty();
+                if apply_pending
+                    && self
+                        .raw_node
+                        .snap()
+                        .is_some_and(|snapshot| !snapshot.is_empty())
+                {
                     break;
                 }
                 processed_ready = true;
@@ -767,22 +819,10 @@ impl RaftNode {
                     }
                 }
 
-                let mut applied_indexes = Vec::new();
-                let mut apply_jobs = Vec::new();
-
-                // 6. Classify committed entries. Entries that require Convex
-                // state-machine work are offloaded after append/persist progress
-                // has advanced.
-                for entry in ready.take_committed_entries() {
-                    let index = entry.index;
-                    match self.classify_committed_entry(entry)? {
-                        CommittedEntryAction::WaitForLocalApply => {
-                            pending_local_applies.insert(index);
-                        },
-                        CommittedEntryAction::MarkApplied(index) => applied_indexes.push(index),
-                        CommittedEntryAction::Apply(job) => apply_jobs.push(job),
-                    }
-                }
+                // 6. Preserve committed-entry order independently from append/transport
+                // progress. The state machine scheduler below releases only one blocking entry at
+                // a time, but Raft can continue processing Ready and sending heartbeats.
+                deferred_committed_entries.extend(ready.take_committed_entries());
 
                 // 7. Advance append/persist state without claiming
                 // state-machine apply completion. `advance_apply_to` is called
@@ -808,30 +848,7 @@ impl RaftNode {
                     }
                 }
 
-                // Classify remaining committed entries.
-                for entry in light_rd.take_committed_entries() {
-                    let index = entry.index;
-                    match self.classify_committed_entry(entry)? {
-                        CommittedEntryAction::WaitForLocalApply => {
-                            pending_local_applies.insert(index);
-                        },
-                        CommittedEntryAction::MarkApplied(index) => applied_indexes.push(index),
-                        CommittedEntryAction::Apply(job) => apply_jobs.push(job),
-                    }
-                }
-
-                for index in applied_indexes {
-                    self.record_applied_index(index)?;
-                }
-                if !apply_jobs.is_empty() {
-                    for job in apply_jobs {
-                        pending_state_machine_applies.insert(job.index);
-                        if apply_tx.send(job).is_err() {
-                            anyhow::bail!("Raft state-machine apply worker stopped");
-                        }
-                    }
-                }
-                self.raw_node.advance_apply_to(self.durable_applied_index);
+                deferred_committed_entries.extend(light_rd.take_committed_entries());
                 self.maybe_mark_leader_ready();
                 self.maybe_refresh_leader_serving_lease(
                     &recent_peer_responses,
@@ -839,7 +856,26 @@ impl RaftNode {
                 );
             }
 
-            if handled_message || handled_apply_result || should_tick || processed_ready {
+            let scheduled_committed_entry = self.schedule_next_committed_entry(
+                &mut deferred_committed_entries,
+                &mut pending_state_machine_applies,
+                &mut pending_local_applies,
+                &apply_tx,
+            )?;
+            if scheduled_committed_entry {
+                self.maybe_mark_leader_ready();
+                self.maybe_refresh_leader_serving_lease(
+                    &recent_peer_responses,
+                    leader_serving_lease_duration,
+                );
+            }
+
+            if handled_message
+                || handled_apply_result
+                || should_tick
+                || processed_ready
+                || scheduled_committed_entry
+            {
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -1294,6 +1330,160 @@ mod tests {
                 anyhow::anyhow!("Raft run loop did not process shutdown while apply blocked")
             })???;
         unblock_tx.send(())?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_leader_keeps_quorum_while_local_apply_is_pending() -> anyhow::Result<()> {
+        use std::sync::atomic::{
+            AtomicBool,
+            Ordering,
+        };
+
+        let peer_ids = vec![1u64, 2, 3];
+        let mut mailbox_txs = Vec::new();
+        let mut mailbox_rxs = Vec::new();
+        let mut transport_txs = Vec::new();
+        let mut transport_rxs = Vec::new();
+        for _ in &peer_ids {
+            let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel();
+            mailbox_txs.push(mailbox_tx);
+            mailbox_rxs.push(Some(mailbox_rx));
+
+            let (transport_tx, transport_rx) = mpsc::unbounded_channel::<Message>();
+            transport_txs.push(transport_tx);
+            transport_rxs.push(transport_rx);
+        }
+
+        let leader_ready = Arc::new(AtomicBool::new(false));
+        let leader_lost = Arc::new(AtomicBool::new(false));
+        let mut nodes = Vec::new();
+        for (node_index, node_id) in peer_ids.iter().copied().enumerate() {
+            let peer_senders = peer_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, peer_id)| *peer_id != node_id)
+                .map(|(peer_index, peer_id)| (peer_id, transport_txs[peer_index].clone()))
+                .collect();
+            let mut node = RaftNode::new(
+                RaftNodeConfig {
+                    node_id,
+                    partition_id: PartitionId(0),
+                    peers: peer_ids.clone(),
+                    election_tick: 10,
+                    heartbeat_tick: 3,
+                },
+                test_engine(),
+                mailbox_rxs[node_index].take().unwrap(),
+                peer_senders,
+                None,
+            )?;
+            if node_id == 1 {
+                let ready = leader_ready.clone();
+                let lost = leader_lost.clone();
+                node.set_leadership_callbacks(LeadershipCallbacks {
+                    on_leader_ready: Box::new(move || ready.store(true, Ordering::SeqCst)),
+                    on_lost_leadership: Box::new(move || lost.store(true, Ordering::SeqCst)),
+                    ..LeadershipCallbacks::default()
+                });
+            }
+            nodes.push(node);
+        }
+
+        nodes[0].raw_node.campaign()?;
+
+        let mut forward_tasks = Vec::new();
+        for (mut transport_rx, mailbox_tx) in
+            transport_rxs.into_iter().zip(mailbox_txs.iter().cloned())
+        {
+            forward_tasks.push(tokio::spawn(async move {
+                while let Some(message) = transport_rx.recv().await {
+                    if mailbox_tx.send(RaftMessage::Raft(message)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        let mut run_tasks = Vec::new();
+        for mut node in nodes {
+            run_tasks.push(tokio::spawn(async move {
+                node.run(|_, _| Ok(()), |_| Ok(())).await
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !leader_ready.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("node 1 did not become ready leader"))?;
+
+        let (first_result_tx, first_result_rx) = tokio::sync::oneshot::channel();
+        mailbox_txs[0].send(RaftMessage::Propose(RaftProposal {
+            data: b"slow local apply".to_vec(),
+            result_tx: first_result_tx,
+        }))?;
+        let first_index = match tokio::time::timeout(Duration::from_secs(5), first_result_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("first proposal did not commit"))??
+        {
+            RaftProposalResult::Committed { index } => index,
+            RaftProposalResult::Rejected => anyhow::bail!("ready leader rejected first proposal"),
+        };
+
+        // Hold the local database apply beyond the randomized election timeout. Consensus
+        // transport must continue independently or a healthy follower will start an election.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let (mark_tx, mark_rx) = tokio::sync::oneshot::channel();
+        mailbox_txs[0].send(RaftMessage::MarkApplied {
+            index: first_index,
+            result_tx: mark_tx,
+        })?;
+        tokio::time::timeout(Duration::from_secs(2), mark_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("first local apply was not acknowledged"))???;
+
+        let (second_result_tx, second_result_rx) = tokio::sync::oneshot::channel();
+        mailbox_txs[0].send(RaftMessage::Propose(RaftProposal {
+            data: b"leader retained quorum".to_vec(),
+            result_tx: second_result_tx,
+        }))?;
+        let second_index = match tokio::time::timeout(Duration::from_secs(5), second_result_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("second proposal did not resolve"))??
+        {
+            RaftProposalResult::Committed { index } => index,
+            RaftProposalResult::Rejected => {
+                anyhow::bail!("leader lost quorum while local apply was pending")
+            },
+        };
+        anyhow::ensure!(
+            !leader_lost.load(Ordering::SeqCst),
+            "node 1 reported leadership loss while all three nodes were healthy"
+        );
+
+        let (mark_tx, mark_rx) = tokio::sync::oneshot::channel();
+        mailbox_txs[0].send(RaftMessage::MarkApplied {
+            index: second_index,
+            result_tx: mark_tx,
+        })?;
+        tokio::time::timeout(Duration::from_secs(2), mark_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("second local apply was not acknowledged"))???;
+
+        for mailbox_tx in &mailbox_txs {
+            let _ = mailbox_tx.send(RaftMessage::Shutdown);
+        }
+        for run_task in run_tasks {
+            run_task.await??;
+        }
+        for forward_task in forward_tasks {
+            forward_task.abort();
+        }
         Ok(())
     }
 
