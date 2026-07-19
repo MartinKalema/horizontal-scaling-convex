@@ -287,10 +287,13 @@ impl RaftNode {
     }
 
     fn record_snapshot_applied_index(&mut self, index: u64) -> anyhow::Result<()> {
-        if index > self.durable_applied_index {
-            self.storage.set_applied_index(index)?;
-            self.durable_applied_index = index;
-        }
+        anyhow::ensure!(
+            self.storage.applied_index()? == index,
+            "Raft snapshot metadata committed index {} but storage reports applied index {}",
+            index,
+            self.storage.applied_index()?,
+        );
+        self.durable_applied_index = self.durable_applied_index.max(index);
         self.applied_indexes_pending_persistence
             .retain(|pending_index| *pending_index > index);
         Ok(())
@@ -418,8 +421,8 @@ impl RaftNode {
     /// tick → receive messages → propose → process ready → advance.
     pub async fn run(
         &mut self,
-        mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()> + Send + 'static,
-        mut on_snapshot: impl FnMut(&[u8]) -> anyhow::Result<()>,
+        mut on_committed: impl FnMut(u64, &[u8]) -> anyhow::Result<()> + Send + 'static,
+        mut on_snapshot: impl FnMut(&Snapshot) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let tick_interval = RaftNodeConfig::TICK_INTERVAL;
         let leader_serving_lease_duration = self.config.leader_serving_lease_duration();
@@ -431,7 +434,7 @@ impl RaftNode {
         let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<StateMachineApplyResult>();
         let _apply_worker = tokio::task::spawn_blocking(move || {
             while let Some(job) = apply_rx.blocking_recv() {
-                let result = on_committed(&job.data);
+                let result = on_committed(job.index, &job.data);
                 let should_stop = result.is_err();
                 if applied_tx
                     .send(StateMachineApplyResult {
@@ -634,12 +637,16 @@ impl RaftNode {
                     let snapshot_timer = metrics::raft_snapshot_apply_timer();
                     let snapshot_bytes = ready.snapshot().get_data().len();
                     metrics::log_raft_snapshot_apply_bytes(snapshot_bytes);
-                    if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
+                    if let Err(e) = self.storage.stage_snapshot(ready.snapshot(), ready.hs()) {
+                        tracing::error!("Failed to stage snapshot install intent: {e}");
+                        drop(snapshot_timer);
+                        return Err(e);
+                    } else if let Err(e) = on_snapshot(ready.snapshot()) {
                         tracing::error!("Failed to apply snapshot to state machine: {e}");
                         drop(snapshot_timer);
                         return Err(e);
-                    } else if let Err(e) = self.storage.apply_snapshot(ready.snapshot()) {
-                        tracing::error!("Failed to persist snapshot: {e}");
+                    } else if let Err(e) = self.storage.commit_pending_snapshot_install() {
+                        tracing::error!("Failed to commit staged snapshot metadata: {e}");
                         drop(snapshot_timer);
                         return Err(e);
                     } else if let Err(e) =
@@ -1004,7 +1011,7 @@ mod tests {
         node.process_ready_test();
         assert!(node.is_leader());
 
-        let run_task = tokio::spawn(async move { node.run(|_| Ok(()), |_| Ok(())).await });
+        let run_task = tokio::spawn(async move { node.run(|_, _| Ok(()), |_| Ok(())).await });
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tx.send(RaftMessage::Propose(RaftProposal {
             data: b"mailbox proposal".to_vec(),
@@ -1053,7 +1060,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let mut entered_tx = Some(entered_tx);
             node.run(
-                move |_| {
+                move |_, _| {
                     if let Some(entered_tx) = entered_tx.take() {
                         let _ = entered_tx.send(());
                     }
@@ -1202,6 +1209,71 @@ mod tests {
             "committed-but-unapplied entry should replay after restart: {committed:?}",
         );
         assert_eq!(node.storage.applied_index().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_restart_after_snapshot_applies_each_later_entry_exactly_once() {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+        let engine = test_engine();
+
+        {
+            let mut storage =
+                ConvexRaftStorage::new(PartitionId(0), engine.clone(), 1, vec![1], None).unwrap();
+            let mut metadata = SnapshotMetadata::default();
+            metadata.index = 8;
+            metadata.term = 2;
+            metadata.set_conf_state(ConfState::from((vec![1], vec![])));
+            let mut snapshot = Snapshot::default();
+            snapshot.set_metadata(metadata);
+            snapshot.set_data(
+                crate::raft_snapshot::test_snapshot_bytes(8, 2)
+                    .unwrap()
+                    .into(),
+            );
+            storage.apply_snapshot(&snapshot).unwrap();
+
+            let mut entry = Entry::default();
+            entry.set_index(9);
+            entry.set_term(3);
+            entry.set_data(b"after snapshot".to_vec().into());
+            let mut hard_state = HardState::default();
+            hard_state.set_term(3);
+            hard_state.set_vote(1);
+            hard_state.set_commit(9);
+            storage
+                .append_entries_and_hardstate(&[entry], &hard_state)
+                .unwrap();
+        }
+
+        {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let mut node =
+                RaftNode::new(config.clone(), engine.clone(), rx, HashMap::new(), None).unwrap();
+            assert_eq!(node.raw_node.raft.raft_log.applied, 8);
+            let committed = node.process_ready_test();
+            assert_eq!(
+                committed
+                    .iter()
+                    .filter(|data| data.as_slice() == b"after snapshot")
+                    .count(),
+                1,
+            );
+            assert_eq!(node.storage.applied_index().unwrap(), 9);
+        }
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut restarted = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
+        assert_eq!(restarted.raw_node.raft.raft_log.applied, 9);
+        assert!(
+            restarted.process_ready_test().is_empty(),
+            "a second restart must not replay an entry already durably applied",
+        );
     }
 
     #[tokio::test]
