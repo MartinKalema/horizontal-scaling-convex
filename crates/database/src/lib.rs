@@ -79,6 +79,7 @@ pub mod text_index_worker;
 pub use committer::{
     table_dependency_sort_key,
     CommitterClient,
+    ReadTimestampClosure,
 };
 pub use component_registry::ComponentRegistry;
 pub use database_index_workers::{

@@ -31,12 +31,23 @@ use common::{
     },
     types::{
         IndexDescriptor,
+        IndexId,
         IndexName,
+        RepeatableTimestamp,
         TabletIndexName,
         Timestamp,
     },
+    value::TableMapping,
 };
-use indexing::backend_in_memory_indexes::RangeRequest;
+use indexing::{
+    backend_in_memory_indexes::{
+        IndexEntry,
+        IndexPage,
+        IndexReader,
+        RangeRequest,
+    },
+    index_registry::IndexRegistry,
+};
 use pb::{
     common::{
         interval::End as IntervalEndProto,
@@ -44,8 +55,11 @@ use pb::{
         Order as OrderProto,
     },
     replication::{
+        close_read_timestamp_response::Outcome as CloseReadTimestampOutcome,
         owner_read_index_range_result::Cursor as CursorProto,
         owner_read_service_client::OwnerReadServiceClient as TonicOwnerReadClient,
+        CloseReadTimestampRequest,
+        CloseReadTimestampResponse,
         OwnerReadIndexEntry,
         OwnerReadIndexRange,
         OwnerReadIndexRangeResult,
@@ -64,7 +78,10 @@ use tonic::{
 use value::TabletId;
 
 use crate::{
-    committer::CommitterClient,
+    committer::{
+        CommitterClient,
+        ReadTimestampClosure,
+    },
     partition::{
         PartitionId,
         PlacementVersion,
@@ -92,6 +109,13 @@ pub struct OwnerIndexRangeResult {
 
 #[async_trait]
 pub trait OwnerReadClient: Send + Sync + 'static {
+    async fn close_read_timestamp(
+        &self,
+        owner_partition: PartitionId,
+        placement_version: PlacementVersion,
+        target_ts: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure>;
+
     async fn read_index_ranges(
         &self,
         owner_partition: PartitionId,
@@ -99,6 +123,110 @@ pub trait OwnerReadClient: Send + Sync + 'static {
         snapshot_ts: Timestamp,
         ranges: Vec<RangeRequest>,
     ) -> anyhow::Result<Vec<OwnerIndexRangeResult>>;
+}
+
+/// Index reader used by the in-process function runner in a partitioned
+/// deployment. Local and system-table reads retain the normal persistence
+/// path, while remote user-table reads go directly to their placement owner.
+pub(crate) struct OwnerAwareIndexReader {
+    timestamp: RepeatableTimestamp,
+    local_reader: Arc<dyn IndexReader>,
+    owner_read_client: Arc<dyn OwnerReadClient>,
+    partition_map: crate::partition::PartitionMap,
+    table_mapping: TableMapping,
+    index_registry: IndexRegistry,
+}
+
+impl OwnerAwareIndexReader {
+    pub(crate) fn new(
+        timestamp: RepeatableTimestamp,
+        local_reader: Arc<dyn IndexReader>,
+        owner_read_client: Arc<dyn OwnerReadClient>,
+        partition_map: crate::partition::PartitionMap,
+        table_mapping: TableMapping,
+        index_registry: IndexRegistry,
+    ) -> Self {
+        Self {
+            timestamp,
+            local_reader,
+            owner_read_client,
+            partition_map,
+            table_mapping,
+            index_registry,
+        }
+    }
+}
+
+#[async_trait]
+impl IndexReader for OwnerAwareIndexReader {
+    async fn index_page(
+        &self,
+        index_id: IndexId,
+        tablet_id: TabletId,
+        interval: &Interval,
+        order: Order,
+        max_results: usize,
+    ) -> anyhow::Result<IndexPage> {
+        let table_name = self.table_mapping.tablet_name(tablet_id)?;
+        let owner = self.partition_map.partition_for_table(&table_name);
+        if table_name.is_system() || owner == self.partition_map.local_partition() {
+            return self
+                .local_reader
+                .index_page(index_id, tablet_id, interval, order, max_results)
+                .await;
+        }
+
+        let tablet_index_name = self
+            .index_registry
+            .enabled_index_by_index_id(&index_id)
+            .with_context(|| format!("Missing enabled index {index_id} for owner read"))?
+            .name();
+        anyhow::ensure!(
+            tablet_index_name.table() == &tablet_id,
+            "Index {index_id} belongs to tablet {}, not requested tablet {tablet_id}",
+            tablet_index_name.table(),
+        );
+        let printable_index_name = tablet_index_name
+            .clone()
+            .map_table(&self.table_mapping.tablet_to_name())?;
+        let mut results = self
+            .owner_read_client
+            .read_index_ranges(
+                owner,
+                self.partition_map.placement_version(),
+                *self.timestamp,
+                vec![RangeRequest {
+                    index_name: tablet_index_name,
+                    printable_index_name,
+                    interval: interval.clone(),
+                    order,
+                    max_size: max_results,
+                }],
+            )
+            .await?;
+        anyhow::ensure!(
+            results.len() == 1,
+            "Owner {owner} returned {} index pages for one request",
+            results.len(),
+        );
+        let result = results.pop().expect("result count checked above");
+        Ok(IndexPage {
+            entries: result
+                .entries
+                .into_iter()
+                .map(|entry| IndexEntry {
+                    key: entry.key,
+                    ts: entry.ts,
+                    value: entry.document,
+                })
+                .collect(),
+            cursor: result.cursor,
+        })
+    }
+
+    fn timestamp(&self) -> RepeatableTimestamp {
+        self.timestamp
+    }
 }
 
 fn tablet_id_to_bytes(tablet_id: TabletId) -> Vec<u8> {
@@ -283,6 +411,41 @@ impl OwnerReadGrpcClient {
             .into_inner();
         results.into_iter().map(result_from_proto).collect()
     }
+
+    async fn close_read_timestamp(
+        &self,
+        owner_partition: PartitionId,
+        placement_version: PlacementVersion,
+        target_ts: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        let request = CloseReadTimestampRequest {
+            owner_partition: owner_partition.0,
+            placement_version: u64::from(placement_version),
+            target_ts: u64::from(target_ts),
+        };
+        let request = match &self.cluster_auth {
+            Some(auth) => auth.request(request),
+            None => Request::new(request),
+        };
+        let CloseReadTimestampResponse { outcome } = self
+            .client
+            .clone()
+            .close_read_timestamp(request)
+            .await
+            .context("gRPC owner read barrier failed")?
+            .into_inner();
+        match outcome.context("Owner read barrier response missing outcome")? {
+            CloseReadTimestampOutcome::ClosedTs(ts) => {
+                Ok(ReadTimestampClosure::Closed(ts.try_into()?))
+            },
+            CloseReadTimestampOutcome::RetryAtTs(ts) => {
+                Ok(ReadTimestampClosure::RetryAt(ts.try_into()?))
+            },
+            CloseReadTimestampOutcome::BlockedTs(ts) => {
+                Ok(ReadTimestampClosure::Blocked(ts.try_into()?))
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -332,6 +495,41 @@ impl GrpcOwnerReadClient {
 
 #[async_trait]
 impl OwnerReadClient for GrpcOwnerReadClient {
+    async fn close_read_timestamp(
+        &self,
+        owner_partition: PartitionId,
+        placement_version: PlacementVersion,
+        target_ts: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        let addresses = self
+            .committer
+            .node_addresses()
+            .and_then(|addresses| addresses.addresses_for(owner_partition).map(<[_]>::to_vec))
+            .with_context(|| {
+                format!("No live owner-read candidates for partition {owner_partition}")
+            })?;
+        let mut failures = Vec::new();
+        for address in addresses {
+            let attempt = async {
+                self.pool
+                    .client(&address)
+                    .await?
+                    .close_read_timestamp(owner_partition, placement_version, target_ts)
+                    .await
+            }
+            .await;
+            match attempt {
+                Ok(result) => return Ok(result),
+                Err(error) => failures.push(format!("{address}: {error:#}")),
+            }
+        }
+        anyhow::bail!(
+            "All owner-read barrier candidates for partition {} failed: {}",
+            owner_partition,
+            failures.join("; "),
+        )
+    }
+
     async fn read_index_ranges(
         &self,
         owner_partition: PartitionId,

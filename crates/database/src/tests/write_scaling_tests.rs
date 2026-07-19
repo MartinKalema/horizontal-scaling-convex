@@ -68,6 +68,7 @@ use futures::{
     stream::BoxStream,
     TryStreamExt,
 };
+use indexing::backend_in_memory_indexes::RangeRequest;
 use keybroker::Identity;
 use parking_lot::Mutex;
 use pb::replication::{
@@ -122,6 +123,7 @@ use crate::{
     },
     committer::{
         CommitterClient,
+        ReadTimestampClosure,
         AFTER_PENDING_WRITE_SNAPSHOT,
         AFTER_RAFT_APPLIED_INDEX_PERSISTENCE,
         AFTER_RAFT_CONVEX_PERSISTENCE,
@@ -136,6 +138,10 @@ use crate::{
         NodeMembership,
     },
     nats_distributed_log::DeltaEnvelope,
+    owner_read::{
+        OwnerIndexRangeResult,
+        OwnerReadClient,
+    },
     partition::{
         PartitionId,
         PartitionMap,
@@ -396,6 +402,76 @@ impl DistributedLog for SwitchableDistributedLog {
 
 fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1", local_partition, 2)
+}
+
+struct RetryOnceOwnerReadClient {
+    calls: AtomicUsize,
+    targets: Mutex<Vec<Timestamp>>,
+}
+
+impl RetryOnceOwnerReadClient {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            targets: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl OwnerReadClient for RetryOnceOwnerReadClient {
+    async fn close_read_timestamp(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        target_ts: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        self.targets.lock().push(target_ts);
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(ReadTimestampClosure::RetryAt(target_ts.succ()?))
+        } else {
+            Ok(ReadTimestampClosure::Closed(target_ts))
+        }
+    }
+
+    async fn read_index_ranges(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        _snapshot_ts: Timestamp,
+        _ranges: Vec<RangeRequest>,
+    ) -> anyhow::Result<Vec<OwnerIndexRangeResult>> {
+        anyhow::bail!("read_index_ranges is not used by the read barrier test")
+    }
+}
+
+struct PlacementChangingOwnerReadClient {
+    committer: CommitterClient,
+    replacement: PlacementMetadata,
+}
+
+#[async_trait]
+impl OwnerReadClient for PlacementChangingOwnerReadClient {
+    async fn close_read_timestamp(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        target_ts: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        self.committer
+            .refresh_placement_metadata(self.replacement.clone())?;
+        Ok(ReadTimestampClosure::Closed(target_ts))
+    }
+
+    async fn read_index_ranges(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        _snapshot_ts: Timestamp,
+        _ranges: Vec<RangeRequest>,
+    ) -> anyhow::Result<Vec<OwnerIndexRangeResult>> {
+        anyhow::bail!("read_index_ranges is not used by the read barrier test")
+    }
 }
 
 fn partitioned_map_with_version(
@@ -1106,6 +1182,23 @@ impl TimestampOracle for FailingTimestampOracle {
 
     async fn advance_committed_ts(&self, _ts: Timestamp) -> anyhow::Result<()> {
         anyhow::bail!("TSO unavailable during idle heartbeat test");
+    }
+}
+
+struct HangingTimestampOracle;
+
+#[async_trait]
+impl TimestampOracle for HangingTimestampOracle {
+    async fn next_ts_at_or_after(&self, _min_ts: Timestamp) -> anyhow::Result<Timestamp> {
+        std::future::pending().await
+    }
+
+    async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
+        std::future::pending().await
+    }
+
+    async fn advance_committed_ts(&self, _ts: Timestamp) -> anyhow::Result<()> {
+        std::future::pending().await
     }
 }
 
@@ -2500,6 +2593,300 @@ async fn test_max_repeatable_bump_does_not_overtake_prepared_commit(
     .await?;
     assert_eq!(messages.len(), 1);
 
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_waits_for_prepared_transaction(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "prepared"))
+        .await?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare = node
+        .committer_for_test()
+        .prepare(
+            txn_id.clone(),
+            tx.finalize()?,
+            WriteSource::new("read_barrier_prepared_test"),
+        )
+        .await?;
+    let target = prepare.prepare_ts.succ()?;
+
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(target)
+            .await?,
+        ReadTimestampClosure::Blocked(prepare.prepare_ts),
+    );
+
+    node.committer_for_test().rollback_prepared(txn_id).await?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(target)
+            .await?,
+        ReadTimestampClosure::Closed(target),
+    );
+    assert_eq!(*node.now_ts_for_reads(), target);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_retries_above_local_timeline(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let lower = node.committer_for_test().allocate_commit_ts().await?;
+    let higher = node.committer_for_test().allocate_commit_ts().await?;
+
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(lower)
+            .await?,
+        ReadTimestampClosure::RetryAt(higher),
+    );
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(higher)
+            .await?,
+        ReadTimestampClosure::Closed(higher),
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_retries_all_owners_at_one_new_timestamp(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let owner = Arc::new(RetryOnceOwnerReadClient::new());
+    let database = node.with_owner_read_client_for_test(owner.clone());
+    let initial_local_ts = *database.now_ts_for_reads();
+
+    let safe_ts = database.cluster_safe_read_ts().await?;
+    let targets = owner.targets.lock();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0], initial_local_ts);
+    assert!(targets[1] > targets[0]);
+    assert_eq!(*safe_ts, targets[1]);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_fails_closed_across_placement_change(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let replacement = PlacementMetadata::from_static_config(StaticPlacementConfig {
+        table_assignments: "messages=0,projects=1",
+        num_partitions: 2,
+        placement_version: PlacementVersion::new(1),
+    });
+    let database =
+        node.with_owner_read_client_for_test(Arc::new(PlacementChangingOwnerReadClient {
+            committer: node.committer_for_test(),
+            replacement,
+        }));
+
+    let err = database
+        .cluster_safe_read_ts()
+        .await
+        .expect_err("a read barrier must not span placement versions");
+    assert!(
+        format!("{err:#}").contains("Placement changed from"),
+        "unexpected error: {err:#}",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_requires_fresh_raft_serving_lease(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let (raft_state, _raft_rx) =
+        RaftPartitionState::new_with_mailbox_for_test(true, 1, PartitionId(0), 1);
+    node.attach_raft_state(raft_state.clone()).await?;
+    raft_state.expire_leader_serving_lease_for_test();
+    let target = node.committer_for_test().allocate_commit_ts().await?;
+
+    let err = node
+        .committer_for_test()
+        .close_read_timestamp(target)
+        .await
+        .expect_err("a stale Raft leader must not certify a read barrier");
+    assert!(
+        format!("{err:#}").contains("has no valid serving lease"),
+        "unexpected error: {err:#}",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_floor_survives_restart(rt: TestRuntime) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let persistence = Arc::new(TestPersistence::new());
+    let node = create_node_with_persistence(
+        &rt,
+        persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let target = node.now_ts_for_reads().succ()?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(target)
+            .await?,
+        ReadTimestampClosure::Closed(target),
+    );
+    assert_eq!(*node.persisted_max_repeatable_ts_for_test(), target);
+    node.shutdown().await?;
+
+    let restarted_tso = Arc::new(RecordingTimestampOracle::new());
+    let restarted = create_node_with_persistence(
+        &rt,
+        persistence,
+        log,
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        Some(restarted_tso.clone()),
+    )
+    .await?;
+    let next_commit_ts = restarted.committer_for_test().allocate_commit_ts().await?;
+
+    assert!(next_commit_ts > target);
+    assert_eq!(
+        restarted_tso.requested_floors().last().copied(),
+        Some(target.succ()?),
+        "a future leader must allocate commits above the persisted read barrier",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_remote_read_token_cannot_refresh_from_local_write_log(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(
+        &rt,
+        log,
+        Some(partitioned_map_with_version(
+            PartitionId(1),
+            PlacementVersion::new(1),
+        )),
+    )
+    .await?;
+    insert_doc(&node, "projects", assert_obj!("name" => "cached remotely")).await?;
+
+    let mut read_tx = node.begin(Identity::system()).await?;
+    let mut query = ResolvedQuery::new(
+        &mut read_tx,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )?;
+    while query.next(&mut read_tx, Some(2)).await?.is_some() {}
+    let token = read_tx.into_token()?;
+    let original_ts = token.ts();
+    let target = node.committer_for_test().allocate_commit_ts().await?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(target)
+            .await?,
+        ReadTimestampClosure::Closed(target),
+    );
+
+    // Move the table to the other partition without changing its local table
+    // metadata. A local-log-only refresh would incorrectly certify this token.
+    node.committer_for_test()
+        .refresh_placement_metadata(PlacementMetadata::from_static_config(
+            StaticPlacementConfig {
+                table_assignments: "messages=1,projects=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(2),
+            },
+        ))?;
+
+    assert_eq!(
+        node.refresh_token(token, target).await?,
+        Err(Some(original_ts.succ()?)),
+        "remote reads must rerun against their owner rather than refresh from the local mirror",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_live_prepare_rejects_timestamp_closed_for_cluster_reads(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+    insert_doc(
+        &node,
+        "projects",
+        assert_obj!("name" => "seed-before-read-barrier"),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "must-commit-after-read-barrier"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("prepare_after_read_barrier_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let barrier_ts = node.committer_for_test().allocate_commit_ts().await?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(barrier_ts)
+            .await?,
+        ReadTimestampClosure::Closed(barrier_ts),
+    );
+
+    let err = node
+        .committer_for_test()
+        .prepare_remote(
+            TwoPhaseTransactionId::new(),
+            participant_tx,
+            write_source,
+            barrier_ts,
+            vec![PartitionId(1)],
+        )
+        .await
+        .expect_err("a late prepare must not cross an already-certified read barrier");
+    assert!(
+        format!("{err:#}").contains("2PC Prepare assigned ts="),
+        "unexpected error: {err:#}",
+    );
     Ok(())
 }
 
@@ -8663,6 +9050,43 @@ fn test_idle_remote_read_frontier_heartbeat_tso_failure_is_nonfatal() -> anyhow:
         committer
             .tick_idle_remote_read_frontier_heartbeat_for_test()
             .await?;
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_idle_frontier_maintenance_cannot_block_owner_read_barrier() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(HangingTimestampOracle);
+        let node = create_node_with_options(
+            &rt,
+            log,
+            Some(partitioned_map(PartitionId(0))),
+            None,
+            Some(tso),
+        )
+        .await?;
+
+        let committer = node.committer_for_test();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            committer.tick_idle_remote_read_frontier_heartbeat_for_test(),
+        )
+        .await
+        .context("idle frontier maintenance blocked the committer")??;
+
+        let target = *node.now_ts_for_reads();
+        let closure = tokio::time::timeout(
+            Duration::from_secs(1),
+            committer.close_read_timestamp(target),
+        )
+        .await
+        .context("owner read barrier was blocked behind TSO maintenance")??;
+        assert_eq!(closure, ReadTimestampClosure::Closed(target));
 
         Ok(())
     })

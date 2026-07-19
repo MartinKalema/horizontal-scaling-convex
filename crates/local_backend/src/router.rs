@@ -1,6 +1,5 @@
 use std::{
     convert::Infallible,
-    sync::Arc,
     time::Duration,
 };
 
@@ -548,18 +547,7 @@ pub fn router(st: BackendAppState) -> Router {
     let public_openapi_spec = public_openapi.to_pretty_json().unwrap();
 
     let router_state = RouterState {
-        api: Arc::new(
-            crate::query_forwarding_api::SelectiveQueryForwardingApi::new(
-                Arc::new(st.application.clone()),
-                st.application.database().clone(),
-                st.replica_mode,
-                st.partition_id,
-                st.node_addresses.clone(),
-                st.raft_state.clone(),
-                st.raft_peer_grpc_urls.clone(),
-                st.cluster_grpc_auth.clone(),
-            ),
-        ),
+        api: st.cluster_aware_api(),
         database: st.application.database().clone(),
         runtime: st.application.runtime(),
         replica_mode: st.replica_mode,

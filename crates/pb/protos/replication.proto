@@ -141,6 +141,21 @@ message QueryError {
 // never authoritative for these requests.
 service OwnerReadService {
   rpc ReadIndexRanges(OwnerReadIndexRangesRequest) returns (OwnerReadIndexRangesResponse);
+  rpc CloseReadTimestamp(CloseReadTimestampRequest) returns (CloseReadTimestampResponse);
+}
+
+message CloseReadTimestampRequest {
+  uint32 owner_partition = 1;
+  uint64 placement_version = 2;
+  uint64 target_ts = 3;
+}
+
+message CloseReadTimestampResponse {
+  oneof outcome {
+    uint64 closed_ts = 1;
+    uint64 retry_at_ts = 2;
+    uint64 blocked_ts = 3;
+  }
 }
 
 message OwnerReadIndexRangesRequest {

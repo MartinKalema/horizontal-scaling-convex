@@ -1296,7 +1296,7 @@ impl<RT: Runtime> Application<RT> {
         identity: Identity,
         caller: FunctionCaller,
     ) -> anyhow::Result<RedactedQueryReturn> {
-        let ts = *self.now_ts_for_reads();
+        let ts = *self.database.cluster_safe_read_ts().await?;
         self.read_only_udf_at_ts(request_id, path, args, identity, ts, None, caller)
             .await
     }

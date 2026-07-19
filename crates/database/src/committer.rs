@@ -7,7 +7,13 @@ use std::{
     },
     future::Future,
     ops::Bound,
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
     time::Duration,
 };
 
@@ -207,6 +213,7 @@ const RAFT_NATS_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const RAFT_NATS_OUTBOX_KEY_PREFIX: &str = "raft_nats_outbox/";
 pub(crate) const RAFT_APPLY_MARKER_KEY_PREFIX: &str = "raft_apply_marker/";
 const MAX_APPLIED_DATA_ORIGIN_TIMESTAMPS_PER_PARTITION: usize = 1024;
+const MAX_CLOSED_READ_TIMESTAMPS: usize = 4096;
 
 type LegacyRaftNatsOutboxRecords = BTreeMap<String, serde_json::Value>;
 
@@ -425,6 +432,27 @@ pub struct CommitOutcome {
     pub read_after_write_partitions: Vec<crate::partition::PartitionId>,
 }
 
+/// Result of asking one partition leader to make an exact timestamp readable.
+///
+/// A cluster read barrier is complete only when every partition returns
+/// [`Closed`](Self::Closed) for the same timestamp.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadTimestampClosure {
+    Closed(Timestamp),
+    /// This node's translated local timeline is already ahead of the requested
+    /// timestamp. The coordinator must choose a newer common timestamp.
+    RetryAt(Timestamp),
+    /// A prepared transaction at or below the requested timestamp is
+    /// unresolved. Retrying the same barrier after the decision resolves is
+    /// safe.
+    Blocked(Timestamp),
+}
+
+enum RepeatableTimestampResult {
+    Background(oneshot::Sender<Timestamp>),
+    ClusterReadBarrier(oneshot::Sender<anyhow::Result<ReadTimestampClosure>>),
+}
+
 enum PersistenceWrite {
     Commit {
         pending_write: PendingWriteHandle,
@@ -458,7 +486,7 @@ enum PersistenceWrite {
     MaxRepeatableTimestamp {
         new_max_repeatable: Timestamp,
         timer: Timer<VMHistogram>,
-        result: oneshot::Sender<Timestamp>,
+        result: RepeatableTimestampResult,
         commit_id: usize,
     },
     /// Replica delta persistence write. Goes through the same ordered pipeline
@@ -970,6 +998,14 @@ pub struct Committer<RT: Runtime> {
     runtime: RT,
 
     last_assigned_ts: Timestamp,
+    // Highest exact read barrier admitted by this committer. Unlike
+    // `last_assigned_ts`, ordinary timestamp allocation does not advance this
+    // floor, so a coordinator may allocate T and then prepare at T.
+    read_barrier_floor: Timestamp,
+    // Exact cluster barriers certified by this leader. We intentionally do not
+    // infer that every timestamp below the maximum is safe under timestamp
+    // translation.
+    closed_read_timestamps: BTreeSet<Timestamp>,
 
     persistence_writes: FuturesOrdered<BoxFuture<'static, anyhow::Result<PersistenceWrite>>>,
 
@@ -992,6 +1028,7 @@ pub struct Committer<RT: Runtime> {
     // ensuring globally unique timestamps across all nodes.
     // None means single-node mode (local clock, existing behavior).
     timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
+    maintenance_tso_refill_in_flight: Arc<AtomicBool>,
 
     // 2PC prepared transactions awaiting CommitPrepared or RollbackPrepared.
     // Keyed by TwoPhaseTransactionId, storing the prepared intent and metadata
@@ -1127,6 +1164,7 @@ impl<RT: Runtime> Committer<RT> {
         let persistence_reader = persistence.reader();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
         let snapshot_reader = snapshot_manager.reader();
+        let read_barrier_floor = *snapshot_manager.read().persisted_max_repeatable_ts();
         let placement_state =
             partition_map.map(crate::partition::PlacementState::from_partition_map);
         let client_placement_state = placement_state.clone();
@@ -1139,6 +1177,8 @@ impl<RT: Runtime> Committer<RT> {
             persistence,
             runtime: runtime.clone(),
             last_assigned_ts: Timestamp::MIN,
+            read_barrier_floor,
+            closed_read_timestamps: BTreeSet::new(),
             persistence_writes: FuturesOrdered::new(),
             retention_validator: retention_validator.clone(),
             virtual_system_mapping,
@@ -1146,6 +1186,7 @@ impl<RT: Runtime> Committer<RT> {
             distributed_log,
             placement_state,
             timestamp_oracle,
+            maintenance_tso_refill_in_flight: Arc::new(AtomicBool::new(false)),
             prepared_transactions: std::collections::HashMap::new(),
             prepared_commit_waiters: std::collections::HashMap::new(),
             queued_snapshots: VecDeque::new(),
@@ -1272,8 +1313,14 @@ impl<RT: Runtime> Committer<RT> {
                     // establish a recent repeatable snapshot.
                     next_bump_wait = None;
                     let (tx, _rx) = oneshot::channel();
-                    self.bump_max_repeatable_ts(tx, commit_id, committer_span);
-                    commit_id += 1;
+                    if self.bump_max_repeatable_ts(tx, commit_id, committer_span) {
+                        commit_id += 1;
+                    } else {
+                        // No locally reserved TSO value can satisfy the floor.
+                        // Retry maintenance later while an asynchronous refill
+                        // runs outside the committer loop.
+                        next_bump_wait = Some(*MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY);
+                    }
                     last_bumped_repeatable_ts = self.runtime.monotonic_now();
                 }
                 _ = remote_read_frontier_heartbeat_fut.fuse() => {
@@ -1604,16 +1651,57 @@ impl<RT: Runtime> Committer<RT> {
                                 next_bump_wait = Some(
                                     self.runtime.rng().random_range(base_period..base_period * 2),
                                 );
-                                let _ = result.send(current);
+                                match result {
+                                    RepeatableTimestampResult::Background(result) => {
+                                        let _ = result.send(current);
+                                    },
+                                    RepeatableTimestampResult::ClusterReadBarrier(result) => {
+                                        let _ = result.send(Ok(ReadTimestampClosure::Blocked(
+                                            min_prepared_ts,
+                                        )));
+                                    },
+                                }
+                                drop(timer);
+                                continue;
+                            }
+                            let is_cluster_read_barrier = matches!(
+                                &result,
+                                RepeatableTimestampResult::ClusterReadBarrier(_)
+                            );
+                            if is_cluster_read_barrier
+                                && let Err(err) = self.ensure_leader_for_read_barrier()
+                            {
+                                if let RepeatableTimestampResult::ClusterReadBarrier(result) =
+                                    result
+                                {
+                                    let _ = result.send(Err(err));
+                                }
                                 drop(timer);
                                 continue;
                             }
                             self.publish_max_repeatable_ts(new_max_repeatable)?;
+                            if is_cluster_read_barrier {
+                                self.closed_read_timestamps.insert(new_max_repeatable);
+                                while self.closed_read_timestamps.len()
+                                    > MAX_CLOSED_READ_TIMESTAMPS
+                                {
+                                    self.closed_read_timestamps.pop_first();
+                                }
+                            }
                             let base_period = *MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY;
                             next_bump_wait = Some(
                                 self.runtime.rng().random_range(base_period..base_period * 2),
                             );
-                            let _ = result.send(new_max_repeatable);
+                            match result {
+                                RepeatableTimestampResult::Background(result) => {
+                                    let _ = result.send(new_max_repeatable);
+                                },
+                                RepeatableTimestampResult::ClusterReadBarrier(result) => {
+                                    let _ = result.send(Ok(ReadTimestampClosure::Closed(
+                                        new_max_repeatable,
+                                    )));
+                                },
+                            }
                             drop(timer);
                         },
                         PersistenceWrite::ReplicaDelta {
@@ -1847,6 +1935,8 @@ impl<RT: Runtime> Committer<RT> {
                             self.queued_snapshots.clear();
                             self.log.reset(snapshot_ts);
                             self.last_assigned_ts = snapshot_ts;
+                            self.read_barrier_floor = snapshot_ts;
+                            self.closed_read_timestamps.clear();
                             self.applied_delta_watermarks = applied_delta_watermarks.clone();
                             self.applied_data_delta_watermarks = applied_data_delta_watermarks;
                             self.applied_data_delta_ids = applied_data_delta_ids;
@@ -1961,8 +2051,9 @@ impl<RT: Runtime> Committer<RT> {
                         #[cfg(any(test, feature = "testing"))]
                         Some(CommitterMessage::BumpMaxRepeatableTs { result }) => {
                             let span = Span::noop();
-                            self.bump_max_repeatable_ts(result, commit_id, &span);
-                            commit_id += 1;
+                            if self.bump_max_repeatable_ts(result, commit_id, &span) {
+                                commit_id += 1;
+                            }
                         },
                         #[cfg(any(test, feature = "testing"))]
                         Some(CommitterMessage::TickIdleRemoteReadFrontierHeartbeat { result }) => {
@@ -2056,11 +2147,16 @@ impl<RT: Runtime> Committer<RT> {
                             );
                             let _ = result.send(r);
                         },
-                        Some(CommitterMessage::AllocateCommitTs { result }) => {
+                        Some(CommitterMessage::AllocateCommitTs { min_ts, result }) => {
                             let r = self
                                 .ensure_leader_for_writes()
-                                .and_then(|_| self.next_commit_ts());
+                                .and_then(|_| self.next_commit_ts_at_or_after(min_ts));
                             let _ = result.send(r);
+                        },
+                        Some(CommitterMessage::CloseReadTimestamp { target, result }) => {
+                            let span = Span::noop();
+                            self.close_read_timestamp(target, result, commit_id, &span);
+                            commit_id += 1;
                         },
                         Some(CommitterMessage::CommitPrepared {
                             transaction_id,
@@ -2289,13 +2385,101 @@ impl<RT: Runtime> Committer<RT> {
         result: oneshot::Sender<Timestamp>,
         commit_id: usize,
         root_span: &Span,
-    ) {
+    ) -> bool {
         let timer = metrics::bump_repeatable_ts_timer();
         // next_max_repeatable_ts bumps the last_assigned_ts, so all future commits on
         // this committer will be after new_max_repeatable.
-        let new_max_repeatable = self
-            .next_max_repeatable_ts()
-            .expect("new_max_repeatable should exist");
+        let new_max_repeatable = match self.try_next_max_repeatable_ts() {
+            Ok(Some(ts)) => ts,
+            Ok(None) => {
+                let current = *self.snapshot_manager.read().persisted_max_repeatable_ts();
+                let _ = result.send(current);
+                return false;
+            },
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "Skipping optional max repeatable timestamp maintenance",
+                );
+                let current = *self.snapshot_manager.read().persisted_max_repeatable_ts();
+                let _ = result.send(current);
+                return false;
+            },
+        };
+        self.enqueue_max_repeatable_ts(
+            new_max_repeatable,
+            RepeatableTimestampResult::Background(result),
+            commit_id,
+            root_span,
+            timer,
+        );
+        true
+    }
+
+    fn close_read_timestamp(
+        &mut self,
+        target: Timestamp,
+        result: oneshot::Sender<anyhow::Result<ReadTimestampClosure>>,
+        commit_id: usize,
+        root_span: &Span,
+    ) {
+        if let Err(err) = self.ensure_leader_for_read_barrier() {
+            let _ = result.send(Err(err));
+            return;
+        }
+        if self.closed_read_timestamps.contains(&target) {
+            let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
+            return;
+        }
+
+        let latest_ts = *self.snapshot_manager.read().latest_ts();
+        let mut minimum = cmp::max(
+            self.last_assigned_ts,
+            cmp::max(self.log.max_ts(), latest_ts),
+        );
+        if let Some((queued_ts, _)) = self.latest_queued_snapshot() {
+            minimum = cmp::max(minimum, queued_ts);
+        }
+        if let Some((pending_ts, _)) = self.pending_writes.latest() {
+            minimum = cmp::max(minimum, pending_ts);
+        }
+        if let Some(prepared_ts) = self.prepared_writes.max_ts() {
+            minimum = cmp::max(minimum, prepared_ts);
+        }
+
+        if minimum > target {
+            let _ = result.send(Ok(ReadTimestampClosure::RetryAt(minimum)));
+            return;
+        }
+        if let Some(prepared_ts) = self.prepared_writes.min_ts()
+            && prepared_ts <= target
+        {
+            let _ = result.send(Ok(ReadTimestampClosure::Blocked(prepared_ts)));
+            return;
+        }
+
+        // From this point onward every locally allocated commit is above the
+        // barrier. Persistence writes already queued before this message are
+        // ordered before the barrier by `FuturesOrdered`.
+        self.last_assigned_ts = target;
+        self.read_barrier_floor = target;
+        self.enqueue_max_repeatable_ts(
+            target,
+            RepeatableTimestampResult::ClusterReadBarrier(result),
+            commit_id,
+            root_span,
+            metrics::bump_repeatable_ts_timer(),
+        );
+    }
+
+    fn enqueue_max_repeatable_ts(
+        &mut self,
+        new_max_repeatable: Timestamp,
+        result: RepeatableTimestampResult,
+        commit_id: usize,
+        root_span: &Span,
+        timer: Timer<VMHistogram>,
+    ) {
         let persistence = self.persistence.clone();
         let span = Span::enter_with_parent("bump_max_repeatable_ts", root_span);
         let runtime = self.runtime.clone();
@@ -2470,7 +2654,7 @@ impl<RT: Runtime> Committer<RT> {
             return Ok(None);
         }
 
-        Ok(Some(self.next_max_repeatable_ts()?))
+        self.try_next_max_repeatable_ts()
     }
 
     fn ensure_leader_for_writes(&self) -> anyhow::Result<()> {
@@ -2485,6 +2669,19 @@ impl<RT: Runtime> Committer<RT> {
                     leader,
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_leader_for_read_barrier(&self) -> anyhow::Result<()> {
+        self.ensure_leader_for_writes()?;
+        if let Some(raft) = self.raft_state.as_ref() {
+            anyhow::ensure!(
+                raft.has_leader_serving_lease(),
+                "Raft leader {} for partition {} has no valid serving lease",
+                raft.node_id(),
+                raft.partition_id(),
+            );
         }
         Ok(())
     }
@@ -6034,8 +6231,15 @@ impl<RT: Runtime> Committer<RT> {
     }
 
     fn next_commit_ts(&mut self) -> anyhow::Result<Timestamp> {
+        self.next_commit_ts_at_or_after(Timestamp::MIN)
+    }
+
+    fn next_commit_ts_at_or_after(
+        &mut self,
+        requested_floor: Timestamp,
+    ) -> anyhow::Result<Timestamp> {
         let _timer = next_commit_ts_seconds();
-        let local_floor = self.local_commit_floor()?;
+        let local_floor = cmp::max(self.local_commit_floor()?, requested_floor);
         let timestamp_stage_path = if self.timestamp_oracle.is_some() {
             "tso"
         } else {
@@ -6090,14 +6294,15 @@ impl<RT: Runtime> Committer<RT> {
     fn explicit_prepare_commit_floor(&self) -> anyhow::Result<Timestamp> {
         let log_floor = self.log.max_ts().succ()?;
         let latest_ts = self.snapshot_manager.read().latest_ts();
+        let read_barrier_floor = self.read_barrier_floor.succ()?;
         let queued_floor = self
             .latest_queued_snapshot()
             .map(|(ts, _)| ts.succ())
             .transpose()?
             .unwrap_or(Timestamp::MIN);
         Ok(cmp::max(
-            log_floor,
-            cmp::max(latest_ts.succ()?, queued_floor),
+            read_barrier_floor,
+            cmp::max(log_floor, cmp::max(latest_ts.succ()?, queued_floor)),
         ))
     }
 
@@ -6116,7 +6321,7 @@ impl<RT: Runtime> Committer<RT> {
         ))
     }
 
-    fn next_max_repeatable_ts(&mut self) -> anyhow::Result<Timestamp> {
+    fn try_next_max_repeatable_ts(&mut self) -> anyhow::Result<Option<Timestamp>> {
         if !self.prepared_transactions.is_empty() {
             let current = *self.snapshot_manager.read().persisted_max_repeatable_ts();
             tracing::debug!(
@@ -6125,18 +6330,64 @@ impl<RT: Runtime> Committer<RT> {
                 "Skipping max repeatable timestamp bump while 2PC prepared transactions are \
                  unresolved",
             );
-            Ok(current)
+            Ok(Some(current))
         } else if let Some(min_pending) = self.pending_writes.min_ts() {
             // If there's a pending write, push max_repeatable_ts to be right
             // before the pending write, so followers can choose recent
             // timestamps but can't read at the timestamp of the pending write.
             anyhow::ensure!(min_pending <= self.last_assigned_ts);
-            min_pending.pred()
+            Ok(Some(min_pending.pred()?))
         } else {
-            // If there are no pending writes, bump last_assigned_ts and write
-            // to persistence and snapshot manager as a commit would.
-            self.next_commit_ts()
+            // Optional maintenance may use the same globally reserved timestamp
+            // space as commits, but it must not wait indefinitely for a new TSO
+            // batch while holding the single-threaded committer loop.
+            self.try_next_maintenance_ts()
         }
+    }
+
+    fn try_next_maintenance_ts(&mut self) -> anyhow::Result<Option<Timestamp>> {
+        let Some(tso) = self.timestamp_oracle.clone() else {
+            return self.next_commit_ts().map(Some);
+        };
+        let local_floor = self.local_commit_floor()?;
+        let ts = match tso.try_next_ts_at_or_after(local_floor)? {
+            Some(ts) => ts,
+            None => {
+                self.prefetch_maintenance_tso_batch(tso, local_floor);
+                return Ok(None);
+            },
+        };
+        anyhow::ensure!(
+            ts >= local_floor,
+            "TSO returned maintenance ts={} below requested local floor {}",
+            ts,
+            local_floor,
+        );
+        self.last_assigned_ts = ts;
+        Ok(Some(ts))
+    }
+
+    fn prefetch_maintenance_tso_batch(
+        &self,
+        tso: Arc<dyn crate::timestamp_oracle::TimestampOracle>,
+        local_floor: Timestamp,
+    ) {
+        if self
+            .maintenance_tso_refill_in_flight
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let refill_in_flight = self.maintenance_tso_refill_in_flight.clone();
+        tokio_spawn("prefetch_maintenance_tso_batch", async move {
+            if let Err(error) = tso.prefetch_ts_at_or_after(local_floor).await {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "Failed to prefetch timestamp batch for optional maintenance",
+                );
+            }
+            refill_in_flight.store(false, Ordering::Release);
+        });
     }
 }
 
@@ -6621,8 +6872,28 @@ impl CommitterClient {
     }
 
     pub async fn allocate_commit_ts(&self) -> anyhow::Result<Timestamp> {
+        self.allocate_commit_ts_at_or_after(Timestamp::MIN).await
+    }
+
+    pub async fn allocate_commit_ts_at_or_after(
+        &self,
+        min_ts: Timestamp,
+    ) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::AllocateCommitTs { result: tx };
+        let message = CommitterMessage::AllocateCommitTs { min_ts, result: tx };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
+    pub async fn close_read_timestamp(
+        &self,
+        target: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::CloseReadTimestamp { target, result: tx };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -6905,7 +7176,12 @@ enum CommitterMessage {
         result: oneshot::Sender<anyhow::Result<()>>,
     },
     AllocateCommitTs {
+        min_ts: Timestamp,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
+    },
+    CloseReadTimestamp {
+        target: Timestamp,
+        result: oneshot::Sender<anyhow::Result<ReadTimestampClosure>>,
     },
     /// 2PC CommitPrepared: finalize a previously prepared transaction.
     /// Writes to persistence, publishes commit, deletes redo log.
