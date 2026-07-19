@@ -3029,7 +3029,7 @@ impl<RT: Runtime> Committer<RT> {
         if self
             .raft_state
             .as_ref()
-            .is_some_and(|raft_state| !raft_state.is_leader())
+            .is_some_and(|raft_state| !raft_state.is_leader_ready())
         {
             return;
         }
@@ -3066,7 +3066,7 @@ impl<RT: Runtime> Committer<RT> {
         if self
             .raft_state
             .as_ref()
-            .is_some_and(|raft_state| !raft_state.is_leader())
+            .is_some_and(|raft_state| !raft_state.is_leader_ready())
         {
             return Ok(None);
         }
@@ -3076,12 +3076,12 @@ impl<RT: Runtime> Committer<RT> {
 
     fn ensure_leader_for_writes(&self) -> anyhow::Result<()> {
         if let Some(ref raft) = self.raft_state {
-            if !raft.is_leader() {
+            if !raft.is_leader_ready() {
                 let leader = raft.leader_id();
                 metrics::log_write_rejected_not_leader(raft.partition_id());
                 anyhow::bail!(
-                    "Not the Raft leader for partition {}. Current leader: node {}. Forward this \
-                     mutation to the leader.",
+                    "Raft node is not ready to accept writes for partition {}. Current leader: \
+                     node {}. Forward to the ready leader or retry after catch-up.",
                     raft.partition_id(),
                     leader,
                 );
@@ -4058,7 +4058,7 @@ impl<RT: Runtime> Committer<RT> {
         }
         self.raft_state
             .as_ref()
-            .is_none_or(|raft_state| raft_state.is_leader())
+            .is_none_or(|raft_state| raft_state.is_leader_ready())
     }
 
     fn propose_commit_to_raft_state(
@@ -4068,9 +4068,9 @@ impl<RT: Runtime> Committer<RT> {
         let Some(raft) = raft_state else {
             return Ok(None);
         };
-        if !raft.is_leader() {
+        if !raft.is_leader_ready() {
             anyhow::bail!(
-                "Raft leadership lost before proposing commit at ts={} for partition {}",
+                "Raft leader is not ready before proposing commit at ts={} for partition {}",
                 u64::from(delta.ts),
                 raft.partition_id(),
             );
@@ -4111,9 +4111,9 @@ impl<RT: Runtime> Committer<RT> {
         let Some(raft) = self.raft_state.as_ref() else {
             return Ok(None);
         };
-        if !raft.is_leader() {
+        if !raft.is_leader_ready() {
             anyhow::bail!(
-                "Raft leadership lost before proposing 2PC prepare for txn={} on partition {}",
+                "Raft leader is not ready before proposing 2PC prepare for txn={} on partition {}",
                 redo.transaction_id,
                 raft.partition_id(),
             );

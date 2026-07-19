@@ -103,6 +103,20 @@ pub fn log_raft_is_leader(partition: PartitionId, is_leader: bool) {
 }
 
 register_convex_gauge!(
+    DATABASE_RAFT_LEADER_READY_INFO,
+    "Whether this node is the Raft leader and has durably applied its current-term barrier (1 or \
+     0)",
+    &PARTITION_LABELS
+);
+pub fn log_raft_leader_ready(partition: PartitionId, is_ready: bool) {
+    log_gauge_with_labels(
+        &DATABASE_RAFT_LEADER_READY_INFO,
+        if is_ready { 1.0 } else { 0.0 },
+        vec![partition_label(partition)],
+    );
+}
+
+register_convex_gauge!(
     DATABASE_RAFT_LEADER_ID_INFO,
     "Current known Raft leader node ID for the partition (0 if unknown)",
     &PARTITION_LABELS
