@@ -130,8 +130,8 @@ enum CommittedEntryAction {
 /// becomes leader or loses leadership, so the application can start/stop
 /// the Committer accordingly.
 pub struct LeadershipCallbacks {
-    /// Called when this node becomes the Raft leader.
-    /// The Committer should start accepting writes for this partition.
+    /// Called when this node becomes the elected Raft leader. Application work
+    /// must still wait for [`LeadershipCallbacks::on_leader_ready`].
     pub on_became_leader: Box<dyn FnMut() + Send>,
     /// Called when this node loses leadership (stepped down or partitioned).
     /// The Committer should stop accepting writes and drain pending proposals.
@@ -139,6 +139,9 @@ pub struct LeadershipCallbacks {
     /// Called whenever the known leader changes (including on other nodes).
     /// Receives the new leader's node ID (0 if unknown).
     pub on_leader_changed: Box<dyn FnMut(u64) + Send>,
+    /// Called after the current-term leader barrier has committed and the
+    /// local Convex state machine has durably applied through it.
+    pub on_leader_ready: Box<dyn FnMut() + Send>,
     /// Called when the current leader observes enough recent peer responses
     /// to keep serving coordinator-owned reads and subscriptions.
     pub on_leader_serving_lease_refreshed: Box<dyn FnMut() + Send>,
@@ -150,6 +153,7 @@ impl Default for LeadershipCallbacks {
             on_became_leader: Box::new(|| {}),
             on_lost_leadership: Box::new(|| {}),
             on_leader_changed: Box::new(|_| {}),
+            on_leader_ready: Box::new(|| {}),
             on_leader_serving_lease_refreshed: Box::new(|| {}),
         }
     }
@@ -172,6 +176,11 @@ pub struct RaftNode {
     config: RaftNodeConfig,
     /// Whether this node is currently the leader.
     is_leader_flag: bool,
+    /// Whether this leader has durably applied its current-term barrier.
+    is_leader_ready_flag: bool,
+    /// The current term and log index that must be durably applied before
+    /// this elected leader may serve application traffic.
+    leader_readiness_barrier: Option<(u64, u64)>,
     /// Leadership change callbacks.
     leadership_callbacks: LeadershipCallbacks,
     /// Highest Raft log index durably applied to the local Convex state
@@ -260,6 +269,8 @@ impl RaftNode {
             peer_senders,
             config,
             is_leader_flag: false,
+            is_leader_ready_flag: false,
+            leader_readiness_barrier: None,
             leadership_callbacks: LeadershipCallbacks::default(),
             durable_applied_index: applied,
             applied_indexes_pending_persistence: BTreeSet::new(),
@@ -287,13 +298,63 @@ impl RaftNode {
     }
 
     fn record_snapshot_applied_index(&mut self, index: u64) -> anyhow::Result<()> {
-        if index > self.durable_applied_index {
-            self.storage.set_applied_index(index)?;
-            self.durable_applied_index = index;
-        }
+        anyhow::ensure!(
+            self.storage.applied_index()? == index,
+            "Raft snapshot metadata committed index {} but storage reports applied index {}",
+            index,
+            self.storage.applied_index()?,
+        );
+        self.durable_applied_index = self.durable_applied_index.max(index);
         self.applied_indexes_pending_persistence
             .retain(|pending_index| *pending_index > index);
         Ok(())
+    }
+
+    fn maybe_mark_leader_ready(&mut self) -> bool {
+        if !self.is_leader_flag || self.is_leader_ready_flag {
+            return false;
+        }
+        let Some((barrier_term, barrier_index)) = self.leader_readiness_barrier else {
+            return false;
+        };
+        if self.raw_node.raft.term != barrier_term
+            || self.raw_node.raft.raft_log.committed < barrier_index
+            || self.durable_applied_index < barrier_index
+        {
+            return false;
+        }
+
+        self.is_leader_ready_flag = true;
+        self.leader_readiness_barrier = None;
+        tracing::info!(
+            "Raft node {}: leader READY for partition {} after applying term {} barrier at index \
+             {}",
+            self.config.node_id,
+            self.config.partition_id,
+            barrier_term,
+            barrier_index,
+        );
+        (self.leadership_callbacks.on_leader_ready)();
+        true
+    }
+
+    fn maybe_refresh_leader_serving_lease(
+        &mut self,
+        recent_peer_responses: &HashMap<u64, Instant>,
+        lease_duration: Duration,
+    ) {
+        if !self.is_leader_ready_flag {
+            return;
+        }
+        if has_recent_peer_quorum(
+            self.config.node_id,
+            &self.config.peers,
+            recent_peer_responses,
+            Instant::now(),
+            lease_duration,
+        ) {
+            (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
+        }
     }
 
     fn classify_committed_entry(&mut self, entry: Entry) -> anyhow::Result<CommittedEntryAction> {
@@ -360,15 +421,10 @@ impl RaftNode {
                 {
                     let now = Instant::now();
                     recent_peer_responses.insert(msg.from, now);
-                    if has_recent_peer_quorum(
-                        self.config.node_id,
-                        &self.config.peers,
+                    self.maybe_refresh_leader_serving_lease(
                         recent_peer_responses,
-                        now,
                         leader_serving_lease_duration,
-                    ) {
-                        (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
-                    }
+                    );
                 }
                 if let Err(e) = self.raw_node.step(msg) {
                     tracing::warn!("Raft step error: {e}");
@@ -376,7 +432,7 @@ impl RaftNode {
                 Ok(false)
             },
             RaftMessage::Propose(proposal) => {
-                if self.raw_node.raft.state == StateRole::Leader {
+                if self.raw_node.raft.state == StateRole::Leader && self.is_leader_ready_flag {
                     let index = self.raw_node.raft.raft_log.last_index() + 1;
                     if let Err(e) = self.raw_node.propose(vec![], proposal.data) {
                         tracing::warn!("Raft propose error: {e}");
@@ -395,6 +451,11 @@ impl RaftNode {
                 if result.is_ok() {
                     pending_local_applies.remove(&index);
                     self.raw_node.advance_apply_to(self.durable_applied_index);
+                    self.maybe_mark_leader_ready();
+                    self.maybe_refresh_leader_serving_lease(
+                        recent_peer_responses,
+                        leader_serving_lease_duration,
+                    );
                 }
                 let _ = result_tx.send(result);
                 Ok(false)
@@ -408,7 +469,10 @@ impl RaftNode {
 
     fn tick_election_and_heartbeat(&mut self, last_tick: &mut Instant) {
         self.raw_node.tick();
-        if self.raw_node.raft.state == StateRole::Leader && self.config.peers.len() == 1 {
+        if self.raw_node.raft.state == StateRole::Leader
+            && self.is_leader_ready_flag
+            && self.config.peers.len() == 1
+        {
             (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
         }
         *last_tick = Instant::now();
@@ -418,8 +482,8 @@ impl RaftNode {
     /// tick → receive messages → propose → process ready → advance.
     pub async fn run(
         &mut self,
-        mut on_committed: impl FnMut(&[u8]) -> anyhow::Result<()> + Send + 'static,
-        mut on_snapshot: impl FnMut(&[u8]) -> anyhow::Result<()>,
+        mut on_committed: impl FnMut(u64, &[u8]) -> anyhow::Result<()> + Send + 'static,
+        mut on_snapshot: impl FnMut(&Snapshot) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let tick_interval = RaftNodeConfig::TICK_INTERVAL;
         let leader_serving_lease_duration = self.config.leader_serving_lease_duration();
@@ -431,7 +495,7 @@ impl RaftNode {
         let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<StateMachineApplyResult>();
         let _apply_worker = tokio::task::spawn_blocking(move || {
             while let Some(job) = apply_rx.blocking_recv() {
-                let result = on_committed(&job.data);
+                let result = on_committed(job.index, &job.data);
                 let should_stop = result.is_err();
                 if applied_tx
                     .send(StateMachineApplyResult {
@@ -483,6 +547,11 @@ impl RaftNode {
                             tracing::error!("Failed to finish state-machine apply: {e}");
                             return Err(e);
                         }
+                        self.maybe_mark_leader_ready();
+                        self.maybe_refresh_leader_serving_lease(
+                            &recent_peer_responses,
+                            leader_serving_lease_duration,
+                        );
                     },
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -567,8 +636,16 @@ impl RaftNode {
                             self.config.partition_id,
                         );
                         self.is_leader_flag = true;
+                        self.is_leader_ready_flag = false;
+                        // raft-rs appends a no-op entry in the new term when it
+                        // becomes leader. Applying through the current last
+                        // index proves this state machine has caught up through
+                        // that current-term barrier.
+                        self.leader_readiness_barrier = Some((
+                            self.raw_node.raft.term,
+                            self.raw_node.raft.raft_log.last_index(),
+                        ));
                         (self.leadership_callbacks.on_became_leader)();
-                        (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
                     } else if !now_leader && self.is_leader_flag {
                         tracing::info!(
                             "Raft node {}: lost leadership for partition {}",
@@ -576,6 +653,8 @@ impl RaftNode {
                             self.config.partition_id,
                         );
                         self.is_leader_flag = false;
+                        self.is_leader_ready_flag = false;
+                        self.leader_readiness_barrier = None;
                         // Reject all pending proposals — we're no longer leader.
                         for (_, tx) in self.pending_proposals.drain() {
                             let _ = tx.send(RaftProposalResult::Rejected);
@@ -634,12 +713,16 @@ impl RaftNode {
                     let snapshot_timer = metrics::raft_snapshot_apply_timer();
                     let snapshot_bytes = ready.snapshot().get_data().len();
                     metrics::log_raft_snapshot_apply_bytes(snapshot_bytes);
-                    if let Err(e) = on_snapshot(ready.snapshot().get_data()) {
+                    if let Err(e) = self.storage.stage_snapshot(ready.snapshot(), ready.hs()) {
+                        tracing::error!("Failed to stage snapshot install intent: {e}");
+                        drop(snapshot_timer);
+                        return Err(e);
+                    } else if let Err(e) = on_snapshot(ready.snapshot()) {
                         tracing::error!("Failed to apply snapshot to state machine: {e}");
                         drop(snapshot_timer);
                         return Err(e);
-                    } else if let Err(e) = self.storage.apply_snapshot(ready.snapshot()) {
-                        tracing::error!("Failed to persist snapshot: {e}");
+                    } else if let Err(e) = self.storage.commit_pending_snapshot_install() {
+                        tracing::error!("Failed to commit staged snapshot metadata: {e}");
                         drop(snapshot_timer);
                         return Err(e);
                     } else if let Err(e) =
@@ -749,6 +832,11 @@ impl RaftNode {
                     }
                 }
                 self.raw_node.advance_apply_to(self.durable_applied_index);
+                self.maybe_mark_leader_ready();
+                self.maybe_refresh_leader_serving_lease(
+                    &recent_peer_responses,
+                    leader_serving_lease_duration,
+                );
             }
 
             if handled_message || handled_apply_result || should_tick || processed_ready {
@@ -789,6 +877,11 @@ impl RaftNode {
                         tracing::error!("Failed to finish state-machine apply: {e}");
                         return Err(e);
                     }
+                    self.maybe_mark_leader_ready();
+                    self.maybe_refresh_leader_serving_lease(
+                        &recent_peer_responses,
+                        leader_serving_lease_duration,
+                    );
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_tick)) => {
                     self.tick_election_and_heartbeat(&mut last_tick);
@@ -806,6 +899,12 @@ impl RaftNode {
     /// Check if this node is the current Raft leader.
     pub fn is_leader(&self) -> bool {
         self.is_leader_flag
+    }
+
+    /// Check whether this elected leader has durably applied through its
+    /// current-term barrier and may accept application work.
+    pub fn is_leader_ready(&self) -> bool {
+        self.is_leader_flag && self.is_leader_ready_flag
     }
 
     /// Get this node's ID.
@@ -840,13 +939,18 @@ impl RaftNode {
         if let Some(ss) = ready.ss() {
             (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
             let now_leader = ss.raft_state == StateRole::Leader;
-            (self.leadership_callbacks.on_leader_changed)(ss.leader_id);
             if now_leader && !self.is_leader_flag {
                 self.is_leader_flag = true;
+                self.is_leader_ready_flag = false;
+                self.leader_readiness_barrier = Some((
+                    self.raw_node.raft.term,
+                    self.raw_node.raft.raft_log.last_index(),
+                ));
                 (self.leadership_callbacks.on_became_leader)();
-                (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
             } else if !now_leader && self.is_leader_flag {
                 self.is_leader_flag = false;
+                self.is_leader_ready_flag = false;
+                self.leader_readiness_barrier = None;
                 (self.leadership_callbacks.on_lost_leadership)();
             }
         }
@@ -892,6 +996,10 @@ impl RaftNode {
             committed.push(job.data);
         }
         self.raw_node.advance_apply_to(self.durable_applied_index);
+        self.maybe_mark_leader_ready();
+        if self.config.peers.len() == 1 && self.is_leader_ready_flag {
+            (self.leadership_callbacks.on_leader_serving_lease_refreshed)();
+        }
         Ok(committed)
     }
 
@@ -939,6 +1047,114 @@ mod tests {
         node.process_ready_test();
 
         assert!(node.is_leader(), "Single node should become leader");
+        assert!(
+            node.is_leader_ready(),
+            "single-node leader should apply its current-term barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_elected_leader_waits_for_committed_prefix_before_ready() -> anyhow::Result<()> {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+        let engine = test_engine();
+        {
+            let storage =
+                ConvexRaftStorage::new(PartitionId(0), engine.clone(), 1, vec![1], None).unwrap();
+            let mut entry = Entry::default();
+            entry.set_index(1);
+            entry.set_term(1);
+            entry.set_data(b"committed before election".to_vec().into());
+            let mut hs = HardState::default();
+            hs.set_term(1);
+            hs.set_commit(1);
+            storage.append_entries_and_hardstate(&[entry], &hs).unwrap();
+            assert_eq!(storage.applied_index().unwrap(), 0);
+        }
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut node = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        node.set_leadership_callbacks(LeadershipCallbacks {
+            on_became_leader: Box::new({
+                let events = events.clone();
+                move || events.lock().unwrap().push("elected")
+            }),
+            on_leader_ready: Box::new({
+                let events = events.clone();
+                move || events.lock().unwrap().push("ready")
+            }),
+            on_leader_serving_lease_refreshed: Box::new({
+                let events = events.clone();
+                move || events.lock().unwrap().push("lease")
+            }),
+            on_lost_leadership: Box::new(|| {}),
+            on_leader_changed: Box::new(|_| {}),
+        });
+
+        for _ in 0..20 {
+            node.raw_node.tick();
+        }
+        node.try_process_ready_test_with_apply({
+            let events = events.clone();
+            move |data| {
+                assert_eq!(data, b"committed before election");
+                let observed = events.lock().unwrap().clone();
+                assert_eq!(
+                    observed,
+                    vec!["elected"],
+                    "readiness and lease must remain closed while the committed prefix applies",
+                );
+                events.lock().unwrap().push("applied");
+                Ok(())
+            }
+        })?;
+
+        assert!(node.is_leader());
+        assert!(node.is_leader_ready());
+        assert_eq!(node.storage.applied_index()?, 2);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["elected", "applied", "ready", "lease"],
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_elected_but_unready_leader_rejects_proposals() -> anyhow::Result<()> {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+        let engine = test_engine();
+        let (_mailbox_tx, mailbox_rx) = mpsc::unbounded_channel();
+        let mut node = RaftNode::new(config, engine, mailbox_rx, HashMap::new(), None)?;
+        for _ in 0..20 {
+            node.raw_node.tick();
+        }
+        assert_eq!(node.raw_node.raft.state, StateRole::Leader);
+        assert!(!node.is_leader_ready());
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        node.process_mailbox_message(
+            RaftMessage::Propose(RaftProposal {
+                data: b"must wait for readiness".to_vec(),
+                result_tx,
+            }),
+            &mut HashMap::new(),
+            Duration::from_secs(1),
+            &mut BTreeSet::new(),
+        )?;
+        assert_eq!(result_rx.await?, RaftProposalResult::Rejected);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1004,7 +1220,7 @@ mod tests {
         node.process_ready_test();
         assert!(node.is_leader());
 
-        let run_task = tokio::spawn(async move { node.run(|_| Ok(()), |_| Ok(())).await });
+        let run_task = tokio::spawn(async move { node.run(|_, _| Ok(()), |_| Ok(())).await });
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tx.send(RaftMessage::Propose(RaftProposal {
             data: b"mailbox proposal".to_vec(),
@@ -1053,7 +1269,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let mut entered_tx = Some(entered_tx);
             node.run(
-                move |_| {
+                move |_, _| {
                     if let Some(entered_tx) = entered_tx.take() {
                         let _ = entered_tx.send(());
                     }
@@ -1205,6 +1421,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restart_after_snapshot_applies_each_later_entry_exactly_once() {
+        let config = RaftNodeConfig {
+            node_id: 1,
+            partition_id: PartitionId(0),
+            peers: vec![1],
+            election_tick: 10,
+            heartbeat_tick: 3,
+        };
+        let engine = test_engine();
+
+        {
+            let mut storage =
+                ConvexRaftStorage::new(PartitionId(0), engine.clone(), 1, vec![1], None).unwrap();
+            let mut metadata = SnapshotMetadata::default();
+            metadata.index = 8;
+            metadata.term = 2;
+            metadata.set_conf_state(ConfState::from((vec![1], vec![])));
+            let mut snapshot = Snapshot::default();
+            snapshot.set_metadata(metadata);
+            snapshot.set_data(
+                crate::raft_snapshot::test_snapshot_bytes(8, 2)
+                    .unwrap()
+                    .into(),
+            );
+            storage.apply_snapshot(&snapshot).unwrap();
+
+            let mut entry = Entry::default();
+            entry.set_index(9);
+            entry.set_term(3);
+            entry.set_data(b"after snapshot".to_vec().into());
+            let mut hard_state = HardState::default();
+            hard_state.set_term(3);
+            hard_state.set_vote(1);
+            hard_state.set_commit(9);
+            storage
+                .append_entries_and_hardstate(&[entry], &hard_state)
+                .unwrap();
+        }
+
+        {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let mut node =
+                RaftNode::new(config.clone(), engine.clone(), rx, HashMap::new(), None).unwrap();
+            assert_eq!(node.raw_node.raft.raft_log.applied, 8);
+            let committed = node.process_ready_test();
+            assert_eq!(
+                committed
+                    .iter()
+                    .filter(|data| data.as_slice() == b"after snapshot")
+                    .count(),
+                1,
+            );
+            assert_eq!(node.storage.applied_index().unwrap(), 9);
+        }
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut restarted = RaftNode::new(config, engine, rx, HashMap::new(), None).unwrap();
+        assert_eq!(restarted.raw_node.raft.raft_log.applied, 9);
+        assert!(
+            restarted.process_ready_test().is_empty(),
+            "a second restart must not replay an entry already durably applied",
+        );
+    }
+
+    #[tokio::test]
     async fn test_leadership_callback() {
         let config = RaftNodeConfig {
             node_id: 1,
@@ -1231,6 +1512,7 @@ mod tests {
                 observed_leader_id_clone.store(leader_id, std::sync::atomic::Ordering::SeqCst);
             }),
             on_lost_leadership: Box::new(|| {}),
+            on_leader_ready: Box::new(|| {}),
             on_leader_serving_lease_refreshed: Box::new(|| {}),
         });
 

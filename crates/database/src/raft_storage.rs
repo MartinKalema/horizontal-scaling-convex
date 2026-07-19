@@ -45,18 +45,28 @@ const APPLIED_INDEX_KEY: &[u8] = b"applied_index";
 /// Key for storing the latest installed/generated snapshot in raft-engine's KV
 /// space.
 const SNAPSHOT_KEY: &[u8] = b"snapshot";
+/// Incoming snapshot staged before mutating Convex persistence. This is the
+/// durable cross-store install intent used to resume after a process crash.
+const PENDING_SNAPSHOT_KEY: &[u8] = b"pending_snapshot";
+const PENDING_SNAPSHOT_HARD_STATE_KEY: &[u8] = b"pending_snapshot_hard_state";
 
 pub trait RaftSnapshotProvider: Send + Sync {
-    fn snapshot_bytes(&self) -> anyhow::Result<Vec<u8>>;
+    fn snapshot_bytes(&self, raft_index: u64, raft_term: u64) -> anyhow::Result<Vec<u8>>;
 }
 
 impl<F> RaftSnapshotProvider for F
 where
-    F: Fn() -> anyhow::Result<Vec<u8>> + Send + Sync,
+    F: Fn(u64, u64) -> anyhow::Result<Vec<u8>> + Send + Sync,
 {
-    fn snapshot_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        self()
+    fn snapshot_bytes(&self, raft_index: u64, raft_term: u64) -> anyhow::Result<Vec<u8>> {
+        self(raft_index, raft_term)
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingSnapshotInstall {
+    pub snapshot: Snapshot,
+    pub hard_state: HardState,
 }
 
 /// Bridge between raft-rs Entry type and raft-engine's MessageExt trait.
@@ -297,25 +307,150 @@ impl ConvexRaftStorage {
             .context("Failed to read Snapshot from raft-engine")
     }
 
-    pub fn apply_snapshot(&mut self, snapshot: &Snapshot) -> anyhow::Result<()> {
+    fn pending_snapshot_install_from_engine(
+        engine: &Engine,
+        region_id: u64,
+    ) -> anyhow::Result<Option<PendingSnapshotInstall>> {
+        let snapshot: Option<Snapshot> = engine
+            .get_message(region_id, PENDING_SNAPSHOT_KEY)
+            .context("Failed to read pending Raft snapshot install")?;
+        let hard_state: Option<HardState> = engine
+            .get_message(region_id, PENDING_SNAPSHOT_HARD_STATE_KEY)
+            .context("Failed to read pending Raft snapshot hard state")?;
+        match (snapshot, hard_state) {
+            (None, None) => Ok(None),
+            (Some(snapshot), Some(hard_state)) => Ok(Some(PendingSnapshotInstall {
+                snapshot,
+                hard_state,
+            })),
+            _ => anyhow::bail!("Incomplete durable Raft snapshot install intent"),
+        }
+    }
+
+    pub fn pending_snapshot_install_for_engine(
+        engine: &Engine,
+        partition_id: PartitionId,
+    ) -> anyhow::Result<Option<PendingSnapshotInstall>> {
+        Self::pending_snapshot_install_from_engine(engine, partition_id.0 as u64)
+    }
+
+    pub fn pending_snapshot_install(&self) -> anyhow::Result<Option<PendingSnapshotInstall>> {
+        Self::pending_snapshot_install_from_engine(&self.engine, self.region_id())
+    }
+
+    /// Durably stage the complete incoming snapshot before Convex persistence
+    /// is changed. The staged record survives every later install crash window.
+    pub fn stage_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        ready_hard_state: Option<&HardState>,
+    ) -> anyhow::Result<()> {
         self.check_fail_next_write_for_test()?;
         let metadata = snapshot.get_metadata();
+        anyhow::ensure!(
+            metadata.index > self.applied_index()?,
+            "Rejecting stale Raft snapshot at index {} because durable applied index is {}",
+            metadata.index,
+            self.applied_index()?,
+        );
+        crate::raft_snapshot::decode_snapshot(snapshot.get_data(), metadata.index, metadata.term)?;
+        if let Some(pending) = self.pending_snapshot_install()? {
+            anyhow::ensure!(
+                pending.snapshot == *snapshot,
+                "A different Raft snapshot install is already pending at index {}",
+                pending.snapshot.get_metadata().index,
+            );
+            return Ok(());
+        }
+
+        let mut hard_state = ready_hard_state.cloned().unwrap_or(self.hard_state()?);
+        hard_state.commit = metadata.index;
         let mut batch = LogBatch::default();
-        batch.add_command(self.region_id(), raft_engine::Command::Clean);
         batch
-            .put_message(self.region_id(), SNAPSHOT_KEY.to_vec(), snapshot)
-            .context("Failed to add Snapshot to LogBatch")?;
+            .put_message(self.region_id(), PENDING_SNAPSHOT_KEY.to_vec(), snapshot)
+            .context("Failed to stage pending Snapshot")?;
         batch
             .put_message(
                 self.region_id(),
+                PENDING_SNAPSHOT_HARD_STATE_KEY.to_vec(),
+                &hard_state,
+            )
+            .context("Failed to stage pending snapshot HardState")?;
+        self.engine
+            .write(&mut batch, true)
+            .context("Failed to stage snapshot install in raft-engine")?;
+        Ok(())
+    }
+
+    fn commit_pending_snapshot_install_to_engine(
+        engine: &Engine,
+        region_id: u64,
+    ) -> anyhow::Result<PendingSnapshotInstall> {
+        let pending = Self::pending_snapshot_install_from_engine(engine, region_id)?
+            .context("No staged Raft snapshot install to commit")?;
+        let metadata = pending.snapshot.get_metadata();
+        crate::raft_snapshot::decode_snapshot(
+            pending.snapshot.get_data(),
+            metadata.index,
+            metadata.term,
+        )?;
+        anyhow::ensure!(
+            pending.hard_state.commit == metadata.index,
+            "Pending snapshot HardState commit {} does not match snapshot index {}",
+            pending.hard_state.commit,
+            metadata.index,
+        );
+
+        // `Clean` plus every replacement metadata key is one synced
+        // raft-engine batch. A restart observes either the old generation and
+        // pending intent, or the complete new generation, never a mixture.
+        let mut batch = LogBatch::default();
+        batch.add_command(region_id, raft_engine::Command::Clean);
+        batch
+            .put_message(region_id, SNAPSHOT_KEY.to_vec(), &pending.snapshot)
+            .context("Failed to add Snapshot to install batch")?;
+        batch
+            .put_message(
+                region_id,
                 CONF_STATE_KEY.to_vec(),
                 metadata.get_conf_state(),
             )
-            .context("Failed to add snapshot ConfState to LogBatch")?;
-        self.engine
+            .context("Failed to add snapshot ConfState to install batch")?;
+        batch
+            .put_message(region_id, HARD_STATE_KEY.to_vec(), &pending.hard_state)
+            .context("Failed to add snapshot HardState to install batch")?;
+        batch
+            .put(
+                region_id,
+                APPLIED_INDEX_KEY.to_vec(),
+                metadata.index.to_be_bytes().to_vec(),
+            )
+            .context("Failed to add snapshot applied index to install batch")?;
+        engine
             .write(&mut batch, true)
-            .context("Failed to write snapshot to raft-engine")?;
+            .context("Failed to atomically commit snapshot metadata to raft-engine")?;
+        Ok(pending)
+    }
+
+    pub fn commit_pending_snapshot_install_for_engine(
+        engine: &Engine,
+        partition_id: PartitionId,
+    ) -> anyhow::Result<PendingSnapshotInstall> {
+        Self::commit_pending_snapshot_install_to_engine(engine, partition_id.0 as u64)
+    }
+
+    pub fn commit_pending_snapshot_install(&mut self) -> anyhow::Result<u64> {
+        self.check_fail_next_write_for_test()?;
+        let pending =
+            Self::commit_pending_snapshot_install_to_engine(&self.engine, self.region_id())?;
+        let metadata = pending.snapshot.get_metadata();
         self.conf_state = metadata.get_conf_state().clone();
+        Ok(metadata.index)
+    }
+
+    pub fn apply_snapshot(&mut self, snapshot: &Snapshot) -> anyhow::Result<()> {
+        self.stage_snapshot(snapshot, None)?;
+        self.commit_pending_snapshot_install()?;
         Ok(())
     }
 
@@ -483,11 +618,17 @@ impl Storage for ConvexRaftStorage {
             ));
         }
         let snapshot_term = self.term(snapshot_index)?;
-        let snapshot_data = snapshot_provider.snapshot_bytes().map_err(|e| {
-            raft::Error::Store(StorageError::Other(Box::new(std::io::Error::other(
-                e.to_string(),
-            ))))
-        })?;
+        let snapshot_data = snapshot_provider
+            .snapshot_bytes(snapshot_index, snapshot_term)
+            .map_err(|e| {
+                if e.is::<crate::raft_snapshot::RaftSnapshotTemporarilyUnavailable>() {
+                    raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable)
+                } else {
+                    raft::Error::Store(StorageError::Other(Box::new(std::io::Error::other(
+                        e.to_string(),
+                    ))))
+                }
+            })?;
 
         let mut metadata = SnapshotMetadata::default();
         metadata.index = snapshot_index;
@@ -508,6 +649,21 @@ mod tests {
     fn test_engine() -> Arc<Engine> {
         let dir = tempfile::tempdir().unwrap();
         ConvexRaftStorage::open_engine(dir.path().to_str().unwrap()).unwrap()
+    }
+
+    fn test_snapshot(index: u64, term: u64, voters: Vec<u64>) -> Snapshot {
+        let mut metadata = SnapshotMetadata::default();
+        metadata.index = index;
+        metadata.term = term;
+        metadata.set_conf_state(ConfState::from((voters, vec![])));
+        let mut snapshot = Snapshot::default();
+        snapshot.set_metadata(metadata);
+        snapshot.set_data(
+            crate::raft_snapshot::test_snapshot_bytes(index, term)
+                .unwrap()
+                .into(),
+        );
+        snapshot
     }
 
     #[test]
@@ -624,13 +780,14 @@ mod tests {
 
     #[test]
     fn test_snapshot_persists_and_reloads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().to_str().unwrap();
 
-        {
-            let engine = ConvexRaftStorage::open_engine(path).unwrap();
-            let provider: Arc<dyn RaftSnapshotProvider> = Arc::new(|| Ok(b"checkpoint".to_vec()));
-            let mut storage =
+        let snapshot = {
+            let engine = ConvexRaftStorage::open_engine(source_path).unwrap();
+            let provider: Arc<dyn RaftSnapshotProvider> =
+                Arc::new(crate::raft_snapshot::test_snapshot_bytes);
+            let storage =
                 ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3], Some(provider))
                     .unwrap();
 
@@ -656,8 +813,17 @@ mod tests {
             let snapshot = storage.snapshot(5, 2).unwrap();
             assert_eq!(snapshot.get_metadata().index, 5);
             assert_eq!(snapshot.get_metadata().term, 2);
-            assert_eq!(snapshot.get_data(), b"checkpoint");
+            let decoded = crate::raft_snapshot::decode_snapshot(snapshot.get_data(), 5, 2).unwrap();
+            assert_eq!(decoded.state_machine_index, 5);
+            snapshot
+        };
 
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination_path = destination_dir.path().to_str().unwrap();
+        {
+            let engine = ConvexRaftStorage::open_engine(destination_path).unwrap();
+            let mut storage =
+                ConvexRaftStorage::new(PartitionId(0), engine, 2, vec![1, 2, 3], None).unwrap();
             storage.apply_snapshot(&snapshot).unwrap();
             assert_eq!(storage.first_index().unwrap(), 6);
             assert_eq!(storage.last_index().unwrap(), 5);
@@ -665,12 +831,75 @@ mod tests {
         }
 
         {
-            let engine = ConvexRaftStorage::open_engine(path).unwrap();
+            let engine = ConvexRaftStorage::open_engine(destination_path).unwrap();
             let storage =
                 ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3], None).unwrap();
             assert_eq!(storage.first_index().unwrap(), 6);
             assert_eq!(storage.last_index().unwrap(), 5);
             assert_eq!(storage.term(5).unwrap(), 2);
+            assert_eq!(storage.applied_index().unwrap(), 5);
+            assert_eq!(storage.hard_state().unwrap().commit, 5);
+            assert!(storage.pending_snapshot_install().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn test_staged_snapshot_survives_restart_and_finalize_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let snapshot = test_snapshot(5, 2, vec![1, 2, 3]);
+
+        {
+            let engine = ConvexRaftStorage::open_engine(path).unwrap();
+            let storage =
+                ConvexRaftStorage::new(PartitionId(0), engine, 2, vec![1, 2, 3], None).unwrap();
+            storage.set_applied_index(2).unwrap();
+            storage.stage_snapshot(&snapshot, None).unwrap();
+            assert_eq!(storage.applied_index().unwrap(), 2);
+            assert_eq!(
+                storage
+                    .pending_snapshot_install()
+                    .unwrap()
+                    .unwrap()
+                    .snapshot,
+                snapshot,
+            );
+        }
+
+        {
+            let engine = ConvexRaftStorage::open_engine(path).unwrap();
+            let mut storage =
+                ConvexRaftStorage::new(PartitionId(0), engine, 2, vec![1, 2, 3], None).unwrap();
+            storage.fail_next_write_for_test();
+            assert!(storage.commit_pending_snapshot_install().is_err());
+            assert_eq!(storage.applied_index().unwrap(), 2);
+            assert!(storage.pending_snapshot_install().unwrap().is_some());
+
+            assert_eq!(storage.commit_pending_snapshot_install().unwrap(), 5);
+            assert_eq!(storage.applied_index().unwrap(), 5);
+            assert_eq!(storage.hard_state().unwrap().commit, 5);
+            assert!(storage.pending_snapshot_install().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn test_snapshot_stage_rejects_stale_mismatched_and_competing_generations() {
+        let engine = test_engine();
+        let storage =
+            ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1, 2, 3], None).unwrap();
+        storage.set_applied_index(5).unwrap();
+
+        let stale = test_snapshot(5, 2, vec![1, 2, 3]);
+        assert!(storage.stage_snapshot(&stale, None).is_err());
+
+        let mut mismatched = test_snapshot(6, 2, vec![1, 2, 3]);
+        mismatched.mut_metadata().index = 7;
+        assert!(storage.stage_snapshot(&mismatched, None).is_err());
+
+        let accepted = test_snapshot(6, 2, vec![1, 2, 3]);
+        storage.stage_snapshot(&accepted, None).unwrap();
+        storage.stage_snapshot(&accepted, None).unwrap();
+        let competing = test_snapshot(7, 2, vec![1, 2, 3]);
+        assert!(storage.stage_snapshot(&competing, None).is_err());
     }
 }

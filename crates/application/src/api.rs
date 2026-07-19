@@ -317,7 +317,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
             }
         }
         let ts = match ts {
-            ExecuteQueryTimestamp::Latest => *self.now_ts_for_reads(),
+            ExecuteQueryTimestamp::Latest => *self.database.cluster_safe_read_ts().await?,
             ExecuteQueryTimestamp::At(ts) => ts,
         };
         self.read_only_udf_at_ts(
@@ -348,7 +348,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
             "Only admin or system users can call functions on non-root components directly"
         );
         let ts = match ts {
-            ExecuteQueryTimestamp::Latest => *self.now_ts_for_reads(),
+            ExecuteQueryTimestamp::Latest => *self.database.cluster_safe_read_ts().await?,
             ExecuteQueryTimestamp::At(ts) => ts,
         };
         self.read_only_udf_at_ts(
@@ -485,7 +485,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         _host: &ResolvedHostname,
         _request_id: RequestId,
     ) -> anyhow::Result<RepeatableTimestamp> {
-        Ok(self.now_ts_for_reads())
+        self.database.cluster_safe_read_ts().await
     }
 
     async fn execute_http_action(

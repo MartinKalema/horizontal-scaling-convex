@@ -951,6 +951,43 @@ own for distributed changes.
   - `BACKEND_PULL_POLICY=never bash self-hosted/docker/test.sh` passed
     write-scaling `146/146`, Raft failover `24/24`, and `ALL SUITES PASSED`.
 
+### 2026-07 — Added an owner-coordinated cluster-safe read timestamp
+
+- **Status:** complete
+- **Related issue:** `#278`
+- **What this fixes:** a latest query or reactive rerun could choose one node's
+  local repeatable timestamp without proving that every partition owner could
+  serve that exact point. During a delayed 2PC participant delta, that left no
+  cluster-wide proof against combining one committed half with one older half.
+- **Behavior:** the coordinator now starts from its current readable timestamp
+  and asks every current partition's Raft serving leader to close its ordered
+  MVCC state at exactly that value. Owners negotiate the candidate upward above
+  newer local timelines, block behind unresolved prepared transactions, and
+  fail closed across placement or leader lease changes. The read barrier does
+  not consume a TSO timestamp, so direct owner reads remain available during a
+  NATS outage. Optional frontier and repeatable-timestamp maintenance also uses
+  only locally reserved TSO values from the committer loop; batch refill runs
+  asynchronously and cannot block owner barriers. Public/admin latest queries,
+  query batches, sync reruns, and action `ctx.runQuery` callbacks all use the
+  certified timestamp. Remote-read cache tokens rerun against owners instead
+  of refreshing from a stale local mirror. Explicit historical timestamps are
+  re-certified rather than silently translated.
+- **Validation:**
+  - `cargo test -p database cluster_read_barrier -- --nocapture`
+  - `cargo test -p database test_live_prepare_rejects_timestamp_closed_for_cluster_reads -- --nocapture`
+  - `cargo test -p database test_cluster_read_barrier_floor_survives_restart -- --nocapture`
+  - `cargo test -p database test_idle_frontier_maintenance_cannot_block_owner_read_barrier -- --nocapture`
+  - `cargo test -p database test_idle_remote_read_frontier_heartbeat_tso_failure_is_nonfatal -- --nocapture`
+  - Docker test 9m pauses one coordinator's remote JetStream consumer while a
+    cross-partition 2PC commits, then asserts both latest HTTP queries and a live
+    WebSocket subscription observe the pair atomically.
+  - Built `ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest` and
+    verified all six backend containers ran local image
+    `sha256:c4c1362b860cf377f56c98c623c6ae158d337c92c67e99a4ea91b669dd230f8e`
+    with registry pulls disabled.
+  - `BACKEND_PULL_POLICY=never bash self-hosted/docker/test.sh` passed
+    write-scaling `149/149`, Raft failover `24/24`, `ALL SUITES PASSED`.
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

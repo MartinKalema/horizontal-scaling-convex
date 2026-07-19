@@ -111,7 +111,16 @@ impl SelectiveQueryForwardingApi {
         let Some(raft_state) = self.raft_state.as_ref() else {
             return Ok(None);
         };
+        anyhow::ensure!(
+            raft_state.is_cluster_genesis_ready(),
+            "Canonical cluster genesis is not ready"
+        );
         if raft_state.is_leader() {
+            anyhow::ensure!(
+                raft_state.is_leader_ready(),
+                "Coordinator partition is elected leader but has not applied its current-term \
+                 barrier"
+            );
             if raft_state.has_leader_serving_lease() {
                 return Ok(None);
             }
@@ -178,6 +187,14 @@ impl SelectiveQueryForwardingApi {
         let Some(partition_id) = self.partition_id else {
             return Ok(());
         };
+        if let Some(raft_state) = self.raft_state.as_ref()
+            && !raft_state.is_cluster_genesis_ready()
+        {
+            return Err(self.unsupported_cluster_surface_error(
+                surface,
+                "canonical cluster genesis is not Raft-confirmed by every partition".to_string(),
+            ));
+        }
         if partition_id != SELECTIVE_QUERY_AUTHORITY_PARTITION {
             return Err(self.unsupported_cluster_surface_error(
                 surface,
@@ -193,6 +210,14 @@ impl SelectiveQueryForwardingApi {
             return Err(self.unsupported_cluster_surface_error(
                 surface,
                 "the coordinator partition is running as a Raft follower".to_string(),
+            ));
+        }
+        if let Some(raft_state) = self.raft_state.as_ref()
+            && !raft_state.is_leader_ready()
+        {
+            return Err(self.unsupported_cluster_surface_error(
+                surface,
+                "the coordinator leader is still applying its current-term barrier".to_string(),
             ));
         }
         if let Some(raft_state) = self.raft_state.as_ref()

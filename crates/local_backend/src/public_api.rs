@@ -322,8 +322,15 @@ async fn maybe_forward_public_mutation(
                 .clone(),
         ))
     } else if let Some(raft_state) = st.raft_state.as_ref() {
-        if raft_state.is_leader() {
+        if raft_state.is_leader_ready() {
             None
+        } else if raft_state.is_leader() {
+            return Err(HttpResponseError::from(
+                anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(
+                    "Raft leader is still applying its current-term barrier and cannot execute \
+                     mutations yet",
+                ),
+            ));
         } else {
             let leader_id = raft_state.leader_id();
             if leader_id == 0 {

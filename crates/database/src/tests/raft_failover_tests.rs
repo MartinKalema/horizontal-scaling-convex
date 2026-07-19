@@ -50,7 +50,7 @@ fn create_three_node_group() -> Vec<RaftNode> {
     let peer_ids = vec![1u64, 2, 3];
     let mut nodes = Vec::new();
     let snapshot_provider: Arc<dyn crate::raft_storage::RaftSnapshotProvider> =
-        Arc::new(|| Ok(Vec::new()));
+        Arc::new(crate::raft_snapshot::test_snapshot_bytes);
 
     for &id in &peer_ids {
         let engine = test_engine();

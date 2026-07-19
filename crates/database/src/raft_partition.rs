@@ -69,6 +69,8 @@ use crate::{
 pub struct RaftPartitionState {
     /// Whether this node is the current Raft leader for this partition.
     is_leader: Arc<AtomicBool>,
+    /// Whether the elected leader has durably applied its current-term barrier.
+    leader_ready: Arc<AtomicBool>,
     /// The current leader's node ID (0 if unknown).
     leader_id: Arc<AtomicU64>,
     /// Channel to send proposals to the Raft node.
@@ -79,6 +81,8 @@ pub struct RaftPartitionState {
     node_id: u64,
     /// Local serving lease for coordinator-owned reads/subscriptions.
     leader_serving_lease_valid_until: Arc<Mutex<Option<Instant>>>,
+    /// Cluster-wide genesis has been installed by every configured partition.
+    cluster_genesis_ready: Arc<AtomicBool>,
 }
 
 impl RaftPartitionState {
@@ -87,13 +91,31 @@ impl RaftPartitionState {
         self.is_leader.load(Ordering::SeqCst)
     }
 
+    /// Check whether this node is both elected leader and caught up through
+    /// the current-term Raft barrier.
+    pub fn is_leader_ready(&self) -> bool {
+        self.is_leader() && self.leader_ready.load(Ordering::SeqCst)
+    }
+
     pub fn has_leader_serving_lease(&self) -> bool {
-        if !self.is_leader() {
+        if !self.is_leader_ready() {
             return false;
         }
         self.leader_serving_lease_valid_until
             .lock()
             .is_some_and(|valid_until| valid_until > Instant::now())
+    }
+
+    pub fn is_cluster_genesis_ready(&self) -> bool {
+        self.cluster_genesis_ready.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_cluster_genesis_ready(&self) {
+        self.cluster_genesis_ready.store(true, Ordering::SeqCst);
+    }
+
+    pub fn can_serve_as_leader(&self) -> bool {
+        self.is_cluster_genesis_ready() && self.is_leader() && self.has_leader_serving_lease()
     }
 
     /// Get the current leader's node ID.
@@ -142,6 +164,7 @@ impl RaftPartitionState {
         let (proposal_tx, _proposal_rx) = mpsc::unbounded_channel();
         Self {
             is_leader: Arc::new(AtomicBool::new(is_leader)),
+            leader_ready: Arc::new(AtomicBool::new(is_leader)),
             leader_id: Arc::new(AtomicU64::new(leader_id)),
             proposal_tx,
             partition_id,
@@ -151,12 +174,53 @@ impl RaftPartitionState {
             } else {
                 None
             })),
+            cluster_genesis_ready: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_with_mailbox_for_test(
+        is_leader: bool,
+        leader_id: u64,
+        partition_id: PartitionId,
+        node_id: u64,
+    ) -> (Self, mpsc::UnboundedReceiver<RaftMessage>) {
+        let (proposal_tx, proposal_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                is_leader: Arc::new(AtomicBool::new(is_leader)),
+                leader_ready: Arc::new(AtomicBool::new(is_leader)),
+                leader_id: Arc::new(AtomicU64::new(leader_id)),
+                proposal_tx,
+                partition_id,
+                node_id,
+                leader_serving_lease_valid_until: Arc::new(Mutex::new(if is_leader {
+                    Some(Instant::now() + std::time::Duration::from_secs(60))
+                } else {
+                    None
+                })),
+                cluster_genesis_ready: Arc::new(AtomicBool::new(true)),
+            },
+            proposal_rx,
+        )
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn expire_leader_serving_lease_for_test(&self) {
         *self.leader_serving_lease_valid_until.lock() = Some(Instant::now());
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn mark_cluster_genesis_unready_for_test(&self) {
+        self.cluster_genesis_ready.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_leader_ready_for_test(&self, ready: bool) {
+        self.leader_ready.store(ready, Ordering::SeqCst);
+        if !ready {
+            *self.leader_serving_lease_valid_until.lock() = None;
+        }
     }
 }
 
@@ -182,6 +246,24 @@ impl RaftPartitionManager {
         snapshot_provider: Option<Arc<dyn crate::raft_storage::RaftSnapshotProvider>>,
         timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_cluster_genesis_gate(
+            config,
+            engine,
+            peer_senders,
+            snapshot_provider,
+            timestamp_oracle,
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    pub fn new_with_cluster_genesis_gate(
+        config: RaftNodeConfig,
+        engine: Arc<raft_engine::Engine>,
+        peer_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
+        snapshot_provider: Option<Arc<dyn crate::raft_storage::RaftSnapshotProvider>>,
+        timestamp_oracle: Option<Arc<dyn TimestampOracle>>,
+        cluster_genesis_ready: Arc<AtomicBool>,
+    ) -> anyhow::Result<Self> {
         let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel();
 
         let mut node = RaftNode::new(
@@ -193,12 +275,15 @@ impl RaftPartitionManager {
         )?;
 
         let is_leader = Arc::new(AtomicBool::new(false));
+        let leader_ready = Arc::new(AtomicBool::new(false));
         let leader_id = Arc::new(AtomicU64::new(0));
         let leader_serving_lease_valid_until = Arc::new(Mutex::new(None));
         let leader_serving_lease_duration = config.leader_serving_lease_duration();
 
         // Set up leadership callbacks that update shared atomic state.
         let is_leader_cb = is_leader.clone();
+        let leader_ready_became_leader = leader_ready.clone();
+        let serving_lease_became_leader = leader_serving_lease_valid_until.clone();
         let serving_lease_refresh = leader_serving_lease_valid_until.clone();
         let serving_lease_duration_refresh = leader_serving_lease_duration;
         let partition_id = config.partition_id;
@@ -209,8 +294,11 @@ impl RaftPartitionManager {
                 if let Some(tso) = tso_became_leader.as_ref() {
                     tso.discard_reserved_batch();
                 }
+                leader_ready_became_leader.store(false, Ordering::SeqCst);
+                *serving_lease_became_leader.lock() = None;
                 is_leader_cb.store(true, Ordering::SeqCst);
                 metrics::log_raft_is_leader(partition_id, true);
+                metrics::log_raft_leader_ready(partition_id, false);
                 tracing::info!(
                     "Raft partition {}: Committer ACTIVATED (this node is leader)",
                     partition_id,
@@ -218,6 +306,7 @@ impl RaftPartitionManager {
             }),
             on_lost_leadership: Box::new({
                 let is_leader_lost = is_leader.clone();
+                let leader_ready_lost = leader_ready.clone();
                 let serving_lease_lost = leader_serving_lease_valid_until.clone();
                 let partition_id_lost = partition_id;
                 let tso_lost_leadership = timestamp_oracle.clone();
@@ -226,12 +315,25 @@ impl RaftPartitionManager {
                         tso.discard_reserved_batch();
                     }
                     is_leader_lost.store(false, Ordering::SeqCst);
+                    leader_ready_lost.store(false, Ordering::SeqCst);
                     *serving_lease_lost.lock() = None;
                     metrics::log_raft_is_leader(partition_id_lost, false);
+                    metrics::log_raft_leader_ready(partition_id_lost, false);
                     metrics::reset_raft_replication_health(partition_id_lost);
                     tracing::info!(
                         "Raft partition {}: Committer DEACTIVATED (lost leadership)",
                         partition_id_lost,
+                    );
+                }
+            }),
+            on_leader_ready: Box::new({
+                let leader_ready = leader_ready.clone();
+                move || {
+                    leader_ready.store(true, Ordering::SeqCst);
+                    metrics::log_raft_leader_ready(partition_id, true);
+                    tracing::info!(
+                        "Raft partition {}: leader is caught up and READY to serve",
+                        partition_id,
                     );
                 }
             }),
@@ -260,13 +362,16 @@ impl RaftPartitionManager {
 
         let state = RaftPartitionState {
             is_leader: is_leader.clone(),
+            leader_ready,
             leader_id,
             proposal_tx: mailbox_tx.clone(),
             partition_id: config.partition_id,
             node_id: config.node_id,
             leader_serving_lease_valid_until,
+            cluster_genesis_ready,
         };
         metrics::log_raft_is_leader(config.partition_id, false);
+        metrics::log_raft_leader_ready(config.partition_id, false);
         metrics::log_raft_leader_id(config.partition_id, 0);
         metrics::reset_raft_replication_health(config.partition_id);
 
@@ -353,6 +458,8 @@ mod tests {
         let state = manager.state();
 
         assert!(!state.is_leader());
+        assert!(!state.is_leader_ready());
+        assert!(!state.has_leader_serving_lease());
         assert_eq!(state.leader_id(), 0);
         assert_eq!(state.partition_id(), PartitionId(0));
     }
@@ -382,6 +489,8 @@ mod tests {
 
         // The shared state should now reflect leadership.
         assert!(state.is_leader());
+        assert!(state.is_leader_ready());
+        assert!(state.has_leader_serving_lease());
         assert_eq!(state.leader_id(), 1);
         assert_eq!(
             state.leader_id(),
