@@ -277,6 +277,12 @@ async fn run_sync_socket(
                         "Sync socket authority lost: coordinator partition is a Raft follower"
                     );
                 }
+                if !raft_state.is_leader_ready() {
+                    anyhow::bail!(
+                        "Sync socket authority lost: coordinator leader has not applied its \
+                         current-term barrier"
+                    );
+                }
                 if !raft_state.has_leader_serving_lease() {
                     anyhow::bail!(
                         "Sync socket authority lost: coordinator partition does not have a fresh \

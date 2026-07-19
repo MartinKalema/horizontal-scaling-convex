@@ -23,6 +23,7 @@ mod execution_size;
 pub mod membership;
 mod metrics;
 pub mod nats_distributed_log;
+pub mod owner_read;
 pub mod partition;
 pub mod patch;
 pub mod persistence_helpers;
@@ -30,6 +31,7 @@ mod preloaded;
 pub mod query;
 pub mod raft_node;
 pub mod raft_partition;
+pub mod raft_snapshot;
 pub mod raft_state_machine;
 pub mod raft_storage;
 pub mod raft_transport;
@@ -77,8 +79,10 @@ pub mod test_helpers;
 pub mod tests;
 pub mod text_index_worker;
 pub use committer::{
+    recover_staged_raft_snapshot_install,
     table_dependency_sort_key,
     CommitterClient,
+    ReadTimestampClosure,
 };
 pub use component_registry::ComponentRegistry;
 pub use database_index_workers::{

@@ -165,9 +165,13 @@ async fn raft_leader_origin(st: &DeployRouterState) -> anyhow::Result<Option<Str
         raft_state.is_cluster_genesis_ready(),
         "Canonical cluster genesis is not Raft-confirmed by every partition"
     );
-    if raft_state.is_leader() {
+    if raft_state.is_leader_ready() {
         return Ok(None);
     }
+    anyhow::ensure!(
+        !raft_state.is_leader(),
+        "Raft leader is still applying its current-term barrier and cannot serve deploy metadata"
+    );
     let peer_http_origins = st.raft_peer_http_origins.as_ref().context(
         "RAFT_PEERS is required to forward deploy metadata operations to the Raft leader",
     )?;

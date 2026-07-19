@@ -26,6 +26,7 @@ use ::storage::{
     Storage,
     StorageUseCase,
 };
+use anyhow::Context;
 use application::{
     self,
     api::ApplicationApi,
@@ -110,6 +111,7 @@ pub mod logs;
 mod metrics;
 pub mod mutation_forwarder;
 pub mod node_action_callbacks;
+pub mod owner_read_service;
 pub mod parse;
 pub mod proxy;
 pub mod public_api;
@@ -180,6 +182,19 @@ pub struct BackendAppState {
 }
 
 impl BackendAppState {
+    pub fn cluster_aware_api(&self) -> Arc<dyn ApplicationApi> {
+        Arc::new(query_forwarding_api::SelectiveQueryForwardingApi::new(
+            Arc::new(self.application.clone()),
+            self.application.database().clone(),
+            self.replica_mode,
+            self.partition_id,
+            self.node_addresses.clone(),
+            self.raft_state.clone(),
+            self.raft_peer_grpc_urls.clone(),
+            self.cluster_grpc_auth.clone(),
+        ))
+    }
+
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.application.shutdown().await?;
 
@@ -880,6 +895,33 @@ pub async fn make_app(
             },
         )
     });
+    let initial_partition_map = config.partition_id.map(|id| {
+        static_placement_metadata
+            .as_ref()
+            .expect("partitioned startup should have placement metadata")
+            .into_partition_map(database::partition::PartitionId(id))
+    });
+
+    // Snapshot installation spans Convex persistence and raft-engine. Recover
+    // any durable cross-store install intent before Database::load exposes the
+    // partially installed persistence generation to normal workers.
+    let raft_engine = if config.raft_node_id.is_some() && config.raft_peers.is_some() {
+        let engine =
+            database::raft_storage::ConvexRaftStorage::open_engine("/convex/data/raft-engine")?;
+        let partition_id = database::partition::PartitionId(config.partition_id.unwrap_or(0));
+        database::recover_staged_raft_snapshot_install(
+            engine.clone(),
+            partition_id,
+            persistence.clone(),
+            runtime.clone(),
+            virtual_system_mapping().clone(),
+            initial_partition_map.clone(),
+        )
+        .await?;
+        Some(engine)
+    } else {
+        None
+    };
 
     let load_database = || {
         Database::load(
@@ -896,12 +938,7 @@ pub async fn make_app(
             deleted_tablet_sender.clone(),
             distributed_log.clone(),
             config.replication_mode == "replica",
-            config.partition_id.map(|id| {
-                static_placement_metadata
-                    .as_ref()
-                    .expect("partitioned startup should have placement metadata")
-                    .into_partition_map(database::partition::PartitionId(id))
-            }),
+            initial_partition_map.clone(),
             static_node_addresses.clone(),
             two_phase_decision_log.clone(),
             Some(cluster_grpc_auth.clone()),
@@ -1386,6 +1423,8 @@ pub async fn make_app(
             let from_ts =
                 replica_delta_consumer_start_ts(*database.now_ts_for_reads(), config.partition_id);
             let consumer_name = config.name();
+            let excluded_source_partition =
+                config.partition_id.map(database::partition::PartitionId);
             let consumer_runtime = runtime.clone();
             let consumer_genesis_ready = cluster_genesis_ready.clone();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
@@ -1443,6 +1482,7 @@ pub async fn make_app(
                             let result = database::replica::consume_replication_stream(
                                 stream,
                                 committer.clone(),
+                                excluded_source_partition,
                                 |ts, n| {
                                     if use_selective_node_targeting {
                                         database::log_selective_delivery_shadow_receive();
@@ -1519,7 +1559,6 @@ pub async fn make_app(
             raft_node::RaftNodeConfig,
             raft_partition::RaftPartitionManager,
             raft_state_machine::RaftStateMachineEntry,
-            raft_storage::ConvexRaftStorage,
             raft_transport,
         };
 
@@ -1559,12 +1598,9 @@ pub async fn make_app(
             heartbeat_tick: 3, // 300ms
         };
 
-        // Open raft-engine for persistent Raft log storage (TiKV pattern).
-        // One engine per node, shared across all partitions. Data survives
-        // restarts — this prevents the "to_commit X out of range" panic
-        // that MemStorage caused.
-        let raft_engine_path = "/convex/data/raft-engine";
-        let raft_engine = ConvexRaftStorage::open_engine(raft_engine_path)?;
+        let raft_engine = raft_engine
+            .clone()
+            .context("Raft was configured without an initialized raft-engine")?;
 
         // Create transport channels for peer communication.
         let (peer_senders, transport_clients) = raft_transport::create_transport(
@@ -1574,11 +1610,13 @@ pub async fn make_app(
         );
 
         let snapshot_provider = {
-            let database = database.clone();
-            Arc::new(move || {
+            let committer = database.committer_client();
+            Arc::new(move |raft_index, raft_term| {
                 common::runtime::block_in_place(|| {
                     let rt = tokio::runtime::Handle::current();
-                    rt.block_on(async { database.build_raft_snapshot_bytes().await })
+                    rt.block_on(async {
+                        committer.build_raft_snapshot(raft_index, raft_term).await
+                    })
                 })
             }) as Arc<dyn database::raft_storage::RaftSnapshotProvider>
         };
@@ -1616,7 +1654,7 @@ pub async fn make_app(
                 let persistence_for_snapshots = persistence_for_apply.clone();
                 if let Err(e) = node
                     .run(
-                        move |data| {
+                        move |raft_index, data| {
                             match RaftStateMachineEntry::from_bytes(data)? {
                                 RaftStateMachineEntry::CommitDelta { envelope } => {
                                     let proposed_locally =
@@ -1633,13 +1671,14 @@ pub async fn make_app(
                                     let committer = committer_for_entries.clone();
                                     let rt = tokio::runtime::Handle::current();
                                     rt.block_on(async {
-                                        committer.apply_raft_commit_delta(delta).await.map_err(
-                                            |e| {
+                                        committer
+                                            .apply_raft_commit_delta(raft_index, delta)
+                                            .await
+                                            .map_err(|e| {
                                                 anyhow::anyhow!(
                                                     "Raft state-machine apply failed: {e:#}"
                                                 )
-                                            },
-                                        )
+                                            })
                                     })?;
                                 },
                                 RaftStateMachineEntry::TwoPhasePrepare { redo } => {
@@ -1652,13 +1691,14 @@ pub async fn make_app(
                                     let committer = committer_for_entries.clone();
                                     let rt = tokio::runtime::Handle::current();
                                     rt.block_on(async {
-                                        committer.apply_raft_prepared_redo(redo).await.map_err(
-                                            |e| {
+                                        committer
+                                            .apply_raft_prepared_redo(raft_index, redo)
+                                            .await
+                                            .map_err(|e| {
                                                 anyhow::anyhow!(
                                                     "Raft 2PC prepare apply failed: {e:#}"
                                                 )
-                                            },
-                                        )
+                                            })
                                     })?;
                                 },
                                 RaftStateMachineEntry::ClusterGenesis {
@@ -1683,12 +1723,15 @@ pub async fn make_app(
 
                             Ok(())
                         },
-                        move |snapshot_bytes| {
-                            let checkpoint =
-                                database::snapshot_checkpointer::checkpoint_from_bytes(
-                                    snapshot_bytes,
-                                )?;
-                            let genesis_marker = checkpoint
+                        move |snapshot| {
+                            let metadata = snapshot.get_metadata();
+                            let decoded = database::raft_snapshot::decode_snapshot(
+                                snapshot.get_data(),
+                                metadata.index,
+                                metadata.term,
+                            )?;
+                            let genesis_marker = decoded
+                                .checkpoint
                                 .globals
                                 .get(&String::from(
                                     common::persistence::PersistenceGlobalKey::ClusterGenesis,
@@ -1700,7 +1743,7 @@ pub async fn make_app(
                             let persistence = persistence_for_snapshots.clone();
                             let rt = tokio::runtime::Handle::current();
                             rt.block_on(async {
-                                committer.install_snapshot(checkpoint).await?;
+                                committer.install_raft_snapshot(decoded.checkpoint).await?;
                                 if let Some(marker) = genesis_marker {
                                     record_raft_applied_genesis_marker(&persistence, &marker)
                                         .await?;

@@ -68,6 +68,7 @@ use futures::{
     stream::BoxStream,
     TryStreamExt,
 };
+use indexing::backend_in_memory_indexes::RangeRequest;
 use keybroker::Identity;
 use parking_lot::Mutex;
 use pb::replication::{
@@ -83,6 +84,12 @@ use pb::replication::{
     TwoPcRollbackResponse,
     TwoPcValidateReadsRequest,
     TwoPcValidateReadsResponse,
+};
+use raft::prelude::{
+    ConfState,
+    HardState,
+    Snapshot as RaftSnapshot,
+    SnapshotMetadata,
 };
 use rand::{
     Rng,
@@ -122,13 +129,24 @@ use crate::{
     },
     committer::{
         CommitterClient,
+        ReadTimestampClosure,
         AFTER_PENDING_WRITE_SNAPSHOT,
+        AFTER_RAFT_APPLIED_INDEX_PERSISTENCE,
+        AFTER_RAFT_CONVEX_PERSISTENCE,
+        AFTER_RAFT_SNAPSHOT_PUBLICATION,
+        RAFT_APPLY_MARKER_KEY_PREFIX,
+        RAFT_NATS_OUTBOX_KEY_PREFIX,
     },
     membership::{
         ClusterNodeId,
         MembershipSnapshot,
         MembershipVersion,
         NodeMembership,
+    },
+    nats_distributed_log::DeltaEnvelope,
+    owner_read::{
+        OwnerIndexRangeResult,
+        OwnerReadClient,
     },
     partition::{
         PartitionId,
@@ -138,7 +156,17 @@ use crate::{
         StaticPlacementConfig,
     },
     query::ResolvedQuery,
+    raft_node::{
+        RaftMessage,
+        RaftProposalResult,
+    },
     raft_partition::RaftPartitionState,
+    raft_snapshot::{
+        decode_snapshot as decode_raft_snapshot,
+        RAFT_STATE_MACHINE_INDEX_KEY,
+    },
+    raft_state_machine::RaftStateMachineEntry,
+    raft_storage::ConvexRaftStorage,
     snapshot_manager::partition_timestamp_map_from_json,
     table_number_allocator::{
         testing::InMemoryTableNumberAllocator,
@@ -180,6 +208,19 @@ async fn create_node(
     partition_map: Option<PartitionMap>,
 ) -> anyhow::Result<Database<TestRuntime>> {
     create_node_with_options(rt, distributed_log, partition_map, None, None).await
+}
+
+async fn run_local_replica_query(
+    database: Database<TestRuntime>,
+    namespace: TableNamespace,
+    query: Query,
+) -> anyhow::Result<Vec<ResolvedDocument>> {
+    run_query(
+        database.with_local_replica_reads_for_test(),
+        namespace,
+        query,
+    )
+    .await
 }
 
 async fn create_node_with_options(
@@ -334,6 +375,17 @@ async fn create_node_with_custom_distributed_log(
     Ok(db)
 }
 
+fn raft_snapshot_for_test(index: u64, term: u64, bytes: Vec<u8>) -> RaftSnapshot {
+    let mut metadata = SnapshotMetadata::default();
+    metadata.index = index;
+    metadata.term = term;
+    metadata.set_conf_state(ConfState::from((vec![1, 2, 3], vec![])));
+    let mut snapshot = RaftSnapshot::default();
+    snapshot.set_metadata(metadata);
+    snapshot.set_data(bytes.into());
+    snapshot
+}
+
 #[derive(Default)]
 struct SwitchableDistributedLog {
     fail_publishes: AtomicBool,
@@ -373,6 +425,76 @@ impl DistributedLog for SwitchableDistributedLog {
 
 fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1", local_partition, 2)
+}
+
+struct RetryOnceOwnerReadClient {
+    calls: AtomicUsize,
+    targets: Mutex<Vec<Timestamp>>,
+}
+
+impl RetryOnceOwnerReadClient {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            targets: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl OwnerReadClient for RetryOnceOwnerReadClient {
+    async fn close_read_timestamp(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        target_ts: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        self.targets.lock().push(target_ts);
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(ReadTimestampClosure::RetryAt(target_ts.succ()?))
+        } else {
+            Ok(ReadTimestampClosure::Closed(target_ts))
+        }
+    }
+
+    async fn read_index_ranges(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        _snapshot_ts: Timestamp,
+        _ranges: Vec<RangeRequest>,
+    ) -> anyhow::Result<Vec<OwnerIndexRangeResult>> {
+        anyhow::bail!("read_index_ranges is not used by the read barrier test")
+    }
+}
+
+struct PlacementChangingOwnerReadClient {
+    committer: CommitterClient,
+    replacement: PlacementMetadata,
+}
+
+#[async_trait]
+impl OwnerReadClient for PlacementChangingOwnerReadClient {
+    async fn close_read_timestamp(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        target_ts: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        self.committer
+            .refresh_placement_metadata(self.replacement.clone())?;
+        Ok(ReadTimestampClosure::Closed(target_ts))
+    }
+
+    async fn read_index_ranges(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        _snapshot_ts: Timestamp,
+        _ranges: Vec<RangeRequest>,
+    ) -> anyhow::Result<Vec<OwnerIndexRangeResult>> {
+        anyhow::bail!("read_index_ranges is not used by the read barrier test")
+    }
 }
 
 fn partitioned_map_with_version(
@@ -453,6 +575,57 @@ async fn persisted_document_log_count(tp: &Arc<TestPersistence>) -> anyhow::Resu
         .try_collect::<Vec<_>>()
         .await?
         .len())
+}
+
+async fn commit_next_raft_delta_for_test(
+    raft_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
+    index: u64,
+) -> anyhow::Result<CommitDelta> {
+    let message = tokio::time::timeout(Duration::from_secs(1), raft_rx.recv())
+        .await?
+        .context("test Raft mailbox closed before receiving a proposal")?;
+    let RaftMessage::Propose(proposal) = message else {
+        anyhow::bail!("expected a Raft proposal in the test mailbox")
+    };
+    let delta = match RaftStateMachineEntry::from_bytes(&proposal.data)? {
+        RaftStateMachineEntry::CommitDelta { envelope } => envelope.to_delta()?,
+        RaftStateMachineEntry::TwoPhasePrepare { .. } => {
+            anyhow::bail!("expected a commit delta Raft entry")
+        },
+        RaftStateMachineEntry::ClusterGenesis { .. } => {
+            anyhow::bail!("expected a commit delta, not cluster genesis")
+        },
+    };
+    proposal
+        .result_tx
+        .send(RaftProposalResult::Committed { index })
+        .map_err(|_| anyhow::anyhow!("commit waiter dropped before test Raft decision"))?;
+    Ok(delta)
+}
+
+async fn acknowledge_next_raft_applied_for_test(
+    mut raft_rx: tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
+    expected_index: u64,
+) -> anyhow::Result<bool> {
+    while let Some(message) = raft_rx.recv().await {
+        match message {
+            RaftMessage::MarkApplied { index, result_tx } => {
+                anyhow::ensure!(
+                    index == expected_index,
+                    "expected applied index {expected_index}, got {index}",
+                );
+                result_tx
+                    .send(Ok(()))
+                    .map_err(|_| anyhow::anyhow!("committer dropped Raft applied-index waiter"))?;
+                return Ok(true);
+            },
+            RaftMessage::Propose(_) => {
+                anyhow::bail!("received an unexpected second Raft proposal")
+            },
+            RaftMessage::Raft(_) | RaftMessage::Shutdown => {},
+        }
+    }
+    Ok(false)
 }
 
 async fn global_table_scan_or_empty(
@@ -1087,6 +1260,23 @@ impl TimestampOracle for FailingTimestampOracle {
     }
 }
 
+struct HangingTimestampOracle;
+
+#[async_trait]
+impl TimestampOracle for HangingTimestampOracle {
+    async fn next_ts_at_or_after(&self, _min_ts: Timestamp) -> anyhow::Result<Timestamp> {
+        std::future::pending().await
+    }
+
+    async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
+        std::future::pending().await
+    }
+
+    async fn advance_committed_ts(&self, _ts: Timestamp) -> anyhow::Result<()> {
+        std::future::pending().await
+    }
+}
+
 struct RecordingTimestampOracle {
     state: Mutex<RecordingTimestampOracleState>,
 }
@@ -1316,6 +1506,347 @@ async fn test_failed_raft_proposal_does_not_publish_or_persist(
         "failed Raft proposal must not be resurrected from persistence",
     );
 
+    Ok(())
+}
+
+async fn assert_raft_replay_is_idempotent_across_crash_window(
+    rt: &TestRuntime,
+    pause: PauseController,
+    pause_label: &'static str,
+    expect_raw_marker_at_crash: bool,
+) -> anyhow::Result<()> {
+    let log = Arc::new(SwitchableDistributedLog::default());
+    let persistence = Arc::new(TestPersistence::new());
+    let node = create_node_with_custom_distributed_log(
+        rt,
+        persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        Arc::new(crate::LocalTableNumberAllocator),
+    )
+    .await?;
+    insert_doc(&node, "messages", assert_obj!("text" => "seed")).await?;
+    log.fail_publishes.store(true, Ordering::SeqCst);
+
+    let (raft_state, mut raft_rx) =
+        RaftPartitionState::new_with_mailbox_for_test(true, 1, PartitionId(0), 1);
+    node.attach_raft_state(raft_state).await?;
+
+    let hold = pause.hold(pause_label);
+    let node_for_commit = node.clone();
+    let commit_task = tokio::spawn(async move {
+        insert_doc(
+            &node_for_commit,
+            "messages",
+            assert_obj!("text" => "raft-committed"),
+        )
+        .await
+    });
+    let delta = commit_next_raft_delta_for_test(&mut raft_rx, 7).await?;
+    let mark_applied_task = tokio::spawn(acknowledge_next_raft_applied_for_test(raft_rx, 7));
+    let pause_guard = hold
+        .wait_for_blocked()
+        .await
+        .context("Raft commit did not reach the injected crash boundary")?;
+
+    let raw_markers = persistence
+        .reader()
+        .list_persistence_globals_with_prefix(RAFT_APPLY_MARKER_KEY_PREFIX)
+        .await?;
+    assert_eq!(
+        !raw_markers.is_empty(),
+        expect_raw_marker_at_crash,
+        "raw apply marker presence should identify which crash bridge is durable",
+    );
+    let outbox_at_crash = persistence
+        .reader()
+        .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+        .await?;
+    assert_eq!(
+        outbox_at_crash.len(),
+        1,
+        "the cross-partition outbox record must be atomic with Raft state-machine persistence",
+    );
+    let installed_document_count = persisted_document_log_count(&persistence).await?;
+
+    // Abort the committer at the selected boundary. The test replays the entry
+    // even at the post-applied-index boundary to prove duplicate delivery is
+    // harmless in addition to exercising the real pre-index recovery window.
+    node.shutdown().await?;
+    pause_guard.unpause();
+    let interrupted = tokio::time::timeout(Duration::from_secs(1), commit_task).await??;
+    assert!(
+        interrupted.is_err(),
+        "the client commit must not complete after the injected process stop",
+    );
+    drop(node);
+    let applied_index_was_persisted = mark_applied_task.await??;
+    assert_eq!(
+        applied_index_was_persisted,
+        pause_label == AFTER_RAFT_APPLIED_INDEX_PERSISTENCE,
+        "the injected boundary must precisely bracket applied-index persistence",
+    );
+
+    let restarted = create_node_with_custom_distributed_log(
+        rt,
+        persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(0))),
+        Arc::new(crate::LocalTableNumberAllocator),
+    )
+    .await?;
+    restarted
+        .attach_raft_state(RaftPartitionState::new_for_test(
+            false,
+            1,
+            PartitionId(0),
+            2,
+        ))
+        .await?;
+    let snapshot_before_replay = *restarted.now_ts_for_reads();
+    let replay_ts = restarted
+        .committer_for_test()
+        .apply_raft_commit_delta(7, delta.clone())
+        .await?;
+    assert_eq!(
+        replay_ts, delta.ts,
+        "already-installed Raft replay should ACK at its stable origin timestamp",
+    );
+    assert_eq!(
+        persisted_document_log_count(&persistence).await?,
+        installed_document_count,
+        "Raft replay must not append a second document-log version",
+    );
+    assert_eq!(
+        *restarted.now_ts_for_reads(),
+        snapshot_before_replay,
+        "Raft replay must not publish a second snapshot or invalidation",
+    );
+    assert!(
+        persistence
+            .reader()
+            .list_persistence_globals_with_prefix(RAFT_APPLY_MARKER_KEY_PREFIX)
+            .await?
+            .is_empty(),
+        "successful replay recovery should consolidate and clear the raw marker",
+    );
+    let outbox_records = persistence
+        .reader()
+        .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+        .await?;
+    assert_eq!(
+        outbox_records.len(),
+        1,
+        "Raft replay recovery must restore exactly one cross-partition outbox record",
+    );
+    let recovered_envelope: DeltaEnvelope = serde_json::from_value(outbox_records[0].1.clone())?;
+    let recovered_delta = recovered_envelope.to_delta()?;
+    assert_eq!(
+        recovered_delta.ts, delta.ts,
+        "the recovered outbox record must contain the original committed delta",
+    );
+
+    let messages = run_query(
+        restarted,
+        TableNamespace::root_component(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        messages.len(),
+        2,
+        "the committed write must remain visible once"
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_replay_after_crash_post_persistence_is_idempotent(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    assert_raft_replay_is_idempotent_across_crash_window(
+        &rt,
+        pause,
+        AFTER_RAFT_CONVEX_PERSISTENCE,
+        true,
+    )
+    .await
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_replay_after_crash_post_snapshot_is_idempotent(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    assert_raft_replay_is_idempotent_across_crash_window(
+        &rt,
+        pause,
+        AFTER_RAFT_SNAPSHOT_PUBLICATION,
+        false,
+    )
+    .await
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_replay_after_crash_post_applied_index_is_idempotent(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    assert_raft_replay_is_idempotent_across_crash_window(
+        &rt,
+        pause,
+        AFTER_RAFT_APPLIED_INDEX_PERSISTENCE,
+        false,
+    )
+    .await
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_prepared_commit_replay_after_crash_is_idempotent(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    let log = Arc::new(SwitchableDistributedLog::default());
+    let persistence = Arc::new(TestPersistence::new());
+    let node = create_node_with_custom_distributed_log(
+        &rt,
+        persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        Arc::new(crate::LocalTableNumberAllocator),
+    )
+    .await?;
+    insert_doc(&node, "projects", assert_obj!("name" => "seed")).await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "raft-prepared-committed"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("raft_prepared_commit_crash_replay_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare_ts = node.committer_for_test().allocate_commit_ts().await?;
+    node.committer_for_test()
+        .prepare_remote(
+            txn_id.clone(),
+            participant_tx,
+            write_source,
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+
+    log.fail_publishes.store(true, Ordering::SeqCst);
+    let (raft_state, mut raft_rx) =
+        RaftPartitionState::new_with_mailbox_for_test(true, 1, PartitionId(1), 1);
+    node.attach_raft_state(raft_state).await?;
+    let hold = pause.hold(AFTER_RAFT_CONVEX_PERSISTENCE);
+    let committer = node.committer_for_test();
+    let txn_id_for_commit = txn_id.clone();
+    let commit_task =
+        tokio::spawn(async move { committer.commit_prepared(txn_id_for_commit).await });
+    let delta = commit_next_raft_delta_for_test(&mut raft_rx, 11).await?;
+    let mark_applied_task = tokio::spawn(acknowledge_next_raft_applied_for_test(raft_rx, 11));
+    let pause_guard = hold
+        .wait_for_blocked()
+        .await
+        .context("prepared commit did not reach atomic Raft persistence")?;
+
+    assert_eq!(delta.ts, prepare_ts);
+    assert_eq!(
+        persistence
+            .reader()
+            .list_persistence_globals_with_prefix(RAFT_APPLY_MARKER_KEY_PREFIX)
+            .await?
+            .len(),
+        1,
+    );
+    assert_eq!(
+        persistence
+            .reader()
+            .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+            .await?
+            .len(),
+        1,
+    );
+    let installed_document_count = persisted_document_log_count(&persistence).await?;
+
+    node.shutdown().await?;
+    pause_guard.unpause();
+    let interrupted = tokio::time::timeout(Duration::from_secs(1), commit_task).await??;
+    assert!(interrupted.is_err());
+    drop(node);
+    assert!(!mark_applied_task.await??);
+
+    let restarted = create_node_with_custom_distributed_log(
+        &rt,
+        persistence.clone(),
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        Arc::new(crate::LocalTableNumberAllocator),
+    )
+    .await?;
+    restarted
+        .attach_raft_state(RaftPartitionState::new_for_test(
+            false,
+            1,
+            PartitionId(1),
+            2,
+        ))
+        .await?;
+    let snapshot_before_replay = *restarted.now_ts_for_reads();
+    let replay_ts = restarted
+        .committer_for_test()
+        .apply_raft_commit_delta(11, delta)
+        .await?;
+    assert_eq!(replay_ts, prepare_ts);
+    assert_eq!(
+        persisted_document_log_count(&persistence).await?,
+        installed_document_count,
+        "prepared Raft replay must not append another document version",
+    );
+    assert_eq!(
+        *restarted.now_ts_for_reads(),
+        snapshot_before_replay,
+        "prepared Raft replay must not publish another snapshot",
+    );
+    assert!(persistence
+        .reader()
+        .list_persistence_globals_with_prefix(RAFT_APPLY_MARKER_KEY_PREFIX)
+        .await?
+        .is_empty(),);
+    assert_eq!(
+        persistence
+            .reader()
+            .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+            .await?,
+        Some(serde_json::json!({})),
+        "replayed prepared commit must clear its durable redo record",
+    );
+    let projects = run_query(
+        restarted,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(projects.len(), 2);
     Ok(())
 }
 
@@ -2141,6 +2672,300 @@ async fn test_max_repeatable_bump_does_not_overtake_prepared_commit(
 }
 
 #[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_waits_for_prepared_transaction(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"messages".parse()?, assert_obj!("text" => "prepared"))
+        .await?;
+    let txn_id = TwoPhaseTransactionId::new();
+    let prepare = node
+        .committer_for_test()
+        .prepare(
+            txn_id.clone(),
+            tx.finalize()?,
+            WriteSource::new("read_barrier_prepared_test"),
+        )
+        .await?;
+    let target = prepare.prepare_ts.succ()?;
+
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(target)
+            .await?,
+        ReadTimestampClosure::Blocked(prepare.prepare_ts),
+    );
+
+    node.committer_for_test().rollback_prepared(txn_id).await?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(target)
+            .await?,
+        ReadTimestampClosure::Closed(target),
+    );
+    assert_eq!(*node.now_ts_for_reads(), target);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_retries_above_local_timeline(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let lower = node.committer_for_test().allocate_commit_ts().await?;
+    let higher = node.committer_for_test().allocate_commit_ts().await?;
+
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(lower)
+            .await?,
+        ReadTimestampClosure::RetryAt(higher),
+    );
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(higher)
+            .await?,
+        ReadTimestampClosure::Closed(higher),
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_retries_all_owners_at_one_new_timestamp(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let owner = Arc::new(RetryOnceOwnerReadClient::new());
+    let database = node.with_owner_read_client_for_test(owner.clone());
+    let initial_local_ts = *database.now_ts_for_reads();
+
+    let safe_ts = database.cluster_safe_read_ts().await?;
+    let targets = owner.targets.lock();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0], initial_local_ts);
+    assert!(targets[1] > targets[0]);
+    assert_eq!(*safe_ts, targets[1]);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_fails_closed_across_placement_change(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let replacement = PlacementMetadata::from_static_config(StaticPlacementConfig {
+        table_assignments: "messages=0,projects=1",
+        num_partitions: 2,
+        placement_version: PlacementVersion::new(1),
+    });
+    let database =
+        node.with_owner_read_client_for_test(Arc::new(PlacementChangingOwnerReadClient {
+            committer: node.committer_for_test(),
+            replacement,
+        }));
+
+    let err = database
+        .cluster_safe_read_ts()
+        .await
+        .expect_err("a read barrier must not span placement versions");
+    assert!(
+        format!("{err:#}").contains("Placement changed from"),
+        "unexpected error: {err:#}",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_requires_fresh_raft_serving_lease(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let (raft_state, _raft_rx) =
+        RaftPartitionState::new_with_mailbox_for_test(true, 1, PartitionId(0), 1);
+    node.attach_raft_state(raft_state.clone()).await?;
+    raft_state.expire_leader_serving_lease_for_test();
+    let target = node.committer_for_test().allocate_commit_ts().await?;
+
+    let err = node
+        .committer_for_test()
+        .close_read_timestamp(target)
+        .await
+        .expect_err("a stale Raft leader must not certify a read barrier");
+    assert!(
+        format!("{err:#}").contains("has no valid serving lease"),
+        "unexpected error: {err:#}",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_read_barrier_floor_survives_restart(rt: TestRuntime) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let persistence = Arc::new(TestPersistence::new());
+    let node = create_node_with_persistence(
+        &rt,
+        persistence.clone(),
+        log.clone(),
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let target = node.now_ts_for_reads().succ()?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(target)
+            .await?,
+        ReadTimestampClosure::Closed(target),
+    );
+    assert_eq!(*node.persisted_max_repeatable_ts_for_test(), target);
+    node.shutdown().await?;
+
+    let restarted_tso = Arc::new(RecordingTimestampOracle::new());
+    let restarted = create_node_with_persistence(
+        &rt,
+        persistence,
+        log,
+        Some(partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        Some(restarted_tso.clone()),
+    )
+    .await?;
+    let next_commit_ts = restarted.committer_for_test().allocate_commit_ts().await?;
+
+    assert!(next_commit_ts > target);
+    assert_eq!(
+        restarted_tso.requested_floors().last().copied(),
+        Some(target.succ()?),
+        "a future leader must allocate commits above the persisted read barrier",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_remote_read_token_cannot_refresh_from_local_write_log(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(
+        &rt,
+        log,
+        Some(partitioned_map_with_version(
+            PartitionId(1),
+            PlacementVersion::new(1),
+        )),
+    )
+    .await?;
+    insert_doc(&node, "projects", assert_obj!("name" => "cached remotely")).await?;
+
+    let mut read_tx = node.begin(Identity::system()).await?;
+    let mut query = ResolvedQuery::new(
+        &mut read_tx,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )?;
+    while query.next(&mut read_tx, Some(2)).await?.is_some() {}
+    let token = read_tx.into_token()?;
+    let original_ts = token.ts();
+    let target = node.committer_for_test().allocate_commit_ts().await?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(target)
+            .await?,
+        ReadTimestampClosure::Closed(target),
+    );
+
+    // Move the table to the other partition without changing its local table
+    // metadata. A local-log-only refresh would incorrectly certify this token.
+    node.committer_for_test()
+        .refresh_placement_metadata(PlacementMetadata::from_static_config(
+            StaticPlacementConfig {
+                table_assignments: "messages=1,projects=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(2),
+            },
+        ))?;
+
+    assert_eq!(
+        node.refresh_token(token, target).await?,
+        Err(Some(original_ts.succ()?)),
+        "remote reads must rerun against their owner rather than refresh from the local mirror",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_live_prepare_rejects_timestamp_closed_for_cluster_reads(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+    insert_doc(
+        &node,
+        "projects",
+        assert_obj!("name" => "seed-before-read-barrier"),
+    )
+    .await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "must-commit-after-read-barrier"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("prepare_after_read_barrier_test");
+    let participant_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let barrier_ts = node.committer_for_test().allocate_commit_ts().await?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(barrier_ts)
+            .await?,
+        ReadTimestampClosure::Closed(barrier_ts),
+    );
+
+    let err = node
+        .committer_for_test()
+        .prepare_remote(
+            TwoPhaseTransactionId::new(),
+            participant_tx,
+            write_source,
+            barrier_ts,
+            vec![PartitionId(1)],
+        )
+        .await
+        .expect_err("a late prepare must not cross an already-certified read barrier");
+    assert!(
+        format!("{err:#}").contains("2PC Prepare assigned ts="),
+        "unexpected error: {err:#}",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_cross_partition_replica_delta_waits_behind_unresolved_prepared_transaction(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
@@ -2211,13 +3036,13 @@ async fn test_cross_partition_replica_delta_waits_behind_unresolved_prepared_tra
         .apply_replica_delta(racing_delta)
         .await?;
 
-    let tasks = run_query(
+    let tasks = run_local_replica_query(
         node_b.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("tasks".parse()?, Order::Asc),
     )
     .await?;
-    let messages = run_query(
+    let messages = run_local_replica_query(
         node_b,
         TableNamespace::root_component(),
         Query::full_table_scan("messages".parse()?, Order::Asc),
@@ -2961,7 +3786,7 @@ impl SeededReplicaApplySimulation {
         self.last_read_frontier = read_frontier;
         self.last_write_frontier = write_frontier;
 
-        let projects = run_query(
+        let projects = run_local_replica_query(
             target.clone(),
             TableNamespace::root_component(),
             Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -3250,7 +4075,7 @@ async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
 
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(delta)
+        .apply_raft_commit_delta(1, delta)
         .await?;
 
     let records = follower_persistence
@@ -3400,7 +4225,7 @@ async fn test_frontier_heartbeat_does_not_dedupe_later_data_delta(
         "late data should apply at a fresh local timestamp after the heartbeat",
     );
 
-    let projects = run_query(
+    let projects = run_local_replica_query(
         target.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -3521,7 +4346,7 @@ async fn test_late_outbox_replay_data_delta_not_deduped_by_newer_data_watermark(
         "older origin delta should still apply at a fresh local timestamp after a newer watermark",
     );
 
-    let projects = run_query(
+    let projects = run_local_replica_query(
         target.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -3658,7 +4483,7 @@ async fn test_ordered_transport_ids_skip_redelivery_after_origin_ids_pruned(
         "contiguous transport ids should not leave exact-id metadata behind",
     );
 
-    let projects = run_query(
+    let projects = run_local_replica_query(
         target.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -4014,7 +4839,7 @@ async fn test_raft_delta_apply_preserves_full_system_state(rt: TestRuntime) -> a
 
     raft_follower
         .committer_for_test()
-        .apply_raft_commit_delta(system_delta)
+        .apply_raft_commit_delta(1, system_delta)
         .await?;
     let raft_docs = global_table_scan_or_empty(raft_follower, "_environment_variables").await?;
     assert_eq!(
@@ -4248,7 +5073,7 @@ async fn test_raft_prepared_redo_apply_can_commit_after_failover(
     )?;
 
     node.committer_for_test()
-        .apply_raft_prepared_redo(redo)
+        .apply_raft_prepared_redo(1, redo)
         .await?;
     let committed_ts = node
         .committer_for_test()
@@ -4345,7 +5170,7 @@ async fn test_watcher_recovers_staged_prepare_after_participant_leader_failover(
 
     new_leader
         .committer_for_test()
-        .apply_raft_prepared_redo(redo.clone())
+        .apply_raft_prepared_redo(1, redo.clone())
         .await
         .context("new participant leader should replay the Raft-prepared redo")?;
     let staging = TwoPhaseDecision::staging(
@@ -4472,7 +5297,7 @@ async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
 
     owner
         .committer_for_test()
-        .apply_raft_prepared_redo(redo)
+        .apply_raft_prepared_redo(1, redo)
         .await?;
     let committed_ts = owner.committer_for_test().commit_prepared(txn_id).await?;
     assert_eq!(committed_ts, prepare_ts);
@@ -4618,7 +5443,7 @@ async fn test_raft_commit_delta_cleans_prepared_redo_on_follower(
 
     follower
         .committer_for_test()
-        .apply_raft_prepared_redo(redo)
+        .apply_raft_prepared_redo(1, redo)
         .await?;
     source
         .committer_for_test()
@@ -4768,7 +5593,7 @@ async fn test_raft_prepared_redo_rewrites_when_follower_floor_advanced_by_replic
     )?;
     let prepare_result = follower
         .committer_for_test()
-        .apply_raft_prepared_redo(redo)
+        .apply_raft_prepared_redo(1, redo)
         .await?;
     assert_eq!(prepare_result.prepare_ts, prepare_ts);
 
@@ -4814,7 +5639,7 @@ async fn test_raft_prepared_redo_rewrites_when_follower_floor_advanced_by_replic
         .context("prepared commit should publish a delta")?;
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(delta)
+        .apply_raft_commit_delta(2, delta)
         .await?;
     follower
         .committer_for_test()
@@ -4954,10 +5779,10 @@ async fn test_raft_prepared_redo_rewrite_allocates_unique_local_prepare_timestam
         .apply_replica_delta(foreign_delta)
         .await?;
 
-    for (_, prepare_ts, redo) in redos.iter().cloned() {
+    for (raft_index, (_, prepare_ts, redo)) in (1..).zip(redos.iter().cloned()) {
         let prepare_result = follower
             .committer_for_test()
-            .apply_raft_prepared_redo(redo)
+            .apply_raft_prepared_redo(raft_index, redo)
             .await?;
         assert_eq!(prepare_result.prepare_ts, prepare_ts);
     }
@@ -5232,7 +6057,7 @@ async fn test_raft_prepared_redo_rewrites_when_pre_replay_heartbeat_advances_ret
     )?;
     let prepare_result = follower
         .committer_for_test()
-        .apply_raft_prepared_redo(redo)
+        .apply_raft_prepared_redo(1, redo)
         .await?;
     assert_eq!(prepare_result.prepare_ts, prepare_ts);
 
@@ -5254,7 +6079,7 @@ async fn test_raft_prepared_redo_rewrites_when_pre_replay_heartbeat_advances_ret
         .context("prepared commit should publish a delta")?;
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(delta)
+        .apply_raft_commit_delta(2, delta)
         .await?;
 
     let projects = run_query(
@@ -5360,7 +6185,7 @@ async fn test_raft_prepared_redo_replay_uses_local_anchor_when_begin_ts_is_out_o
     )?;
     let prepare_result = follower
         .committer_for_test()
-        .apply_raft_prepared_redo(redo)
+        .apply_raft_prepared_redo(1, redo)
         .await?;
     assert_eq!(prepare_result.prepare_ts, prepare_ts);
 
@@ -5382,7 +6207,7 @@ async fn test_raft_prepared_redo_replay_uses_local_anchor_when_begin_ts_is_out_o
         .context("prepared commit should publish a delta")?;
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(delta)
+        .apply_raft_commit_delta(2, delta)
         .await?;
 
     let projects = run_query(
@@ -5474,7 +6299,7 @@ async fn test_raft_prepared_redo_rewrites_when_heartbeat_advances_last_assigned(
     )?;
     let prepare_result = follower
         .committer_for_test()
-        .apply_raft_prepared_redo(redo)
+        .apply_raft_prepared_redo(1, redo)
         .await?;
     assert_eq!(prepare_result.prepare_ts, prepare_ts);
 
@@ -5511,7 +6336,7 @@ async fn test_raft_prepared_redo_rewrites_when_heartbeat_advances_last_assigned(
         .context("prepared commit should publish a delta")?;
     let applied_ts = follower
         .committer_for_test()
-        .apply_raft_commit_delta(delta)
+        .apply_raft_commit_delta(2, delta)
         .await?;
     assert!(
         applied_ts > heartbeat_ts,
@@ -5557,7 +6382,7 @@ async fn test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts(
     let snapshot_ts_before = *node_a.now_ts_for_reads();
     let persisted_repeatable_before = *node_a.persisted_max_repeatable_ts_for_test();
     let write_frontier_before = node_a.replication_write_frontier_for_test(PartitionId(1));
-    let projects = run_query(
+    let projects = run_local_replica_query(
         node_a.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -5614,7 +6439,7 @@ async fn test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts(
         "waiting for local write visibility should stay blocked on a frontier-only heartbeat",
     );
 
-    let projects_after = run_query(
+    let projects_after = run_local_replica_query(
         node_a,
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -5714,7 +6539,7 @@ async fn test_replica_delta_timestamp_translation_records_origin_watermark(
         duplicate_apply_ts, remote_ts,
         "duplicate detection uses the persisted data idempotency watermark",
     );
-    let projects = run_query(
+    let projects = run_local_replica_query(
         target,
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -5882,7 +6707,10 @@ async fn test_replica_preserves_global_table_numbers_for_embedded_ids(
         .apply_replica_delta(user_delta)
         .await?;
 
-    let mut tx = node_b.begin(Identity::system()).await?;
+    let mut tx = node_b
+        .with_local_replica_reads_for_test()
+        .begin(Identity::system())
+        .await?;
     let replica_user_id =
         tx.resolve_developer_id(&user_public_id, TableNamespace::root_component())?;
     assert_eq!(
@@ -5911,7 +6739,7 @@ async fn test_replica_preserves_global_table_numbers_for_embedded_ids(
         .apply_replica_delta(task_delta)
         .await?;
 
-    let tasks = run_query(
+    let tasks = run_local_replica_query(
         node_a,
         TableNamespace::root_component(),
         Query::full_table_scan("tasks".parse()?, Order::Asc),
@@ -8395,6 +9223,279 @@ fn test_idle_remote_read_frontier_heartbeat_tso_failure_is_nonfatal() -> anyhow:
         committer
             .tick_idle_remote_read_frontier_heartbeat_for_test()
             .await?;
+
+        Ok(())
+    })
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_snapshot_barrier_includes_prior_pending_commit(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    let partition_map = partitioned_map(PartitionId(0));
+    let source = create_node(
+        &rt,
+        Arc::new(InMemoryDistributedLog::new()),
+        Some(partition_map.clone()),
+    )
+    .await?;
+    insert_doc(&source, "messages", assert_obj!("text" => "before-barrier")).await?;
+
+    let hold = pause.hold(AFTER_PENDING_WRITE_SNAPSHOT);
+    let source_for_commit = source.clone();
+    let commit = tokio::spawn(async move {
+        insert_doc(
+            &source_for_commit,
+            "messages",
+            assert_obj!("text" => "pending-at-barrier"),
+        )
+        .await
+    });
+    let pause_guard = hold
+        .wait_for_blocked()
+        .await
+        .context("commit did not reach the pending snapshot boundary")?;
+
+    let busy_error = source
+        .committer_for_test()
+        .build_raft_snapshot(5, 2)
+        .await
+        .expect_err("snapshot generation must not block the Raft loop behind an in-flight commit");
+    assert!(
+        busy_error.is::<crate::raft_snapshot::RaftSnapshotTemporarilyUnavailable>(),
+        "busy snapshot generation should signal Raft to retry: {busy_error:#}",
+    );
+
+    pause_guard.unpause();
+    commit.await??;
+    let bytes = source
+        .committer_for_test()
+        .build_raft_snapshot(5, 2)
+        .await?;
+    let decoded = decode_raft_snapshot(&bytes, 5, 2)?;
+
+    let restored = create_node(
+        &rt,
+        Arc::new(InMemoryDistributedLog::new()),
+        Some(partition_map),
+    )
+    .await?;
+    restored
+        .committer_for_test()
+        .install_raft_snapshot(decoded.checkpoint)
+        .await?;
+    let messages = run_query(
+        restored,
+        TableNamespace::root_component(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(messages.len(), 2);
+    assert!(messages.iter().any(|message| {
+        message.value().0.get("text") == Some(&assert_val!("pending-at-barrier"))
+    }));
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_staged_raft_snapshot_recovers_every_cross_store_crash_window(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let partition_map = partitioned_map(PartitionId(0));
+    let source_persistence = Arc::new(TestPersistence::new());
+    let source = create_node_with_persistence(
+        &rt,
+        source_persistence.clone(),
+        Arc::new(InMemoryDistributedLog::new()),
+        Some(partition_map.clone()),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    insert_doc(&source, "messages", assert_obj!("text" => "generation-7")).await?;
+    source_persistence
+        .write_persistence_global_raw(RAFT_STATE_MACHINE_INDEX_KEY, 7.into())
+        .await?;
+    let first_bytes = source
+        .committer_for_test()
+        .build_raft_snapshot(7, 2)
+        .await?;
+    let first_snapshot = raft_snapshot_for_test(7, 2, first_bytes);
+
+    let destination_persistence = Arc::new(TestPersistence::new());
+    let raft_dir = tempfile::tempdir()?;
+    let engine = ConvexRaftStorage::open_engine(
+        raft_dir
+            .path()
+            .to_str()
+            .context("temporary raft-engine path was not UTF-8")?,
+    )?;
+    let storage = ConvexRaftStorage::new(PartitionId(0), engine.clone(), 2, vec![1, 2, 3], None)?;
+    let mut first_hard_state = HardState::default();
+    first_hard_state.term = 2;
+    first_hard_state.commit = 7;
+    storage.stage_snapshot(&first_snapshot, Some(&first_hard_state))?;
+    drop(storage);
+
+    assert!(
+        crate::recover_staged_raft_snapshot_install(
+            engine.clone(),
+            PartitionId(0),
+            destination_persistence.clone(),
+            rt.clone(),
+            Default::default(),
+            Some(partition_map.clone()),
+        )
+        .await?,
+        "startup should recover a snapshot staged before Convex persistence changed",
+    );
+    let first_storage =
+        ConvexRaftStorage::new(PartitionId(0), engine.clone(), 2, vec![1, 2, 3], None)?;
+    assert_eq!(first_storage.applied_index()?, 7);
+    assert!(first_storage.pending_snapshot_install()?.is_none());
+    drop(first_storage);
+
+    let destination = create_node_with_persistence(
+        &rt,
+        destination_persistence.clone(),
+        Arc::new(InMemoryDistributedLog::new()),
+        Some(partition_map.clone()),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    assert_eq!(
+        run_query(
+            destination.clone(),
+            TableNamespace::root_component(),
+            Query::full_table_scan("messages".parse()?, Order::Asc),
+        )
+        .await?
+        .len(),
+        1,
+    );
+
+    insert_doc(&source, "messages", assert_obj!("text" => "generation-8")).await?;
+    source_persistence
+        .write_persistence_global_raw(RAFT_STATE_MACHINE_INDEX_KEY, 8.into())
+        .await?;
+    let stale_generation = source
+        .committer_for_test()
+        .build_raft_snapshot(7, 3)
+        .await
+        .expect_err("snapshot generation must reject state beyond the requested Raft prefix");
+    assert!(format!("{stale_generation:#}").contains("beyond requested snapshot index"));
+
+    let second_bytes = source
+        .committer_for_test()
+        .build_raft_snapshot(8, 3)
+        .await?;
+    let second_decoded = decode_raft_snapshot(&second_bytes, 8, 3)?;
+    let second_snapshot = raft_snapshot_for_test(8, 3, second_bytes);
+    let second_storage =
+        ConvexRaftStorage::new(PartitionId(0), engine.clone(), 2, vec![1, 2, 3], None)?;
+    let mut second_hard_state = HardState::default();
+    second_hard_state.term = 3;
+    second_hard_state.commit = 8;
+    second_storage.stage_snapshot(&second_snapshot, Some(&second_hard_state))?;
+
+    destination
+        .committer_for_test()
+        .install_raft_snapshot(second_decoded.checkpoint)
+        .await?;
+    destination.shutdown().await?;
+    drop(destination);
+    drop(second_storage);
+
+    assert!(
+        crate::recover_staged_raft_snapshot_install(
+            engine.clone(),
+            PartitionId(0),
+            destination_persistence.clone(),
+            rt.clone(),
+            Default::default(),
+            Some(partition_map.clone()),
+        )
+        .await?,
+        "startup should idempotently recover after Convex state changed but before Raft metadata",
+    );
+    assert!(
+        !crate::recover_staged_raft_snapshot_install(
+            engine.clone(),
+            PartitionId(0),
+            destination_persistence.clone(),
+            rt.clone(),
+            Default::default(),
+            Some(partition_map.clone()),
+        )
+        .await?,
+        "a finalized snapshot generation must not replay again",
+    );
+
+    let restarted = create_node_with_persistence(
+        &rt,
+        destination_persistence.clone(),
+        Arc::new(InMemoryDistributedLog::new()),
+        Some(partition_map),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        None,
+    )
+    .await?;
+    let messages = run_query(
+        restarted,
+        TableNamespace::root_component(),
+        Query::full_table_scan("messages".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        crate::raft_snapshot::load_state_machine_index(destination_persistence.reader().as_ref(),)
+            .await?,
+        8,
+    );
+    let finalized_storage = ConvexRaftStorage::new(PartitionId(0), engine, 2, vec![1, 2, 3], None)?;
+    assert_eq!(finalized_storage.applied_index()?, 8);
+    assert_eq!(finalized_storage.hard_state()?.commit, 8);
+    assert!(finalized_storage.pending_snapshot_install()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_idle_frontier_maintenance_cannot_block_owner_read_barrier() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(HangingTimestampOracle);
+        let node = create_node_with_options(
+            &rt,
+            log,
+            Some(partitioned_map(PartitionId(0))),
+            None,
+            Some(tso),
+        )
+        .await?;
+
+        let committer = node.committer_for_test();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            committer.tick_idle_remote_read_frontier_heartbeat_for_test(),
+        )
+        .await
+        .context("idle frontier maintenance blocked the committer")??;
+
+        let target = *node.now_ts_for_reads();
+        let closure = tokio::time::timeout(
+            Duration::from_secs(1),
+            committer.close_read_timestamp(target),
+        )
+        .await
+        .context("owner read barrier was blocked behind TSO maintenance")??;
+        assert_eq!(closure, ReadTimestampClosure::Closed(target));
 
         Ok(())
     })

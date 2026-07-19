@@ -461,6 +461,15 @@ fn ensure_cluster_coordinator_authority(
         ));
     }
     if let Some(raft_state) = st.raft_state()
+        && !raft_state.is_leader_ready()
+    {
+        return Err(unsupported_local_backend_cluster_surface_error(
+            surface,
+            class,
+            "the coordinator leader is still applying its current-term barrier".to_string(),
+        ));
+    }
+    if let Some(raft_state) = st.raft_state()
         && !raft_state.has_leader_serving_lease()
     {
         return Err(unsupported_local_backend_cluster_surface_error(
@@ -644,5 +653,23 @@ mod tests {
         assert!(format!("{error:#}").contains("canonical cluster genesis"));
         ensure_local_backend_api_authority(&st, "/api/dashboard_openapi.json")
             .expect("static schema remains safe during bootstrap");
+    }
+
+    #[test]
+    fn test_coordinator_owner_rejects_elected_leader_before_apply_readiness() {
+        let raft_state = RaftPartitionState::new_for_test(true, 1, PartitionId(0), 1);
+        raft_state.set_leader_ready_for_test(false);
+        let st = TestAuthorityContext {
+            replica_mode: false,
+            partition_id: Some(PartitionId(0)),
+            raft_state: Some(raft_state),
+        };
+
+        let err = ensure_local_backend_api_authority(&st, "/api/sync")
+            .expect_err("elected-but-unapplied leader must not serve coordinator routes");
+        assert!(
+            format!("{err:#}").contains("current-term barrier"),
+            "unexpected error: {err:#}",
+        );
     }
 }

@@ -131,6 +131,23 @@ pub enum ConflictStrategy {
     Overwrite,
 }
 
+/// An unversioned persistence-global value written atomically with a batch of
+/// document and index revisions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistenceGlobalWrite {
+    pub key: String,
+    pub value: JsonValue,
+}
+
+impl PersistenceGlobalWrite {
+    pub fn new(key: impl Into<String>, value: JsonValue) -> Self {
+        Self {
+            key: key.into(),
+            value,
+        }
+    }
+}
+
 // When adding a new persistence global, make sure it's copied
 // or computed in migrate_db_cluster/text_index_worker.
 #[cfg_attr(test, derive(proptest_derive::Arbitrary))]
@@ -310,6 +327,23 @@ pub trait Persistence: Sync + Send + 'static {
         documents: &'a [DocumentLogEntry],
         indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
+    ) -> anyhow::Result<()> {
+        self.write_with_persistence_globals(documents, indexes, conflict_strategy, &[])
+            .await
+    }
+
+    /// Atomically writes versioned document/index revisions and unversioned
+    /// persistence-global values in one storage transaction.
+    ///
+    /// Raft state-machine apply uses this to bind a stable apply identity to
+    /// the exact Convex revisions it installs. Implementations must not expose
+    /// either side without the other after a crash.
+    async fn write_with_persistence_globals<'a>(
+        &self,
+        documents: &'a [DocumentLogEntry],
+        indexes: &'a [PersistenceIndexEntry],
+        conflict_strategy: ConflictStrategy,
+        persistence_globals: &'a [PersistenceGlobalWrite],
     ) -> anyhow::Result<()>;
 
     /// Writes global key-value data for the whole persistence.

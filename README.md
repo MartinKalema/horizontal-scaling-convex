@@ -43,6 +43,8 @@ What is implemented today:
 - shared-secret authentication for internal cluster gRPC calls;
 - route authority checks that fail closed for unsafe clustered routes;
 - write-owner mutation routing so clients do not have to hand-route simple writes;
+- owner-coordinated safe snapshot timestamps for atomic latest queries and
+  reactive reruns across partitions;
 - selective-delivery groundwork for reducing replication fanout;
 - cluster observability metrics and an issue journal for validation history and open correctness work.
 
@@ -52,7 +54,8 @@ Important work still remains:
 - replicate full intra-partition state needed for failover;
 - harden 2PC prepare durability, rollback, and decision retention;
 - gate background workers with cluster authority or leases;
-- unify timestamp domains for portable read-after-write fences;
+- unify timestamp domains for historical cursor portability and
+  identity-preserving replica apply;
 - define distributed index metadata and backfill correctness;
 - mature selective delivery into distributed reactive invalidation;
 - add formal Jepsen / Elle coverage and real cloud benchmarks.
@@ -74,6 +77,8 @@ Project-wide goals: [docs/project-goals.md](docs/project-goals.md)
 Issue journal: [docs/issue-journal.md](docs/issue-journal.md)
 
 Cluster authority routing: [docs/cluster-authority-routing.md](docs/cluster-authority-routing.md)
+
+Cluster-safe read timestamps: [docs/cluster-safe-read-timestamps.md](docs/cluster-safe-read-timestamps.md)
 
 ## Architecture
 

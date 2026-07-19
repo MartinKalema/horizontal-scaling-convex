@@ -104,8 +104,21 @@ Partitions 0 and 1 are separate Raft groups. Cross-partition reads still use NAT
 
 **Committer lifecycle**
 
-Before: Committer starts at node boot, runs until shutdown.
-After: Committer starts when this node becomes Raft leader for a partition. Stops when leadership is lost (demotion, network partition).
+The Committer remains available to apply committed state on every voter, but
+application work is admitted only by a **ready leader**. Election and readiness
+are deliberately different states:
+
+1. raft-rs elects the node and appends its current-term no-op entry;
+2. the node keeps routes, subscriptions, writes, deploy operations, and 2PC
+   participant work closed;
+3. the Raft apply path durably installs every entry through that no-op in the
+   Convex state machine;
+4. only then does `RaftPartitionState::is_leader_ready()` become true;
+5. coordinator reads and subscriptions additionally require a fresh quorum
+   serving lease.
+
+Readiness and the lease are revoked whenever leadership is lost. This prevents
+a lagging newly elected leader from serving stale Convex state during failover.
 
 ### New Files
 

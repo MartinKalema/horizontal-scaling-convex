@@ -116,6 +116,11 @@ impl SelectiveQueryForwardingApi {
             "Canonical cluster genesis is not ready"
         );
         if raft_state.is_leader() {
+            anyhow::ensure!(
+                raft_state.is_leader_ready(),
+                "Coordinator partition is elected leader but has not applied its current-term \
+                 barrier"
+            );
             if raft_state.has_leader_serving_lease() {
                 return Ok(None);
             }
@@ -205,6 +210,14 @@ impl SelectiveQueryForwardingApi {
             return Err(self.unsupported_cluster_surface_error(
                 surface,
                 "the coordinator partition is running as a Raft follower".to_string(),
+            ));
+        }
+        if let Some(raft_state) = self.raft_state.as_ref()
+            && !raft_state.is_leader_ready()
+        {
+            return Err(self.unsupported_cluster_surface_error(
+                surface,
+                "the coordinator leader is still applying its current-term barrier".to_string(),
             ));
         }
         if let Some(raft_state) = self.raft_state.as_ref()

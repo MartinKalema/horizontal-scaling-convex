@@ -26,6 +26,7 @@
 #   9j. 2PC Exactness During Repeated NATS Flaps
 #   9k. Post-Ack 2PC Exactness After Cleanup-Window Restarts
 #   9l. Parallel 2PC Early-Ack Code-Path Proof
+#   9m. Cluster-Safe Latest Reads With Delayed Participant Delta
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -430,6 +431,18 @@ export const countTasksByTitle = query({
   },
 });
 
+export const safeSnapshotPair = query({
+  args: { text: v.string(), taskTitle: v.string() },
+  handler: async (ctx, args) => {
+    const messages = await ctx.db.query("messages").collect();
+    const tasks = await ctx.db.query("tasks").collect();
+    return {
+      messages: messages.filter((message: any) => message.text === args.text).length,
+      tasks: tasks.filter((task: any) => task.title === args.taskTitle).length,
+    };
+  },
+});
+
 // Concurrent counter: multiple increments, verify total.
 export const incrementCounter = mutation({
   args: { name: v.string() },
@@ -525,6 +538,58 @@ export const count = query({
 });
 TSEOF
 
+cat > "$DEPLOY_DIR/safe-snapshot-subscription.mjs" << 'JSEOF'
+import { ConvexClient } from "convex/browser";
+import { api } from "./convex/_generated/api.js";
+
+const [url, text, taskTitle] = process.argv.slice(2);
+const client = new ConvexClient(url, { unsavedChangesWarning: false });
+let subscription;
+let finished = false;
+let sawInitial = false;
+
+const finish = async (code, event, details = {}) => {
+  if (finished) return;
+  finished = true;
+  console.log(JSON.stringify({ event, ...details }));
+  subscription?.unsubscribe();
+  await Promise.race([
+    client.close(),
+    new Promise((resolve) => setTimeout(resolve, 1000)),
+  ]);
+  process.exit(code);
+};
+
+subscription = client.onUpdate(
+  api.messages.safeSnapshotPair,
+  { text, taskTitle },
+  async (value) => {
+    console.log(JSON.stringify({ event: "value", value }));
+    if (value.messages !== value.tasks) {
+      await finish(2, "torn", { value });
+      return;
+    }
+    if (!sawInitial) {
+      if (value.messages !== 0) {
+        await finish(3, "unexpected-initial", { value });
+        return;
+      }
+      sawInitial = true;
+      console.log(JSON.stringify({ event: "ready" }));
+      return;
+    }
+    if (value.messages === 1) {
+      await finish(0, "complete", { value });
+    }
+  },
+  async (error) => {
+    await finish(4, "error", { message: String(error) });
+  },
+);
+
+setTimeout(() => void finish(5, "timeout"), 25000);
+JSEOF
+
 deploy_functions_with_retry() {
     local key="$1"
     local url="$2"
@@ -565,6 +630,53 @@ query_api() {
         -H "Authorization: Convex $2" \
         -H "Content-Type: application/json" \
         -d "{\"path\":\"$3\",\"args\":{}}"
+}
+
+set_jetstream_consumer_pause() {
+    local consumer="$1"
+    local seconds="$2"
+    python3 - "$consumer" "$seconds" << 'PYEOF'
+import datetime
+import json
+import socket
+import sys
+import uuid
+
+consumer = sys.argv[1]
+seconds = int(sys.argv[2])
+pause_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
+payload = json.dumps(
+    {"pause_until": pause_until.isoformat().replace("+00:00", "Z")},
+    separators=(",", ":"),
+).encode()
+subject = f"$JS.API.CONSUMER.PAUSE.CONVEX_COMMITS.{consumer}"
+inbox = f"_INBOX.{uuid.uuid4().hex}"
+
+with socket.create_connection(("127.0.0.1", 4222), timeout=5) as connection:
+    protocol = connection.makefile("rb")
+    if not protocol.readline().startswith(b"INFO "):
+        raise RuntimeError("NATS did not send INFO during consumer pause request")
+    command = (
+        f'CONNECT {{"verbose":false,"pedantic":false}}\r\n'
+        f"SUB {inbox} 1\r\n"
+        f"PUB {subject} {inbox} {len(payload)}\r\n"
+    ).encode() + payload + b"\r\nPING\r\n"
+    connection.sendall(command)
+    while True:
+        line = protocol.readline()
+        if not line:
+            raise RuntimeError("NATS closed before consumer pause response")
+        if line.startswith(b"MSG "):
+            size = int(line.split()[-1])
+            response = json.loads(protocol.read(size))
+            protocol.read(2)
+            if "error" in response:
+                raise RuntimeError(f"JetStream consumer pause failed: {response['error']}")
+            expected_paused = seconds > 0
+            if bool(response.get("paused")) != expected_paused:
+                raise RuntimeError(f"Unexpected JetStream pause response: {response}")
+            break
+PYEOF
 }
 
 query_with_args() {
@@ -638,6 +750,13 @@ two_pc_counts_match_response() {
     local msg_b="$3"
     local task_a="$4"
     local task_b="$5"
+    local count
+
+    for count in "$msg_a" "$msg_b" "$task_a" "$task_b"; do
+        case "$count" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+    done
 
     if echo "$response" | grep -q '"status":"success"'; then
         [ "$msg_a" -eq 1 ] && [ "$msg_b" -eq 1 ] && [ "$task_a" -eq 1 ] && [ "$task_b" -eq 1 ]
@@ -1343,6 +1462,127 @@ done
 if $MONO_OK; then
     pass "Monotonic reads: values never went backward (last=$LAST_SEEN)"
 fi
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 9m: Cluster-Safe Latest Reads With Delayed Participant Delta${NC}"
+# ============================================================
+# Discover the current partition-0 serving leader, then pause only that node's
+# partition-1 JetStream consumer. NATS KV remains available for the 2PC
+# decision, so the write can commit while the coordinator's local mirror is
+# deliberately missing the remote participant half.
+# Latest reads and sync reruns must use authoritative owners at one certified
+# timestamp and therefore expose either neither half or both halves.
+
+SAFE_SNAPSHOT_RUN="safe-snapshot-$(date +%s)-$$"
+SAFE_SNAPSHOT_TEXT="$SAFE_SNAPSHOT_RUN-msg"
+SAFE_SNAPSHOT_TASK="$SAFE_SNAPSHOT_RUN-task"
+SAFE_SNAPSHOT_SUB_LOG=$(mktemp)
+SAFE_SNAPSHOT_COORDINATOR_FOUND=false
+SAFE_SNAPSHOT_URL=""
+SAFE_SNAPSHOT_KEY=""
+SAFE_SNAPSHOT_CONTAINER=""
+for entry in \
+    "docker-node-p0a-1|$NODE_P0A_URL|$NODE_P0A_KEY" \
+    "docker-node-p0b-1|$NODE_P0B_URL|$NODE_P0B_KEY" \
+    "docker-node-p0c-1|$NODE_P0C_URL|$NODE_P0C_KEY"; do
+    IFS='|' read -r candidate_container candidate_url candidate_key <<< "$entry"
+    status=$(curl --max-time 2 -s -o /dev/null -w "%{http_code}" \
+        -H "Connection: Upgrade" \
+        -H "Upgrade: websocket" \
+        -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+        -H "Sec-WebSocket-Version: 13" \
+        "$candidate_url/api/1.34.1/sync" 2>/dev/null || true)
+    if [ "$status" = "101" ]; then
+        SAFE_SNAPSHOT_COORDINATOR_FOUND=true
+        SAFE_SNAPSHOT_URL="$candidate_url"
+        SAFE_SNAPSHOT_KEY="$candidate_key"
+        SAFE_SNAPSHOT_CONTAINER="$candidate_container"
+        break
+    fi
+done
+
+if $SAFE_SNAPSHOT_COORDINATOR_FOUND; then
+    # Partition 0 uses Config::name() directly for its durable replication
+    # consumer, which is sourced from INSTANCE_NAME in the container.
+    SAFE_SNAPSHOT_NATS_CONSUMER=$(docker exec "$SAFE_SNAPSHOT_CONTAINER" \
+        printenv INSTANCE_NAME 2>/dev/null)
+
+    (cd "$DEPLOY_DIR" && node safe-snapshot-subscription.mjs \
+        "$SAFE_SNAPSHOT_URL" "$SAFE_SNAPSHOT_TEXT" "$SAFE_SNAPSHOT_TASK" \
+        > "$SAFE_SNAPSHOT_SUB_LOG" 2>&1) &
+    SAFE_SNAPSHOT_SUB_PID=$!
+else
+    SAFE_SNAPSHOT_SUB_PID=""
+fi
+
+SAFE_SNAPSHOT_SUB_READY=false
+if $SAFE_SNAPSHOT_COORDINATOR_FOUND; then
+    for _ in $(seq 1 100); do
+        if grep -q '"event":"ready"' "$SAFE_SNAPSHOT_SUB_LOG"; then
+            SAFE_SNAPSHOT_SUB_READY=true
+            break
+        fi
+        if ! kill -0 "$SAFE_SNAPSHOT_SUB_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+fi
+
+if $SAFE_SNAPSHOT_SUB_READY; then
+    set_jetstream_consumer_pause "$SAFE_SNAPSHOT_NATS_CONSUMER" 30
+    SAFE_SNAPSHOT_RESPONSE=$(mutation_response \
+        "$SAFE_SNAPSHOT_URL" "$SAFE_SNAPSHOT_KEY" "messages:crossPartitionWrite" \
+        "{\"text\":\"$SAFE_SNAPSHOT_TEXT\",\"taskTitle\":\"$SAFE_SNAPSHOT_TASK\"}")
+
+    SAFE_SNAPSHOT_HTTP_OK=true
+    SAFE_SNAPSHOT_HTTP_DETAILS=""
+    for _ in $(seq 1 5); do
+        SAFE_SNAPSHOT_PAIR=$(query_with_args \
+            "$SAFE_SNAPSHOT_URL" "$SAFE_SNAPSHOT_KEY" "messages:safeSnapshotPair" \
+            "{\"text\":\"$SAFE_SNAPSHOT_TEXT\",\"taskTitle\":\"$SAFE_SNAPSHOT_TASK\"}")
+        read -r SAFE_SNAPSHOT_MESSAGES SAFE_SNAPSHOT_TASKS <<< "$(python3 -c \
+            'import json,sys; value=json.load(sys.stdin)["value"]; print(int(value["messages"]), int(value["tasks"]))' \
+            <<< "$SAFE_SNAPSHOT_PAIR")"
+        if [ "$SAFE_SNAPSHOT_MESSAGES" -ne "$SAFE_SNAPSHOT_TASKS" ] || \
+            [ "$SAFE_SNAPSHOT_MESSAGES" -ne 1 ]; then
+            SAFE_SNAPSHOT_HTTP_OK=false
+            SAFE_SNAPSHOT_HTTP_DETAILS="$SAFE_SNAPSHOT_HTTP_DETAILS [$SAFE_SNAPSHOT_MESSAGES,$SAFE_SNAPSHOT_TASKS]"
+        fi
+    done
+
+    SAFE_SNAPSHOT_SUB_STATUS=0
+    wait "$SAFE_SNAPSHOT_SUB_PID" || SAFE_SNAPSHOT_SUB_STATUS=$?
+    set_jetstream_consumer_pause "$SAFE_SNAPSHOT_NATS_CONSUMER" 0
+
+    if echo "$SAFE_SNAPSHOT_RESPONSE" | grep -q '"status":"success"' && \
+        $SAFE_SNAPSHOT_HTTP_OK; then
+        pass "Latest HTTP reads stayed atomic while the participant delta was delayed"
+    else
+        fail "Latest HTTP read exposed or failed to recover the delayed 2PC pair" \
+            "response=$SAFE_SNAPSHOT_RESPONSE observations=$SAFE_SNAPSHOT_HTTP_DETAILS"
+    fi
+
+    if [ "$SAFE_SNAPSHOT_SUB_STATUS" -eq 0 ] && \
+        grep -q '"event":"complete"' "$SAFE_SNAPSHOT_SUB_LOG" && \
+        ! grep -q '"event":"torn"' "$SAFE_SNAPSHOT_SUB_LOG"; then
+        pass "WebSocket subscription rerun stayed atomic with delayed participant delivery"
+    else
+        fail "WebSocket subscription observed a torn or missing 2PC pair" \
+            "$(tr '\n' ' ' < "$SAFE_SNAPSHOT_SUB_LOG")"
+    fi
+else
+    if [ -n "$SAFE_SNAPSHOT_SUB_PID" ]; then
+        kill "$SAFE_SNAPSHOT_SUB_PID" 2>/dev/null || true
+        wait "$SAFE_SNAPSHOT_SUB_PID" 2>/dev/null || true
+    fi
+    fail "WebSocket safe-snapshot probe did not reach its initial state" \
+        "coordinator_found=$SAFE_SNAPSHOT_COORDINATOR_FOUND $(tr '\n' ' ' < "$SAFE_SNAPSHOT_SUB_LOG")"
+    fail "Latest HTTP delayed-participant test could not start" \
+        "subscription setup failed before the participant delta was delayed"
+fi
+rm -f "$SAFE_SNAPSHOT_SUB_LOG"
 
 # ============================================================
 echo ""
@@ -2942,6 +3182,20 @@ echo -e "${BOLD}Test 26: NATS Partition Simulation${NC}"
 
 echo "  Pausing NATS for 3 seconds..."
 docker pause docker-nats-1 > /dev/null 2>&1
+
+# Strong remote reads use the partition owner directly, not the NATS-maintained
+# local mirror. The task was written to partition 1 in Test 25, so querying it
+# through partition 0 must remain available while NATS is paused.
+OWNER_READ_DURING_NATS=$(curl --max-time 10 -sf "$NODE_A_URL/api/query" \
+    -H "Authorization: Convex $NODE_A_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"path\":\"messages:countTasksByTitle\",\"args\":{\"title\":\"$DJ_KEY\"}}" 2>/dev/null || true)
+OWNER_READ_DURING_NATS_COUNT=$(python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" \
+    <<< "$OWNER_READ_DURING_NATS" 2>/dev/null || echo -1)
+[ "$OWNER_READ_DURING_NATS_COUNT" -eq 1 ] \
+    && pass "Partition 0 read partition-1-owned data while NATS was unavailable" \
+    || fail "Owner-authoritative remote read depended on NATS or stale local state" \
+        "expected task count 1, got $OWNER_READ_DURING_NATS_COUNT; response=$OWNER_READ_DURING_NATS"
 
 # Write during NATS outage. It may fail closed if the TSO/decision path cannot
 # make progress, but if it is accepted then the Raft/NATS outbox must replay it
