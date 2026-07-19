@@ -104,6 +104,7 @@ pub mod logs;
 mod metrics;
 pub mod mutation_forwarder;
 pub mod node_action_callbacks;
+pub mod owner_read_service;
 pub mod parse;
 pub mod proxy;
 pub mod public_api;

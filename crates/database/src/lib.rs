@@ -22,6 +22,7 @@ mod execution_size;
 pub mod membership;
 mod metrics;
 pub mod nats_distributed_log;
+pub mod owner_read;
 pub mod partition;
 pub mod patch;
 pub mod persistence_helpers;

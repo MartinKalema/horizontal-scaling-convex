@@ -6169,6 +6169,15 @@ impl CommitterClient {
             .map(|placement_state| placement_state.local_partition())
     }
 
+    /// Snapshot the placement map for one transaction or internal request.
+    /// Callers keep this value pinned so a placement refresh cannot split one
+    /// operation across ownership versions.
+    pub fn partition_map(&self) -> Option<crate::partition::PartitionMap> {
+        self.placement_state
+            .as_ref()
+            .map(|placement_state| placement_state.partition_map())
+    }
+
     pub async fn finish_search_and_vector_bootstrap(
         &self,
         bootstrapped_indexes: BootstrappedSearchIndexes,

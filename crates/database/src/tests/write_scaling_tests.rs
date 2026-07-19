@@ -192,6 +192,19 @@ async fn create_node(
     create_node_with_options(rt, distributed_log, partition_map, None, None).await
 }
 
+async fn run_local_replica_query(
+    database: Database<TestRuntime>,
+    namespace: TableNamespace,
+    query: Query,
+) -> anyhow::Result<Vec<ResolvedDocument>> {
+    run_query(
+        database.with_local_replica_reads_for_test(),
+        namespace,
+        query,
+    )
+    .await
+}
+
 async fn create_node_with_options(
     rt: &TestRuntime,
     distributed_log: Arc<InMemoryDistributedLog>,
@@ -2561,13 +2574,13 @@ async fn test_cross_partition_replica_delta_waits_behind_unresolved_prepared_tra
         .apply_replica_delta(racing_delta)
         .await?;
 
-    let tasks = run_query(
+    let tasks = run_local_replica_query(
         node_b.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("tasks".parse()?, Order::Asc),
     )
     .await?;
-    let messages = run_query(
+    let messages = run_local_replica_query(
         node_b,
         TableNamespace::root_component(),
         Query::full_table_scan("messages".parse()?, Order::Asc),
@@ -3311,7 +3324,7 @@ impl SeededReplicaApplySimulation {
         self.last_read_frontier = read_frontier;
         self.last_write_frontier = write_frontier;
 
-        let projects = run_query(
+        let projects = run_local_replica_query(
             target.clone(),
             TableNamespace::root_component(),
             Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -3750,7 +3763,7 @@ async fn test_frontier_heartbeat_does_not_dedupe_later_data_delta(
         "late data should apply at a fresh local timestamp after the heartbeat",
     );
 
-    let projects = run_query(
+    let projects = run_local_replica_query(
         target.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -3871,7 +3884,7 @@ async fn test_late_outbox_replay_data_delta_not_deduped_by_newer_data_watermark(
         "older origin delta should still apply at a fresh local timestamp after a newer watermark",
     );
 
-    let projects = run_query(
+    let projects = run_local_replica_query(
         target.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -4008,7 +4021,7 @@ async fn test_ordered_transport_ids_skip_redelivery_after_origin_ids_pruned(
         "contiguous transport ids should not leave exact-id metadata behind",
     );
 
-    let projects = run_query(
+    let projects = run_local_replica_query(
         target.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -5907,7 +5920,7 @@ async fn test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts(
     let snapshot_ts_before = *node_a.now_ts_for_reads();
     let persisted_repeatable_before = *node_a.persisted_max_repeatable_ts_for_test();
     let write_frontier_before = node_a.replication_write_frontier_for_test(PartitionId(1));
-    let projects = run_query(
+    let projects = run_local_replica_query(
         node_a.clone(),
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -5964,7 +5977,7 @@ async fn test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts(
         "waiting for local write visibility should stay blocked on a frontier-only heartbeat",
     );
 
-    let projects_after = run_query(
+    let projects_after = run_local_replica_query(
         node_a,
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -6064,7 +6077,7 @@ async fn test_replica_delta_timestamp_translation_records_origin_watermark(
         duplicate_apply_ts, remote_ts,
         "duplicate detection uses the persisted data idempotency watermark",
     );
-    let projects = run_query(
+    let projects = run_local_replica_query(
         target,
         TableNamespace::root_component(),
         Query::full_table_scan("projects".parse()?, Order::Asc),
@@ -6232,7 +6245,10 @@ async fn test_replica_preserves_global_table_numbers_for_embedded_ids(
         .apply_replica_delta(user_delta)
         .await?;
 
-    let mut tx = node_b.begin(Identity::system()).await?;
+    let mut tx = node_b
+        .with_local_replica_reads_for_test()
+        .begin(Identity::system())
+        .await?;
     let replica_user_id =
         tx.resolve_developer_id(&user_public_id, TableNamespace::root_component())?;
     assert_eq!(
@@ -6261,7 +6277,7 @@ async fn test_replica_preserves_global_table_numbers_for_embedded_ids(
         .apply_replica_delta(task_delta)
         .await?;
 
-    let tasks = run_query(
+    let tasks = run_local_replica_query(
         node_a,
         TableNamespace::root_component(),
         Query::full_table_scan("tasks".parse()?, Order::Asc),
