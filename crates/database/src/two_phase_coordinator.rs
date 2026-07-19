@@ -29,6 +29,7 @@ use common::{
     runtime::tokio_spawn,
     types::Timestamp,
 };
+use errors::ErrorMetadataAnyhowExt;
 use futures::{
     stream::FuturesUnordered,
     StreamExt,
@@ -834,6 +835,11 @@ fn is_ambiguous_prepare_error(err: &anyhow::Error) -> bool {
 }
 
 fn should_try_next_participant_address(err: &anyhow::Error) -> bool {
+    // An OCC is a deterministic participant response. Trying every peer only
+    // delays the application-level mutation retry and can overload a Raft group.
+    if err.is_occ() {
+        return false;
+    }
     let message = format!("{err:#}").to_ascii_lowercase();
     message.contains("transport error")
         || message.contains("connection error")
@@ -1193,6 +1199,7 @@ mod tests {
         RepeatableTimestamp,
         Timestamp,
     };
+    use errors::ErrorMetadata;
 
     use super::{
         is_ambiguous_prepare_error,
@@ -1269,6 +1276,13 @@ mod tests {
         let err = anyhow::anyhow!(
             "gRPC Prepare failed: status: Internal, message: \"forced prepare failure\""
         );
+        assert!(!is_ambiguous_prepare_error(&err));
+    }
+
+    #[test]
+    fn ambiguous_prepare_error_rejects_structured_occ_from_forwarded_leader() {
+        let err = anyhow::Error::new(ErrorMetadata::system_occ(Some(42), None))
+            .context("Leader Prepare failed");
         assert!(!is_ambiguous_prepare_error(&err));
     }
 

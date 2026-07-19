@@ -691,7 +691,7 @@ mutate() {
 }
 
 mutation_response() {
-    curl -s "$1/api/mutation" \
+    curl --max-time 60 -s "$1/api/mutation" \
         -H "Authorization: Convex $2" \
         -H "Content-Type: application/json" \
         -d "{\"path\":\"$3\",\"args\":$4}"

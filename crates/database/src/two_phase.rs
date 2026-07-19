@@ -1844,16 +1844,13 @@ impl TwoPhaseCommitGrpcClient {
             placement_version: u64::from(placement_version),
             participants: participants.iter().map(|partition| partition.0).collect(),
         };
-        let response = self
-            .client
-            .clone()
-            .prepare(self.request(request))
-            .await
-            .context("gRPC Prepare failed")?;
+        let response =
+            common::grpc::handle_response(self.client.clone().prepare(self.request(request)).await)
+                .context("gRPC Prepare failed")?;
         let TwoPcPrepareResponse {
             prepare_ts,
             required_prepare_ts,
-        } = response.into_inner();
+        } = response;
         if let Some(required_prepare_ts) = required_prepare_ts {
             return Err(PrepareTimestampTooLow {
                 proposed_ts: prepare_ts.try_into()?,
@@ -1881,13 +1878,14 @@ impl TwoPhaseCommitGrpcClient {
             validate_ts: u64::from(validate_ts),
             placement_version: u64::from(placement_version),
         };
-        let response = self
-            .client
-            .clone()
-            .validate_reads(self.request(request))
-            .await
-            .context("gRPC ValidateReads failed")?;
-        if let Some(required_prepare_ts) = response.into_inner().required_prepare_ts {
+        let response = common::grpc::handle_response(
+            self.client
+                .clone()
+                .validate_reads(self.request(request))
+                .await,
+        )
+        .context("gRPC ValidateReads failed")?;
+        if let Some(required_prepare_ts) = response.required_prepare_ts {
             return Err(PrepareTimestampTooLow {
                 proposed_ts: validate_ts,
                 required_ts: required_prepare_ts.try_into()?,
@@ -1904,13 +1902,14 @@ impl TwoPhaseCommitGrpcClient {
         let request = TwoPcCommitRequest {
             transaction_id: transaction_id.0.clone(),
         };
-        let response = self
-            .client
-            .clone()
-            .commit_prepared(self.request(request))
-            .await
-            .context("gRPC CommitPrepared failed")?;
-        Ok(response.into_inner().commit_ts)
+        let response = common::grpc::handle_response(
+            self.client
+                .clone()
+                .commit_prepared(self.request(request))
+                .await,
+        )
+        .context("gRPC CommitPrepared failed")?;
+        Ok(response.commit_ts)
     }
 
     pub async fn rollback_prepared(
@@ -1920,11 +1919,13 @@ impl TwoPhaseCommitGrpcClient {
         let request = TwoPcRollbackRequest {
             transaction_id: transaction_id.0.clone(),
         };
-        self.client
-            .clone()
-            .rollback_prepared(self.request(request))
-            .await
-            .context("gRPC RollbackPrepared failed")?;
+        common::grpc::handle_response(
+            self.client
+                .clone()
+                .rollback_prepared(self.request(request))
+                .await,
+        )
+        .context("gRPC RollbackPrepared failed")?;
         Ok(())
     }
 }
