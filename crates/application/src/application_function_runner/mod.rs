@@ -1974,7 +1974,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
         args: SerializedArgs,
         context: ExecutionContext,
     ) -> anyhow::Result<FunctionResult> {
-        let ts = self.database.now_ts_for_reads();
+        let ts = self.database.cluster_safe_read_ts().await?;
         let result = self
             .run_query_at_ts(
                 context.request_id,

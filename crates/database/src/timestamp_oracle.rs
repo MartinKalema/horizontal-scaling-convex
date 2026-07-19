@@ -55,6 +55,25 @@ pub trait TimestampOracle: Send + Sync + 'static {
     /// callers to bump a returned timestamp outside the reserved range.
     async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp>;
 
+    /// Assign a timestamp only when doing so requires no network I/O.
+    ///
+    /// Optional maintenance runs this method from the single committer loop.
+    /// Batch-based implementations return `None` when their local reservation
+    /// cannot satisfy the floor; callers may then request an asynchronous
+    /// refill without blocking commits, reads, or replicated apply.
+    fn try_next_ts_at_or_after(&self, _min_ts: Timestamp) -> anyhow::Result<Option<Timestamp>> {
+        Ok(None)
+    }
+
+    /// Ensure a future nonblocking allocation can satisfy `min_ts`.
+    ///
+    /// This may perform network I/O and must therefore be called outside the
+    /// single-threaded committer loop. Implementations that do not batch may
+    /// leave the default no-op behavior.
+    async fn prefetch_ts_at_or_after(&self, _min_ts: Timestamp) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Get the current maximum committed timestamp across all nodes.
     /// Used for read-after-write consistency.
     async fn max_committed_ts(&self) -> anyhow::Result<Timestamp>;
@@ -110,6 +129,17 @@ impl<RT: Runtime> TimestampOracle for LocalTimestampOracle<RT> {
         Ok(next)
     }
 
+    fn try_next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Option<Timestamp>> {
+        let mut state = self.state.lock();
+        let system_ts = self.runtime.generate_timestamp()?;
+        let next = std::cmp::max(
+            std::cmp::max(system_ts, min_ts),
+            std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?),
+        );
+        state.last_assigned = next;
+        Ok(Some(next))
+    }
+
     async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
         Ok(self.state.lock().max_committed)
     }
@@ -142,6 +172,7 @@ pub struct BatchTimestampOracle {
     kv: async_nats::jetstream::kv::Store,
     batch_size: u64,
     state: Mutex<BatchState>,
+    reservation_lock: tokio::sync::Mutex<()>,
 }
 
 struct BatchState {
@@ -154,6 +185,10 @@ struct BatchState {
     /// Force the next assignment to refresh the global committed floor before
     /// reserving or consuming any batch.
     refresh_committed_floor: bool,
+    /// Invalidates a reservation that was in flight when Raft leadership
+    /// changed. Such a range is safely leaked rather than installed in a newer
+    /// leadership epoch.
+    reservation_epoch: u64,
 }
 
 const TSO_COUNTER_KEY: &str = "tso_counter";
@@ -189,6 +224,7 @@ fn discard_batch_state_for_leadership_change(state: &mut BatchState) {
     state.current = 0;
     state.upper_bound = 0;
     state.refresh_committed_floor = true;
+    state.reservation_epoch = state.reservation_epoch.wrapping_add(1);
 }
 
 fn refresh_committed_floor(state: &mut BatchState, committed_floor: Timestamp) {
@@ -247,7 +283,9 @@ impl BatchTimestampOracle {
                 upper_bound: 0,
                 max_committed: Timestamp::MIN,
                 refresh_committed_floor: false,
+                reservation_epoch: 0,
             }),
+            reservation_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -304,20 +342,71 @@ impl BatchTimestampOracle {
         anyhow::bail!("TSO: Failed to reserve batch after 10 attempts")
     }
 
-    fn assign_from_reserved_batch(
+    fn try_assign_from_reserved_batch(
         &self,
-        lower: u64,
-        upper: u64,
-        min_next: u64,
-    ) -> anyhow::Result<Timestamp> {
+        min_ts: Timestamp,
+    ) -> anyhow::Result<Option<Timestamp>> {
         let mut state = self.state.lock();
-        state.current = lower;
-        state.upper_bound = upper;
-        let (ts, next_current) =
+        if state.refresh_committed_floor {
+            return Ok(None);
+        }
+        let min_next = local_min_next_from_floor(min_ts, state.max_committed)?;
+        let Some((ts, next_current)) =
             next_ts_from_reserved_batch(state.current, state.upper_bound, min_next)
-                .context("TSO: Reserved batch cannot satisfy requested floor")?;
+        else {
+            return Ok(None);
+        };
         state.current = next_current;
-        Timestamp::try_from(ts)
+        Ok(Some(Timestamp::try_from(ts)?))
+    }
+
+    async fn ensure_reserved_batch_at_or_above(&self, min_ts: Timestamp) -> anyhow::Result<()> {
+        let _reservation_guard = self.reservation_lock.lock().await;
+        loop {
+            if self.try_assignable_from_reserved_batch(min_ts)? {
+                return Ok(());
+            }
+
+            let committed_floor = self.max_committed_ts().await?;
+            let (min_next, reservation_epoch) = {
+                let mut state = self.state.lock();
+                refresh_committed_floor(&mut state, committed_floor);
+                let min_next = local_min_next_from_floor(min_ts, state.max_committed)?;
+                if reserved_batch_can_satisfy_local_floor(
+                    state.current,
+                    state.upper_bound,
+                    min_next,
+                ) {
+                    return Ok(());
+                }
+                (min_next, state.reservation_epoch)
+            };
+
+            let (lower, upper) = self.reserve_batch_at_or_above(min_next).await?;
+            let mut state = self.state.lock();
+            if state.reservation_epoch != reservation_epoch {
+                // Leadership changed while NATS was reserving this range. Do not
+                // install it into the newer epoch; loop and fence against the
+                // latest committed floor instead.
+                continue;
+            }
+            state.current = lower;
+            state.upper_bound = upper;
+            return Ok(());
+        }
+    }
+
+    fn try_assignable_from_reserved_batch(&self, min_ts: Timestamp) -> anyhow::Result<bool> {
+        let state = self.state.lock();
+        if state.refresh_committed_floor {
+            return Ok(false);
+        }
+        let min_next = local_min_next_from_floor(min_ts, state.max_committed)?;
+        Ok(reserved_batch_can_satisfy_local_floor(
+            state.current,
+            state.upper_bound,
+            min_next,
+        ))
     }
 }
 
@@ -327,57 +416,10 @@ impl TimestampOracle for BatchTimestampOracle {
         let timer = metrics::tso_operation_timer("next_ts_at_or_after");
         let result = async {
             loop {
-                if self.state.lock().refresh_committed_floor {
-                    let committed_floor = self.max_committed_ts().await?;
-                    let mut state = self.state.lock();
-                    refresh_committed_floor(&mut state, committed_floor);
+                if let Some(ts) = self.try_assign_from_reserved_batch(min_ts)? {
+                    return Ok(ts);
                 }
-
-                let local_min_next = {
-                    let state = self.state.lock();
-                    local_min_next_from_floor(min_ts, state.max_committed)?
-                };
-
-                let can_assign_from_reserved_batch = {
-                    let state = self.state.lock();
-                    reserved_batch_can_satisfy_local_floor(
-                        state.current,
-                        state.upper_bound,
-                        local_min_next,
-                    )
-                };
-
-                if !can_assign_from_reserved_batch {
-                    let committed_floor = self.max_committed_ts().await?;
-                    let min_next = {
-                        let mut state = self.state.lock();
-                        refresh_committed_floor(&mut state, committed_floor);
-                        u64::from(std::cmp::max(min_ts, state.max_committed.succ()?))
-                    };
-
-                    let (lower, upper) = self.reserve_batch_at_or_above(min_next).await?;
-                    return self.assign_from_reserved_batch(lower, upper, min_next);
-                }
-
-                let candidate = {
-                    let mut state = self.state.lock();
-                    if let Some((ts, next_current)) = next_ts_from_reserved_batch(
-                        state.current,
-                        state.upper_bound,
-                        local_min_next,
-                    ) {
-                        state.current = next_current;
-                        Some(ts)
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(ts) = candidate {
-                    return Timestamp::try_from(ts);
-                }
-
-                continue;
+                self.ensure_reserved_batch_at_or_above(min_ts).await?;
             }
         }
         .await;
@@ -385,6 +427,14 @@ impl TimestampOracle for BatchTimestampOracle {
             timer.finish();
         }
         result
+    }
+
+    fn try_next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Option<Timestamp>> {
+        self.try_assign_from_reserved_batch(min_ts)
+    }
+
+    async fn prefetch_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<()> {
+        self.ensure_reserved_batch_at_or_above(min_ts).await
     }
 
     async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
@@ -523,6 +573,16 @@ pub mod testing {
             Ok(next)
         }
 
+        fn try_next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Option<Timestamp>> {
+            let mut state = self.state.lock();
+            let next = std::cmp::max(
+                min_ts,
+                std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?),
+            );
+            state.last_assigned = next;
+            Ok(Some(next))
+        }
+
         async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
             Ok(self.state.lock().max_committed)
         }
@@ -599,6 +659,7 @@ mod tests {
             upper_bound: 200,
             max_committed: Timestamp::must(120),
             refresh_committed_floor: false,
+            reservation_epoch: 0,
         };
 
         discard_batch_state_for_leadership_change(&mut state);
@@ -616,6 +677,7 @@ mod tests {
             upper_bound: 200,
             max_committed: Timestamp::must(120),
             refresh_committed_floor: false,
+            reservation_epoch: 0,
         };
 
         discard_batch_state_for_leadership_change(&mut state);

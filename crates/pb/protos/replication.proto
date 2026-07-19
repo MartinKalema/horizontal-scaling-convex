@@ -4,6 +4,7 @@ package replication;
 
 import "convex_identity.proto";
 import "common.proto";
+import "google/protobuf/empty.proto";
 import "searchlight.proto";
 
 // Service for forwarding mutations from Replica nodes to the Primary.
@@ -133,6 +134,62 @@ message QueryError {
 
   // Log lines captured during execution.
   common.RedactedLogLines log_lines = 2;
+}
+
+// Internal strong-read service. A transaction coordinator uses this service
+// when an index range belongs to another partition. NATS-delivered mirrors are
+// never authoritative for these requests.
+service OwnerReadService {
+  rpc ReadIndexRanges(OwnerReadIndexRangesRequest) returns (OwnerReadIndexRangesResponse);
+  rpc CloseReadTimestamp(CloseReadTimestampRequest) returns (CloseReadTimestampResponse);
+}
+
+message CloseReadTimestampRequest {
+  uint32 owner_partition = 1;
+  uint64 placement_version = 2;
+  uint64 target_ts = 3;
+}
+
+message CloseReadTimestampResponse {
+  oneof outcome {
+    uint64 closed_ts = 1;
+    uint64 retry_at_ts = 2;
+    uint64 blocked_ts = 3;
+  }
+}
+
+message OwnerReadIndexRangesRequest {
+  uint32 owner_partition = 1;
+  uint64 placement_version = 2;
+  uint64 snapshot_ts = 3;
+  repeated OwnerReadIndexRange ranges = 4;
+}
+
+message OwnerReadIndexRange {
+  bytes tablet_id = 1;
+  string descriptor = 2;
+  string table_name = 3;
+  common.Interval interval = 4;
+  common.Order order = 5;
+  uint64 max_size = 6;
+}
+
+message OwnerReadIndexRangesResponse {
+  repeated OwnerReadIndexRangeResult results = 1;
+}
+
+message OwnerReadIndexRangeResult {
+  repeated OwnerReadIndexEntry entries = 1;
+  oneof cursor {
+    bytes after = 2;
+    google.protobuf.Empty end = 3;
+  }
+}
+
+message OwnerReadIndexEntry {
+  bytes index_key = 1;
+  uint64 commit_ts = 2;
+  common.ResolvedDocument document = 3;
 }
 
 // Two-Phase Commit service for cross-partition writes (Vitess 2PC pattern).

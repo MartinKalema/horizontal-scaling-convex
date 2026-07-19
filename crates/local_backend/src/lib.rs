@@ -105,6 +105,7 @@ pub mod logs;
 mod metrics;
 pub mod mutation_forwarder;
 pub mod node_action_callbacks;
+pub mod owner_read_service;
 pub mod parse;
 pub mod proxy;
 pub mod public_api;
@@ -175,6 +176,19 @@ pub struct BackendAppState {
 }
 
 impl BackendAppState {
+    pub fn cluster_aware_api(&self) -> Arc<dyn ApplicationApi> {
+        Arc::new(query_forwarding_api::SelectiveQueryForwardingApi::new(
+            Arc::new(self.application.clone()),
+            self.application.database().clone(),
+            self.replica_mode,
+            self.partition_id,
+            self.node_addresses.clone(),
+            self.raft_state.clone(),
+            self.raft_peer_grpc_urls.clone(),
+            self.cluster_grpc_auth.clone(),
+        ))
+    }
+
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.application.shutdown().await?;
 

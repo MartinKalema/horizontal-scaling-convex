@@ -114,7 +114,10 @@ use errors::{
     ErrorMetadataAnyhowExt,
 };
 use futures::{
-    future::Either,
+    future::{
+        join_all,
+        Either,
+    },
     pin_mut,
     stream::BoxStream,
     FutureExt,
@@ -127,6 +130,7 @@ use indexing::{
         BackendInMemoryIndexes,
         DatabaseIndexSnapshot,
         NoInMemoryIndexes,
+        RangeRequest,
         TimestampedIndexCache,
     },
     index_cache::SharedIndexCache,
@@ -177,6 +181,7 @@ use crate::{
     committer::{
         Committer,
         CommitterClient,
+        ReadTimestampClosure,
     },
     defaults::{
         bootstrap_system_tables,
@@ -187,6 +192,13 @@ use crate::{
         load_indexes_into_memory_timer,
         vector::vector_search_with_retries_timer,
         verify_invariants_timer,
+    },
+    owner_read::{
+        GrpcOwnerReadClient,
+        OwnerAwareIndexReader,
+        OwnerIndexEntry,
+        OwnerIndexRangeResult,
+        OwnerReadClient,
     },
     retention::{
         LeaderRetentionManager,
@@ -301,6 +313,7 @@ pub struct Database<RT: Runtime> {
     shared_index_cache: Option<SharedIndexCache>,
     virtual_system_mapping: VirtualSystemMapping,
     table_number_allocator: Arc<dyn TableNumberAllocator>,
+    owner_read_client: Option<Arc<dyn OwnerReadClient>>,
     pub bootstrap_metadata: BootstrapMetadata,
     // Caches of snapshot TableMapping and by_id index ids, which are used repeatedly by
     // /api/list_snapshot.
@@ -1125,6 +1138,7 @@ impl<RT: Runtime> Database<RT> {
         } else {
             distributed_log.clone()
         };
+        let owner_read_cluster_auth = cluster_grpc_auth.clone();
         let committer = Committer::start(
             log_writer,
             snapshot_writer,
@@ -1145,6 +1159,12 @@ impl<RT: Runtime> Database<RT> {
             applied_data_delta_ids,
             raft_apply_markers,
         );
+        let owner_read_client = committer.local_partition().map(|_| {
+            Arc::new(GrpcOwnerReadClient::new(
+                committer.clone(),
+                owner_read_cluster_auth,
+            )) as Arc<dyn OwnerReadClient>
+        });
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
         let by_id_indexes_snapshot_cache =
@@ -1167,6 +1187,7 @@ impl<RT: Runtime> Database<RT> {
             shared_index_cache,
             virtual_system_mapping,
             table_number_allocator,
+            owner_read_client,
             bootstrap_metadata,
             table_mapping_snapshot_cache,
             by_id_indexes_snapshot_cache,
@@ -1199,6 +1220,26 @@ impl<RT: Runtime> Database<RT> {
     #[cfg(test)]
     pub(crate) fn committer_for_test(&self) -> CommitterClient {
         self.committer.clone()
+    }
+
+    /// Return a test-only view that reads this node's local replica directly.
+    /// Public transactions must keep owner reads enabled; replication tests use
+    /// this only to inspect the state that an apply operation materialized.
+    #[cfg(test)]
+    pub(crate) fn with_local_replica_reads_for_test(&self) -> Self {
+        let mut database = self.clone();
+        database.owner_read_client = None;
+        database
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_owner_read_client_for_test(
+        &self,
+        owner_read_client: Arc<dyn OwnerReadClient>,
+    ) -> Self {
+        let mut database = self.clone();
+        database.owner_read_client = Some(owner_read_client);
+        database
     }
 
     #[cfg(test)]
@@ -1712,9 +1753,225 @@ impl<RT: Runtime> Database<RT> {
         Ok((entries, cursor))
     }
 
+    /// Read index ranges from this partition's authoritative MVCC state.
+    ///
+    /// The caller has already pinned placement and verified ownership. We wait
+    /// briefly for the local state machine to reach the requested logical
+    /// timestamp, then read every range from one repeatable snapshot. We never
+    /// lower the timestamp or substitute a replica mirror.
+    pub async fn authoritative_index_ranges(
+        &self,
+        snapshot_ts: Timestamp,
+        ranges: Vec<RangeRequest>,
+    ) -> anyhow::Result<Vec<OwnerIndexRangeResult>> {
+        if *self.now_ts_for_reads() < snapshot_ts {
+            let target = snapshot_ts.pred()?;
+            let wait = self.snapshot_manager.lock().wait_for_higher_ts(target);
+            tokio::time::timeout(*REMOTE_READ_FRONTIER_WAIT_TIMEOUT, wait)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Timed out after {:?} waiting for owner snapshot {}",
+                        *REMOTE_READ_FRONTIER_WAIT_TIMEOUT, snapshot_ts,
+                    )
+                })?;
+        }
+
+        let latest_ts = self.now_ts_for_reads();
+        anyhow::ensure!(
+            *latest_ts >= snapshot_ts,
+            "Owner cannot serve snapshot {} because its applied state is only at {}",
+            snapshot_ts,
+            latest_ts,
+        );
+        let repeatable_ts = latest_ts.prior_ts(snapshot_ts)?;
+        let snapshot = self.snapshot_manager.lock().snapshot(*repeatable_ts)?;
+
+        for range in &ranges {
+            anyhow::ensure!(
+                !range.printable_index_name.table().is_system(),
+                "Owner read RPC only serves partitioned user tables; system table {} uses its \
+                 route-specific authority",
+                range.printable_index_name.table(),
+            );
+        }
+        let persistence_snapshot = RepeatablePersistence::new(
+            self.reader.clone(),
+            repeatable_ts,
+            self.retention_validator(),
+        )
+        .read_snapshot(repeatable_ts)?;
+        let mut database_index_snapshot = DatabaseIndexSnapshot::new(
+            snapshot.index_registry,
+            Arc::new(snapshot.in_memory_indexes),
+            snapshot.table_registry.table_mapping().clone(),
+            Arc::new(persistence_snapshot),
+            self.shared_index_cache.clone(),
+            None,
+        );
+        let range_refs: Vec<_> = ranges.iter().collect();
+        let results = database_index_snapshot.range_batch(&range_refs).await;
+        results
+            .into_iter()
+            .map(|result| {
+                let (entries, cursor) = result?;
+                let entries = entries
+                    .into_iter()
+                    .map(|(key, ts, document)| OwnerIndexEntry {
+                        key,
+                        ts,
+                        document: document.pack(),
+                    })
+                    .collect();
+                Ok(OwnerIndexRangeResult { entries, cursor })
+            })
+            .collect()
+    }
+
     pub fn now_ts_for_reads(&self) -> RepeatableTimestamp {
         let snapshot_manager = self.snapshot_manager.lock();
         snapshot_manager.latest_ts()
+    }
+
+    /// Build the index reader used while user code executes in Funrun.
+    ///
+    /// The function runner normally constructs its own persistence snapshot,
+    /// which is only authoritative for tables owned by this partition. In
+    /// cluster mode, replace that reader with one that sends remote user-table
+    /// ranges to their owner at the transaction's certified timestamp.
+    pub fn function_runner_index_reader(
+        &self,
+        ts: RepeatableTimestamp,
+    ) -> anyhow::Result<Option<Arc<dyn indexing::backend_in_memory_indexes::IndexReader>>> {
+        let (Some(owner_read_client), Some(partition_map)) = (
+            self.owner_read_client.clone(),
+            self.committer.partition_map(),
+        ) else {
+            return Ok(None);
+        };
+        if partition_map.num_partitions() <= 1 {
+            return Ok(None);
+        }
+
+        let snapshot = self.snapshot(ts)?;
+        let persistence_snapshot =
+            RepeatablePersistence::new(self.reader.clone(), ts, self.retention_validator())
+                .read_snapshot(ts)?;
+        Ok(Some(Arc::new(OwnerAwareIndexReader::new(
+            ts,
+            Arc::new(persistence_snapshot),
+            owner_read_client,
+            partition_map,
+            snapshot.table_registry.table_mapping().clone(),
+            snapshot.index_registry,
+        ))))
+    }
+
+    /// Establish one exact MVCC timestamp on every partition owner.
+    ///
+    /// TSO allocation alone is not a safe read timestamp: replica apply may
+    /// translate an origin timestamp forward in a node's local timeline. This
+    /// barrier raises the candidate until every current owner can persist and
+    /// serve the exact same timestamp without crossing unresolved 2PC state.
+    pub async fn cluster_safe_read_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
+        let Some(partition_map) = self.committer.partition_map() else {
+            return Ok(self.now_ts_for_reads());
+        };
+        if partition_map.num_partitions() <= 1 {
+            return Ok(self.now_ts_for_reads());
+        }
+
+        let deadline = Instant::now() + *REMOTE_READ_FRONTIER_WAIT_TIMEOUT;
+        // Read barriers do not consume write timestamps. Start from the local
+        // readable floor and let owners raise the candidate until every leader
+        // can close the same timestamp. This keeps reads available when the
+        // NATS-backed write timestamp oracle is unavailable.
+        let mut candidate = *self.now_ts_for_reads();
+        loop {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "Timed out after {:?} establishing a cluster-safe read timestamp",
+                *REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
+            );
+            match self
+                .close_cluster_read_timestamp(&partition_map, candidate)
+                .await?
+            {
+                ReadTimestampClosure::Closed(closed) => {
+                    anyhow::ensure!(
+                        closed == candidate,
+                        "Cluster read barrier closed at {} instead of requested {}",
+                        closed,
+                        candidate,
+                    );
+                    anyhow::ensure!(
+                        self.committer.placement_version() == partition_map.placement_version(),
+                        "Placement changed from {} while closing cluster read timestamp {}",
+                        partition_map.placement_version(),
+                        candidate,
+                    );
+                    let latest = self.now_ts_for_reads();
+                    return latest.prior_ts(candidate);
+                },
+                ReadTimestampClosure::RetryAt(retry_at) => candidate = retry_at,
+                ReadTimestampClosure::Blocked(_) => {
+                    self.runtime.wait(Duration::from_millis(5)).await;
+                },
+            }
+        }
+    }
+
+    async fn close_cluster_read_timestamp(
+        &self,
+        partition_map: &crate::partition::PartitionMap,
+        target: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        let owner_read_client = self
+            .owner_read_client
+            .as_ref()
+            .with_context(|| "Cluster-safe reads require the authoritative owner-read client")?;
+        let local_partition = partition_map.local_partition();
+        let placement_version = partition_map.placement_version();
+        let remote_closures = join_all(
+            partition_map
+                .all_partitions()
+                .into_iter()
+                .filter(|partition| *partition != local_partition)
+                .map(|partition| {
+                    owner_read_client.close_read_timestamp(partition, placement_version, target)
+                }),
+        );
+        let (local, remotes) =
+            futures::join!(self.committer.close_read_timestamp(target), remote_closures,);
+        let mut closures = Vec::with_capacity(partition_map.num_partitions() as usize);
+        closures.push(local?);
+        closures.extend(remotes.into_iter().collect::<anyhow::Result<Vec<_>>>()?);
+
+        let mut retry_at = None;
+        let mut blocked_at = None;
+        for closure in closures {
+            match closure {
+                ReadTimestampClosure::Closed(closed) => anyhow::ensure!(
+                    closed == target,
+                    "Partition closed read timestamp {} instead of requested {}",
+                    closed,
+                    target,
+                ),
+                ReadTimestampClosure::RetryAt(ts) => {
+                    retry_at = Some(retry_at.map_or(ts, |current| cmp::max(current, ts)));
+                },
+                ReadTimestampClosure::Blocked(ts) => {
+                    blocked_at = Some(blocked_at.map_or(ts, |current| cmp::min(current, ts)));
+                },
+            }
+        }
+        if let Some(ts) = retry_at {
+            Ok(ReadTimestampClosure::RetryAt(ts))
+        } else if let Some(ts) = blocked_at {
+            Ok(ReadTimestampClosure::Blocked(ts))
+        } else {
+            Ok(ReadTimestampClosure::Closed(target))
+        }
     }
 
     /// Waits until the given write timestamp is observable for new
@@ -2006,30 +2263,47 @@ impl<RT: Runtime> Database<RT> {
         let begin_ts = cmp::max(latest_ts.succ()?, self.runtime.generate_timestamp()?);
         let creation_time = CreationTime::try_from(begin_ts)?;
         let id_generator = TransactionIdGenerator::new(&self.runtime)?;
-        let transaction_index = TransactionIndex::new(
+        let database_index_snapshot = DatabaseIndexSnapshot::new(
             snapshot.index_registry.clone(),
-            DatabaseIndexSnapshot::new(
-                snapshot.index_registry.clone(),
-                Arc::new(snapshot.in_memory_indexes),
-                snapshot.table_registry.table_mapping().clone(),
-                Arc::new(
-                    RepeatablePersistence::new(
-                        self.reader.clone(),
-                        repeatable_ts,
-                        self.retention_manager.clone(),
-                    )
-                    .read_snapshot(repeatable_ts)?,
-                ),
-                self.shared_index_cache.clone(),
-                index_cache,
+            Arc::new(snapshot.in_memory_indexes),
+            snapshot.table_registry.table_mapping().clone(),
+            Arc::new(
+                RepeatablePersistence::new(
+                    self.reader.clone(),
+                    repeatable_ts,
+                    self.retention_manager.clone(),
+                )
+                .read_snapshot(repeatable_ts)?,
             ),
-            Arc::new(TextIndexManagerSnapshot::new(
-                snapshot.index_registry,
-                snapshot.text_indexes,
-                self.searcher.clone(),
-                self.search_storage.clone(),
-            )),
+            self.shared_index_cache.clone(),
+            index_cache,
         );
+        let text_index_snapshot = Arc::new(TextIndexManagerSnapshot::new(
+            snapshot.index_registry.clone(),
+            snapshot.text_indexes,
+            self.searcher.clone(),
+            self.search_storage.clone(),
+        ));
+        let transaction_index = match (
+            self.owner_read_client.clone(),
+            self.committer.partition_map(),
+        ) {
+            (Some(owner_read_client), Some(partition_map)) => {
+                TransactionIndex::new_with_owner_reads(
+                    snapshot.index_registry.clone(),
+                    database_index_snapshot,
+                    text_index_snapshot,
+                    owner_read_client,
+                    partition_map,
+                    *repeatable_ts,
+                )
+            },
+            _ => TransactionIndex::new(
+                snapshot.index_registry.clone(),
+                database_index_snapshot,
+                text_index_snapshot,
+            ),
+        };
         let count_snapshot = Arc::new(snapshot.table_summaries);
         let tx = Transaction::new_with_table_number_allocator(
             identity,
@@ -2217,6 +2491,17 @@ impl<RT: Runtime> Database<RT> {
 
     pub fn token_table_names(&self, token: &Token) -> anyhow::Result<BTreeSet<TableName>> {
         self.read_set_table_names(token.reads())
+    }
+
+    fn token_reads_remote_partition(&self, token: &Token) -> anyhow::Result<bool> {
+        let Some(partition_map) = self.committer.partition_map() else {
+            return Ok(false);
+        };
+        let local_partition = partition_map.local_partition();
+        Ok(self
+            .token_table_names(token)?
+            .iter()
+            .any(|table| partition_map.partition_for_table(table) != local_partition))
     }
 
     pub fn note_recent_delta_interest_for_token(
@@ -2708,6 +2993,14 @@ impl<RT: Runtime> Database<RT> {
         ts: Timestamp,
     ) -> anyhow::Result<Result<Token, Option<Timestamp>>> {
         let _timer = metrics::refresh_token_timer();
+        if token.ts() < ts && self.token_reads_remote_partition(&token)? {
+            // The local write log only reflects remote-owner writes after
+            // replication applies them. It therefore cannot prove that a
+            // cached result containing remote reads stayed valid through `ts`.
+            // Force a rerun, which reads remote ranges from their owners at the
+            // cluster-certified timestamp instead of serving a stale cache hit.
+            return Ok(Err(Some(token.ts().succ()?)));
+        }
         self.log.refresh_token(token, ts)
     }
 

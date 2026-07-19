@@ -41,9 +41,11 @@ use common::{
         IndexId,
         IndexName,
         TabletIndexName,
+        Timestamp,
         WriteTimestamp,
     },
 };
+use futures::future::join_all;
 use imbl::OrdMap;
 use indexing::{
     backend_in_memory_indexes::{
@@ -72,6 +74,11 @@ use value::{
 };
 
 use crate::{
+    owner_read::{
+        OwnerIndexRangeResult,
+        OwnerReadClient,
+    },
+    partition::PartitionMap,
     preloaded::PreloadedIndexRange,
     query::IndexRangeResponse,
     reads::TransactionReadSet,
@@ -102,6 +109,13 @@ pub struct TransactionIndex {
     // on top of the transaction base snapshot.
     text_index_snapshot: Arc<dyn TransactionTextSnapshot>,
     text_index_updates: OrdMap<IndexId, Vec<DocumentUpdate>>,
+
+    // Cluster reads pin placement and snapshot metadata for the lifetime of a
+    // transaction. Local NATS mirrors remain useful caches, but remote ranges
+    // are fetched from their placement owner and never fall back to a mirror.
+    owner_read_client: Option<Arc<dyn OwnerReadClient>>,
+    partition_map: Option<PartitionMap>,
+    snapshot_ts: Timestamp,
 }
 
 impl PendingWrites for TransactionIndex {}
@@ -119,6 +133,30 @@ impl TransactionIndex {
             database_index_updates: OrdMap::new(),
             text_index_snapshot,
             text_index_updates: OrdMap::new(),
+            owner_read_client: None,
+            partition_map: None,
+            snapshot_ts: Timestamp::MIN,
+        }
+    }
+
+    pub fn new_with_owner_reads(
+        index_registry: IndexRegistry,
+        database_index_snapshot: DatabaseIndexSnapshot,
+        text_index_snapshot: Arc<dyn TransactionTextSnapshot>,
+        owner_read_client: Arc<dyn OwnerReadClient>,
+        partition_map: PartitionMap,
+        snapshot_ts: Timestamp,
+    ) -> Self {
+        Self {
+            index_registry,
+            index_registry_updated: false,
+            database_index_snapshot,
+            database_index_updates: OrdMap::new(),
+            text_index_snapshot,
+            text_index_updates: OrdMap::new(),
+            owner_read_client: Some(owner_read_client),
+            partition_map: Some(partition_map),
+            snapshot_ts,
         }
     }
 
@@ -168,9 +206,10 @@ impl TransactionIndex {
         // Resolve singleton ranges that have pending writes without
         // hitting persistence.
         let mut pre_resolved = Vec::with_capacity(batch_size);
-        let mut persistence_ranges: Vec<&RangeRequest> = Vec::new();
+        let mut local_ranges: Vec<(usize, &RangeRequest)> = Vec::new();
+        let mut remote_ranges = BTreeMap::new();
 
-        for &range_request in ranges.iter() {
+        for (request_index, &range_request) in ranges.iter().enumerate() {
             if range_request.interval.is_singleton().is_some() {
                 let pending_result = Self::pending_iter_for_request(
                     &self.index_registry,
@@ -202,28 +241,134 @@ impl TransactionIndex {
             }
 
             pre_resolved.push(None);
-            persistence_ranges.push(range_request);
+            let table_name = range_request.printable_index_name.table();
+            let remote_owner = self.partition_map.as_ref().and_then(|partition_map| {
+                // System tables have route-specific authority and node-local
+                // physical IDs. Owner routing is only for partitioned user data.
+                if table_name.is_system() {
+                    return None;
+                }
+                let owner = partition_map.partition_for_table(table_name);
+                (owner != partition_map.local_partition()).then_some(owner)
+            });
+            if let Some(owner) = remote_owner {
+                remote_ranges
+                    .entry(owner)
+                    .or_insert_with(Vec::new)
+                    .push((request_index, range_request.clone()));
+            } else {
+                local_ranges.push((request_index, range_request));
+            }
         }
 
-        // Fetch only the ranges that weren't resolved from pending writes.
-        let snapshot_results = self
-            .database_index_snapshot
-            .range_batch(&persistence_ranges)
-            .await;
+        type SnapshotResult = anyhow::Result<(
+            Vec<(IndexKeyBytes, Timestamp, LazyDocument)>,
+            CursorPosition,
+        )>;
+        let mut snapshot_results: Vec<Option<SnapshotResult>> =
+            std::iter::repeat_with(|| None).take(batch_size).collect();
 
-        let mut persistence_iter = snapshot_results.into_iter();
+        // Local ownership continues to use the transaction's local snapshot.
+        let local_requests: Vec<_> = local_ranges.iter().map(|(_, range)| *range).collect();
+        let local_results = self
+            .database_index_snapshot
+            .range_batch(&local_requests)
+            .await;
+        for ((request_index, _), result) in local_ranges.into_iter().zip(local_results) {
+            snapshot_results[request_index] = Some(result);
+        }
+
+        // Fetch every remote range from its placement owner. Errors are
+        // returned to the transaction; consulting the node-local NATS mirror
+        // here would silently weaken a strong read into an unbounded stale read.
+        if !remote_ranges.is_empty() {
+            if let (Some(client), Some(partition_map)) =
+                (self.owner_read_client.clone(), self.partition_map.as_ref())
+            {
+                let placement_version = partition_map.placement_version();
+                let snapshot_ts = self.snapshot_ts;
+                let fetches = remote_ranges.into_iter().map(|(owner, indexed_ranges)| {
+                    let client = client.clone();
+                    let requests = indexed_ranges
+                        .iter()
+                        .map(|(_, range)| range.clone())
+                        .collect();
+                    async move {
+                        let result = client
+                            .read_index_ranges(owner, placement_version, snapshot_ts, requests)
+                            .await;
+                        (owner, indexed_ranges, result)
+                    }
+                });
+                for (owner, indexed_ranges, fetch_result) in join_all(fetches).await {
+                    match fetch_result {
+                        Ok(owner_results) if owner_results.len() == indexed_ranges.len() => {
+                            for ((request_index, _), owner_result) in
+                                indexed_ranges.into_iter().zip(owner_results)
+                            {
+                                let OwnerIndexRangeResult { entries, cursor } = owner_result;
+                                let entries = entries
+                                    .into_iter()
+                                    .map(|entry| {
+                                        (entry.key, entry.ts, LazyDocument::Packed(entry.document))
+                                    })
+                                    .collect();
+                                snapshot_results[request_index] = Some(Ok((entries, cursor)));
+                            }
+                        },
+                        Ok(owner_results) => {
+                            let error = format!(
+                                "Owner {} returned {} range results for {} requests",
+                                owner,
+                                owner_results.len(),
+                                indexed_ranges.len(),
+                            );
+                            for (request_index, _) in indexed_ranges {
+                                snapshot_results[request_index] =
+                                    Some(Err(anyhow::anyhow!(error.clone())));
+                            }
+                        },
+                        Err(error) => {
+                            let error = format!(
+                                "Authoritative read from {} failed; local replica was not used: \
+                                 {error:#}",
+                                owner,
+                            );
+                            for (request_index, _) in indexed_ranges {
+                                snapshot_results[request_index] =
+                                    Some(Err(anyhow::anyhow!(error.clone())));
+                            }
+                        },
+                    }
+                }
+            } else {
+                for (owner, indexed_ranges) in remote_ranges {
+                    let error = format!(
+                        "No authoritative read client configured for remote owner {owner}; local \
+                         replica was not used"
+                    );
+                    for (request_index, _) in indexed_ranges {
+                        snapshot_results[request_index] = Some(Err(anyhow::anyhow!(error.clone())));
+                    }
+                }
+            }
+        }
 
         let mut results = Vec::with_capacity(batch_size);
-        for (&range_request, resolved) in ranges.iter().zip(pre_resolved) {
+        for (request_index, (&range_request, resolved)) in
+            ranges.iter().zip(pre_resolved).enumerate()
+        {
             // We need to preserve the order of the ranges.
             if let Some(resolved) = resolved {
                 results.push(resolved);
                 continue;
             }
 
-            let snapshot_result = persistence_iter
-                .next()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("fewer persistence results than expected")));
+            let snapshot_result = snapshot_results[request_index].take().unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "missing snapshot result for range request {request_index}"
+                ))
+            });
 
             let result = try_anyhow!({
                 let (snapshot_result_vec, cursor) = snapshot_result?;
@@ -349,9 +494,20 @@ impl TransactionIndex {
         // transactions if the search index is removed. In practice, that should
         // only happen as part of a push that would separately invalidate user
         // transactions anyway.
+        let printable_index_name = query.printable_index_name()?;
+        if let Some(partition_map) = &self.partition_map {
+            let table_name = printable_index_name.table();
+            let owner = partition_map.partition_for_table(table_name);
+            anyhow::ensure!(
+                table_name.is_system() || owner == partition_map.local_partition(),
+                "Text search on remote table {} requires an authoritative owner-search path; \
+                 local replica was not used",
+                table_name,
+            );
+        }
         let index = self
             .index_registry
-            .require_enabled(&index_name, &query.printable_index_name()?)?;
+            .require_enabled(&index_name, &printable_index_name)?;
         let empty = vec![];
         let pending_updates = self.text_index_updates.get(&index.id()).unwrap_or(&empty);
         let results = self
@@ -858,10 +1014,12 @@ mod tests {
         str::FromStr,
         sync::{
             Arc,
+            Mutex as StdMutex,
             OnceLock,
         },
     };
 
+    use async_trait::async_trait;
     use common::{
         bootstrap_model::index::{
             database_index::IndexedFields,
@@ -907,6 +1065,7 @@ mod tests {
         backend_in_memory_indexes::{
             BackendInMemoryIndexes,
             DatabaseIndexSnapshot,
+            IndexReader,
             RangeRequest,
         },
         index_registry::IndexRegistry,
@@ -924,12 +1083,72 @@ mod tests {
     };
     use value::assert_obj;
 
-    use super::TextIndexManagerSnapshot;
+    use super::{
+        SearchNotEnabled,
+        TextIndexManagerSnapshot,
+    };
     use crate::{
+        owner_read::{
+            OwnerAwareIndexReader,
+            OwnerIndexEntry,
+            OwnerIndexRangeResult,
+            OwnerReadClient,
+        },
+        partition::{
+            PartitionId,
+            PartitionMap,
+            PlacementVersion,
+        },
         query::IndexRangeResponse,
         transaction_index::TransactionIndex,
         FollowerRetentionManager,
+        ReadTimestampClosure,
     };
+
+    #[derive(Clone)]
+    struct OwnerReadCall {
+        owner: PartitionId,
+        placement_version: PlacementVersion,
+        snapshot_ts: Timestamp,
+        ranges: Vec<RangeRequest>,
+    }
+
+    struct FakeOwnerReadClient {
+        calls: Arc<StdMutex<Vec<OwnerReadCall>>>,
+        results: Vec<OwnerIndexRangeResult>,
+        failure: Option<String>,
+    }
+
+    #[async_trait]
+    impl OwnerReadClient for FakeOwnerReadClient {
+        async fn close_read_timestamp(
+            &self,
+            _owner_partition: PartitionId,
+            _placement_version: PlacementVersion,
+            target_ts: Timestamp,
+        ) -> anyhow::Result<ReadTimestampClosure> {
+            Ok(ReadTimestampClosure::Closed(target_ts))
+        }
+
+        async fn read_index_ranges(
+            &self,
+            owner_partition: PartitionId,
+            placement_version: PlacementVersion,
+            snapshot_ts: Timestamp,
+            ranges: Vec<RangeRequest>,
+        ) -> anyhow::Result<Vec<OwnerIndexRangeResult>> {
+            self.calls.lock().unwrap().push(OwnerReadCall {
+                owner: owner_partition,
+                placement_version,
+                snapshot_ts,
+                ranges,
+            });
+            if let Some(failure) = &self.failure {
+                anyhow::bail!(failure.clone());
+            }
+            Ok(self.results.clone())
+        }
+    }
 
     fn next_document_id(
         id_generator: &mut TestIdGenerator,
@@ -983,6 +1202,212 @@ mod tests {
             TextIndexManager::new(TextIndexManagerState::Bootstrapping, persistence.version());
 
         Ok((index_registry, index, search, index_id_by_name))
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_remote_ranges_use_owner_and_never_stale_local_mirror(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let mut id_generator = TestIdGenerator::new();
+        let table: TableName = "projects".parse()?;
+        let tablet_id = id_generator.user_table_id(&table).tablet_id;
+        let by_id = TabletIndexName::by_id(tablet_id);
+        let printable_by_id = IndexName::by_id(table.clone());
+        let persistence = Arc::new(TestPersistence::new());
+        let retention_manager =
+            Arc::new(FollowerRetentionManager::new(rt.clone(), persistence.clone()).await?);
+        let initial_ts = rt.generate_timestamp()?;
+        let repeatable = RepeatablePersistence::new(
+            persistence.clone(),
+            unchecked_repeatable_ts(initial_ts),
+            retention_manager.clone(),
+        );
+        let (mut index_registry, mut in_memory_indexes, _search, index_id_by_name) =
+            bootstrap_index(
+                &mut id_generator,
+                vec![IndexMetadata::new_enabled(
+                    by_id.clone(),
+                    IndexedFields::by_id(),
+                )],
+                repeatable,
+            )
+            .await?;
+
+        let stale = ResolvedDocument::new(
+            next_document_id(&mut id_generator, "projects")?,
+            CreationTime::ONE,
+            assert_obj!("name" => "stale mirror"),
+        )?;
+        let stale_ts = initial_ts.succ()?;
+        index_registry.update(None, Some(&stale))?;
+        let index_updates =
+            in_memory_indexes.update(&index_registry, stale_ts, None, Some(stale.clone()));
+        persistence
+            .write(
+                &[DocumentLogEntry {
+                    ts: stale_ts,
+                    id: stale.id_with_table_id(),
+                    value: Some(stale.clone()),
+                    prev_ts: None,
+                }],
+                &index_updates
+                    .into_iter()
+                    .map(|update| PersistenceIndexEntry::from_index_update(stale_ts, &update))
+                    .collect_vec(),
+                ConflictStrategy::Error,
+            )
+            .await?;
+        id_generator.write_tables(persistence.clone()).await?;
+
+        let snapshot_ts = stale_ts.succ()?;
+        let persistence_snapshot = RepeatablePersistence::new(
+            persistence,
+            unchecked_repeatable_ts(snapshot_ts),
+            retention_manager,
+        )
+        .read_snapshot(unchecked_repeatable_ts(snapshot_ts))?;
+        let local_reader: Arc<dyn IndexReader> = Arc::new(persistence_snapshot);
+        let database_index_snapshot = DatabaseIndexSnapshot::new(
+            index_registry.clone(),
+            Arc::new(in_memory_indexes),
+            id_generator.clone(),
+            local_reader.clone(),
+            None,
+            None,
+        );
+
+        let fresh = ResolvedDocument::new(
+            stale.id(),
+            CreationTime::ONE,
+            assert_obj!("name" => "authoritative owner"),
+        )?;
+        let owner_ts = snapshot_ts;
+        let owner_result = OwnerIndexRangeResult {
+            entries: vec![OwnerIndexEntry {
+                key: fresh.index_key(&IndexedFields::by_id()[..]).to_bytes(),
+                ts: owner_ts,
+                document: PackedDocument::pack(&fresh),
+            }],
+            cursor: CursorPosition::End,
+        };
+        let placement_version = PlacementVersion::new(9);
+        let partition_map = PartitionMap::from_config_with_version(
+            "projects=1",
+            PartitionId(0),
+            2,
+            placement_version,
+        );
+        let runner_calls = Arc::new(StdMutex::new(Vec::new()));
+        let runner_reader = OwnerAwareIndexReader::new(
+            unchecked_repeatable_ts(snapshot_ts),
+            local_reader,
+            Arc::new(FakeOwnerReadClient {
+                calls: runner_calls.clone(),
+                results: vec![owner_result.clone()],
+                failure: None,
+            }),
+            partition_map.clone(),
+            id_generator.clone(),
+            index_registry.clone(),
+        );
+        let page = runner_reader
+            .index_page(
+                index_id_by_name[&by_id].internal_id(),
+                tablet_id,
+                &Interval::all(),
+                Order::Asc,
+                100,
+            )
+            .await?;
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].value.unpack(), fresh);
+        assert_eq!(runner_calls.lock().unwrap().len(), 1);
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let owner_client = Arc::new(FakeOwnerReadClient {
+            calls: calls.clone(),
+            results: vec![owner_result],
+            failure: None,
+        });
+        let mut index = TransactionIndex::new_with_owner_reads(
+            index_registry.clone(),
+            database_index_snapshot.clone(),
+            Arc::new(SearchNotEnabled),
+            owner_client,
+            partition_map.clone(),
+            snapshot_ts,
+        );
+        let request = RangeRequest {
+            index_name: by_id.clone(),
+            printable_index_name: printable_by_id.clone(),
+            interval: Interval::all(),
+            order: Order::Asc,
+            max_size: 100,
+        };
+        let result = index.range(request.clone()).await?;
+        assert_eq!(result.page.len(), 1);
+        assert_eq!(result.page[0].1.unpack(), fresh);
+        assert_eq!(result.page[0].2, WriteTimestamp::Committed(owner_ts));
+        let recorded_calls = calls.lock().unwrap();
+        assert_eq!(recorded_calls.len(), 1);
+        assert_eq!(recorded_calls[0].owner, PartitionId(1));
+        assert_eq!(recorded_calls[0].placement_version, placement_version);
+        assert_eq!(recorded_calls[0].snapshot_ts, snapshot_ts);
+        assert_eq!(recorded_calls[0].ranges.len(), 1);
+        drop(recorded_calls);
+
+        let system_by_id =
+            TabletIndexName::by_id(id_generator.system_table_id(&INDEX_TABLE).tablet_id);
+        let system_request = RangeRequest {
+            index_name: system_by_id,
+            printable_index_name: IndexName::by_id((*INDEX_TABLE).clone()),
+            interval: Interval::all(),
+            order: Order::Asc,
+            max_size: 100,
+        };
+        index.range(system_request).await?;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "system-table ranges must retain route-specific local authority",
+        );
+
+        let pending = ResolvedDocument::new(
+            stale.id(),
+            CreationTime::ONE,
+            assert_obj!("name" => "transaction pending write"),
+        )?;
+        index
+            .begin_update(Some(fresh.clone()), Some(pending.clone()))?
+            .apply();
+        let overlaid = index.range(request.clone()).await?;
+        assert_eq!(overlaid.page.len(), 1);
+        assert_eq!(overlaid.page[0].1.unpack(), pending);
+        assert_eq!(overlaid.page[0].2, WriteTimestamp::Pending);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+
+        let failing_client = Arc::new(FakeOwnerReadClient {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            results: Vec::new(),
+            failure: Some("owner unavailable".to_string()),
+        });
+        let mut index = TransactionIndex::new_with_owner_reads(
+            index_registry,
+            database_index_snapshot,
+            Arc::new(SearchNotEnabled),
+            failing_client,
+            partition_map,
+            snapshot_ts,
+        );
+        let error = match index.range(request).await {
+            Ok(_) => anyhow::bail!("stale local mirror unexpectedly satisfied owner read"),
+            Err(error) => error,
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains("owner unavailable"), "{error}");
+        assert!(error.contains("local replica was not used"), "{error}");
+
+        Ok(())
     }
 
     #[convex_macro::prod_rt_test]
