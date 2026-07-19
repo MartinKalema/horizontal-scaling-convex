@@ -139,8 +139,7 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     // Start gRPC services (mutation forwarder + 2PC + Raft transport).
     if config.replication_mode == "primary" && config.nats_url.is_some() {
         let grpc_addr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
-        let api: std::sync::Arc<dyn application::api::ApplicationApi> =
-            std::sync::Arc::new(st.application.clone());
+        let api = st.cluster_aware_api();
         let cluster_grpc_auth = st.cluster_grpc_auth.clone();
         let forwarder =
             MutationForwarderService::new(api, st.instance_name.clone(), cluster_grpc_auth.clone());

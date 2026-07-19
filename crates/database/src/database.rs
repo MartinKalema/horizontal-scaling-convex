@@ -114,7 +114,10 @@ use errors::{
     ErrorMetadataAnyhowExt,
 };
 use futures::{
-    future::Either,
+    future::{
+        join_all,
+        Either,
+    },
     pin_mut,
     stream::BoxStream,
     FutureExt,
@@ -178,6 +181,7 @@ use crate::{
     committer::{
         Committer,
         CommitterClient,
+        ReadTimestampClosure,
     },
     defaults::{
         bootstrap_system_tables,
@@ -191,6 +195,7 @@ use crate::{
     },
     owner_read::{
         GrpcOwnerReadClient,
+        OwnerAwareIndexReader,
         OwnerIndexEntry,
         OwnerIndexRangeResult,
         OwnerReadClient,
@@ -1229,6 +1234,16 @@ impl<RT: Runtime> Database<RT> {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_owner_read_client_for_test(
+        &self,
+        owner_read_client: Arc<dyn OwnerReadClient>,
+    ) -> Self {
+        let mut database = self.clone();
+        database.owner_read_client = Some(owner_read_client);
+        database
+    }
+
+    #[cfg(test)]
     pub(crate) fn replication_frontier_for_test(
         &self,
         partition: crate::partition::PartitionId,
@@ -1819,6 +1834,147 @@ impl<RT: Runtime> Database<RT> {
         snapshot_manager.latest_ts()
     }
 
+    /// Build the index reader used while user code executes in Funrun.
+    ///
+    /// The function runner normally constructs its own persistence snapshot,
+    /// which is only authoritative for tables owned by this partition. In
+    /// cluster mode, replace that reader with one that sends remote user-table
+    /// ranges to their owner at the transaction's certified timestamp.
+    pub fn function_runner_index_reader(
+        &self,
+        ts: RepeatableTimestamp,
+    ) -> anyhow::Result<Option<Arc<dyn indexing::backend_in_memory_indexes::IndexReader>>> {
+        let (Some(owner_read_client), Some(partition_map)) = (
+            self.owner_read_client.clone(),
+            self.committer.partition_map(),
+        ) else {
+            return Ok(None);
+        };
+        if partition_map.num_partitions() <= 1 {
+            return Ok(None);
+        }
+
+        let snapshot = self.snapshot(ts)?;
+        let persistence_snapshot =
+            RepeatablePersistence::new(self.reader.clone(), ts, self.retention_validator())
+                .read_snapshot(ts)?;
+        Ok(Some(Arc::new(OwnerAwareIndexReader::new(
+            ts,
+            Arc::new(persistence_snapshot),
+            owner_read_client,
+            partition_map,
+            snapshot.table_registry.table_mapping().clone(),
+            snapshot.index_registry,
+        ))))
+    }
+
+    /// Establish one exact MVCC timestamp on every partition owner.
+    ///
+    /// TSO allocation alone is not a safe read timestamp: replica apply may
+    /// translate an origin timestamp forward in a node's local timeline. This
+    /// barrier raises the candidate until every current owner can persist and
+    /// serve the exact same timestamp without crossing unresolved 2PC state.
+    pub async fn cluster_safe_read_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
+        let Some(partition_map) = self.committer.partition_map() else {
+            return Ok(self.now_ts_for_reads());
+        };
+        if partition_map.num_partitions() <= 1 {
+            return Ok(self.now_ts_for_reads());
+        }
+
+        let deadline = Instant::now() + *REMOTE_READ_FRONTIER_WAIT_TIMEOUT;
+        // Read barriers do not consume write timestamps. Start from the local
+        // readable floor and let owners raise the candidate until every leader
+        // can close the same timestamp. This keeps reads available when the
+        // NATS-backed write timestamp oracle is unavailable.
+        let mut candidate = *self.now_ts_for_reads();
+        loop {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "Timed out after {:?} establishing a cluster-safe read timestamp",
+                *REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
+            );
+            match self
+                .close_cluster_read_timestamp(&partition_map, candidate)
+                .await?
+            {
+                ReadTimestampClosure::Closed(closed) => {
+                    anyhow::ensure!(
+                        closed == candidate,
+                        "Cluster read barrier closed at {} instead of requested {}",
+                        closed,
+                        candidate,
+                    );
+                    anyhow::ensure!(
+                        self.committer.placement_version() == partition_map.placement_version(),
+                        "Placement changed from {} while closing cluster read timestamp {}",
+                        partition_map.placement_version(),
+                        candidate,
+                    );
+                    let latest = self.now_ts_for_reads();
+                    return latest.prior_ts(candidate);
+                },
+                ReadTimestampClosure::RetryAt(retry_at) => candidate = retry_at,
+                ReadTimestampClosure::Blocked(_) => {
+                    self.runtime.wait(Duration::from_millis(5)).await;
+                },
+            }
+        }
+    }
+
+    async fn close_cluster_read_timestamp(
+        &self,
+        partition_map: &crate::partition::PartitionMap,
+        target: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        let owner_read_client = self
+            .owner_read_client
+            .as_ref()
+            .with_context(|| "Cluster-safe reads require the authoritative owner-read client")?;
+        let local_partition = partition_map.local_partition();
+        let placement_version = partition_map.placement_version();
+        let remote_closures = join_all(
+            partition_map
+                .all_partitions()
+                .into_iter()
+                .filter(|partition| *partition != local_partition)
+                .map(|partition| {
+                    owner_read_client.close_read_timestamp(partition, placement_version, target)
+                }),
+        );
+        let (local, remotes) =
+            futures::join!(self.committer.close_read_timestamp(target), remote_closures,);
+        let mut closures = Vec::with_capacity(partition_map.num_partitions() as usize);
+        closures.push(local?);
+        closures.extend(remotes.into_iter().collect::<anyhow::Result<Vec<_>>>()?);
+
+        let mut retry_at = None;
+        let mut blocked_at = None;
+        for closure in closures {
+            match closure {
+                ReadTimestampClosure::Closed(closed) => anyhow::ensure!(
+                    closed == target,
+                    "Partition closed read timestamp {} instead of requested {}",
+                    closed,
+                    target,
+                ),
+                ReadTimestampClosure::RetryAt(ts) => {
+                    retry_at = Some(retry_at.map_or(ts, |current| cmp::max(current, ts)));
+                },
+                ReadTimestampClosure::Blocked(ts) => {
+                    blocked_at = Some(blocked_at.map_or(ts, |current| cmp::min(current, ts)));
+                },
+            }
+        }
+        if let Some(ts) = retry_at {
+            Ok(ReadTimestampClosure::RetryAt(ts))
+        } else if let Some(ts) = blocked_at {
+            Ok(ReadTimestampClosure::Blocked(ts))
+        } else {
+            Ok(ReadTimestampClosure::Closed(target))
+        }
+    }
+
     /// Waits until the given write timestamp is observable for new
     /// transactions. Used by retry loops to ensure they observe the write.
     pub async fn wait_for_write_ts(&self, write_ts: Timestamp) {
@@ -2343,6 +2499,17 @@ impl<RT: Runtime> Database<RT> {
         self.read_set_table_names(token.reads())
     }
 
+    fn token_reads_remote_partition(&self, token: &Token) -> anyhow::Result<bool> {
+        let Some(partition_map) = self.committer.partition_map() else {
+            return Ok(false);
+        };
+        let local_partition = partition_map.local_partition();
+        Ok(self
+            .token_table_names(token)?
+            .iter()
+            .any(|table| partition_map.partition_for_table(table) != local_partition))
+    }
+
     pub fn note_recent_delta_interest_for_token(
         &self,
         token: &Token,
@@ -2832,6 +2999,14 @@ impl<RT: Runtime> Database<RT> {
         ts: Timestamp,
     ) -> anyhow::Result<Result<Token, Option<Timestamp>>> {
         let _timer = metrics::refresh_token_timer();
+        if token.ts() < ts && self.token_reads_remote_partition(&token)? {
+            // The local write log only reflects remote-owner writes after
+            // replication applies them. It therefore cannot prove that a
+            // cached result containing remote reads stayed valid through `ts`.
+            // Force a rerun, which reads remote ranges from their owners at the
+            // cluster-certified timestamp instead of serving a stale cache hit.
+            return Ok(Err(Some(token.ts().succ()?)));
+        }
         self.log.refresh_token(token, ts)
     }
 

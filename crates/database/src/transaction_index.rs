@@ -1065,6 +1065,7 @@ mod tests {
         backend_in_memory_indexes::{
             BackendInMemoryIndexes,
             DatabaseIndexSnapshot,
+            IndexReader,
             RangeRequest,
         },
         index_registry::IndexRegistry,
@@ -1088,6 +1089,7 @@ mod tests {
     };
     use crate::{
         owner_read::{
+            OwnerAwareIndexReader,
             OwnerIndexEntry,
             OwnerIndexRangeResult,
             OwnerReadClient,
@@ -1100,6 +1102,7 @@ mod tests {
         query::IndexRangeResponse,
         transaction_index::TransactionIndex,
         FollowerRetentionManager,
+        ReadTimestampClosure,
     };
 
     #[derive(Clone)]
@@ -1118,6 +1121,15 @@ mod tests {
 
     #[async_trait]
     impl OwnerReadClient for FakeOwnerReadClient {
+        async fn close_read_timestamp(
+            &self,
+            _owner_partition: PartitionId,
+            _placement_version: PlacementVersion,
+            target_ts: Timestamp,
+        ) -> anyhow::Result<ReadTimestampClosure> {
+            Ok(ReadTimestampClosure::Closed(target_ts))
+        }
+
         async fn read_index_ranges(
             &self,
             owner_partition: PartitionId,
@@ -1210,15 +1222,16 @@ mod tests {
             unchecked_repeatable_ts(initial_ts),
             retention_manager.clone(),
         );
-        let (mut index_registry, mut in_memory_indexes, _search, _) = bootstrap_index(
-            &mut id_generator,
-            vec![IndexMetadata::new_enabled(
-                by_id.clone(),
-                IndexedFields::by_id(),
-            )],
-            repeatable,
-        )
-        .await?;
+        let (mut index_registry, mut in_memory_indexes, _search, index_id_by_name) =
+            bootstrap_index(
+                &mut id_generator,
+                vec![IndexMetadata::new_enabled(
+                    by_id.clone(),
+                    IndexedFields::by_id(),
+                )],
+                repeatable,
+            )
+            .await?;
 
         let stale = ResolvedDocument::new(
             next_document_id(&mut id_generator, "projects")?,
@@ -1253,11 +1266,12 @@ mod tests {
             retention_manager,
         )
         .read_snapshot(unchecked_repeatable_ts(snapshot_ts))?;
+        let local_reader: Arc<dyn IndexReader> = Arc::new(persistence_snapshot);
         let database_index_snapshot = DatabaseIndexSnapshot::new(
             index_registry.clone(),
             Arc::new(in_memory_indexes),
             id_generator.clone(),
-            Arc::new(persistence_snapshot),
+            local_reader.clone(),
             None,
             None,
         );
@@ -1276,12 +1290,6 @@ mod tests {
             }],
             cursor: CursorPosition::End,
         };
-        let calls = Arc::new(StdMutex::new(Vec::new()));
-        let owner_client = Arc::new(FakeOwnerReadClient {
-            calls: calls.clone(),
-            results: vec![owner_result],
-            failure: None,
-        });
         let placement_version = PlacementVersion::new(9);
         let partition_map = PartitionMap::from_config_with_version(
             "projects=1",
@@ -1289,6 +1297,38 @@ mod tests {
             2,
             placement_version,
         );
+        let runner_calls = Arc::new(StdMutex::new(Vec::new()));
+        let runner_reader = OwnerAwareIndexReader::new(
+            unchecked_repeatable_ts(snapshot_ts),
+            local_reader,
+            Arc::new(FakeOwnerReadClient {
+                calls: runner_calls.clone(),
+                results: vec![owner_result.clone()],
+                failure: None,
+            }),
+            partition_map.clone(),
+            id_generator.clone(),
+            index_registry.clone(),
+        );
+        let page = runner_reader
+            .index_page(
+                index_id_by_name[&by_id].internal_id(),
+                tablet_id,
+                &Interval::all(),
+                Order::Asc,
+                100,
+            )
+            .await?;
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].value.unpack(), fresh);
+        assert_eq!(runner_calls.lock().unwrap().len(), 1);
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let owner_client = Arc::new(FakeOwnerReadClient {
+            calls: calls.clone(),
+            results: vec![owner_result],
+            failure: None,
+        });
         let mut index = TransactionIndex::new_with_owner_reads(
             index_registry.clone(),
             database_index_snapshot.clone(),

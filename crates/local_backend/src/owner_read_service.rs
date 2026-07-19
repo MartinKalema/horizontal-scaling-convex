@@ -25,13 +25,17 @@ use database::{
     raft_partition::RaftPartitionState,
     CommitterClient,
     Database,
+    ReadTimestampClosure,
 };
 use indexing::backend_in_memory_indexes::RangeRequest;
 use pb::replication::{
+    close_read_timestamp_response::Outcome as CloseReadTimestampOutcome,
     owner_read_service_server::{
         OwnerReadService,
         OwnerReadServiceServer as TonicOwnerReadServer,
     },
+    CloseReadTimestampRequest,
+    CloseReadTimestampResponse,
     OwnerReadIndexRange,
     OwnerReadIndexRangesRequest,
     OwnerReadIndexRangesResponse,
@@ -191,6 +195,52 @@ impl OwnerReadGrpcService {
 
 #[tonic::async_trait]
 impl OwnerReadService for OwnerReadGrpcService {
+    async fn close_read_timestamp(
+        &self,
+        request: Request<CloseReadTimestampRequest>,
+    ) -> Result<Response<CloseReadTimestampResponse>, Status> {
+        self.authenticate(&request)?;
+        let request = request.into_inner();
+        let owner_partition = PartitionId(request.owner_partition);
+        let local_partition = self.committer.local_partition().ok_or_else(|| {
+            Status::failed_precondition("Owner-read service requires a partitioned node")
+        })?;
+        if owner_partition != local_partition {
+            return Err(Status::failed_precondition(format!(
+                "Read barrier for {} reached {}",
+                owner_partition, local_partition,
+            )));
+        }
+
+        let placement_version = PlacementVersion::from(request.placement_version);
+        self.ensure_placement_version(placement_version).await?;
+        self.ensure_serving_leader()?;
+        let target_ts = request.target_ts.try_into().map_err(|error| {
+            Status::invalid_argument(format!("Invalid read barrier timestamp: {error:#}"))
+        })?;
+        let outcome = self
+            .committer
+            .close_read_timestamp(target_ts)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!("Failed to close owner read timestamp: {error:#}"))
+            })?;
+        // Recheck after the asynchronous persistence barrier. A leader that lost
+        // its lease while closing must not certify a cluster snapshot.
+        self.ensure_placement_version(placement_version).await?;
+        self.ensure_serving_leader()?;
+        let outcome = Some(match outcome {
+            ReadTimestampClosure::Closed(ts) => CloseReadTimestampOutcome::ClosedTs(u64::from(ts)),
+            ReadTimestampClosure::RetryAt(ts) => {
+                CloseReadTimestampOutcome::RetryAtTs(u64::from(ts))
+            },
+            ReadTimestampClosure::Blocked(ts) => {
+                CloseReadTimestampOutcome::BlockedTs(u64::from(ts))
+            },
+        });
+        Ok(Response::new(CloseReadTimestampResponse { outcome }))
+    }
+
     async fn read_index_ranges(
         &self,
         request: Request<OwnerReadIndexRangesRequest>,
@@ -224,6 +274,36 @@ impl OwnerReadService for OwnerReadGrpcService {
         let snapshot_ts = request.snapshot_ts.try_into().map_err(|error| {
             Status::invalid_argument(format!("Invalid owner-read snapshot timestamp: {error:#}"))
         })?;
+        match self
+            .committer
+            .close_read_timestamp(snapshot_ts)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "Owner could not verify read barrier {snapshot_ts}: {error:#}"
+                ))
+            })? {
+            ReadTimestampClosure::Closed(closed) if closed == snapshot_ts => {},
+            ReadTimestampClosure::Closed(closed) => {
+                return Err(Status::internal(format!(
+                    "Owner certified read barrier {closed} instead of {snapshot_ts}"
+                )));
+            },
+            ReadTimestampClosure::RetryAt(local_floor) => {
+                return Err(Status::unavailable(format!(
+                    "Owner read barrier {snapshot_ts} is not portable to this leader; local floor \
+                     is {local_floor}"
+                )));
+            },
+            ReadTimestampClosure::Blocked(prepared_ts) => {
+                return Err(Status::unavailable(format!(
+                    "Owner read barrier {snapshot_ts} is blocked by prepared transaction at \
+                     {prepared_ts}"
+                )));
+            },
+        }
+        self.ensure_placement_version(placement_version).await?;
+        self.ensure_serving_leader()?;
         let ranges = request
             .ranges
             .into_iter()
