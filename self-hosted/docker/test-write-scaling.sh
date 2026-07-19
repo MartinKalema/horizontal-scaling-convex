@@ -2858,6 +2858,20 @@ echo -e "${BOLD}Test 26: NATS Partition Simulation${NC}"
 echo "  Pausing NATS for 3 seconds..."
 docker pause docker-nats-1 > /dev/null 2>&1
 
+# Strong remote reads use the partition owner directly, not the NATS-maintained
+# local mirror. The task was written to partition 1 in Test 25, so querying it
+# through partition 0 must remain available while NATS is paused.
+OWNER_READ_DURING_NATS=$(curl --max-time 10 -sf "$NODE_A_URL/api/query" \
+    -H "Authorization: Convex $NODE_A_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"path\":\"messages:countTasksByTitle\",\"args\":{\"title\":\"$DJ_KEY\"}}" 2>/dev/null || true)
+OWNER_READ_DURING_NATS_COUNT=$(python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" \
+    <<< "$OWNER_READ_DURING_NATS" 2>/dev/null || echo -1)
+[ "$OWNER_READ_DURING_NATS_COUNT" -eq 1 ] \
+    && pass "Partition 0 read partition-1-owned data while NATS was unavailable" \
+    || fail "Owner-authoritative remote read depended on NATS or stale local state" \
+        "expected task count 1, got $OWNER_READ_DURING_NATS_COUNT; response=$OWNER_READ_DURING_NATS"
+
 # Write during NATS outage. It may fail closed if the TSO/decision path cannot
 # make progress, but if it is accepted then the Raft/NATS outbox must replay it
 # after recovery.

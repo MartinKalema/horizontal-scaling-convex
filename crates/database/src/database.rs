@@ -127,6 +127,7 @@ use indexing::{
         BackendInMemoryIndexes,
         DatabaseIndexSnapshot,
         NoInMemoryIndexes,
+        RangeRequest,
         TimestampedIndexCache,
     },
     index_cache::SharedIndexCache,
@@ -187,6 +188,12 @@ use crate::{
         load_indexes_into_memory_timer,
         vector::vector_search_with_retries_timer,
         verify_invariants_timer,
+    },
+    owner_read::{
+        GrpcOwnerReadClient,
+        OwnerIndexEntry,
+        OwnerIndexRangeResult,
+        OwnerReadClient,
     },
     retention::{
         LeaderRetentionManager,
@@ -302,6 +309,7 @@ pub struct Database<RT: Runtime> {
     shared_index_cache: Option<SharedIndexCache>,
     virtual_system_mapping: VirtualSystemMapping,
     table_number_allocator: Arc<dyn TableNumberAllocator>,
+    owner_read_client: Option<Arc<dyn OwnerReadClient>>,
     pub bootstrap_metadata: BootstrapMetadata,
     // Caches of snapshot TableMapping and by_id index ids, which are used repeatedly by
     // /api/list_snapshot.
@@ -1126,6 +1134,7 @@ impl<RT: Runtime> Database<RT> {
         } else {
             distributed_log.clone()
         };
+        let owner_read_cluster_auth = cluster_grpc_auth.clone();
         let committer = Committer::start(
             log_writer,
             snapshot_writer,
@@ -1146,6 +1155,12 @@ impl<RT: Runtime> Database<RT> {
             applied_data_delta_ids,
             raft_apply_markers,
         );
+        let owner_read_client = committer.local_partition().map(|_| {
+            Arc::new(GrpcOwnerReadClient::new(
+                committer.clone(),
+                owner_read_cluster_auth,
+            )) as Arc<dyn OwnerReadClient>
+        });
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
         let by_id_indexes_snapshot_cache =
@@ -1168,6 +1183,7 @@ impl<RT: Runtime> Database<RT> {
             shared_index_cache,
             virtual_system_mapping,
             table_number_allocator,
+            owner_read_client,
             bootstrap_metadata,
             table_mapping_snapshot_cache,
             by_id_indexes_snapshot_cache,
@@ -1200,6 +1216,16 @@ impl<RT: Runtime> Database<RT> {
     #[cfg(test)]
     pub(crate) fn committer_for_test(&self) -> CommitterClient {
         self.committer.clone()
+    }
+
+    /// Return a test-only view that reads this node's local replica directly.
+    /// Public transactions must keep owner reads enabled; replication tests use
+    /// this only to inspect the state that an apply operation materialized.
+    #[cfg(test)]
+    pub(crate) fn with_local_replica_reads_for_test(&self) -> Self {
+        let mut database = self.clone();
+        database.owner_read_client = None;
+        database
     }
 
     #[cfg(test)]
@@ -1713,6 +1739,81 @@ impl<RT: Runtime> Database<RT> {
         Ok((entries, cursor))
     }
 
+    /// Read index ranges from this partition's authoritative MVCC state.
+    ///
+    /// The caller has already pinned placement and verified ownership. We wait
+    /// briefly for the local state machine to reach the requested logical
+    /// timestamp, then read every range from one repeatable snapshot. We never
+    /// lower the timestamp or substitute a replica mirror.
+    pub async fn authoritative_index_ranges(
+        &self,
+        snapshot_ts: Timestamp,
+        ranges: Vec<RangeRequest>,
+    ) -> anyhow::Result<Vec<OwnerIndexRangeResult>> {
+        if *self.now_ts_for_reads() < snapshot_ts {
+            let target = snapshot_ts.pred()?;
+            let wait = self.snapshot_manager.lock().wait_for_higher_ts(target);
+            tokio::time::timeout(*REMOTE_READ_FRONTIER_WAIT_TIMEOUT, wait)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Timed out after {:?} waiting for owner snapshot {}",
+                        *REMOTE_READ_FRONTIER_WAIT_TIMEOUT, snapshot_ts,
+                    )
+                })?;
+        }
+
+        let latest_ts = self.now_ts_for_reads();
+        anyhow::ensure!(
+            *latest_ts >= snapshot_ts,
+            "Owner cannot serve snapshot {} because its applied state is only at {}",
+            snapshot_ts,
+            latest_ts,
+        );
+        let repeatable_ts = latest_ts.prior_ts(snapshot_ts)?;
+        let snapshot = self.snapshot_manager.lock().snapshot(*repeatable_ts)?;
+
+        for range in &ranges {
+            anyhow::ensure!(
+                !range.printable_index_name.table().is_system(),
+                "Owner read RPC only serves partitioned user tables; system table {} uses its \
+                 route-specific authority",
+                range.printable_index_name.table(),
+            );
+        }
+        let persistence_snapshot = RepeatablePersistence::new(
+            self.reader.clone(),
+            repeatable_ts,
+            self.retention_validator(),
+        )
+        .read_snapshot(repeatable_ts)?;
+        let mut database_index_snapshot = DatabaseIndexSnapshot::new(
+            snapshot.index_registry,
+            Arc::new(snapshot.in_memory_indexes),
+            snapshot.table_registry.table_mapping().clone(),
+            Arc::new(persistence_snapshot),
+            self.shared_index_cache.clone(),
+            None,
+        );
+        let range_refs: Vec<_> = ranges.iter().collect();
+        let results = database_index_snapshot.range_batch(&range_refs).await;
+        results
+            .into_iter()
+            .map(|result| {
+                let (entries, cursor) = result?;
+                let entries = entries
+                    .into_iter()
+                    .map(|(key, ts, document)| OwnerIndexEntry {
+                        key,
+                        ts,
+                        document: document.pack(),
+                    })
+                    .collect();
+                Ok(OwnerIndexRangeResult { entries, cursor })
+            })
+            .collect()
+    }
+
     pub fn now_ts_for_reads(&self) -> RepeatableTimestamp {
         let snapshot_manager = self.snapshot_manager.lock();
         snapshot_manager.latest_ts()
@@ -2007,30 +2108,47 @@ impl<RT: Runtime> Database<RT> {
         let begin_ts = cmp::max(latest_ts.succ()?, self.runtime.generate_timestamp()?);
         let creation_time = CreationTime::try_from(begin_ts)?;
         let id_generator = TransactionIdGenerator::new(&self.runtime)?;
-        let transaction_index = TransactionIndex::new(
+        let database_index_snapshot = DatabaseIndexSnapshot::new(
             snapshot.index_registry.clone(),
-            DatabaseIndexSnapshot::new(
-                snapshot.index_registry.clone(),
-                Arc::new(snapshot.in_memory_indexes),
-                snapshot.table_registry.table_mapping().clone(),
-                Arc::new(
-                    RepeatablePersistence::new(
-                        self.reader.clone(),
-                        repeatable_ts,
-                        self.retention_manager.clone(),
-                    )
-                    .read_snapshot(repeatable_ts)?,
-                ),
-                self.shared_index_cache.clone(),
-                index_cache,
+            Arc::new(snapshot.in_memory_indexes),
+            snapshot.table_registry.table_mapping().clone(),
+            Arc::new(
+                RepeatablePersistence::new(
+                    self.reader.clone(),
+                    repeatable_ts,
+                    self.retention_manager.clone(),
+                )
+                .read_snapshot(repeatable_ts)?,
             ),
-            Arc::new(TextIndexManagerSnapshot::new(
-                snapshot.index_registry,
-                snapshot.text_indexes,
-                self.searcher.clone(),
-                self.search_storage.clone(),
-            )),
+            self.shared_index_cache.clone(),
+            index_cache,
         );
+        let text_index_snapshot = Arc::new(TextIndexManagerSnapshot::new(
+            snapshot.index_registry.clone(),
+            snapshot.text_indexes,
+            self.searcher.clone(),
+            self.search_storage.clone(),
+        ));
+        let transaction_index = match (
+            self.owner_read_client.clone(),
+            self.committer.partition_map(),
+        ) {
+            (Some(owner_read_client), Some(partition_map)) => {
+                TransactionIndex::new_with_owner_reads(
+                    snapshot.index_registry.clone(),
+                    database_index_snapshot,
+                    text_index_snapshot,
+                    owner_read_client,
+                    partition_map,
+                    *repeatable_ts,
+                )
+            },
+            _ => TransactionIndex::new(
+                snapshot.index_registry.clone(),
+                database_index_snapshot,
+                text_index_snapshot,
+            ),
+        };
         let count_snapshot = Arc::new(snapshot.table_summaries);
         let tx = Transaction::new_with_table_number_allocator(
             identity,
