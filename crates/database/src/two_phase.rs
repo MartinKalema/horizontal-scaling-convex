@@ -32,8 +32,21 @@ use async_nats::jetstream::kv::{
 };
 use async_trait::async_trait;
 use common::{
-    bootstrap_model::index::database_index::IndexedFields,
-    document::DocumentUpdateWithPrevTs,
+    bootstrap_model::{
+        index::{
+            database_index::IndexedFields,
+            TabletIndexMetadata,
+            INDEX_TABLE,
+        },
+        tables::{
+            TableMetadata,
+            TABLES_TABLE,
+        },
+    },
+    document::{
+        DocumentUpdateWithPrevTs,
+        ParseDocument,
+    },
     grpc::ClusterGrpcAuth,
     interval::IntervalSet,
     query::FilterValue,
@@ -1211,6 +1224,98 @@ pub struct ParticipantTabletMetadata {
     pub table_name: TableName,
 }
 
+pub(crate) fn user_catalog_write_target(
+    transaction: &FinalTransaction,
+    write: &DocumentUpdateWithPrevTs,
+) -> anyhow::Result<Option<ParticipantTabletMetadata>> {
+    let Some(catalog_table) = transaction
+        .table_mapping
+        .tablet_name(write.id.tablet_id)
+        .ok()
+    else {
+        return Ok(None);
+    };
+    if &catalog_table != &*TABLES_TABLE && &catalog_table != &*INDEX_TABLE {
+        return Ok(None);
+    }
+    let Some(document) = write
+        .new_document
+        .as_ref()
+        .or_else(|| write.old_document.as_ref().map(|(document, _)| document))
+    else {
+        return Ok(None);
+    };
+
+    let metadata = if &catalog_table == &*TABLES_TABLE {
+        let table: common::document::ParsedDocument<TableMetadata> =
+            document.parse().with_context(|| {
+                format!(
+                    "failed to parse _tables catalog metadata while routing write {:?}",
+                    write.id
+                )
+            })?;
+        let table = table.into_value();
+        ParticipantTabletMetadata {
+            tablet_id: TabletId(write.id.internal_id()),
+            namespace: table.namespace,
+            table_number: table.number,
+            table_name: table.name,
+        }
+    } else {
+        let index: common::document::ParsedDocument<TabletIndexMetadata> =
+            document.parse().with_context(|| {
+                format!(
+                    "failed to parse _index catalog metadata while routing write {:?}",
+                    write.id
+                )
+            })?;
+        let indexed_tablet = *index.into_value().name.table();
+        ParticipantTabletMetadata {
+            tablet_id: indexed_tablet,
+            namespace: transaction
+                .table_mapping
+                .tablet_namespace(indexed_tablet)
+                .with_context(|| {
+                    format!(
+                        "_index catalog metadata for write {:?} references unknown tablet {:?}",
+                        write.id, indexed_tablet
+                    )
+                })?,
+            table_number: transaction
+                .table_mapping
+                .tablet_number(indexed_tablet)
+                .with_context(|| {
+                    format!(
+                        "_index catalog metadata for write {:?} references unknown tablet {:?}",
+                        write.id, indexed_tablet
+                    )
+                })?,
+            table_name: transaction
+                .table_mapping
+                .tablet_name(indexed_tablet)
+                .with_context(|| {
+                    format!(
+                        "_index catalog metadata for write {:?} references unknown tablet {:?}",
+                        write.id, indexed_tablet
+                    )
+                })?,
+        }
+    };
+
+    Ok((!metadata.table_name.is_system()).then_some(metadata))
+}
+
+pub(crate) fn transaction_has_user_catalog_writes(
+    transaction: &FinalTransaction,
+) -> anyhow::Result<bool> {
+    for write in transaction.writes.coalesced_writes() {
+        if user_catalog_write_target(transaction, write)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(any(test, feature = "testing"), derive(PartialEq))]
 pub struct ParticipantTransaction {
@@ -1236,10 +1341,18 @@ impl ParticipantTransaction {
             .map(|(_, write)| write.clone())
             .collect();
 
+        let metadata_authority = (partition_map.enforces_catalog_coherence()
+            && transaction_has_user_catalog_writes(transaction)?)
+        .then(|| partition_map.partition_for_table(&TABLES_TABLE));
         let belongs_to_participant = |tablet_id: TabletId| -> bool {
             let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) else {
                 return false;
             };
+            if metadata_authority.is_some()
+                && (&table_name == &*TABLES_TABLE || &table_name == &*INDEX_TABLE)
+            {
+                return metadata_authority == Some(participant);
+            }
             match routed_partition_for_table(&table_name, partition_map, write_source) {
                 Some(owner) => owner == participant,
                 None => participant == partition_map.local_partition(),
@@ -1288,8 +1401,18 @@ impl ParticipantTransaction {
         for (index_name, _) in reads.iter_search() {
             record_tablet(*index_name.table())?;
         }
+        let mut catalog_tablet_metadata = Vec::new();
         for write in &selected_writes {
             record_tablet(write.id.tablet_id)?;
+            if let Some(metadata) = user_catalog_write_target(transaction, write)? {
+                catalog_tablet_metadata.push(metadata);
+            }
+        }
+        drop(record_tablet);
+        for metadata in catalog_tablet_metadata {
+            tablet_metadata
+                .entry(metadata.tablet_id)
+                .or_insert(metadata);
         }
 
         Ok(Self {

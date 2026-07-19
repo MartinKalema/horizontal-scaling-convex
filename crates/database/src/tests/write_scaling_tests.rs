@@ -425,6 +425,11 @@ impl DistributedLog for SwitchableDistributedLog {
 
 fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1", local_partition, 2)
+        .without_catalog_authority_for_test()
+}
+
+fn strict_partitioned_map(local_partition: PartitionId) -> PartitionMap {
+    PartitionMap::from_config("messages=0,projects=1", local_partition, 2)
 }
 
 struct RetryOnceOwnerReadClient {
@@ -507,18 +512,22 @@ fn partitioned_map_with_version(
         2,
         placement_version,
     )
+    .without_catalog_authority_for_test()
 }
 
 fn partitioned_map_with_tasks(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1,tasks=1", local_partition, 2)
+        .without_catalog_authority_for_test()
 }
 
 fn partitioned_map_with_users_and_tasks(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("users=0,tasks=1", local_partition, 2)
+        .without_catalog_authority_for_test()
 }
 
 fn three_partitioned_map(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1,tasks=2", local_partition, 3)
+        .without_catalog_authority_for_test()
 }
 
 async fn insert_doc_get_id(
@@ -1385,6 +1394,74 @@ where
     })
 }
 
+async fn create_strict_catalog_cluster(
+    rt: &TestRuntime,
+) -> anyhow::Result<(
+    Arc<InMemoryDistributedLog>,
+    Database<TestRuntime>,
+    Database<TestRuntime>,
+    TestGrpcServerHandle,
+    TestGrpcServerHandle,
+)> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+    let table_number_allocator: Arc<dyn TableNumberAllocator> =
+        Arc::new(InMemoryTableNumberAllocator::default());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let authority = create_node_with_persistence_and_table_number_allocator(
+        rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(strict_partitioned_map(PartitionId(0))),
+        None,
+        decision_log.clone(),
+        Some(tso.clone()),
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let owner = create_node_with_persistence_and_table_number_allocator(
+        rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(strict_partitioned_map(PartitionId(1))),
+        None,
+        decision_log,
+        Some(tso),
+        table_number_allocator,
+    )
+    .await?;
+    let authority_server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+        authority.committer_for_test(),
+    ))
+    .await?;
+    let owner_server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+        owner.committer_for_test(),
+    ))
+    .await?;
+    let membership = MembershipSnapshot::new(
+        MembershipVersion::new(1),
+        vec![
+            NodeMembership::new(
+                ClusterNodeId::new("catalog-authority")?,
+                PartitionId(0),
+                authority_server.addr(),
+            )?,
+            NodeMembership::new(
+                ClusterNodeId::new("catalog-owner")?,
+                PartitionId(1),
+                owner_server.addr(),
+            )?,
+        ],
+    );
+    authority
+        .committer_for_test()
+        .refresh_membership_snapshot(membership.clone())?;
+    owner
+        .committer_for_test()
+        .refresh_membership_snapshot(membership)?;
+    Ok((log, authority, owner, authority_server, owner_server))
+}
+
 /// Partitioned nodes should still fail closed when ownership routing is
 /// impossible because the cluster has no owner address map.
 #[convex_macro::test_runtime]
@@ -1394,21 +1471,19 @@ async fn test_partition_enforcement(rt: TestRuntime) -> anyhow::Result<()> {
     let node_a = create_node(
         &rt,
         log.clone(),
-        Some(PartitionMap::from_config(
-            "messages=0,projects=1",
-            PartitionId(0),
-            2,
-        )),
+        Some(
+            PartitionMap::from_config("messages=0,projects=1", PartitionId(0), 2)
+                .without_catalog_authority_for_test(),
+        ),
     )
     .await?;
     let node_b = create_node(
         &rt,
         log.clone(),
-        Some(PartitionMap::from_config(
-            "messages=0,projects=1",
-            PartitionId(1),
-            2,
-        )),
+        Some(
+            PartitionMap::from_config("messages=0,projects=1", PartitionId(1), 2)
+                .without_catalog_authority_for_test(),
+        ),
     )
     .await?;
 
@@ -5247,11 +5322,16 @@ async fn test_watcher_recovers_staged_prepare_after_participant_leader_failover(
 }
 
 #[convex_macro::test_runtime]
-async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
+async fn test_remote_table_catalog_writes_commit_on_authority_and_owner(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
     let log = Arc::new(InMemoryDistributedLog::new());
-    let source = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let source = create_node(
+        &rt,
+        log.clone(),
+        Some(strict_partitioned_map(PartitionId(0))),
+    )
+    .await?;
 
     let mut tx = source.begin(Identity::system()).await?;
     TestFacingModel::new(&mut tx)
@@ -5262,22 +5342,37 @@ async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
         .await?;
     let final_tx = tx.finalize()?;
     let write_source = WriteSource::new("remote_catalog_owner_prepare_test");
-    let source_map = partitioned_map(PartitionId(0));
+    let source_map = strict_partitioned_map(PartitionId(0));
     let participant_indexes = crate::two_phase_coordinator::participant_write_indexes(
         &final_tx,
         &source_map,
         &write_source,
     )?;
+    let authority_writes = participant_indexes
+        .get(&PartitionId(0))
+        .expect("catalog metadata should route to partition 0");
     let owner_writes = participant_indexes
         .get(&PartitionId(1))
         .expect("projects writes and catalog metadata should route to partition 1");
-    assert_eq!(participant_indexes.len(), 1);
+    assert_eq!(participant_indexes.len(), 2);
+    assert_eq!(
+        authority_writes.len() + 1,
+        owner_writes.len(),
+        "the owner should additionally receive the first projects document",
+    );
     assert_eq!(
         owner_writes.len(),
         final_tx.writes.coalesced_writes().count()
     );
 
-    let owner = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+    let owner = create_node(&rt, log, Some(strict_partitioned_map(PartitionId(1)))).await?;
+    let authority_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(0),
+        authority_writes,
+        &source_map,
+        &write_source,
+    )?;
     let participant_tx = ParticipantTransaction::from_final_transaction(
         &final_tx,
         PartitionId(1),
@@ -5287,6 +5382,13 @@ async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
     )?;
     let txn_id = TwoPhaseTransactionId::new();
     let prepare_ts = owner.committer_for_test().allocate_commit_ts().await?;
+    let authority_redo = TwoPhaseRedoEntry::new(
+        &txn_id,
+        prepare_ts,
+        PartitionId(0),
+        authority_tx,
+        &write_source,
+    )?;
     let redo = TwoPhaseRedoEntry::new(
         &txn_id,
         prepare_ts,
@@ -5295,13 +5397,32 @@ async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
         &write_source,
     )?;
 
+    source
+        .committer_for_test()
+        .apply_raft_prepared_redo(1, authority_redo)
+        .await?;
     owner
         .committer_for_test()
         .apply_raft_prepared_redo(1, redo)
         .await?;
+    let authority_committed_ts = source
+        .committer_for_test()
+        .commit_prepared(txn_id.clone())
+        .await?;
     let committed_ts = owner.committer_for_test().commit_prepared(txn_id).await?;
+    assert_eq!(authority_committed_ts, prepare_ts);
     assert_eq!(committed_ts, prepare_ts);
 
+    let coordinator_projects = run_local_replica_query(
+        source,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        coordinator_projects.is_empty(),
+        "the coordinator should resolve the new catalog immediately without mirroring owner data",
+    );
     let projects = run_query(
         owner.clone(),
         TableNamespace::root_component(),
@@ -5310,6 +5431,205 @@ async fn test_remote_table_catalog_writes_follow_owner_prepare_redo(
     .await?;
     assert_eq!(projects.len(), 1);
     Ok(())
+}
+
+#[test]
+fn test_fresh_remote_table_commit_materializes_catalog_before_response() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let table_number_allocator: Arc<dyn TableNumberAllocator> =
+            Arc::new(InMemoryTableNumberAllocator::default());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+
+        let owner = create_node_with_persistence_and_table_number_allocator(
+            &rt,
+            Arc::new(TestPersistence::new()),
+            log.clone(),
+            Some(strict_partitioned_map(PartitionId(1))),
+            None,
+            decision_log.clone(),
+            Some(tso.clone()),
+            table_number_allocator.clone(),
+        )
+        .await?;
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::new(
+            owner.committer_for_test(),
+        ))
+        .await?;
+        let authority = create_node_with_persistence_and_table_number_allocator(
+            &rt,
+            Arc::new(TestPersistence::new()),
+            log.clone(),
+            Some(strict_partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            decision_log,
+            Some(tso),
+            table_number_allocator,
+        )
+        .await?;
+
+        let commit_ts = insert_doc(
+            &authority,
+            "projects",
+            assert_obj!("name" => "fresh-remote-project"),
+        )
+        .await?;
+
+        let local_catalog_view = run_local_replica_query(
+            authority.clone(),
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        assert!(
+            local_catalog_view.is_empty(),
+            "catalog authority should resolve the new table without mirroring its owner data",
+        );
+        let owner_rows = run_query(
+            owner,
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        assert_eq!(owner_rows.len(), 1);
+
+        let committed_deltas: Vec<_> = log
+            .deltas()
+            .into_iter()
+            .filter(|delta| delta.ts == commit_ts)
+            .collect();
+        assert_eq!(
+            committed_deltas.len(),
+            2,
+            "catalog authority and data owner should publish one committed half each",
+        );
+        assert!(
+            committed_deltas.iter().any(|delta| {
+                delta.source_partition == Some(PartitionId(0)) && !delta.document_updates.is_empty()
+            }),
+            "partition 0 must commit catalog metadata before the mutation returns",
+        );
+        assert!(
+            committed_deltas.iter().any(|delta| {
+                delta.source_partition == Some(PartitionId(1)) && delta.document_updates.len() > 1
+            }),
+            "partition 1 must atomically commit catalog metadata and the first document",
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_owner_entrypoint_materializes_fresh_catalog_on_authority() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let (_log, authority, owner, authority_server, owner_server) =
+            create_strict_catalog_cluster(&rt).await?;
+
+        insert_doc(
+            &owner,
+            "projects",
+            assert_obj!("name" => "owner-created-project"),
+        )
+        .await?;
+
+        let authority_catalog_view = run_local_replica_query(
+            authority,
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        assert!(
+            authority_catalog_view.is_empty(),
+            "partition 0 should resolve a table created through partition 1 without a NATS delta",
+        );
+        let owner_rows = run_query(
+            owner,
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        assert_eq!(owner_rows.len(), 1);
+
+        authority_server.shutdown().await?;
+        owner_server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_stale_same_name_creation_aborts_before_retrying_winning_catalog() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let (_log, authority, owner, authority_server, owner_server) =
+            create_strict_catalog_cluster(&rt).await?;
+
+        let mut stale = owner.begin(Identity::system()).await?;
+        TestFacingModel::new(&mut stale)
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "must-not-commit"),
+            )
+            .await?;
+
+        insert_doc(
+            &authority,
+            "projects",
+            assert_obj!("name" => "winning-first-write"),
+        )
+        .await?;
+
+        let stale_error = owner
+            .commit(stale)
+            .await
+            .expect_err("the stale same-name catalog proposal must not commit");
+        assert!(
+            format!("{stale_error:#}").contains("duplicate table"),
+            "stale creator should lose at the catalog authority: {stale_error:#}",
+        );
+
+        insert_doc(
+            &owner,
+            "projects",
+            assert_obj!("name" => "retry-after-catalog-refresh"),
+        )
+        .await?;
+
+        let mut authority_tx = authority.begin(Identity::system()).await?;
+        let authority_table = authority_tx
+            .table_mapping()
+            .namespace(TableNamespace::root_component())
+            .id(&"projects".parse()?)?;
+        let mut owner_tx = owner.begin(Identity::system()).await?;
+        let owner_table = owner_tx
+            .table_mapping()
+            .namespace(TableNamespace::root_component())
+            .id(&"projects".parse()?)?;
+        assert_eq!(authority_table, owner_table);
+
+        let owner_rows = run_query(
+            owner,
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        assert_eq!(
+            owner_rows.len(),
+            2,
+            "the aborted stale first write must stay hidden and the retry must commit once",
+        );
+
+        authority_server.shutdown().await?;
+        owner_server.shutdown().await?;
+        Ok(())
+    })
 }
 
 #[convex_macro::test_runtime]

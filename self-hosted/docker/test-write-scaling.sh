@@ -27,6 +27,7 @@
 #   9k. Post-Ack 2PC Exactness After Cleanup-Window Restarts
 #   9l. Parallel 2PC Early-Ack Code-Path Proof
 #   9m. Cluster-Safe Latest Reads With Delayed Participant Delta
+#   0. Fresh Remote Catalog Coherence
 #  10. Rapid-Fire Writes Under Load (Jepsen stress)
 #  11. Write-Then-Immediate-Read Consistency (stale read detection)
 #  12. Double Node Restart (crash recovery stress)
@@ -306,6 +307,24 @@ export const createTask = mutation({
   args: { title: v.string(), assignee: v.string(), project: v.string(), status: v.string() },
   handler: async (ctx, args) => {
     return await ctx.db.insert("tasks", { ...args, createdAt: Date.now() });
+  },
+});
+
+export const createCatalogProbe = mutation({
+  args: { runId: v.string(), token: v.string() },
+  handler: async (ctx, args) => {
+    return await ctx.db.insert("catalog_probe", args);
+  },
+});
+
+export const catalogProbeTokens = query({
+  args: { runId: v.string() },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db.query("catalog_probe").collect();
+    return rows
+      .filter((row: any) => row.runId === args.runId)
+      .map((row: any) => row.token as string)
+      .sort();
   },
 });
 
@@ -590,6 +609,59 @@ subscription = client.onUpdate(
 setTimeout(() => void finish(5, "timeout"), 25000);
 JSEOF
 
+cat > "$DEPLOY_DIR/catalog-coherence-subscription.mjs" << 'JSEOF'
+import { ConvexClient } from "convex/browser";
+import { api } from "./convex/_generated/api.js";
+
+const [url, runId, expectedCountRaw] = process.argv.slice(2);
+const expectedCount = Number(expectedCountRaw);
+const client = new ConvexClient(url, { unsavedChangesWarning: false });
+let subscription;
+let finished = false;
+let sawInitial = false;
+
+const finish = async (code, event, details = {}) => {
+  if (finished) return;
+  finished = true;
+  console.log(JSON.stringify({ event, ...details }));
+  subscription?.unsubscribe();
+  await Promise.race([
+    client.close(),
+    new Promise((resolve) => setTimeout(resolve, 1000)),
+  ]);
+  process.exit(code);
+};
+
+subscription = client.onUpdate(
+  api.messages.catalogProbeTokens,
+  { runId },
+  async (tokens) => {
+    console.log(JSON.stringify({ event: "value", tokens }));
+    if (!sawInitial) {
+      if (tokens.length !== 0) {
+        await finish(2, "unexpected-initial", { tokens });
+        return;
+      }
+      sawInitial = true;
+      console.log(JSON.stringify({ event: "ready" }));
+      return;
+    }
+    if (tokens.length > expectedCount) {
+      await finish(3, "duplicate", { tokens });
+      return;
+    }
+    if (tokens.length === expectedCount) {
+      await finish(0, "complete", { tokens });
+    }
+  },
+  async (error) => {
+    await finish(4, "error", { message: String(error) });
+  },
+);
+
+setTimeout(() => void finish(5, "timeout"), 20000);
+JSEOF
+
 deploy_functions_with_retry() {
     local key="$1"
     local url="$2"
@@ -857,6 +929,234 @@ assert_cross_partition_write_exact_once() {
     fail "$label did not appear exactly once" "messages=$msg_count tasks=$task_count"
     return 1
 }
+
+# ============================================================
+echo ""
+echo -e "${BOLD}Test 0: Fresh Remote Catalog Coherence${NC}"
+# ============================================================
+# catalog_probe is assigned to partition 1 and has never been written. All six
+# public entrypoints race its first implicit creation while partition 0's NATS
+# consumer is paused. A successful response must mean the catalog is already
+# committed through partition 0's Raft group and the row through partition 1's
+# group; neither immediate reads nor subscription reruns may depend on NATS.
+
+CATALOG_RUN="catalog-$(date +%s)-$$"
+CATALOG_EXPECTED="p0a,p0b,p0c,p1a,p1b,p1c"
+CATALOG_SUB_LOG=$(mktemp)
+CATALOG_TMP_DIR=$(mktemp -d)
+CATALOG_COORDINATOR_FOUND=false
+CATALOG_COORDINATOR_CONTAINER=""
+CATALOG_COORDINATOR_URL=""
+CATALOG_COORDINATOR_KEY=""
+
+for entry in \
+    "docker-node-p0a-1|$NODE_P0A_URL|$NODE_P0A_KEY" \
+    "docker-node-p0b-1|$NODE_P0B_URL|$NODE_P0B_KEY" \
+    "docker-node-p0c-1|$NODE_P0C_URL|$NODE_P0C_KEY"; do
+    IFS='|' read -r candidate_container candidate_url candidate_key <<< "$entry"
+    status=$(curl --max-time 2 -s -o /dev/null -w "%{http_code}" \
+        -H "Connection: Upgrade" \
+        -H "Upgrade: websocket" \
+        -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+        -H "Sec-WebSocket-Version: 13" \
+        "$candidate_url/api/1.34.1/sync" 2>/dev/null || true)
+    if [ "$status" = "101" ]; then
+        CATALOG_COORDINATOR_FOUND=true
+        CATALOG_COORDINATOR_CONTAINER="$candidate_container"
+        CATALOG_COORDINATOR_URL="$candidate_url"
+        CATALOG_COORDINATOR_KEY="$candidate_key"
+        break
+    fi
+done
+
+if $CATALOG_COORDINATOR_FOUND; then
+    CATALOG_NATS_CONSUMER=$(docker exec "$CATALOG_COORDINATOR_CONTAINER" \
+        printenv INSTANCE_NAME 2>/dev/null)
+    (cd "$DEPLOY_DIR" && node catalog-coherence-subscription.mjs \
+        "$CATALOG_COORDINATOR_URL" "$CATALOG_RUN" 6 \
+        > "$CATALOG_SUB_LOG" 2>&1) &
+    CATALOG_SUB_PID=$!
+else
+    CATALOG_SUB_PID=""
+fi
+
+CATALOG_SUB_READY=false
+if $CATALOG_COORDINATOR_FOUND; then
+    for _ in $(seq 1 100); do
+        if grep -q '"event":"ready"' "$CATALOG_SUB_LOG"; then
+            CATALOG_SUB_READY=true
+            break
+        fi
+        if ! kill -0 "$CATALOG_SUB_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+fi
+
+CATALOG_MUTATIONS_OK=true
+CATALOG_MUTATION_DETAILS=""
+if $CATALOG_SUB_READY; then
+    set_jetstream_consumer_pause "$CATALOG_NATS_CONSUMER" 30
+    CATALOG_ENTRYPOINTS=(
+        "p0a|$NODE_P0A_URL|$NODE_P0A_KEY"
+        "p0b|$NODE_P0B_URL|$NODE_P0B_KEY"
+        "p0c|$NODE_P0C_URL|$NODE_P0C_KEY"
+        "p1a|$NODE_P1A_URL|$NODE_P1A_KEY"
+        "p1b|$NODE_P1B_URL|$NODE_P1B_KEY"
+        "p1c|$NODE_P1C_URL|$NODE_P1C_KEY"
+    )
+    CATALOG_PIDS=()
+    for entry in "${CATALOG_ENTRYPOINTS[@]}"; do
+        IFS='|' read -r label url key <<< "$entry"
+        (mutation_response "$url" "$key" "messages:createCatalogProbe" \
+            "{\"runId\":\"$CATALOG_RUN\",\"token\":\"$label\"}" \
+            > "$CATALOG_TMP_DIR/$label.json" 2>&1 || true) &
+        CATALOG_PIDS+=("$!")
+    done
+    for pid in "${CATALOG_PIDS[@]}"; do
+        wait "$pid" || true
+    done
+    for entry in "${CATALOG_ENTRYPOINTS[@]}"; do
+        label="${entry%%|*}"
+        response=$(cat "$CATALOG_TMP_DIR/$label.json")
+        if ! echo "$response" | grep -q '"status":"success"'; then
+            CATALOG_MUTATIONS_OK=false
+            CATALOG_MUTATION_DETAILS="$CATALOG_MUTATION_DETAILS $label=$response"
+        fi
+    done
+else
+    CATALOG_ENTRYPOINTS=()
+    CATALOG_MUTATIONS_OK=false
+    CATALOG_MUTATION_DETAILS="subscription did not reach the empty-table state"
+fi
+
+$CATALOG_MUTATIONS_OK \
+    && pass "All six public entrypoints committed concurrent first writes" \
+    || fail "Fresh remote table creation failed from a public entrypoint" "$CATALOG_MUTATION_DETAILS"
+
+CATALOG_HTTP_OK=true
+CATALOG_HTTP_DETAILS=""
+docker pause docker-nats-1 > /dev/null 2>&1
+for entry in "${CATALOG_ENTRYPOINTS[@]}"; do
+    IFS='|' read -r label url key <<< "$entry"
+    response=$(curl --max-time 10 -s "$url/api/query" \
+        -H "Authorization: Convex $key" \
+        -H "Content-Type: application/json" \
+        -d "{\"path\":\"messages:catalogProbeTokens\",\"args\":{\"runId\":\"$CATALOG_RUN\"}}" \
+        2>/dev/null || true)
+    tokens=$(python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["value"]))' \
+        <<< "$response" 2>/dev/null || echo parse-error)
+    if [ "$tokens" != "$CATALOG_EXPECTED" ]; then
+        CATALOG_HTTP_OK=false
+        CATALOG_HTTP_DETAILS="$CATALOG_HTTP_DETAILS $label=$tokens response=$response;"
+    fi
+done
+
+CATALOG_SUB_STATUS=124
+if [ -n "$CATALOG_SUB_PID" ]; then
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$CATALOG_SUB_PID" 2>/dev/null; then
+            CATALOG_SUB_STATUS=0
+            wait "$CATALOG_SUB_PID" || CATALOG_SUB_STATUS=$?
+            break
+        fi
+        sleep 0.1
+    done
+fi
+
+docker unpause docker-nats-1 > /dev/null 2>&1 || true
+if $CATALOG_COORDINATOR_FOUND; then
+    set_jetstream_consumer_pause "$CATALOG_NATS_CONSUMER" 0
+fi
+if [ "$CATALOG_SUB_STATUS" -eq 124 ] && [ -n "$CATALOG_SUB_PID" ]; then
+    kill "$CATALOG_SUB_PID" 2>/dev/null || true
+    wait "$CATALOG_SUB_PID" 2>/dev/null || true
+fi
+
+$CATALOG_HTTP_OK \
+    && pass "All six entrypoints immediately resolved catalog and data with NATS unavailable" \
+    || fail "Immediate post-commit read depended on NATS catalog propagation" "$CATALOG_HTTP_DETAILS"
+
+if [ "$CATALOG_SUB_STATUS" -eq 0 ] && \
+    grep -q '"event":"complete"' "$CATALOG_SUB_LOG" && \
+    ! grep -Eq '"event":"(error|duplicate|timeout|unexpected-initial)"' "$CATALOG_SUB_LOG"; then
+    pass "WebSocket subscription crossed first table creation without a catalog gap"
+else
+    fail "WebSocket subscription missed or duplicated the first remote table commit" \
+        "$(tr '\n' ' ' < "$CATALOG_SUB_LOG")"
+fi
+
+CATALOG_FAILOVER_OK=false
+CATALOG_FAILOVER_DETAILS=""
+if $CATALOG_COORDINATOR_FOUND; then
+    docker stop "$CATALOG_COORDINATOR_CONTAINER" > /dev/null 2>&1
+    CATALOG_NEW_COORDINATOR_URL=""
+    CATALOG_NEW_COORDINATOR_KEY=""
+    for _ in $(seq 1 80); do
+        for entry in \
+            "docker-node-p0a-1|$NODE_P0A_URL|$NODE_P0A_KEY" \
+            "docker-node-p0b-1|$NODE_P0B_URL|$NODE_P0B_KEY" \
+            "docker-node-p0c-1|$NODE_P0C_URL|$NODE_P0C_KEY"; do
+            IFS='|' read -r candidate_container candidate_url candidate_key <<< "$entry"
+            [ "$candidate_container" = "$CATALOG_COORDINATOR_CONTAINER" ] && continue
+            status=$(curl --max-time 1 -s -o /dev/null -w "%{http_code}" \
+                -H "Connection: Upgrade" \
+                -H "Upgrade: websocket" \
+                -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+                -H "Sec-WebSocket-Version: 13" \
+                "$candidate_url/api/1.34.1/sync" 2>/dev/null || true)
+            if [ "$status" = "101" ]; then
+                CATALOG_NEW_COORDINATOR_URL="$candidate_url"
+                CATALOG_NEW_COORDINATOR_KEY="$candidate_key"
+                break 2
+            fi
+        done
+        sleep 0.25
+    done
+
+    if [ -n "$CATALOG_NEW_COORDINATOR_URL" ]; then
+        response=$(query_with_args "$CATALOG_NEW_COORDINATOR_URL" \
+            "$CATALOG_NEW_COORDINATOR_KEY" "messages:catalogProbeTokens" \
+            "{\"runId\":\"$CATALOG_RUN\"}" 2>/dev/null || true)
+        tokens=$(python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["value"]))' \
+            <<< "$response" 2>/dev/null || echo parse-error)
+        if [ "$tokens" = "$CATALOG_EXPECTED" ]; then
+            CATALOG_FAILOVER_OK=true
+        else
+            CATALOG_FAILOVER_DETAILS="tokens=$tokens response=$response"
+        fi
+    else
+        CATALOG_FAILOVER_DETAILS="no replacement partition-0 leader elected"
+    fi
+
+    docker start "$CATALOG_COORDINATOR_CONTAINER" > /dev/null 2>&1
+    for _ in $(seq 1 60); do
+        curl --max-time 2 -sf "$CATALOG_COORDINATOR_URL/version" > /dev/null 2>&1 && break
+        sleep 0.5
+    done
+    case "$CATALOG_COORDINATOR_CONTAINER" in
+        docker-node-p0a-1)
+            NODE_P0A_KEY=$(docker exec docker-node-p0a-1 ./generate_admin_key.sh 2>&1 | tail -1)
+            NODE_A_KEY="$NODE_P0A_KEY"
+            ;;
+        docker-node-p0b-1)
+            NODE_P0B_KEY=$(docker exec docker-node-p0b-1 ./generate_admin_key.sh 2>&1 | tail -1)
+            ;;
+        docker-node-p0c-1)
+            NODE_P0C_KEY=$(docker exec docker-node-p0c-1 ./generate_admin_key.sh 2>&1 | tail -1)
+            ;;
+    esac
+else
+    CATALOG_FAILOVER_DETAILS="initial partition-0 leader was not found"
+fi
+
+$CATALOG_FAILOVER_OK \
+    && pass "Fresh remote catalog survived partition-0 leader failover" \
+    || fail "Catalog was not Raft-durable across coordinator failover" "$CATALOG_FAILOVER_DETAILS"
+
+rm -f "$CATALOG_SUB_LOG"
+rm -rf "$CATALOG_TMP_DIR"
 
 # --- Baseline: capture existing counts before tests ---
 
