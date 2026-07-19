@@ -1305,7 +1305,7 @@ pub async fn make_app(
         });
     }
 
-    if config.partition_id == Some(0) {
+    if config.partition_id.is_some() {
         if let Some(nats_url) = &config.nats_url {
             let nats_url = nats_url.clone();
             let shadow_node_name = config.name();
@@ -1331,7 +1331,7 @@ pub async fn make_app(
                 };
 
                 match consumer
-                    .subscribe_node_targeted(shadow_from_ts, &shadow_node_name)
+                    .subscribe_node_targeted_shadow(shadow_from_ts, &shadow_node_name)
                     .await
                 {
                     Ok(mut stream) => {
@@ -1390,9 +1390,6 @@ pub async fn make_app(
         if let Some(nats_url) = &config.nats_url {
             let nats_url = nats_url.clone();
             let committer = database.committer_client();
-            let use_selective_node_targeting = config
-                .partition_id
-                .is_some_and(|local_partition| local_partition != 0);
             let remote_partitions = config.partition_id.map(|local_partition| {
                 if let Some(num_partitions) = config.num_partitions {
                     (0..num_partitions)
@@ -1434,28 +1431,11 @@ pub async fn make_app(
                 let mut backoff = Duration::from_millis(250);
                 loop {
                     tracing::info!(
-                        use_selective_node_targeting,
+                        delivery_mode = "broad_partition_subjects",
                         ?remote_partitions,
                         "ReplicaDeltaConsumer subscribing to NATS..."
                     );
-                    let subscribe_result = if use_selective_node_targeting {
-                        match database::nats_distributed_log::NatsDistributedLog::connect(
-                            database::nats_distributed_log::NatsConfig {
-                                url: nats_url.clone(),
-                                consumer_name: Some(format!("{consumer_name}-selective")),
-                                partition_id: None,
-                            },
-                        )
-                        .await
-                        {
-                            Ok(consumer) => {
-                                consumer
-                                    .subscribe_selective_node(from_ts.into(), &consumer_name)
-                                    .await
-                            },
-                            Err(e) => Err(e),
-                        }
-                    } else {
+                    let subscribe_result =
                         match database::nats_distributed_log::NatsDistributedLog::connect(
                             database::nats_distributed_log::NatsConfig {
                                 url: nats_url.clone(),
@@ -1474,8 +1454,7 @@ pub async fn make_app(
                                     .await
                             },
                             Err(e) => Err(e),
-                        }
-                    };
+                        };
                     match subscribe_result {
                         Ok(stream) => {
                             tracing::info!("ReplicaDeltaConsumer subscribed, processing deltas...");
@@ -1484,9 +1463,6 @@ pub async fn make_app(
                                 committer.clone(),
                                 excluded_source_partition,
                                 |ts, n| {
-                                    if use_selective_node_targeting {
-                                        database::log_selective_delivery_shadow_receive();
-                                    }
                                     tracing::info!(
                                         "Applied replica delta: ts={}, {} updates",
                                         u64::from(ts),

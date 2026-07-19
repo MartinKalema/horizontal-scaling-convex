@@ -120,12 +120,11 @@ impl NatsDistributedLog {
         format!("{SUBJECT_BASE}.{}", partition.0)
     }
 
-    fn selective_node_subjects(node_name: &str) -> Vec<String> {
-        vec![
-            SelectiveDeliveryRegistry::node_subject(node_name),
-            SYSTEM_TABLE_SUBJECT.to_string(),
-            FRONTIER_HEARTBEAT_SUBJECT.to_string(),
-        ]
+    fn partition_filter_subjects(partitions: Vec<PartitionId>) -> Vec<String> {
+        partitions
+            .into_iter()
+            .map(Self::partition_subject)
+            .collect()
     }
 
     fn is_frontier_heartbeat_delta(delta: &CommitDelta) -> bool {
@@ -323,16 +322,14 @@ impl NatsDistributedLog {
         from_ts: Timestamp,
         source_partitions: Option<Vec<PartitionId>>,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
-        let filter_subjects = source_partitions.map(|partitions| {
-            partitions
-                .into_iter()
-                .map(Self::partition_subject)
-                .collect::<Vec<_>>()
-        });
+        let filter_subjects = source_partitions.map(Self::partition_filter_subjects);
         self.subscribe_subjects(from_ts, filter_subjects).await
     }
 
-    pub async fn subscribe_node_targeted(
+    /// Observe best-effort selective-delivery traffic without applying it to
+    /// the database state machine. Correctness-critical replica apply must use
+    /// the broad partition subjects through `subscribe_filtered`.
+    pub async fn subscribe_node_targeted_shadow(
         &self,
         from_ts: Timestamp,
         node_name: &str,
@@ -342,15 +339,6 @@ impl NatsDistributedLog {
             Some(vec![SelectiveDeliveryRegistry::node_subject(node_name)]),
         )
         .await
-    }
-
-    pub async fn subscribe_selective_node(
-        &self,
-        from_ts: Timestamp,
-        node_name: &str,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
-        self.subscribe_subjects(from_ts, Some(Self::selective_node_subjects(node_name)))
-            .await
     }
 
     /// Connect to NATS and create/get the JetStream stream.
@@ -679,26 +667,20 @@ mod tests {
 
     use common::types::Timestamp;
 
-    use super::{
-        NatsDistributedLog,
-        FRONTIER_HEARTBEAT_SUBJECT,
-        SYSTEM_TABLE_SUBJECT,
-    };
+    use super::NatsDistributedLog;
     use crate::{
         commit_delta::CommitDelta,
         partition::PartitionId,
-        selective_delivery::SelectiveDeliveryRegistry,
         write_log::WriteSource,
     };
 
     #[test]
-    fn selective_node_subscriptions_include_frontier_heartbeats() {
+    fn replica_apply_filters_use_broad_partition_subjects() {
         assert_eq!(
-            NatsDistributedLog::selective_node_subjects("node-b"),
+            NatsDistributedLog::partition_filter_subjects(vec![PartitionId(0), PartitionId(2)]),
             vec![
-                SelectiveDeliveryRegistry::node_subject("node-b"),
-                SYSTEM_TABLE_SUBJECT.to_string(),
-                FRONTIER_HEARTBEAT_SUBJECT.to_string(),
+                "convex.commits.0".to_string(),
+                "convex.commits.2".to_string(),
             ],
         );
     }

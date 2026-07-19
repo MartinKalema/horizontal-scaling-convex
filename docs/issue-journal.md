@@ -920,6 +920,37 @@ own for distributed changes.
   - `BACKEND_PULL_POLICY=never bash self-hosted/docker/test.sh`
     passed write-scaling `146/146`, Raft failover `24/24`, `ALL SUITES PASSED`
 
+### 2026-07 — Restored broad replica apply before selective-delivery correctness
+
+- **Status:** implemented and validated
+- **Related issue:** `#133`
+- **What the audit found:** nonzero partition writers were applying only their
+  node-targeted selective stream. Interest registrations came from active
+  subscriptions and recent queries, so they could not predict a future
+  mutation's remote read set. A remote data delta could be omitted while a
+  later broadcast heartbeat advanced the source frontier, allowing OCC to
+  validate against stale replicated state.
+- **Behavior:** every correctness-critical replica consumer now tails the
+  broad subjects for all remote partitions. Node-targeted delivery remains
+  active only as a shadow stream on partitioned nodes so targeting efficiency
+  can still be measured without changing database state. The apply API for a
+  combined targeted/system/heartbeat stream was removed to keep the boundary
+  explicit.
+- **Why:** selective delivery is an optimization until distributed read-set
+  ownership and invalidation correctness are implemented. Missing interest
+  must over-deliver, route, wait, or fail closed; it must never create a stale
+  committed view.
+- **Validation:**
+  - `cargo test -p database nats_distributed_log --lib -- --nocapture` passed
+    `7/7`.
+  - `cargo test -p database tests::write_scaling_tests --lib` passed `78/78`.
+  - `cargo test -p local_backend --lib` passed `100/100`.
+  - Built `ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest` and
+    verified all six backend containers ran local image
+    `sha256:0169de0fc71b12f415169de130a63afc5beaa82f2bdd4deaa028e5b0f32b4f35`.
+  - `BACKEND_PULL_POLICY=never bash self-hosted/docker/test.sh` passed
+    write-scaling `146/146`, Raft failover `24/24`, and `ALL SUITES PASSED`.
+
 ### 2026-07 — Added an owner-coordinated cluster-safe read timestamp
 
 - **Status:** complete
