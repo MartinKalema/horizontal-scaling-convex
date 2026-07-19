@@ -26,6 +26,7 @@ use local_backend::{
     config::LocalConfig,
     make_app,
     mutation_forwarder::MutationForwarderService,
+    owner_read_service::OwnerReadGrpcService,
     proxy::dev_site_proxy,
     router::router,
     two_phase_service,
@@ -138,8 +139,7 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     // Start gRPC services (mutation forwarder + 2PC + Raft transport).
     if config.replication_mode == "primary" && config.nats_url.is_some() {
         let grpc_addr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
-        let api: std::sync::Arc<dyn application::api::ApplicationApi> =
-            std::sync::Arc::new(st.application.clone());
+        let api = st.cluster_aware_api();
         let cluster_grpc_auth = st.cluster_grpc_auth.clone();
         let forwarder =
             MutationForwarderService::new(api, st.instance_name.clone(), cluster_grpc_auth.clone());
@@ -147,6 +147,13 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
             st.application.database().committer_client(),
             st.raft_state.clone(),
             st.raft_peer_grpc_urls.clone(),
+            st.placement_metadata_store.clone(),
+            cluster_grpc_auth.clone(),
+        );
+        let owner_reads = OwnerReadGrpcService::new(
+            st.application.database().clone(),
+            st.application.database().committer_client(),
+            st.raft_state.clone(),
             st.placement_metadata_store.clone(),
             cluster_grpc_auth.clone(),
         );
@@ -164,7 +171,8 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
             tracing::info!("Starting gRPC services on {grpc_addr}");
             let mut builder = tonic::transport::Server::builder()
                 .add_service(forwarder.into_server())
-                .add_service(two_pc.into_server());
+                .add_service(two_pc.into_server())
+                .add_service(owner_reads.into_server());
 
             if let Some(raft) = raft_transport {
                 builder = builder.add_service(raft.into_service());

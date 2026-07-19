@@ -29,6 +29,7 @@ use crate::{
         RetryableReplicaApplyError,
     },
     committer::CommitterClient,
+    partition::PartitionId,
 };
 
 const RETRYABLE_REPLICA_APPLY_NAK_DELAY: Duration = Duration::from_millis(250);
@@ -36,27 +37,33 @@ const RETRYABLE_REPLICA_APPLY_NAK_DELAY: Duration = Duration::from_millis(250);
 pub async fn apply_replication_message(
     committer: &CommitterClient,
     message: ReplicationMessage,
+    excluded_source_partition: Option<PartitionId>,
 ) -> anyhow::Result<(common::types::Timestamp, usize)> {
     let committer = committer.clone();
-    apply_replication_message_with(message, move |delta, transport_id| {
-        let committer = committer.clone();
-        async move {
-            match transport_id {
-                Some(transport_id) => {
-                    committer
-                        .apply_replica_delta_with_transport_id(delta, transport_id)
-                        .await
-                },
-                None => committer.apply_replica_delta(delta).await,
+    apply_replication_message_with(
+        message,
+        excluded_source_partition,
+        move |delta, transport_id| {
+            let committer = committer.clone();
+            async move {
+                match transport_id {
+                    Some(transport_id) => {
+                        committer
+                            .apply_replica_delta_with_transport_id(delta, transport_id)
+                            .await
+                    },
+                    None => committer.apply_replica_delta(delta).await,
+                }
             }
-        }
-    })
+        },
+    )
     .await
 }
 
 pub async fn consume_replication_stream<F>(
     stream: BoxStream<'static, anyhow::Result<ReplicationMessage>>,
     committer: CommitterClient,
+    excluded_source_partition: Option<PartitionId>,
     after_success: F,
 ) -> anyhow::Result<()>
 where
@@ -66,7 +73,9 @@ where
         stream,
         move |message| {
             let committer = committer.clone();
-            async move { apply_replication_message(&committer, message).await }
+            async move {
+                apply_replication_message(&committer, message, excluded_source_partition).await
+            }
         },
         after_success,
     )
@@ -100,6 +109,7 @@ where
 
 async fn apply_replication_message_with<F, Fut>(
     message: ReplicationMessage,
+    excluded_source_partition: Option<PartitionId>,
     mut apply: F,
 ) -> anyhow::Result<(common::types::Timestamp, usize)>
 where
@@ -109,6 +119,24 @@ where
     let (delta, transport_id, ack) = message.into_parts();
     let ts = delta.ts;
     let num_updates = delta.document_updates.len();
+
+    if let Some(excluded_source_partition) = excluded_source_partition {
+        if delta.source_partition == Some(excluded_source_partition) {
+            tracing::debug!(
+                source_partition = excluded_source_partition.0,
+                origin_ts = u64::from(ts),
+                "Acknowledging same-partition NATS delta without applying it; Raft is \
+                 authoritative"
+            );
+            ack.ack().await.with_context(|| {
+                format!(
+                    "Failed to ack same-partition NATS delta at ts={}",
+                    u64::from(ts),
+                )
+            })?;
+            return Ok((ts, 0));
+        }
+    }
 
     match apply(delta, transport_id).await {
         Ok(applied_ts) => {
@@ -222,7 +250,7 @@ impl ReplicaDeltaConsumer {
 
         tracing::info!("ReplicaDeltaConsumer subscribed, waiting for deltas...");
 
-        consume_replication_stream(stream, committer, |applied_ts, num_updates| {
+        consume_replication_stream(stream, committer, None, |applied_ts, num_updates| {
             tracing::info!(
                 "Applied replica delta: ts={}, {} updates",
                 u64::from(applied_ts),
@@ -262,6 +290,7 @@ mod tests {
             ReplicationMessage,
             RetryableReplicaApplyError,
         },
+        partition::PartitionId,
         write_log::WriteSource,
     };
 
@@ -303,6 +332,14 @@ mod tests {
     }
 
     fn test_message(ts: Timestamp, counts: Arc<AckCounts>) -> ReplicationMessage {
+        test_message_from_partition(ts, None, counts)
+    }
+
+    fn test_message_from_partition(
+        ts: Timestamp,
+        source_partition: Option<PartitionId>,
+        counts: Arc<AckCounts>,
+    ) -> ReplicationMessage {
         ReplicationMessage::new(
             CommitDelta {
                 ts,
@@ -312,7 +349,7 @@ mod tests {
                 write_source: WriteSource::unknown(),
                 write_bytes: 0,
                 tablet_id_to_table_name: BTreeMap::new(),
-                source_partition: None,
+                source_partition,
             },
             Box::new(RecordingAck { counts }),
         )
@@ -324,6 +361,7 @@ mod tests {
         let ts = Timestamp::try_from(42u64)?;
         let (applied_ts, num_updates) = apply_replication_message_with(
             test_message(ts, counts.clone()),
+            None,
             |delta, _transport_id| async move { Ok(delta.ts) },
         )
         .await?;
@@ -338,11 +376,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_partition_nats_delta_is_acked_without_apply() -> anyhow::Result<()> {
+        let counts = Arc::new(AckCounts::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let ts = Timestamp::try_from(42u64)?;
+        let local_partition = PartitionId(1);
+
+        let (applied_ts, num_updates) = apply_replication_message_with(
+            test_message_from_partition(ts, Some(local_partition), counts.clone()),
+            Some(local_partition),
+            {
+                let attempts = attempts.clone();
+                move |delta, _transport_id| {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(delta.ts)
+                    }
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(applied_ts, ts);
+        assert_eq!(num_updates, 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.term.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn apply_replication_message_naks_after_apply_failure() -> anyhow::Result<()> {
         let counts = Arc::new(AckCounts::default());
         let ts = Timestamp::try_from(42u64)?;
         let err = apply_replication_message_with(
             test_message(ts, counts.clone()),
+            None,
             |_delta, _transport_id| async move { anyhow::bail!("forced apply failure") },
         )
         .await
@@ -367,7 +439,7 @@ mod tests {
         let ts = Timestamp::try_from(42u64)?;
         let attempts = Arc::new(AtomicUsize::new(0));
 
-        let err = apply_replication_message_with(test_message(ts, counts.clone()), {
+        let err = apply_replication_message_with(test_message(ts, counts.clone()), None, {
             let attempts = attempts.clone();
             move |_delta, _transport_id| {
                 let attempts = attempts.clone();
@@ -411,6 +483,7 @@ mod tests {
 
         let first_attempt = apply_replication_message_with(
             test_message(ts, counts.clone()),
+            None,
             |_delta, _transport_id| async move {
                 Err(anyhow::Error::new(RetryableReplicaApplyError::new(
                     "prepared transaction still unresolved",
@@ -425,6 +498,7 @@ mod tests {
 
         let (applied_ts, num_updates) = apply_replication_message_with(
             test_message(ts, counts.clone()),
+            None,
             |delta, _transport_id| async move { Ok(delta.ts) },
         )
         .await?;
@@ -456,7 +530,7 @@ mod tests {
             move |message| {
                 let attempts = attempts.clone();
                 async move {
-                    apply_replication_message_with(message, |delta, _transport_id| {
+                    apply_replication_message_with(message, None, |delta, _transport_id| {
                         let attempts = attempts.clone();
                         async move {
                             if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -496,6 +570,7 @@ mod tests {
 
         let first_attempt = apply_replication_message_with(
             test_message(ts, counts.clone()),
+            None,
             |_delta, _transport_id| async move { anyhow::bail!("transient apply failure") },
         )
         .await;
@@ -505,6 +580,7 @@ mod tests {
 
         let (applied_ts, _) = apply_replication_message_with(
             test_message(ts, counts.clone()),
+            None,
             |delta, _transport_id| async move { Ok(delta.ts) },
         )
         .await?;
@@ -534,7 +610,7 @@ mod tests {
             move |message| {
                 let attempts = attempts.clone();
                 async move {
-                    apply_replication_message_with(message, |delta, _transport_id| {
+                    apply_replication_message_with(message, None, |delta, _transport_id| {
                         let attempts = attempts.clone();
                         async move {
                             if attempts.fetch_add(1, Ordering::SeqCst) == 0 {

@@ -69,6 +69,7 @@ use common::{
         LatestDocument,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceGlobalWrite,
         PersistenceIndexEntry,
         PersistenceReader,
         PersistenceTableSize,
@@ -485,11 +486,12 @@ impl Persistence for PostgresPersistence {
     }
 
     #[fastrace::trace]
-    async fn write<'a>(
+    async fn write_with_persistence_globals<'a>(
         &self,
         documents: &'a [DocumentLogEntry],
         indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
+        persistence_globals: &'a [PersistenceGlobalWrite],
     ) -> anyhow::Result<()> {
         anyhow::ensure!(documents.len() <= MAX_INSERT_SIZE);
         let mut write_size = 0;
@@ -584,6 +586,22 @@ impl Persistence for PostgresPersistence {
 
                 let timer = metrics::insert_timer();
                 try_join!(insert_docs, insert_idxs)?;
+                if !persistence_globals.is_empty() {
+                    let write_global = tx
+                        .prepare_cached(sql::write_persistence_global(multitenant))
+                        .await?;
+                    for write in persistence_globals {
+                        let mut params = [
+                            Param::Text(write.key.clone()),
+                            Param::JsonValue(write.value.to_string()),
+                        ]
+                        .to_vec();
+                        if multitenant {
+                            params.push(Param::Text(instance_name.to_string()));
+                        }
+                        tx.execute_raw(&write_global, params).await?;
+                    }
+                }
                 timer.finish();
 
                 Ok(())

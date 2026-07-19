@@ -32,6 +32,7 @@ use common::{
         LatestDocument,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceGlobalWrite,
         PersistenceIndexEntry,
         PersistenceReader,
         RetentionValidator,
@@ -138,11 +139,12 @@ impl Persistence for CheckpointPersistence {
         Arc::new(self.clone()) as Arc<_>
     }
 
-    async fn write<'a>(
+    async fn write_with_persistence_globals<'a>(
         &self,
         _documents: &'a [DocumentLogEntry],
         _indexes: &'a [PersistenceIndexEntry],
         _conflict_strategy: ConflictStrategy,
+        _persistence_globals: &'a [PersistenceGlobalWrite],
     ) -> anyhow::Result<()> {
         anyhow::bail!("CheckpointPersistence is read-only")
     }

@@ -91,6 +91,23 @@ No TSO (reserved for local commits), no system clock (would leap ahead of TSO ra
 
 This is a translation model, not timestamp identity. It is safe for the current single read-authority/fail-closed routing model, but portable client cursors and follower-safe reads must use the follow-up read-fencing work before relying on timestamps across nodes.
 
+Latest clustered reads now use the exact owner-coordinated barrier described in
+[`cluster-safe-read-timestamps.md`](cluster-safe-read-timestamps.md). That
+barrier does not erase timestamp translation. It finds one exact timestamp that
+every current owner can serve, blocks behind unresolved 2PC prepares, and fails
+closed when an explicit historical timestamp cannot be certified. The barrier
+negotiates from owner timeline floors rather than allocating from the TSO, so a
+healthy set of Raft owners can continue serving latest reads while NATS is
+unavailable.
+
+The same availability boundary applies to periodic frontier and
+`max_repeatable_ts` maintenance. These optional tasks use only an already
+reserved local batch value while running in the committer loop. If the batch is
+missing or exhausted, they trigger one coalesced asynchronous reservation and
+retry later instead of waiting for NATS. Commit timestamp allocation remains on
+the ordinary fail-closed path and may wait for a reservation because a write
+cannot safely proceed without a globally unique timestamp.
+
 ## Why System Clock Was Also Wrong (Second Fix)
 
 The first attempt replaced the TSO call with the single-node formula: `max(latest_ts + 1, system_clock, last_assigned_ts + 1)`. This still crashed under concurrent load. The reason:

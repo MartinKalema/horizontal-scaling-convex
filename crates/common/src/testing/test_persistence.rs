@@ -44,6 +44,7 @@ use crate::{
         LatestDocument,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceGlobalWrite,
         PersistenceIndexEntry,
         PersistenceReader,
         RetentionValidator,
@@ -99,22 +100,44 @@ impl Persistence for TestPersistence {
         Arc::new(self.clone()) as Arc<_>
     }
 
-    async fn write<'a>(
+    async fn write_with_persistence_globals<'a>(
         &self,
         documents: &'a [DocumentLogEntry],
         indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
+        persistence_globals: &'a [PersistenceGlobalWrite],
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
+        if conflict_strategy == ConflictStrategy::Error {
+            let mut document_keys = BTreeSet::new();
+            for update in documents {
+                anyhow::ensure!(
+                    document_keys.insert((update.ts, update.id))
+                        && !inner.log.contains_key(&(update.ts, update.id)),
+                    "Unique constraint not satisfied. Failed to write document at ts {} with id \
+                     {}: (document, ts) pair already exists",
+                    update.ts,
+                    update.id
+                );
+            }
+            let mut index_keys = BTreeSet::new();
+            for update in indexes {
+                let key = (update.index_id, update.key.clone(), update.ts);
+                anyhow::ensure!(
+                    index_keys.insert(key)
+                        && !inner
+                            .index
+                            .get(&update.index_id)
+                            .is_some_and(|idx| idx.contains_key(&(update.key.clone(), update.ts))),
+                    "Unique constraint not satisfied. Failed to write to index {} at ts {} with \
+                     key {:?}: (key, ts) pair already exists",
+                    update.index_id,
+                    update.ts,
+                    update.key,
+                );
+            }
+        }
         for update in documents {
-            anyhow::ensure!(
-                conflict_strategy == ConflictStrategy::Overwrite
-                    || !inner.log.contains_key(&(update.ts, update.id)),
-                "Unique constraint not satisfied. Failed to write document at ts {} with id {}: \
-                 (document, ts) pair already exists",
-                update.ts,
-                update.id
-            );
             inner.log.insert(
                 (update.ts, update.id),
                 (update.value.clone(), update.prev_ts),
@@ -123,24 +146,16 @@ impl Persistence for TestPersistence {
         inner.is_fresh = false;
         for update in indexes {
             let index_key_bytes = update.key.clone();
-            anyhow::ensure!(
-                conflict_strategy == ConflictStrategy::Overwrite
-                    || !inner
-                        .index
-                        .get(&update.index_id)
-                        .map(|idx| idx.contains_key(&(index_key_bytes.clone(), update.ts)))
-                        .unwrap_or(false),
-                "Unique constraint not satisfied. Failed to write to index {} at ts {} with key \
-                 {:?}: (key, ts) pair already exists",
-                update.index_id,
-                update.ts,
-                index_key_bytes
-            );
             inner
                 .index
                 .entry(update.index_id)
                 .or_default()
                 .insert((index_key_bytes, update.ts), update.value);
+        }
+        for write in persistence_globals {
+            inner
+                .persistence_globals
+                .insert(write.key.clone(), write.value.clone());
         }
         Ok(())
     }

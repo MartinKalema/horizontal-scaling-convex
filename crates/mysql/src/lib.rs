@@ -73,6 +73,7 @@ use common::{
         LatestDocument,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceGlobalWrite,
         PersistenceIndexEntry,
         PersistenceReader,
         PersistenceTableSize,
@@ -381,11 +382,12 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
     }
 
     #[fastrace::trace]
-    async fn write<'a>(
+    async fn write_with_persistence_globals<'a>(
         &self,
         documents: &'a [DocumentLogEntry],
         indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
+        persistence_globals: &'a [PersistenceGlobalWrite],
     ) -> anyhow::Result<()> {
         anyhow::ensure!(documents.len() <= sql::MAX_INSERT_SIZE);
         let mut write_size = 0;
@@ -505,6 +507,16 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
                                 ]
                             }),
                         )
+                        .await?;
+                }
+                for write in persistence_globals {
+                    let mut params = if multitenant {
+                        vec![instance_name.clone()]
+                    } else {
+                        vec![]
+                    };
+                    params.extend([write.key.clone().into(), write.value.clone().into()]);
+                    tx.exec_drop(sql::write_persistence_global(multitenant), params)
                         .await?;
                 }
                 Ok(())

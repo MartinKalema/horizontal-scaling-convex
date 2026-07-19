@@ -164,6 +164,32 @@ impl RaftPartitionState {
     }
 
     #[cfg(any(test, feature = "testing"))]
+    pub fn new_with_mailbox_for_test(
+        is_leader: bool,
+        leader_id: u64,
+        partition_id: PartitionId,
+        node_id: u64,
+    ) -> (Self, mpsc::UnboundedReceiver<RaftMessage>) {
+        let (proposal_tx, proposal_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                is_leader: Arc::new(AtomicBool::new(is_leader)),
+                leader_ready: Arc::new(AtomicBool::new(is_leader)),
+                leader_id: Arc::new(AtomicU64::new(leader_id)),
+                proposal_tx,
+                partition_id,
+                node_id,
+                leader_serving_lease_valid_until: Arc::new(Mutex::new(if is_leader {
+                    Some(Instant::now() + std::time::Duration::from_secs(60))
+                } else {
+                    None
+                })),
+            },
+            proposal_rx,
+        )
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     pub fn expire_leader_serving_lease_for_test(&self) {
         *self.leader_serving_lease_valid_until.lock() = Some(Instant::now());
     }
