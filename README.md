@@ -71,6 +71,8 @@ The open issues are the active roadmap: [GitHub Issues](https://github.com/Marti
 
 Project-wide goals: [docs/project-goals.md](docs/project-goals.md)
 
+Normative correctness model: [docs/distributed-correctness-model.md](docs/distributed-correctness-model.md)
+
 Issue journal: [docs/issue-journal.md](docs/issue-journal.md)
 
 Cluster authority routing: [docs/cluster-authority-routing.md](docs/cluster-authority-routing.md)
@@ -157,8 +159,8 @@ This is how the project avoids accidentally running deployment-global or subscri
 
 The repository currently includes:
 
-- 77 write-scaling integration tests;
-- 10 Raft failover tests;
+- 146 write-scaling integration assertions;
+- 24 Raft failover assertions;
 - database unit tests for replica replay, NATS delivery, remote-read frontier behavior, partition enforcement, 2PC, and table-number allocation;
 - Docker cluster scripts under [self-hosted/docker](self-hosted/docker).
 
@@ -250,6 +252,7 @@ Approximate local development guidance:
 | Document | Contents |
 | --- | --- |
 | [Project Goals](docs/project-goals.md) | The semantic guarantees this fork must preserve. |
+| [Distributed Correctness Model](docs/distributed-correctness-model.md) | Normative invariants, authority boundaries, failure behavior, audit map, and review requirements. |
 | [Issue Journal](docs/issue-journal.md) | Regressions, root causes, fixes, and validation notes. |
 | [Cluster Authority Routing](docs/cluster-authority-routing.md) | Route authority classes and fail-closed behavior. |
 | [Dynamic Placement](docs/dynamic-placement.md) | Placement metadata and future rebalancing control plane. |

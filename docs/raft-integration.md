@@ -1,5 +1,10 @@
 # Raft Integration Design: tikv/raft-rs for Automatic Failover
 
+> **Implementation history:** This document explains the original Raft
+> integration plan. Its availability claims are not a substitute for the
+> quorum, apply, replay, snapshot, and serving invariants in
+> [Distributed Correctness Model](distributed-correctness-model.md).
+
 ## Overview
 
 Each partition becomes a 3-node Raft group. The leader runs the Committer. If the leader dies, followers elect a new leader and start a Committer. Sub-second failover with zero data loss.

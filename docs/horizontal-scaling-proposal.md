@@ -1,5 +1,10 @@
 # Engineering Proposal: Horizontally Scaling Convex
 
+> **Historical proposal:** This document captures the project's original
+> direction and may describe mechanisms that are now intermediate or rejected
+> as final correctness authorities. New designs must follow
+> [Distributed Correctness Model](distributed-correctness-model.md).
+
 **Author:** Systems Architecture  
 **Date:** March 31, 2026  
 **Status:** Proposal  
