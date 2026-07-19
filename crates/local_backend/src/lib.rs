@@ -7,7 +7,13 @@
 use std::{
     self,
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
     time::Duration,
 };
 
@@ -468,9 +474,7 @@ fn should_run_cluster_singleton_workers(
     if partition_id != route_authority::CLUSTER_COORDINATOR_PARTITION {
         return false;
     }
-    raft_state.is_none_or(|raft_state| {
-        raft_state.is_leader_ready() && raft_state.has_leader_serving_lease()
-    })
+    raft_state.is_none_or(database::raft_partition::RaftPartitionState::can_serve_as_leader)
 }
 
 fn start_cluster_singleton_worker_supervisor(
@@ -515,6 +519,261 @@ fn application_worker_startup_policy(
     }
 }
 
+async fn load_cluster_genesis_marker(
+    persistence: &Arc<dyn Persistence>,
+) -> anyhow::Result<Option<database::cluster_genesis::ClusterGenesisMarker>> {
+    persistence
+        .reader()
+        .get_persistence_global(common::persistence::PersistenceGlobalKey::ClusterGenesis)
+        .await?
+        .map(database::cluster_genesis::ClusterGenesisMarker::parse)
+        .transpose()
+}
+
+async fn load_raft_applied_genesis(
+    persistence: &Arc<dyn Persistence>,
+) -> anyhow::Result<Option<database::cluster_genesis::ClusterGenesisMarker>> {
+    persistence
+        .reader()
+        .get_persistence_global(
+            common::persistence::PersistenceGlobalKey::ClusterGenesisRaftApplied,
+        )
+        .await?
+        .map(database::cluster_genesis::ClusterGenesisMarker::parse)
+        .transpose()
+}
+
+async fn record_raft_applied_genesis_marker(
+    persistence: &Arc<dyn Persistence>,
+    marker: &database::cluster_genesis::ClusterGenesisMarker,
+) -> anyhow::Result<()> {
+    if let Some(existing) = load_raft_applied_genesis(persistence).await? {
+        anyhow::ensure!(
+            existing == *marker,
+            "Local Raft applied genesis {} conflicts with canonical genesis {}",
+            existing.genesis_id,
+            marker.genesis_id,
+        );
+        return Ok(());
+    }
+    persistence
+        .write_persistence_global(
+            common::persistence::PersistenceGlobalKey::ClusterGenesisRaftApplied,
+            serde_json::to_value(marker)?,
+        )
+        .await
+}
+
+async fn record_raft_applied_genesis(
+    persistence: &Arc<dyn Persistence>,
+    manifest: &database::cluster_genesis::ClusterGenesisManifest,
+) -> anyhow::Result<()> {
+    record_raft_applied_genesis_marker(
+        persistence,
+        &database::cluster_genesis::ClusterGenesisMarker {
+            format_version: manifest.format_version,
+            genesis_id: manifest.genesis_id.clone(),
+        },
+    )
+    .await
+}
+
+async fn prepare_cluster_genesis(
+    runtime: &ProdRuntime,
+    database: &Database<ProdRuntime>,
+    persistence: &Arc<dyn Persistence>,
+    store: &database::cluster_genesis::NatsClusterGenesisStore,
+    partition_id: database::partition::PartitionId,
+    persistence_was_fresh: bool,
+) -> anyhow::Result<database::cluster_genesis::CanonicalGenesisPayload> {
+    let local_marker = load_cluster_genesis_marker(persistence).await?;
+    if local_marker.is_none() {
+        anyhow::ensure!(
+            persistence_was_fresh,
+            "Existing partition {} persistence has no canonical cluster genesis marker; refusing \
+             to guess cluster identity",
+            partition_id,
+        );
+        if partition_id == route_authority::CLUSTER_COORDINATOR_PARTITION
+            && store.load_manifest().await?.is_none()
+        {
+            let candidate = database::cluster_genesis::canonicalize_checkpoint(
+                database.build_raft_snapshot_checkpoint().await?,
+            )?;
+            store.put_payload(&candidate).await?;
+            store.publish_manifest(&candidate.manifest).await?;
+        }
+    }
+
+    let mut waits = 0u64;
+    let manifest = loop {
+        if let Some(manifest) = store.load_manifest().await? {
+            break manifest;
+        }
+        anyhow::ensure!(
+            local_marker.is_none(),
+            "Local persistence has cluster genesis {}, but the canonical NATS manifest is \
+             missing; refusing to create a new identity",
+            local_marker.as_ref().expect("checked above").genesis_id,
+        );
+        if waits % 20 == 0 {
+            tracing::info!(
+                %partition_id,
+                "Waiting for coordinator partition to publish canonical cluster genesis"
+            );
+        }
+        waits += 1;
+        runtime.wait(Duration::from_millis(250)).await;
+    };
+    database::cluster_genesis::validate_manifest(&manifest)?;
+
+    if let Some(marker) = local_marker.as_ref() {
+        anyhow::ensure!(
+            marker.genesis_id == manifest.genesis_id,
+            "Local cluster genesis {} conflicts with canonical genesis {}",
+            marker.genesis_id,
+            manifest.genesis_id,
+        );
+    }
+    let checkpoint_bytes = store.load_payload(&manifest).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Canonical cluster genesis payload {} is missing",
+            manifest.genesis_id
+        )
+    })?;
+    let payload = database::cluster_genesis::CanonicalGenesisPayload {
+        manifest,
+        checkpoint_bytes,
+    };
+    if local_marker.is_none() {
+        let checkpoint = database::cluster_genesis::validate_payload(
+            &payload.manifest,
+            &payload.checkpoint_bytes,
+        )?;
+        database
+            .committer_client()
+            .install_snapshot(checkpoint)
+            .await?;
+        tracing::info!(
+            %partition_id,
+            genesis_id = %payload.manifest.genesis_id,
+            "Installed canonical cluster genesis before application startup"
+        );
+    }
+    Ok(payload)
+}
+
+async fn propose_cluster_genesis(
+    database: &Database<ProdRuntime>,
+    persistence: &Arc<dyn Persistence>,
+    raft_state: &database::raft_partition::RaftPartitionState,
+    payload: &database::cluster_genesis::CanonicalGenesisPayload,
+) -> anyhow::Result<bool> {
+    if !raft_state.is_leader() {
+        return Ok(false);
+    }
+    let data =
+        database::raft_state_machine::RaftStateMachineEntry::cluster_genesis(payload).to_bytes()?;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    raft_state.send(database::raft_node::RaftMessage::Propose(
+        database::raft_node::RaftProposal { data, result_tx },
+    ))?;
+    match result_rx.await? {
+        database::raft_node::RaftProposalResult::Committed { index } => {
+            install_raft_confirmed_cluster_genesis(
+                &database.committer_client(),
+                persistence,
+                &payload.manifest,
+                &payload.checkpoint_bytes,
+            )
+            .await?;
+            raft_state.mark_applied(index).await?;
+            Ok(true)
+        },
+        database::raft_node::RaftProposalResult::Rejected => Ok(false),
+    }
+}
+
+async fn install_raft_confirmed_cluster_genesis(
+    committer: &database::CommitterClient,
+    persistence: &Arc<dyn Persistence>,
+    manifest: &database::cluster_genesis::ClusterGenesisManifest,
+    checkpoint_bytes: &[u8],
+) -> anyhow::Result<()> {
+    if let Some(marker) = load_cluster_genesis_marker(persistence).await? {
+        anyhow::ensure!(
+            marker.genesis_id == manifest.genesis_id,
+            "Raft committed cluster genesis {} conflicts with local genesis {}",
+            manifest.genesis_id,
+            marker.genesis_id,
+        );
+    }
+    let checkpoint = database::cluster_genesis::validate_payload(manifest, checkpoint_bytes)?;
+    committer.install_snapshot(checkpoint).await?;
+    record_raft_applied_genesis(persistence, manifest).await
+}
+
+fn start_cluster_genesis_coordinator(
+    runtime: ProdRuntime,
+    database: Database<ProdRuntime>,
+    persistence: Arc<dyn Persistence>,
+    store: database::cluster_genesis::NatsClusterGenesisStore,
+    payload: database::cluster_genesis::CanonicalGenesisPayload,
+    raft_state: database::raft_partition::RaftPartitionState,
+    num_partitions: u32,
+) {
+    let coordinator_runtime = runtime.clone();
+    runtime.spawn_background("cluster_genesis_coordinator", async move {
+        loop {
+            let result: anyhow::Result<bool> = async {
+                match load_raft_applied_genesis(&persistence).await? {
+                    Some(applied) => {
+                        anyhow::ensure!(
+                            applied.genesis_id == payload.manifest.genesis_id,
+                            "Raft applied genesis {} conflicts with canonical genesis {}",
+                            applied.genesis_id,
+                            payload.manifest.genesis_id,
+                        );
+                    },
+                    None => {
+                        if !propose_cluster_genesis(&database, &persistence, &raft_state, &payload)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
+                    },
+                }
+                store
+                    .mark_partition_ready(raft_state.partition_id(), &payload.manifest)
+                    .await?;
+                if !store
+                    .all_partitions_ready(num_partitions, &payload.manifest)
+                    .await?
+                {
+                    return Ok(false);
+                }
+                raft_state.mark_cluster_genesis_ready();
+                tracing::info!(
+                    partition = %raft_state.partition_id(),
+                    genesis_id = %payload.manifest.genesis_id,
+                    "Cluster genesis is Raft-confirmed by every partition; serving enabled"
+                );
+                Ok(true)
+            }
+            .await;
+            match result {
+                Ok(true) => return,
+                Ok(false) => {},
+                Err(error) => tracing::error!(
+                    partition = %raft_state.partition_id(),
+                    "Cluster genesis remains fail-closed: {error:#}"
+                ),
+            }
+            coordinator_runtime.wait(Duration::from_millis(250)).await;
+        }
+    });
+}
+
 pub async fn make_app(
     runtime: ProdRuntime,
     config: LocalConfig,
@@ -524,6 +783,8 @@ pub async fn make_app(
 ) -> anyhow::Result<BackendAppState> {
     let key_broker = config.key_broker()?;
     let persistence_was_fresh = persistence.is_fresh();
+    let raft_cluster_enabled = config.partition_id.is_some() && config.raft_node_id.is_some();
+    let cluster_genesis_ready = Arc::new(AtomicBool::new(!raft_cluster_enabled));
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
     let searcher: Arc<dyn Searcher> = in_process_searcher.clone();
     // TODO(CX-6572) Separate `SegmentMetadataFetcher` from `SearcherImpl`
@@ -542,6 +803,16 @@ pub async fn make_app(
         Arc::new(database::nats_distributed_log::NatsDistributedLog::connect(nats_config).await?)
     } else {
         Arc::new(database::commit_delta::NoopDistributedLog)
+    };
+    let distributed_log: Arc<dyn database::commit_delta::DistributedLog> = if raft_cluster_enabled {
+        Arc::new(
+            database::commit_delta::ClusterGenesisGatedDistributedLog::new(
+                distributed_log,
+                cluster_genesis_ready.clone(),
+            ),
+        )
+    } else {
+        distributed_log
     };
 
     // Set up the global Timestamp Oracle (TSO) for multi-node deployments.
@@ -652,29 +923,142 @@ pub async fn make_app(
         None
     };
 
-    let database = Database::load(
-        persistence.clone(),
-        runtime.clone(),
-        searcher.clone(),
-        preempt_tx.clone(),
-        virtual_system_mapping().clone(),
-        Some(SharedIndexCache),
-        Arc::new(new_rate_limiter(
+    let load_database = || {
+        Database::load(
+            persistence.clone(),
             runtime.clone(),
-            Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
-        )),
-        deleted_tablet_sender,
-        distributed_log.clone(),
-        config.replication_mode == "replica",
-        initial_partition_map,
-        static_node_addresses.clone(),
-        two_phase_decision_log,
-        Some(cluster_grpc_auth.clone()),
-        timestamp_oracle.clone(),
-        table_number_allocator,
-        None, // raft_state: set after Raft node starts, not during Database::load
-    )
-    .await?;
+            searcher.clone(),
+            preempt_tx.clone(),
+            virtual_system_mapping().clone(),
+            Some(SharedIndexCache),
+            Arc::new(new_rate_limiter(
+                runtime.clone(),
+                Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
+            )),
+            deleted_tablet_sender.clone(),
+            distributed_log.clone(),
+            config.replication_mode == "replica",
+            initial_partition_map.clone(),
+            static_node_addresses.clone(),
+            two_phase_decision_log.clone(),
+            Some(cluster_grpc_auth.clone()),
+            timestamp_oracle.clone(),
+            table_number_allocator.clone(),
+            None, // raft_state: set after Raft node starts, not during Database::load
+        )
+    };
+    let mut database = load_database().await?;
+
+    if config.replication_mode == "replica" && persistence_was_fresh {
+        let checkpoint_path = config.checkpoint_storage_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "CHECKPOINT_STORAGE_PATH is required to bootstrap a fresh replica from checkpoint"
+            )
+        })?;
+        let checkpoint_storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::for_use_case(
+            runtime.clone(),
+            checkpoint_path,
+            StorageUseCase::Checkpoints,
+        )?);
+        let checkpoint = match database::snapshot_checkpointer::load_latest_checkpoint(
+            &checkpoint_storage,
+        )
+        .await
+        {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => {
+                metrics::log_replica_bootstrap_result(false);
+                anyhow::bail!(
+                    "Fresh replica startup requires a checkpoint, but none was found at {}",
+                    checkpoint_path
+                );
+            },
+            Err(e) => {
+                metrics::log_replica_bootstrap_result(false);
+                return Err(e);
+            },
+        };
+        let checkpoint_ts = checkpoint.timestamp;
+        if let Err(e) = database
+            .committer_client()
+            .install_snapshot(checkpoint)
+            .await
+        {
+            metrics::log_replica_bootstrap_result(false);
+            return Err(e);
+        }
+        metrics::log_replica_bootstrap_result(true);
+        tracing::info!("Bootstrapped fresh replica from checkpoint at ts={checkpoint_ts}");
+    }
+
+    initialize_application_system_tables(&database).await?;
+    if raft_cluster_enabled && config.replication_mode != "replica" {
+        Application::initialize_storage_config(
+            &database,
+            config.storage_tag_initializer(),
+            config.name(),
+        )
+        .await?;
+    }
+
+    let (cluster_genesis_store, cluster_genesis_payload) = if raft_cluster_enabled {
+        let nats_url = config.nats_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Raft cluster genesis requires NATS_URL for payload transport")
+        })?;
+        let partition_id = database::partition::PartitionId(
+            config
+                .partition_id
+                .expect("raft cluster requires partition ID"),
+        );
+        let store = database::cluster_genesis::NatsClusterGenesisStore::connect(
+            nats_url,
+            instance_secret.as_bytes(),
+        )
+        .await?;
+        let payload = prepare_cluster_genesis(
+            &runtime,
+            &database,
+            &persistence,
+            &store,
+            partition_id,
+            persistence_was_fresh,
+        )
+        .await?;
+        (Some(store), Some(payload))
+    } else {
+        (None, None)
+    };
+
+    if raft_cluster_enabled && persistence_was_fresh {
+        database.shutdown().await?;
+        database = load_database().await?;
+        tracing::info!(
+            partition_id = ?config.partition_id,
+            "Reloaded serving database from canonical cluster genesis"
+        );
+    }
+
+    let application_storage = if config.replication_mode == "replica" {
+        // Replica uses local storage — doesn't write storage config to DB.
+        let replica_path = config
+            .replica_storage_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("REPLICA_STORAGE_PATH is required in replica mode"))?;
+        let (storage, search_storage) =
+            application::ApplicationStorage::new_local(runtime.clone(), replica_path)?;
+        database.set_search_storage(search_storage);
+        storage
+    } else if raft_cluster_enabled {
+        Application::load_storage(runtime.clone(), &database).await?
+    } else {
+        Application::initialize_storage(
+            runtime.clone(),
+            &database,
+            config.storage_tag_initializer(),
+            config.name(),
+        )
+        .await?
+    };
 
     let placement_metadata_store: Option<Arc<dyn database::partition::PlacementMetadataStore>> =
         if let (Some(bootstrap_metadata), Some(nats_url)) = (
@@ -744,69 +1128,6 @@ pub async fn make_app(
             None
         };
 
-    if config.replication_mode == "replica" && persistence_was_fresh {
-        let checkpoint_path = config.checkpoint_storage_path.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "CHECKPOINT_STORAGE_PATH is required to bootstrap a fresh replica from checkpoint"
-            )
-        })?;
-        let checkpoint_storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::for_use_case(
-            runtime.clone(),
-            checkpoint_path,
-            StorageUseCase::Checkpoints,
-        )?);
-        let checkpoint = match database::snapshot_checkpointer::load_latest_checkpoint(
-            &checkpoint_storage,
-        )
-        .await
-        {
-            Ok(Some(checkpoint)) => checkpoint,
-            Ok(None) => {
-                metrics::log_replica_bootstrap_result(false);
-                anyhow::bail!(
-                    "Fresh replica startup requires a checkpoint, but none was found at {}",
-                    checkpoint_path
-                );
-            },
-            Err(e) => {
-                metrics::log_replica_bootstrap_result(false);
-                return Err(e);
-            },
-        };
-        let checkpoint_ts = checkpoint.timestamp;
-        if let Err(e) = database
-            .committer_client()
-            .install_snapshot(checkpoint)
-            .await
-        {
-            metrics::log_replica_bootstrap_result(false);
-            return Err(e);
-        }
-        metrics::log_replica_bootstrap_result(true);
-        tracing::info!("Bootstrapped fresh replica from checkpoint at ts={checkpoint_ts}");
-    }
-
-    initialize_application_system_tables(&database).await?;
-    let application_storage = if config.replication_mode == "replica" {
-        // Replica uses local storage — doesn't write storage config to DB.
-        let replica_path = config
-            .replica_storage_path
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("REPLICA_STORAGE_PATH is required in replica mode"))?;
-        let (storage, search_storage) =
-            application::ApplicationStorage::new_local(runtime.clone(), replica_path)?;
-        database.set_search_storage(search_storage);
-        storage
-    } else {
-        Application::initialize_storage(
-            runtime.clone(),
-            &database,
-            config.storage_tag_initializer(),
-            config.name(),
-        )
-        .await?
-    };
-
     let file_storage = FileStorage {
         transactional_file_storage: TransactionalFileStorage::new(
             runtime.clone(),
@@ -816,7 +1137,7 @@ pub async fn make_app(
         database: database.clone(),
     };
 
-    // Start the SnapshotCheckpointer on the Primary when NATS is configured.
+    // Start checkpoint publication only after canonical genesis is Raft-confirmed.
     if config.replication_mode == "primary" && config.nats_url.is_some() {
         let checkpoint_path = config.checkpoint_storage_path.as_ref().ok_or_else(|| {
             anyhow::anyhow!("CHECKPOINT_STORAGE_PATH is required in primary mode with NATS_URL")
@@ -826,13 +1147,23 @@ pub async fn make_app(
             checkpoint_path,
             StorageUseCase::Checkpoints,
         )?);
-        let _checkpointer = database::snapshot_checkpointer::SnapshotCheckpointer::start(
-            runtime.clone(),
-            persistence.reader(),
-            database.retention_validator(),
-            checkpoint_storage,
-        );
-        tracing::info!("Started SnapshotCheckpointer for replication");
+        let checkpointer_runtime = runtime.clone();
+        let checkpointer_database = database.clone();
+        let checkpointer_persistence = persistence.clone();
+        let checkpointer_genesis_ready = cluster_genesis_ready.clone();
+        runtime.spawn_background("snapshot_checkpointer_gate", async move {
+            while !checkpointer_genesis_ready.load(Ordering::SeqCst) {
+                checkpointer_runtime.wait(Duration::from_millis(100)).await;
+            }
+            let _checkpointer = database::snapshot_checkpointer::SnapshotCheckpointer::start(
+                checkpointer_runtime,
+                checkpointer_persistence.reader(),
+                checkpointer_database.retention_validator(),
+                checkpoint_storage,
+            );
+            tracing::info!("Started SnapshotCheckpointer for replication");
+            std::future::pending::<()>().await;
+        });
     }
 
     let node_process_timeout = *ACTION_USER_TIMEOUT + Duration::from_secs(5);
@@ -893,7 +1224,7 @@ pub async fn make_app(
         config.convex_site_url()?,
         searcher.clone(),
         segment_metadata_fetcher,
-        persistence,
+        persistence.clone(),
         actions,
         Arc::new(RedactLogsToClient::new(config.redact_logs_to_client)),
         Arc::new(ApplicationAuth::new(
@@ -1095,7 +1426,11 @@ pub async fn make_app(
             let excluded_source_partition =
                 config.partition_id.map(database::partition::PartitionId);
             let consumer_runtime = runtime.clone();
+            let consumer_genesis_ready = cluster_genesis_ready.clone();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
+                while !consumer_genesis_ready.load(Ordering::SeqCst) {
+                    consumer_runtime.wait(Duration::from_millis(100)).await;
+                }
                 let mut backoff = Duration::from_millis(250);
                 loop {
                     tracing::info!(
@@ -1191,13 +1526,22 @@ pub async fn make_app(
     // Start the 2PC Transaction Watcher for crash recovery.
     if let Some(partition_id) = config.partition_id {
         if let Some(nats_url) = &config.nats_url {
-            database::two_phase_watcher::start(
-                runtime.clone(),
-                database.committer_client(),
-                nats_url.clone(),
-                database::partition::PartitionId(partition_id),
-            );
-            tracing::info!("Started 2PC Transaction Watcher");
+            let watcher_runtime = runtime.clone();
+            let watcher_committer = database.committer_client();
+            let watcher_nats_url = nats_url.clone();
+            let watcher_genesis_ready = cluster_genesis_ready.clone();
+            runtime.spawn_background("two_phase_watcher_gate", async move {
+                while !watcher_genesis_ready.load(Ordering::SeqCst) {
+                    watcher_runtime.wait(Duration::from_millis(100)).await;
+                }
+                database::two_phase_watcher::start(
+                    watcher_runtime,
+                    watcher_committer,
+                    watcher_nats_url,
+                    database::partition::PartitionId(partition_id),
+                );
+                tracing::info!("Started 2PC Transaction Watcher");
+            });
         }
     }
 
@@ -1276,12 +1620,13 @@ pub async fn make_app(
                 })
             }) as Arc<dyn database::raft_storage::RaftSnapshotProvider>
         };
-        let mut manager = RaftPartitionManager::new(
+        let mut manager = RaftPartitionManager::new_with_cluster_genesis_gate(
             raft_config,
             raft_engine,
             peer_senders,
             Some(snapshot_provider),
             timestamp_oracle.clone(),
+            cluster_genesis_ready.clone(),
         )?;
         let raft_state = manager.state();
         raft_state_for_app = Some(raft_state.clone());
@@ -1300,10 +1645,13 @@ pub async fn make_app(
         if let Some(mut node) = manager.take_node() {
             let committer = database.committer_client();
             let raft_state_for_apply = raft_state.clone();
+            let persistence_for_apply = persistence.clone();
             runtime.spawn_background("raft_node", async move {
                 let committer_for_entries = committer.clone();
                 let raft_state_for_entries = raft_state_for_apply.clone();
+                let persistence_for_entries = persistence_for_apply.clone();
                 let committer_for_snapshots = committer.clone();
+                let persistence_for_snapshots = persistence_for_apply.clone();
                 if let Err(e) = node
                     .run(
                         move |raft_index, data| {
@@ -1353,6 +1701,24 @@ pub async fn make_app(
                                             })
                                     })?;
                                 },
+                                RaftStateMachineEntry::ClusterGenesis {
+                                    manifest,
+                                    checkpoint_base64,
+                                } => {
+                                    let checkpoint_bytes = base64::decode(checkpoint_base64)?;
+                                    let committer = committer_for_entries.clone();
+                                    let persistence = persistence_for_entries.clone();
+                                    let rt = tokio::runtime::Handle::current();
+                                    rt.block_on(async {
+                                        install_raft_confirmed_cluster_genesis(
+                                            &committer,
+                                            &persistence,
+                                            &manifest,
+                                            &checkpoint_bytes,
+                                        )
+                                        .await
+                                    })?;
+                                },
                             }
 
                             Ok(())
@@ -1364,10 +1730,24 @@ pub async fn make_app(
                                 metadata.index,
                                 metadata.term,
                             )?;
+                            let genesis_marker = decoded
+                                .checkpoint
+                                .globals
+                                .get(&String::from(
+                                    common::persistence::PersistenceGlobalKey::ClusterGenesis,
+                                ))
+                                .cloned()
+                                .map(database::cluster_genesis::ClusterGenesisMarker::parse)
+                                .transpose()?;
                             let committer = committer_for_snapshots.clone();
+                            let persistence = persistence_for_snapshots.clone();
                             let rt = tokio::runtime::Handle::current();
                             rt.block_on(async {
                                 committer.install_raft_snapshot(decoded.checkpoint).await?;
+                                if let Some(marker) = genesis_marker {
+                                    record_raft_applied_genesis_marker(&persistence, &marker)
+                                        .await?;
+                                }
                                 Ok::<_, anyhow::Error>(())
                             })
                         },
@@ -1385,6 +1765,25 @@ pub async fn make_app(
         // Committer so normal writes propose through Raft and followers reject
         // non-leader writes.
         database.attach_raft_state(raft_state.clone()).await?;
+
+        let genesis_store = cluster_genesis_store.clone().ok_or_else(|| {
+            anyhow::anyhow!("Raft cluster started without a canonical genesis store")
+        })?;
+        let genesis_payload = cluster_genesis_payload.clone().ok_or_else(|| {
+            anyhow::anyhow!("Raft cluster started without a canonical genesis payload")
+        })?;
+        let num_partitions = config
+            .num_partitions
+            .ok_or_else(|| anyhow::anyhow!("Raft cluster genesis requires NUM_PARTITIONS"))?;
+        start_cluster_genesis_coordinator(
+            runtime.clone(),
+            database.clone(),
+            persistence.clone(),
+            genesis_store,
+            genesis_payload,
+            raft_state.clone(),
+            num_partitions,
+        );
 
         // Start transport clients for each peer.
         for client in transport_clients {
@@ -1532,6 +1931,13 @@ mod tests {
             Some(database::partition::PartitionId(0)),
             Some(&raft_state),
         ));
+        raft_state.mark_cluster_genesis_unready_for_test();
+        assert!(!super::should_run_cluster_singleton_workers(
+            false,
+            Some(database::partition::PartitionId(0)),
+            Some(&raft_state),
+        ));
+        raft_state.mark_cluster_genesis_ready();
         raft_state.expire_leader_serving_lease_for_test();
         assert!(!super::should_run_cluster_singleton_workers(
             false,
@@ -1666,6 +2072,114 @@ mod tests {
 
                 primary.shutdown().await?;
                 st.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn canonical_genesis_replaces_independent_random_bootstrap() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        let test_runtime = runtime.clone();
+        runtime.block_on(
+            "canonical_genesis_replaces_independent_random_bootstrap",
+            async move {
+                let source_persistence = Arc::new(TestPersistence::new());
+                let target_persistence = Arc::new(TestPersistence::new());
+                let (_source_shutdown_tx, source_shutdown_rx) = async_broadcast::broadcast(1);
+                let (_target_shutdown_tx, target_shutdown_rx) = async_broadcast::broadcast(1);
+                let source = make_app(
+                    test_runtime.clone(),
+                    LocalConfig::new_for_test()?,
+                    source_persistence,
+                    source_shutdown_rx,
+                    ShutdownSignal::no_op(),
+                )
+                .await?;
+                let target = make_app(
+                    test_runtime,
+                    LocalConfig::new_for_test()?,
+                    target_persistence.clone(),
+                    target_shutdown_rx,
+                    ShutdownSignal::no_op(),
+                )
+                .await?;
+
+                let source_checkpoint = source
+                    .application
+                    .database()
+                    .build_raft_snapshot_checkpoint()
+                    .await?;
+                let target_checkpoint = target
+                    .application
+                    .database()
+                    .build_raft_snapshot_checkpoint()
+                    .await?;
+                let canonical =
+                    database::cluster_genesis::canonicalize_checkpoint(source_checkpoint)?;
+                let independent =
+                    database::cluster_genesis::canonicalize_checkpoint(target_checkpoint)?;
+                assert_ne!(
+                    canonical.manifest.genesis_id,
+                    independent.manifest.genesis_id
+                );
+
+                let checkpoint = database::cluster_genesis::validate_payload(
+                    &canonical.manifest,
+                    &canonical.checkpoint_bytes,
+                )?;
+                let genesis_ts = checkpoint.timestamp;
+                let expected_documents = checkpoint
+                    .documents
+                    .iter()
+                    .filter(|entry| entry.ts <= genesis_ts)
+                    .map(|entry| (entry.id, entry.value.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let expected_globals = checkpoint.globals.clone();
+                target
+                    .application
+                    .database()
+                    .committer_client()
+                    .install_snapshot(checkpoint)
+                    .await?;
+
+                let installed_documents = target_persistence
+                    .load_documents(
+                        TimestampRange::all(),
+                        Order::Asc,
+                        10_000,
+                        Arc::new(NoopRetentionValidator),
+                    )
+                    .try_filter(|entry| futures::future::ready(entry.ts <= genesis_ts))
+                    .map_ok(|entry| (entry.id, entry.value))
+                    .try_collect::<BTreeMap<_, _>>()
+                    .await?;
+                assert_eq!(installed_documents, expected_documents);
+                for key in [
+                    common::persistence::PersistenceGlobalKey::TablesByIdIndex,
+                    common::persistence::PersistenceGlobalKey::IndexByIdIndex,
+                    common::persistence::PersistenceGlobalKey::TablesTabletId,
+                    common::persistence::PersistenceGlobalKey::IndexTabletId,
+                    common::persistence::PersistenceGlobalKey::ClusterGenesis,
+                ] {
+                    assert_eq!(
+                        target_persistence.get_persistence_global(key).await?,
+                        expected_globals.get(&String::from(key)).cloned(),
+                        "canonical persistence global {key:?} diverged",
+                    );
+                }
+                let marker = target_persistence
+                    .get_persistence_global(
+                        common::persistence::PersistenceGlobalKey::ClusterGenesis,
+                    )
+                    .await?
+                    .expect("installed checkpoint must retain canonical genesis marker");
+                let marker = database::cluster_genesis::ClusterGenesisMarker::parse(marker)?;
+                assert_eq!(marker.genesis_id, canonical.manifest.genesis_id);
+
+                source.shutdown().await?;
+                target.shutdown().await?;
                 Ok(())
             },
         )

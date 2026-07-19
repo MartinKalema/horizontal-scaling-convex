@@ -490,6 +490,20 @@ pub(crate) fn ensure_local_backend_api_authority(
     } else {
         (path, RouteAuthorityClass::FailClosed)
     };
+    let static_schema = matches!(
+        normalize_local_backend_api_path(path),
+        "/dashboard_openapi.json" | "/v1/openapi.json"
+    );
+    if !static_schema
+        && let Some(raft_state) = st.raft_state()
+        && !raft_state.is_cluster_genesis_ready()
+    {
+        return Err(unsupported_local_backend_cluster_surface_error(
+            surface,
+            class,
+            "canonical cluster genesis is not Raft-confirmed by every partition".to_string(),
+        ));
+    }
     match class {
         RouteAuthorityClass::AnyNodeSafe | RouteAuthorityClass::ExplicitForwarding => Ok(()),
         RouteAuthorityClass::CoordinatorOwner => {
@@ -622,6 +636,23 @@ mod tests {
             format!("{err:#}").contains("fresh Raft serving lease"),
             "unexpected error: {err:#}",
         );
+    }
+
+    #[test]
+    fn test_stateful_routes_fail_closed_before_cluster_genesis() {
+        let raft_state = RaftPartitionState::new_for_test(true, 1, PartitionId(0), 1);
+        raft_state.mark_cluster_genesis_unready_for_test();
+        let st = TestAuthorityContext {
+            replica_mode: false,
+            partition_id: Some(PartitionId(0)),
+            raft_state: Some(raft_state),
+        };
+
+        let error = ensure_local_backend_api_authority(&st, "/api/sync")
+            .expect_err("stateful route must remain closed before canonical genesis");
+        assert!(format!("{error:#}").contains("canonical cluster genesis"));
+        ensure_local_backend_api_authority(&st, "/api/dashboard_openapi.json")
+            .expect("static schema remains safe during bootstrap");
     }
 
     #[test]

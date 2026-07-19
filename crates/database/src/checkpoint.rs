@@ -42,6 +42,7 @@ use common::{
     types::{
         IndexId,
         PersistenceVersion,
+        RepeatableTimestamp,
         Timestamp,
     },
 };
@@ -66,6 +67,44 @@ pub struct CheckpointData {
     pub globals: BTreeMap<String, JsonValue>,
 }
 
+/// A checkpoint scans the physical document log from its beginning, but the
+/// logical snapshot it must protect is `checkpoint_ts`. Persistence backends
+/// validate the lower bound of `load_documents`, which would otherwise reject
+/// every checkpoint once retention advances beyond `Timestamp::MIN`.
+struct CheckpointRetentionValidator {
+    inner: Arc<dyn RetentionValidator>,
+    checkpoint_ts: Timestamp,
+}
+
+#[async_trait]
+impl RetentionValidator for CheckpointRetentionValidator {
+    fn optimistic_validate_snapshot(&self, _ts: Timestamp) -> anyhow::Result<()> {
+        self.inner.optimistic_validate_snapshot(self.checkpoint_ts)
+    }
+
+    async fn validate_snapshot(&self, _ts: Timestamp) -> anyhow::Result<()> {
+        self.inner.validate_snapshot(self.checkpoint_ts).await
+    }
+
+    async fn validate_document_snapshot(&self, _ts: Timestamp) -> anyhow::Result<()> {
+        self.inner
+            .validate_document_snapshot(self.checkpoint_ts)
+            .await
+    }
+
+    async fn min_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
+        self.inner.min_snapshot_ts().await
+    }
+
+    async fn min_document_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
+        self.inner.min_document_snapshot_ts().await
+    }
+
+    fn fail_if_falling_behind(&self) -> anyhow::Result<()> {
+        self.inner.fail_if_falling_behind()
+    }
+}
+
 /// Creates a checkpoint from an existing persistence layer.
 /// Called periodically on the Primary to produce checkpoint files.
 pub async fn create_checkpoint(
@@ -73,12 +112,16 @@ pub async fn create_checkpoint(
     timestamp: Timestamp,
     retention_validator: Arc<dyn RetentionValidator>,
 ) -> anyhow::Result<CheckpointData> {
+    let checkpoint_retention_validator = Arc::new(CheckpointRetentionValidator {
+        inner: retention_validator,
+        checkpoint_ts: timestamp,
+    });
     let documents: Vec<DocumentLogEntry> = persistence
         .load_documents(
             TimestampRange::new((Bound::Unbounded, Bound::Included(timestamp))),
             Order::Asc,
             10_000,
-            retention_validator,
+            checkpoint_retention_validator,
         )
         .try_collect()
         .await
@@ -348,5 +391,36 @@ impl PersistenceReader for CheckpointPersistence {
 
     fn version(&self) -> PersistenceVersion {
         self.version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common::{
+        persistence::{
+            fake_retention_validator::FakeRetentionValidator,
+            RetentionValidator,
+        },
+        types::Timestamp,
+    };
+
+    use super::CheckpointRetentionValidator;
+
+    #[convex_macro::test_runtime]
+    async fn checkpoint_retention_validates_checkpoint_ts_instead_of_scan_start(
+        _rt: common::runtime::testing::TestRuntime,
+    ) -> anyhow::Result<()> {
+        let retention_min = Timestamp::try_from(100u64)?;
+        let checkpoint_ts = Timestamp::try_from(200u64)?;
+        let validator = CheckpointRetentionValidator {
+            inner: Arc::new(FakeRetentionValidator::new(retention_min, retention_min)),
+            checkpoint_ts,
+        };
+
+        validator.validate_document_snapshot(Timestamp::MIN).await?;
+        validator.validate_snapshot(Timestamp::MIN).await?;
+        Ok(())
     }
 }

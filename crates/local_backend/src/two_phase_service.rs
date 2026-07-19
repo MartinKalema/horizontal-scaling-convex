@@ -20,7 +20,9 @@ use database::{
     },
     raft_partition::RaftPartitionState,
     two_phase::{
+        prepare_timestamp_too_low,
         ParticipantTransaction,
+        PrepareResult,
         TwoPhaseCommitGrpcClient,
         TwoPhaseCommitGrpcClientPool,
         TwoPhaseTransactionId,
@@ -81,10 +83,55 @@ impl TwoPhaseCommitGrpcService {
         TonicTwoPcServer::new(self)
     }
 
+    fn prepare_response(
+        result: anyhow::Result<PrepareResult>,
+        error_context: &str,
+    ) -> Result<Response<TwoPcPrepareResponse>, Status> {
+        match result {
+            Ok(result) => Ok(Response::new(TwoPcPrepareResponse {
+                prepare_ts: u64::from(result.prepare_ts),
+                required_prepare_ts: None,
+            })),
+            Err(err) => {
+                if let Some(retry) = prepare_timestamp_too_low(&err) {
+                    return Ok(Response::new(TwoPcPrepareResponse {
+                        prepare_ts: u64::from(retry.proposed_ts),
+                        required_prepare_ts: Some(u64::from(retry.required_ts)),
+                    }));
+                }
+                Err(Status::internal(format!("{error_context}: {err:#}")))
+            },
+        }
+    }
+
+    fn validate_reads_response(
+        result: anyhow::Result<()>,
+        error_context: &str,
+    ) -> Result<Response<TwoPcValidateReadsResponse>, Status> {
+        match result {
+            Ok(()) => Ok(Response::new(TwoPcValidateReadsResponse {
+                required_prepare_ts: None,
+            })),
+            Err(err) => {
+                if let Some(retry) = prepare_timestamp_too_low(&err) {
+                    return Ok(Response::new(TwoPcValidateReadsResponse {
+                        required_prepare_ts: Some(u64::from(retry.required_ts)),
+                    }));
+                }
+                Err(Status::internal(format!("{error_context}: {err:#}")))
+            },
+        }
+    }
+
     async fn leader_client(&self) -> Result<Option<Arc<TwoPhaseCommitGrpcClient>>, Status> {
         let Some(raft_state) = self.raft_state.as_ref() else {
             return Ok(None);
         };
+        if !raft_state.is_cluster_genesis_ready() {
+            return Err(Status::unavailable(
+                "Canonical cluster genesis is not Raft-confirmed by every partition",
+            ));
+        }
         if raft_state.is_leader_ready() {
             return Ok(None);
         }
@@ -204,11 +251,8 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
                     placement_version,
                     &participants,
                 )
-                .await
-                .map_err(|e| Status::internal(format!("Leader Prepare failed: {e:#}")))?;
-            return Ok(Response::new(TwoPcPrepareResponse {
-                prepare_ts: u64::from(result.prepare_ts),
-            }));
+                .await;
+            return Self::prepare_response(result, "Leader Prepare failed");
         }
 
         let result = self
@@ -220,12 +264,9 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
                 prepare_ts,
                 participants,
             )
-            .await
-            .map_err(|e| Status::internal(format!("Prepare failed: {e:#}")))?;
+            .await;
 
-        Ok(Response::new(TwoPcPrepareResponse {
-            prepare_ts: u64::from(result.prepare_ts),
-        }))
+        Self::prepare_response(result, "Prepare failed")
     }
 
     async fn validate_reads(
@@ -248,7 +289,7 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
         self.ensure_placement_version(placement_version).await?;
 
         if let Some(client) = self.leader_client().await? {
-            client
+            let result = client
                 .validate_reads(
                     &txn_id,
                     transaction,
@@ -256,17 +297,16 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
                     validate_ts,
                     placement_version,
                 )
-                .await
-                .map_err(|e| Status::internal(format!("Leader ValidateReads failed: {e:#}")))?;
-            return Ok(Response::new(TwoPcValidateReadsResponse {}));
+                .await;
+            return Self::validate_reads_response(result, "Leader ValidateReads failed");
         }
 
-        self.committer
+        let result = self
+            .committer
             .validate_remote_reads(txn_id, transaction, req.write_source.into(), validate_ts)
-            .await
-            .map_err(|e| Status::internal(format!("ValidateReads failed: {e:#}")))?;
+            .await;
 
-        Ok(Response::new(TwoPcValidateReadsResponse {}))
+        Self::validate_reads_response(result, "ValidateReads failed")
     }
 
     async fn commit_prepared(

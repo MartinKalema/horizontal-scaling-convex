@@ -709,23 +709,11 @@ pub async fn create_storage<RT: Runtime>(
 }
 
 impl<RT: Runtime> Application<RT> {
-    pub async fn initialize_storage(
+    async fn storage_from_type(
         runtime: RT,
         database: &Database<RT>,
-        storage_tag_initializer: StorageTagInitializer,
-        instance_name: String,
+        storage_type: model::database_globals::types::StorageType,
     ) -> anyhow::Result<ApplicationStorage> {
-        let storage_type = {
-            let mut tx = database.begin_system().await?;
-            let storage_type = DatabaseGlobalsModel::new(&mut tx)
-                .initialize_storage_tag(storage_tag_initializer, instance_name)
-                .await?;
-            database
-                .commit_with_write_source(tx, "init_storage")
-                .await?;
-            storage_type
-        };
-
         let files_storage =
             create_storage(runtime.clone(), &storage_type, StorageUseCase::Files).await?;
         let modules_storage =
@@ -738,16 +726,11 @@ impl<RT: Runtime> Application<RT> {
         .await?;
         let exports_storage =
             create_storage(runtime.clone(), &storage_type, StorageUseCase::Exports).await?;
-        let snapshot_imports_storage = create_storage(
-            runtime.clone(),
-            &storage_type,
-            StorageUseCase::SnapshotImports,
-        )
-        .await?;
+        let snapshot_imports_storage =
+            create_storage(runtime, &storage_type, StorageUseCase::SnapshotImports).await?;
 
-        // Search storage needs to be set for Database to be fully initialized
         database.set_search_storage(search_storage.clone());
-        tracing::info!("{:?} storage is configured.", storage_type);
+        tracing::info!(?storage_type, "Storage is configured");
 
         Ok(ApplicationStorage {
             files_storage,
@@ -756,6 +739,53 @@ impl<RT: Runtime> Application<RT> {
             exports_storage,
             snapshot_imports_storage,
         })
+    }
+
+    pub async fn initialize_storage(
+        runtime: RT,
+        database: &Database<RT>,
+        storage_tag_initializer: StorageTagInitializer,
+        instance_name: String,
+    ) -> anyhow::Result<ApplicationStorage> {
+        let storage_type =
+            Self::initialize_storage_config(database, storage_tag_initializer, instance_name)
+                .await?;
+
+        Self::storage_from_type(runtime, database, storage_type).await
+    }
+
+    /// Persist the deployment's storage configuration without constructing the
+    /// runtime storage handles. Cluster bootstrap uses this to include the
+    /// configuration in canonical genesis before configuring search storage.
+    pub async fn initialize_storage_config(
+        database: &Database<RT>,
+        storage_tag_initializer: StorageTagInitializer,
+        instance_name: String,
+    ) -> anyhow::Result<model::database_globals::types::StorageType> {
+        let mut tx = database.begin_system().await?;
+        let storage_type = DatabaseGlobalsModel::new(&mut tx)
+            .initialize_storage_tag(storage_tag_initializer, instance_name)
+            .await?;
+        database
+            .commit_with_write_source(tx, "init_storage")
+            .await?;
+        Ok(storage_type)
+    }
+
+    pub async fn load_storage(
+        runtime: RT,
+        database: &Database<RT>,
+    ) -> anyhow::Result<ApplicationStorage> {
+        let storage_type = {
+            let mut tx = database.begin_system().await?;
+            DatabaseGlobalsModel::new(&mut tx)
+                .database_globals()
+                .await?
+                .storage_type
+                .clone()
+                .context("Database storage has not been initialized")?
+        };
+        Self::storage_from_type(runtime, database, storage_type).await
     }
 
     pub async fn new(
