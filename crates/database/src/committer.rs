@@ -1433,6 +1433,25 @@ impl<RT: Runtime> Committer<RT> {
             .unwrap_or(crate::partition::PartitionId(0))
     }
 
+    fn prepare_admission_blocker_ts(&self) -> Option<Timestamp> {
+        let pending_write_ts = self.pending_writes.min_ts();
+        let committing_prepared_ts = self
+            .prepared_commit_waiters
+            .keys()
+            .filter_map(|transaction_id| {
+                self.prepared_transactions
+                    .get(transaction_id)
+                    .map(|prepared| prepared.commit_ts)
+            })
+            .min();
+        match (pending_write_ts, committing_prepared_ts) {
+            (Some(pending), Some(prepared)) => Some(cmp::min(pending, prepared)),
+            (Some(pending), None) => Some(pending),
+            (None, Some(prepared)) => Some(prepared),
+            (None, None) => None,
+        }
+    }
+
     fn dequeue_snapshot(&mut self, commit_id: usize) {
         let (queued_commit_id, ..) = self
             .queued_snapshots
@@ -1593,7 +1612,7 @@ impl<RT: Runtime> Committer<RT> {
                 || pending_snapshot_install.is_some()
                 || snapshot_install_in_progress;
             if !snapshot_barrier_active
-                && self.pending_writes.min_ts().is_none()
+                && self.prepare_admission_blocker_ts().is_none()
                 && let Some(deferred_prepare) = deferred_prepares.pop_front()
             {
                 self.handle_deferred_prepare(deferred_prepare).await;
@@ -2402,7 +2421,7 @@ impl<RT: Runtime> Committer<RT> {
                                 redo,
                                 result,
                             };
-                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                            if let Some(min_pending_ts) = self.prepare_admission_blocker_ts() {
                                 Self::defer_prepare_admission(
                                     &mut deferred_prepares,
                                     deferred_prepare,
@@ -2513,7 +2532,7 @@ impl<RT: Runtime> Committer<RT> {
                                 write_source,
                                 result,
                             };
-                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                            if let Some(min_pending_ts) = self.prepare_admission_blocker_ts() {
                                 Self::defer_prepare_admission(
                                     &mut deferred_prepares,
                                     deferred_prepare,
@@ -2539,7 +2558,7 @@ impl<RT: Runtime> Committer<RT> {
                                 participants,
                                 result,
                             };
-                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                            if let Some(min_pending_ts) = self.prepare_admission_blocker_ts() {
                                 Self::defer_prepare_admission(
                                     &mut deferred_prepares,
                                     deferred_prepare,
@@ -5924,14 +5943,14 @@ impl<RT: Runtime> Committer<RT> {
     fn defer_prepare_admission(
         deferred_prepares: &mut VecDeque<DeferredPrepare>,
         deferred_prepare: DeferredPrepare,
-        min_pending_ts: Timestamp,
+        blocking_ts: Timestamp,
     ) {
         tracing::debug!(
             transaction_id = %deferred_prepare.transaction_id(),
             kind = deferred_prepare.kind(),
-            min_pending_ts = u64::from(min_pending_ts),
+            blocking_ts = u64::from(blocking_ts),
             deferred_prepares = deferred_prepares.len() + 1,
-            "Deferring 2PC prepare admission behind older pending write",
+            "Deferring 2PC prepare admission behind earlier unpublished state-machine write",
         );
         deferred_prepares.push_back(deferred_prepare);
     }

@@ -612,6 +612,52 @@ async fn commit_next_raft_delta_for_test(
     Ok(delta)
 }
 
+async fn commit_next_raft_prepare_for_test(
+    raft_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
+    index: u64,
+) -> anyhow::Result<TwoPhaseRedoEntry> {
+    let message = tokio::time::timeout(Duration::from_secs(1), raft_rx.recv())
+        .await?
+        .context("test Raft mailbox closed before receiving a proposal")?;
+    let RaftMessage::Propose(proposal) = message else {
+        anyhow::bail!("expected a Raft proposal in the test mailbox")
+    };
+    let redo = match RaftStateMachineEntry::from_bytes(&proposal.data)? {
+        RaftStateMachineEntry::TwoPhasePrepare { redo } => redo,
+        RaftStateMachineEntry::CommitDelta { .. } => {
+            anyhow::bail!("expected a 2PC prepare Raft entry")
+        },
+        RaftStateMachineEntry::ClusterGenesis { .. } => {
+            anyhow::bail!("expected a 2PC prepare, not cluster genesis")
+        },
+    };
+    proposal
+        .result_tx
+        .send(RaftProposalResult::Committed { index })
+        .map_err(|_| anyhow::anyhow!("prepare waiter dropped before test Raft decision"))?;
+    Ok(redo)
+}
+
+async fn acknowledge_next_raft_applied_for_test_ref(
+    raft_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
+    expected_index: u64,
+) -> anyhow::Result<()> {
+    let message = tokio::time::timeout(Duration::from_secs(1), raft_rx.recv())
+        .await?
+        .context("test Raft mailbox closed before MarkApplied")?;
+    let RaftMessage::MarkApplied { index, result_tx } = message else {
+        anyhow::bail!("expected MarkApplied for index {expected_index}")
+    };
+    anyhow::ensure!(
+        index == expected_index,
+        "expected applied index {expected_index}, got {index}",
+    );
+    result_tx
+        .send(Ok(()))
+        .map_err(|_| anyhow::anyhow!("committer dropped Raft applied-index waiter"))?;
+    Ok(())
+}
+
 async fn acknowledge_next_raft_applied_for_test(
     mut raft_rx: tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
     expected_index: u64,
@@ -1775,6 +1821,126 @@ async fn test_raft_replay_after_crash_post_applied_index_is_idempotent(
         false,
     )
     .await
+}
+
+#[convex_macro::test_runtime]
+async fn test_prepare_waits_for_raft_committed_prepared_write_publication(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+    insert_doc(&node, "projects", assert_obj!("name" => "seed")).await?;
+
+    let mut first_tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut first_tx)
+        .insert(&"projects".parse()?, assert_obj!("name" => "first"))
+        .await?;
+    let first_final_tx = first_tx.finalize()?;
+    let first_write_indexes: Vec<_> = first_final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("prepared_commit_admission_barrier_test");
+    let first_participant = ParticipantTransaction::from_final_transaction(
+        &first_final_tx,
+        PartitionId(1),
+        &first_write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let first_txn_id = TwoPhaseTransactionId::new();
+    let committer = node.committer_for_test();
+    let first_prepare_ts = committer.allocate_commit_ts().await?;
+    committer
+        .prepare_remote(
+            first_txn_id.clone(),
+            first_participant,
+            write_source.clone(),
+            first_prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+
+    let (raft_state, mut raft_rx) =
+        RaftPartitionState::new_with_mailbox_for_test(true, 1, PartitionId(1), 1);
+    node.attach_raft_state(raft_state).await?;
+    let hold = pause.hold(AFTER_RAFT_CONVEX_PERSISTENCE);
+    let first_txn_id_for_commit = first_txn_id.clone();
+    let committer_for_commit = committer.clone();
+    let commit_task = tokio::spawn(async move {
+        committer_for_commit
+            .commit_prepared(first_txn_id_for_commit)
+            .await
+    });
+    let first_delta = commit_next_raft_delta_for_test(&mut raft_rx, 11).await?;
+    assert_eq!(first_delta.ts, first_prepare_ts);
+    let pause_guard = hold
+        .wait_for_blocked()
+        .await
+        .context("prepared commit did not pause before local publication")?;
+
+    let mut second_tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut second_tx)
+        .insert(&"projects".parse()?, assert_obj!("name" => "second"))
+        .await?;
+    let second_final_tx = second_tx.finalize()?;
+    let second_write_indexes: Vec<_> = second_final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let second_participant = ParticipantTransaction::from_final_transaction(
+        &second_final_tx,
+        PartitionId(1),
+        &second_write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let second_txn_id = TwoPhaseTransactionId::new();
+    let second_prepare_ts = committer.allocate_commit_ts().await?;
+    let committer_for_prepare = committer.clone();
+    let second_txn_id_for_prepare = second_txn_id.clone();
+    let prepare_task = tokio::spawn(async move {
+        committer_for_prepare
+            .prepare_remote(
+                second_txn_id_for_prepare,
+                second_participant,
+                write_source,
+                second_prepare_ts,
+                vec![PartitionId(1)],
+            )
+            .await
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), raft_rx.recv())
+            .await
+            .is_err(),
+        "later prepare entered Raft before the earlier committed write became visible",
+    );
+
+    pause_guard.unpause();
+    acknowledge_next_raft_applied_for_test_ref(&mut raft_rx, 11).await?;
+    assert_eq!(commit_task.await??, first_prepare_ts);
+
+    let second_redo = commit_next_raft_prepare_for_test(&mut raft_rx, 12).await?;
+    assert_eq!(second_redo.transaction_id(), second_txn_id);
+    acknowledge_next_raft_applied_for_test_ref(&mut raft_rx, 12).await?;
+    assert_eq!(prepare_task.await??.prepare_ts, second_prepare_ts);
+    committer.rollback_prepared(second_txn_id).await?;
+
+    let rows = run_query(
+        node,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(rows.len(), 2, "only the first prepared write should commit");
+    Ok(())
 }
 
 #[convex_macro::test_runtime]
