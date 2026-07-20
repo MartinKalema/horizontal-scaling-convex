@@ -438,6 +438,7 @@ pub struct CommitOutcome {
     pub ts: Timestamp,
     pub source_partition: Option<crate::partition::PartitionId>,
     pub read_after_write_partitions: Vec<crate::partition::PartitionId>,
+    pub invalidated_tables: BTreeSet<TableName>,
 }
 
 /// Result of asking one partition leader to make an exact timestamp readable.
@@ -1845,6 +1846,12 @@ impl<RT: Runtime> Committer<RT> {
                                     .delta
                                     .source_partition
                                     .into_iter()
+                                    .collect(),
+                                invalidated_tables: published_commit
+                                    .delta
+                                    .tablet_id_to_table_name
+                                    .values()
+                                    .cloned()
                                     .collect(),
                             }));
 
@@ -6742,6 +6749,7 @@ impl<RT: Runtime> Committer<RT> {
                     .as_ref()
                     .map(|placement_state| placement_state.local_partition()),
                 read_after_write_partitions: Vec::new(),
+                invalidated_tables: BTreeSet::new(),
             }));
             return None;
         }

@@ -6,6 +6,7 @@
 //! pattern).
 
 use std::{
+    collections::BTreeSet,
     sync::{
         atomic::{
             AtomicBool,
@@ -169,6 +170,7 @@ use crate::{
     raft_state_machine::RaftStateMachineEntry,
     raft_storage::ConvexRaftStorage,
     snapshot_manager::partition_timestamp_map_from_json,
+    subscription_invalidation::SubscriptionInvalidationClient,
     table_number_allocator::{
         testing::InMemoryTableNumberAllocator,
         TableNumberAllocator,
@@ -427,6 +429,37 @@ impl DistributedLog for SwitchableDistributedLog {
 fn partitioned_map(local_partition: PartitionId) -> PartitionMap {
     PartitionMap::from_config("messages=0,projects=1", local_partition, 2)
         .without_catalog_authority_for_test()
+}
+
+#[derive(Default)]
+struct RecordingSubscriptionInvalidationClient {
+    calls: Mutex<
+        Vec<(
+            PartitionId,
+            PlacementVersion,
+            Timestamp,
+            BTreeSet<TableName>,
+        )>,
+    >,
+}
+
+#[async_trait]
+impl SubscriptionInvalidationClient for RecordingSubscriptionInvalidationClient {
+    async fn invalidate_tables(
+        &self,
+        authority_partition: PartitionId,
+        placement_version: PlacementVersion,
+        commit_ts: Timestamp,
+        table_names: BTreeSet<TableName>,
+    ) -> anyhow::Result<()> {
+        self.calls.lock().push((
+            authority_partition,
+            placement_version,
+            commit_ts,
+            table_names,
+        ));
+        Ok(())
+    }
 }
 
 fn strict_partitioned_map(local_partition: PartitionId) -> PartitionMap {
@@ -2490,6 +2523,31 @@ async fn test_sequential_ordering(rt: TestRuntime) -> anyhow::Result<()> {
 
     assert!(ts2 > ts1, "second must commit after first");
     assert!(ts3 > ts2, "third must commit after second");
+
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_remote_partition_commit_notifies_subscription_authority(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let recorder = Arc::new(RecordingSubscriptionInvalidationClient::default());
+    let db = create_node(&rt, log, Some(partitioned_map(PartitionId(1))))
+        .await?
+        .with_subscription_invalidation_client_for_test(recorder.clone());
+
+    let commit_ts = insert_doc(&db, "projects", assert_obj!("name" => "notified")).await?;
+    let calls = recorder.calls.lock();
+    assert_eq!(calls.len(), 1);
+    let (authority_partition, placement_version, notified_ts, table_names) = &calls[0];
+    assert_eq!(*authority_partition, PartitionId::DEFAULT);
+    assert_eq!(
+        *placement_version,
+        db.committer_for_test().placement_version()
+    );
+    assert_eq!(*notified_ts, commit_ts);
+    assert!(table_names.contains(&"projects".parse()?));
 
     Ok(())
 }

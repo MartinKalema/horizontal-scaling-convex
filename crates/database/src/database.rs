@@ -224,6 +224,10 @@ use crate::{
         SubscriptionsClient,
         SubscriptionsWorker,
     },
+    subscription_invalidation::{
+        GrpcSubscriptionInvalidationClient,
+        SubscriptionInvalidationClient,
+    },
     system_tables::{
         ErasedSystemIndex,
         SystemTable,
@@ -314,6 +318,7 @@ pub struct Database<RT: Runtime> {
     virtual_system_mapping: VirtualSystemMapping,
     table_number_allocator: Arc<dyn TableNumberAllocator>,
     owner_read_client: Option<Arc<dyn OwnerReadClient>>,
+    subscription_invalidation_client: Option<Arc<dyn SubscriptionInvalidationClient>>,
     pub bootstrap_metadata: BootstrapMetadata,
     // Caches of snapshot TableMapping and by_id index ids, which are used repeatedly by
     // /api/list_snapshot.
@@ -1139,6 +1144,7 @@ impl<RT: Runtime> Database<RT> {
             distributed_log.clone()
         };
         let owner_read_cluster_auth = cluster_grpc_auth.clone();
+        let subscription_invalidation_cluster_auth = cluster_grpc_auth.clone();
         let committer = Committer::start(
             log_writer,
             snapshot_writer,
@@ -1165,6 +1171,14 @@ impl<RT: Runtime> Database<RT> {
                 owner_read_cluster_auth,
             )) as Arc<dyn OwnerReadClient>
         });
+        let subscription_invalidation_client = (committer.local_partition().is_some()
+            && committer.node_addresses().is_some())
+        .then(|| {
+            Arc::new(GrpcSubscriptionInvalidationClient::new(
+                committer.clone(),
+                subscription_invalidation_cluster_auth,
+            )) as Arc<dyn SubscriptionInvalidationClient>
+        });
         let table_mapping_snapshot_cache =
             AsyncLru::new(runtime.clone(), 20, 2, "table_mapping_snapshot");
         let by_id_indexes_snapshot_cache =
@@ -1188,6 +1202,7 @@ impl<RT: Runtime> Database<RT> {
             virtual_system_mapping,
             table_number_allocator,
             owner_read_client,
+            subscription_invalidation_client,
             bootstrap_metadata,
             table_mapping_snapshot_cache,
             by_id_indexes_snapshot_cache,
@@ -1239,6 +1254,16 @@ impl<RT: Runtime> Database<RT> {
     ) -> Self {
         let mut database = self.clone();
         database.owner_read_client = Some(owner_read_client);
+        database
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_subscription_invalidation_client_for_test(
+        &self,
+        client: Arc<dyn SubscriptionInvalidationClient>,
+    ) -> Self {
+        let mut database = self.clone();
+        database.subscription_invalidation_client = Some(client);
         database
     }
 
@@ -2443,8 +2468,56 @@ impl<RT: Runtime> Database<RT> {
             .await?;
         if !readonly {
             self.write_commits_since_load.fetch_add(1, Ordering::SeqCst);
+            if !result.invalidated_tables.is_empty() {
+                match self.committer.local_partition() {
+                    Some(local_partition)
+                        if local_partition == crate::partition::PartitionId::DEFAULT =>
+                    {
+                        if let Err(error) = self.invalidate_subscriptions_for_tables(
+                            result.invalidated_tables.clone(),
+                            result.ts,
+                        ) {
+                            tracing::warn!(
+                                commit_ts = %result.ts,
+                                error = %error,
+                                "Failed to enqueue local cluster subscription invalidation; the \
+                                 durable replication path remains authoritative"
+                            );
+                        }
+                    },
+                    Some(_) => {
+                        if let Some(client) = self.subscription_invalidation_client.as_ref()
+                            && let Err(error) = client
+                                .invalidate_tables(
+                                    crate::partition::PartitionId::DEFAULT,
+                                    self.committer.placement_version(),
+                                    result.ts,
+                                    result.invalidated_tables.clone(),
+                                )
+                                .await
+                        {
+                            tracing::warn!(
+                                commit_ts = %result.ts,
+                                error = %error,
+                                "Failed to deliver direct cluster subscription invalidation; the \
+                                 durable replication path will retry visibility"
+                            );
+                        }
+                    },
+                    None => {},
+                }
+            }
         }
         Ok(result)
+    }
+
+    pub fn invalidate_subscriptions_for_tables(
+        &self,
+        table_names: BTreeSet<TableName>,
+        invalid_ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        self.subscriptions
+            .invalidate_tables(table_names, invalid_ts)
     }
 
     #[fastrace::trace]

@@ -34,6 +34,7 @@ use futures::{
     stream::FuturesUnordered,
     StreamExt,
 };
+use value::TableName;
 
 use crate::{
     committer::{
@@ -246,6 +247,19 @@ fn routed_partition_for_catalog_write(
 ) -> anyhow::Result<Option<PartitionId>> {
     Ok(user_catalog_write_target(transaction, write)?
         .map(|metadata| partition_map.partition_for_table(&metadata.table_name)))
+}
+
+fn invalidated_table_names(transaction: &FinalTransaction) -> anyhow::Result<BTreeSet<TableName>> {
+    let mut table_names = BTreeSet::new();
+    for write in transaction.writes.coalesced_writes() {
+        if let Ok(table_name) = transaction.table_mapping.tablet_name(write.id.tablet_id) {
+            table_names.insert(table_name);
+        }
+        if let Some(metadata) = user_catalog_write_target(transaction, write)? {
+            table_names.insert(metadata.table_name);
+        }
+    }
+    Ok(table_names)
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -931,6 +945,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
     commit_mode: TwoPhaseCommitMode,
 ) -> anyhow::Result<CommitOutcome> {
     let timer = metrics::two_phase_coordinator_timer();
+    let invalidated_tables = invalidated_table_names(&transaction)?;
     let source_partition = match classify_transaction(&transaction, partition_map, &write_source)? {
         TransactionClassification::SinglePartition => {
             anyhow::bail!("2PC coordinator called for a local single-partition transaction");
@@ -1139,6 +1154,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                     ts: prepare_ts,
                     source_partition,
                     read_after_write_partitions: prepared_participants.clone(),
+                    invalidated_tables: invalidated_tables.clone(),
                 });
             },
             TwoPhaseCommitMode::ParallelEarlyAck => {
@@ -1175,6 +1191,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                     ts: prepare_ts,
                     source_partition,
                     read_after_write_partitions: prepared_participants.clone(),
+                    invalidated_tables: invalidated_tables.clone(),
                 });
             },
         }

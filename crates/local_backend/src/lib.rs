@@ -126,6 +126,7 @@ pub mod storage;
 pub mod streaming_export;
 pub mod streaming_import;
 pub mod subs;
+pub mod subscription_invalidation_service;
 #[cfg(test)]
 mod test_helpers;
 pub mod two_phase_service;
