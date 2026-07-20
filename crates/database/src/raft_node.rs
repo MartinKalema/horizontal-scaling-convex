@@ -615,8 +615,9 @@ impl RaftNode {
             let mut processed_ready = false;
             while self.raw_node.has_ready() {
                 // Snapshot installation replaces the database state machine, so it must remain
-                // serialized with application work. Ordinary Ready processing must continue while
-                // apply is pending so leaders can send heartbeats and retain a healthy quorum.
+                // serialized with application work. Ordinary Ready processing must continue
+                // while apply is pending so leaders can send heartbeats and
+                // retain a healthy quorum.
                 let apply_pending = !pending_state_machine_applies.is_empty()
                     || !pending_local_applies.is_empty()
                     || !deferred_committed_entries.is_empty();
@@ -820,8 +821,9 @@ impl RaftNode {
                 }
 
                 // 6. Preserve committed-entry order independently from append/transport
-                // progress. The state machine scheduler below releases only one blocking entry at
-                // a time, but Raft can continue processing Ready and sending heartbeats.
+                // progress. The state machine scheduler below releases only one blocking entry
+                // at a time, but Raft can continue processing Ready and sending
+                // heartbeats.
                 deferred_committed_entries.extend(ready.take_committed_entries());
 
                 // 7. Advance append/persist state without claiming
@@ -1434,8 +1436,9 @@ mod tests {
             RaftProposalResult::Rejected => anyhow::bail!("ready leader rejected first proposal"),
         };
 
-        // Hold the local database apply beyond the randomized election timeout. Consensus
-        // transport must continue independently or a healthy follower will start an election.
+        // Hold the local database apply beyond the randomized election timeout.
+        // Consensus transport must continue independently or a healthy follower
+        // will start an election.
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let (mark_tx, mark_rx) = tokio::sync::oneshot::channel();

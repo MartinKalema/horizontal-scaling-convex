@@ -491,6 +491,16 @@ enum PersistenceWrite {
         commit_id: usize,
         err: anyhow::Error,
     },
+    PreparedRollback {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        commit_id: usize,
+        raft_applied_index: Option<u64>,
+    },
+    PreparedRollbackRejected {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        commit_id: usize,
+        err: anyhow::Error,
+    },
     MaxRepeatableTimestamp {
         new_max_repeatable: Timestamp,
         timer: Timer<VMHistogram>,
@@ -850,6 +860,8 @@ impl PersistenceWrite {
             Self::RejectedBeforePersistence { commit_id, .. } => *commit_id,
             Self::PreparedCommit { commit_id, .. } => *commit_id,
             Self::PreparedRejectedBeforePersistence { commit_id, .. } => *commit_id,
+            Self::PreparedRollback { commit_id, .. } => *commit_id,
+            Self::PreparedRollbackRejected { commit_id, .. } => *commit_id,
             Self::MaxRepeatableTimestamp { commit_id, .. } => *commit_id,
             Self::ReplicaDelta { commit_id, .. } => *commit_id,
             Self::RaftReplayRecovery { commit_id, .. } => *commit_id,
@@ -1351,6 +1363,14 @@ pub struct Committer<RT: Runtime> {
         Vec<oneshot::Sender<anyhow::Result<Timestamp>>>,
     >,
 
+    // Rollback is also a replicated state-machine operation. Keep duplicate
+    // requests attached to one in-flight marker and prevent a contradictory
+    // CommitPrepared from starting while that marker is unresolved.
+    prepared_rollback_waiters: std::collections::HashMap<
+        crate::two_phase::TwoPhaseTransactionId,
+        Vec<oneshot::Sender<anyhow::Result<()>>>,
+    >,
+
     // Snapshots for queued-but-not-yet-published state machine writes.
     // Local commits and replica deltas must both build on the latest queued
     // snapshot, not just the latest published one, or a later publish can
@@ -1514,6 +1534,7 @@ impl<RT: Runtime> Committer<RT> {
             maintenance_tso_refill_in_flight: Arc::new(AtomicBool::new(false)),
             prepared_transactions: std::collections::HashMap::new(),
             prepared_commit_waiters: std::collections::HashMap::new(),
+            prepared_rollback_waiters: std::collections::HashMap::new(),
             queued_snapshots: VecDeque::new(),
             raft_state,
             applied_delta_watermarks,
@@ -1984,6 +2005,63 @@ impl<RT: Runtime> Committer<RT> {
                             ..
                         } => {
                             self.send_prepared_commit_waiters(&transaction_id, Err(err));
+                        },
+                        PersistenceWrite::PreparedRollback {
+                            transaction_id,
+                            raft_applied_index,
+                            ..
+                        } => {
+                            let apply_result = async {
+                                self.handle_rollback_prepared(transaction_id.clone())?;
+                                if let Some(raft_applied_index) = raft_applied_index {
+                                    Self::persist_two_phase_rollback_with_state_machine_index(
+                                        self.persistence.clone(),
+                                        &transaction_id,
+                                        raft_applied_index,
+                                    )
+                                    .await?;
+                                    let Some(raft_state) = self.raft_state.as_ref() else {
+                                        anyhow::bail!(
+                                            "2PC RollbackPrepared txn={} returned Raft applied index {} without Raft state",
+                                            transaction_id,
+                                            raft_applied_index,
+                                        );
+                                    };
+                                    raft_state.mark_applied(raft_applied_index).await?;
+                                } else {
+                                    Self::delete_two_phase_redo(
+                                        self.persistence.clone(),
+                                        &transaction_id,
+                                    )
+                                    .await?;
+                                }
+                                Ok::<(), anyhow::Error>(())
+                            }
+                            .await;
+                            match apply_result {
+                                Ok(()) => self.send_prepared_rollback_waiters(
+                                    &transaction_id,
+                                    Ok(()),
+                                ),
+                                Err(err) => {
+                                    let message = format!(
+                                        "Failed to apply committed 2PC rollback for txn={}: {err:#}",
+                                        transaction_id,
+                                    );
+                                    self.send_prepared_rollback_waiters(
+                                        &transaction_id,
+                                        Err(anyhow::anyhow!(message.clone())),
+                                    );
+                                    anyhow::bail!(message);
+                                },
+                            }
+                        },
+                        PersistenceWrite::PreparedRollbackRejected {
+                            transaction_id,
+                            err,
+                            ..
+                        } => {
+                            self.send_prepared_rollback_waiters(&transaction_id, Err(err));
                         },
                         PersistenceWrite::MaxRepeatableTimestamp {
                             new_max_repeatable,
@@ -2609,10 +2687,16 @@ impl<RT: Runtime> Committer<RT> {
                             transaction_id,
                             result,
                         }) => {
-                            let r = self
-                                .handle_rollback_prepared_through_raft(transaction_id)
-                                .await;
-                            let _ = result.send(r);
+                            if let Some(persistence_write_future) =
+                                self.start_rollback_prepared_through_raft(
+                                    transaction_id,
+                                    result,
+                                    commit_id,
+                                )
+                            {
+                                self.persistence_writes.push_back(persistence_write_future);
+                                commit_id += 1;
+                            }
                         },
                         Some(CommitterMessage::ApplyRaftRollback {
                             raft_state_machine_index,
@@ -3772,6 +3856,29 @@ impl<RT: Runtime> Committer<RT> {
             Ok(commit_ts) => {
                 for waiter in waiters {
                     let _ = waiter.send(Ok(commit_ts));
+                }
+            },
+            Err(err) => {
+                let message = format!("{err:#}");
+                for waiter in waiters {
+                    let _ = waiter.send(Err(anyhow::anyhow!(message.clone())));
+                }
+            },
+        }
+    }
+
+    fn send_prepared_rollback_waiters(
+        &mut self,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+        result: anyhow::Result<()>,
+    ) {
+        let Some(waiters) = self.prepared_rollback_waiters.remove(transaction_id) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                for waiter in waiters {
+                    let _ = waiter.send(Ok(()));
                 }
             },
             Err(err) => {
@@ -6170,6 +6277,13 @@ impl<RT: Runtime> Committer<RT> {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
+        if self.prepared_rollback_waiters.contains_key(&transaction_id) {
+            let _ = result.send(Err(anyhow::anyhow!(
+                "2PC CommitPrepared: transaction {} is already rolling back",
+                transaction_id,
+            )));
+            return None;
+        }
         if let Some(waiters) = self.prepared_commit_waiters.get_mut(&transaction_id) {
             tracing::debug!(
                 "2PC CommitPrepared: txn={} already committing; attaching duplicate waiter",
@@ -6474,45 +6588,63 @@ impl<RT: Runtime> Committer<RT> {
         Ok(())
     }
 
-    async fn handle_rollback_prepared_through_raft(
+    /// Queue a rollback marker without waiting inside the single committer
+    /// loop. Raft applies entries in order, so synchronously waiting here
+    /// can deadlock behind an earlier prepared commit that still needs this
+    /// loop to publish and send `MarkApplied`.
+    fn start_rollback_prepared_through_raft(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
-    ) -> anyhow::Result<()> {
-        self.ensure_leader_for_writes()?;
-        anyhow::ensure!(
-            !self.prepared_commit_waiters.contains_key(&transaction_id),
-            "2PC RollbackPrepared: transaction {} is already committing",
-            transaction_id,
-        );
+        result: oneshot::Sender<anyhow::Result<()>>,
+        commit_id: usize,
+    ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
+        if let Some(waiters) = self.prepared_rollback_waiters.get_mut(&transaction_id) {
+            waiters.push(result);
+            return None;
+        }
+        if self.prepared_commit_waiters.contains_key(&transaction_id) {
+            let _ = result.send(Err(anyhow::anyhow!(
+                "2PC RollbackPrepared: transaction {} is already committing",
+                transaction_id,
+            )));
+            return None;
+        }
+        if let Err(err) = self.ensure_leader_for_writes() {
+            let _ = result.send(Err(err));
+            return None;
+        }
 
         // A prepare is a replicated state-machine entry, so its abort must be
         // one too. The local leader may no longer have the intent after a
         // failover, but followers can still have replayed it; always append the
         // idempotent rollback marker before declaring the partition resolved.
-        let raft_rollback_waiter = self.propose_two_phase_rollback_to_raft(&transaction_id)?;
-        let raft_applied_index =
-            Self::wait_for_raft_rollback(raft_rollback_waiter, &transaction_id).await?;
+        let raft_rollback_waiter = match self.propose_two_phase_rollback_to_raft(&transaction_id) {
+            Ok(waiter) => waiter,
+            Err(err) => {
+                let _ = result.send(Err(err));
+                return None;
+            },
+        };
+        self.prepared_rollback_waiters
+            .insert(transaction_id.clone(), vec![result]);
 
-        self.handle_rollback_prepared(transaction_id.clone())?;
-        if let Some(raft_applied_index) = raft_applied_index {
-            Self::persist_two_phase_rollback_with_state_machine_index(
-                self.persistence.clone(),
-                &transaction_id,
-                raft_applied_index,
-            )
-            .await?;
-            let Some(raft_state) = self.raft_state.as_ref() else {
-                anyhow::bail!(
-                    "2PC RollbackPrepared txn={} returned Raft applied index {} without Raft state",
-                    transaction_id,
-                    raft_applied_index,
-                );
-            };
-            raft_state.mark_applied(raft_applied_index).await?;
-        } else {
-            Self::delete_two_phase_redo(self.persistence.clone(), &transaction_id).await?;
-        }
-        Ok(())
+        Some(
+            async move {
+                match Self::wait_for_raft_rollback(raft_rollback_waiter, &transaction_id).await {
+                    Ok(raft_applied_index) => Ok(PersistenceWrite::PreparedRollback {
+                        transaction_id,
+                        commit_id,
+                        raft_applied_index,
+                    }),
+                    Err(err) => Ok(PersistenceWrite::PreparedRollbackRejected {
+                        transaction_id,
+                        commit_id,
+                        err,
+                    }),
+                }
+            }
+            .boxed(),
+        )
     }
 
     async fn handle_raft_rollback(

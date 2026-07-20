@@ -558,6 +558,44 @@ async fn insert_doc(
     db.commit(tx).await
 }
 
+async fn prepare_project_insert_for_test(
+    db: &Database<TestRuntime>,
+    committer: &CommitterClient,
+    name: &str,
+    write_source: &WriteSource,
+) -> anyhow::Result<(TwoPhaseTransactionId, Timestamp)> {
+    let mut tx = db.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(&"projects".parse()?, assert_obj!("name" => name))
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let participant = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        write_source,
+    )?;
+    let transaction_id = TwoPhaseTransactionId::new();
+    let prepare_ts = committer.allocate_commit_ts().await?;
+    committer
+        .prepare_remote(
+            transaction_id.clone(),
+            participant,
+            write_source.clone(),
+            prepare_ts,
+            vec![PartitionId(1)],
+        )
+        .await?;
+    Ok((transaction_id, prepare_ts))
+}
+
 async fn insert_global_system_doc(
     db: &Database<TestRuntime>,
     table: &str,
@@ -672,6 +710,22 @@ async fn commit_next_raft_rollback_for_test(
         .send(RaftProposalResult::Committed { index })
         .map_err(|_| anyhow::anyhow!("rollback waiter dropped before test Raft decision"))?;
     Ok(transaction_id)
+}
+
+async fn receive_next_raft_rollback_for_test(
+    raft_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
+) -> anyhow::Result<(TwoPhaseTransactionId, oneshot::Sender<RaftProposalResult>)> {
+    let message = tokio::time::timeout(Duration::from_secs(1), raft_rx.recv())
+        .await?
+        .context("test Raft mailbox closed before receiving a rollback proposal")?;
+    let RaftMessage::Propose(proposal) = message else {
+        anyhow::bail!("expected a Raft proposal in the test mailbox")
+    };
+    let transaction_id = match RaftStateMachineEntry::from_bytes(&proposal.data)? {
+        RaftStateMachineEntry::TwoPhaseRollback { transaction_id } => transaction_id,
+        _ => anyhow::bail!("expected a 2PC rollback Raft entry"),
+    };
+    Ok((transaction_id, proposal.result_tx))
 }
 
 async fn acknowledge_next_raft_applied_for_test_ref(
@@ -1986,6 +2040,96 @@ async fn test_prepare_waits_for_raft_committed_prepared_write_publication(
     )
     .await?;
     assert_eq!(rows.len(), 2, "only the first prepared write should commit");
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_rollback_does_not_block_prior_raft_commit_apply(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+    insert_doc(&node, "projects", assert_obj!("name" => "seed")).await?;
+    let committer = node.committer_for_test();
+    let write_source = WriteSource::new("rollback_after_prior_raft_commit_test");
+    let (winner_id, winner_ts) =
+        prepare_project_insert_for_test(&node, &committer, "winner", &write_source).await?;
+    let (loser_id, _) =
+        prepare_project_insert_for_test(&node, &committer, "loser", &write_source).await?;
+
+    let (raft_state, mut raft_rx) =
+        RaftPartitionState::new_with_mailbox_for_test(true, 1, PartitionId(1), 1);
+    node.attach_raft_state(raft_state).await?;
+    let hold = pause.hold(AFTER_RAFT_CONVEX_PERSISTENCE);
+    let commit_task = {
+        let committer = committer.clone();
+        let winner_id = winner_id.clone();
+        tokio::spawn(async move { committer.commit_prepared(winner_id).await })
+    };
+    let winner_delta = commit_next_raft_delta_for_test(&mut raft_rx, 31).await?;
+    assert_eq!(winner_delta.ts, winner_ts);
+    let pause_guard = hold
+        .wait_for_blocked()
+        .await
+        .context("winner did not pause before local Raft apply")?;
+
+    let rollback_task = {
+        let committer = committer.clone();
+        let loser_id = loser_id.clone();
+        tokio::spawn(async move { committer.rollback_prepared(loser_id).await })
+    };
+    let (rollback_id, rollback_result) = receive_next_raft_rollback_for_test(&mut raft_rx).await?;
+    assert_eq!(rollback_id, loser_id);
+    let duplicate_rollback_task = {
+        let committer = committer.clone();
+        let loser_id = loser_id.clone();
+        tokio::spawn(async move { committer.rollback_prepared(loser_id).await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), raft_rx.recv())
+            .await
+            .is_err(),
+        "duplicate rollback must join the existing Raft proposal",
+    );
+    let contradictory_commit = tokio::time::timeout(
+        Duration::from_secs(1),
+        committer.commit_prepared(loser_id.clone()),
+    )
+    .await?
+    .expect_err("commit must not start after rollback has entered Raft");
+    assert!(
+        contradictory_commit
+            .to_string()
+            .contains("already rolling back"),
+        "unexpected contradictory decision error: {contradictory_commit:#}",
+    );
+
+    // Raft cannot apply the rollback marker until index 31 is marked applied.
+    // The committer must therefore finish the earlier commit without waiting
+    // synchronously for this later proposal's decision.
+    pause_guard.unpause();
+    acknowledge_next_raft_applied_for_test_ref(&mut raft_rx, 31).await?;
+    assert_eq!(commit_task.await??, winner_ts);
+
+    rollback_result
+        .send(RaftProposalResult::Committed { index: 32 })
+        .map_err(|_| anyhow::anyhow!("rollback waiter dropped before Raft decision"))?;
+    acknowledge_next_raft_applied_for_test_ref(&mut raft_rx, 32).await?;
+    rollback_task.await??;
+    duplicate_rollback_task.await??;
+
+    let rows = run_query(
+        node,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        rows.len(),
+        2,
+        "the winner must commit and the loser must abort"
+    );
     Ok(())
 }
 
