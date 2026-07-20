@@ -195,6 +195,7 @@ use crate::{
     },
     two_phase_coordinator::{
         coordinate_two_phase_commit_with_mode,
+        participant_write_indexes,
         TwoPhaseCommitMode,
     },
     Database,
@@ -6388,6 +6389,181 @@ async fn test_raft_commit_delta_cleans_prepared_redo_on_follower(
     )
     .await
     .context("follower should accept local writes after Raft commit delta cleaned the prepare")?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_raft_prepared_catalog_replay_accepts_equivalent_cross_partition_catalog(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+    let table_number_allocator: Arc<dyn TableNumberAllocator> =
+        Arc::new(InMemoryTableNumberAllocator::default());
+    let source = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(strict_partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        Some(tso.clone()),
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let owner = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(strict_partitioned_map(PartitionId(1))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        Some(tso.clone()),
+        table_number_allocator.clone(),
+    )
+    .await?;
+    let follower = create_node_with_persistence_and_table_number_allocator(
+        &rt,
+        Arc::new(TestPersistence::new()),
+        log.clone(),
+        Some(strict_partitioned_map(PartitionId(0))),
+        None,
+        Arc::new(NoopTwoPhaseDecisionLog),
+        Some(tso),
+        table_number_allocator,
+    )
+    .await?;
+
+    let mut tx = source.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "catalog-arrived-before-raft-prepare"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_source = WriteSource::new("raft_prepared_catalog_replay_test");
+    let partition_map = strict_partitioned_map(PartitionId(0));
+    let write_indexes = participant_write_indexes(&final_tx, &partition_map, &write_source)?;
+    let authority_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(0),
+        write_indexes
+            .get(&PartitionId(0))
+            .context("fresh remote table should have a catalog-authority participant")?,
+        &partition_map,
+        &write_source,
+    )?;
+    let owner_tx = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        write_indexes
+            .get(&PartitionId(1))
+            .context("fresh remote table should have a data-owner participant")?,
+        &partition_map,
+        &write_source,
+    )?;
+    let transaction_id = TwoPhaseTransactionId::new();
+    let prepare_ts = source.committer_for_test().allocate_commit_ts().await?;
+    let participants = vec![PartitionId(0), PartitionId(1)];
+
+    source
+        .committer_for_test()
+        .prepare_remote(
+            transaction_id.clone(),
+            authority_tx.clone(),
+            write_source.clone(),
+            prepare_ts,
+            participants.clone(),
+        )
+        .await?;
+    owner
+        .committer_for_test()
+        .prepare_remote(
+            transaction_id.clone(),
+            owner_tx,
+            write_source.clone(),
+            prepare_ts,
+            participants,
+        )
+        .await?;
+    owner
+        .committer_for_test()
+        .commit_prepared(transaction_id.clone())
+        .await?;
+    let owner_delta = log
+        .deltas()
+        .into_iter()
+        .find(|delta| delta.ts == prepare_ts && delta.source_partition == Some(PartitionId(1)))
+        .context("owner commit should publish its catalog and first-document delta")?;
+    follower
+        .committer_for_test()
+        .apply_replica_delta(owner_delta)
+        .await?;
+
+    let redo = TwoPhaseRedoEntry::new_with_participants(
+        &transaction_id,
+        prepare_ts,
+        PartitionId(0),
+        &[PartitionId(0), PartitionId(1)],
+        authority_tx,
+        &write_source,
+    )?;
+    follower
+        .committer_for_test()
+        .apply_raft_prepared_redo(1, redo)
+        .await?;
+
+    source
+        .committer_for_test()
+        .commit_prepared(transaction_id.clone())
+        .await?;
+    let authority_delta = log
+        .deltas()
+        .into_iter()
+        .find(|delta| delta.ts == prepare_ts && delta.source_partition == Some(PartitionId(0)))
+        .context("catalog authority should publish its committed half")?;
+    follower
+        .committer_for_test()
+        .apply_raft_commit_delta(2, authority_delta)
+        .await?;
+
+    let rows = run_local_replica_query(
+        follower.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the first remote document must remain visible"
+    );
+    let source_mapping = source
+        .begin(Identity::system())
+        .await?
+        .table_mapping()
+        .clone();
+    let follower_mapping = follower
+        .begin(Identity::system())
+        .await?
+        .table_mapping()
+        .clone();
+    assert_eq!(
+        source_mapping
+            .namespace(TableNamespace::root_component())
+            .id(&"projects".parse()?)?,
+        follower_mapping
+            .namespace(TableNamespace::root_component())
+            .id(&"projects".parse()?)?,
+        "catalog replay must preserve the stable tablet and table number",
+    );
+    let redo = follower
+        .committer_for_test()
+        .persistence_reader()
+        .get_persistence_global(PersistenceGlobalKey::TwoPhaseRedoRecords)
+        .await?;
+    assert_eq!(redo, Some(serde_json::json!({})));
     Ok(())
 }
 

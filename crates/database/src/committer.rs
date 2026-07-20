@@ -5574,12 +5574,8 @@ impl<RT: Runtime> Committer<RT> {
         require_leader: bool,
         allow_explicit_ts_rewrite: bool,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        let local_table_mapping = self
-            .snapshot_manager
-            .read()
-            .latest_snapshot()
-            .table_mapping()
-            .clone();
+        let local_snapshot = self.base_snapshot_for_new_writes();
+        let local_table_mapping = local_snapshot.table_mapping().clone();
         Self::validate_participant_catalog_creations(
             &transaction,
             &local_table_mapping,
@@ -5587,11 +5583,18 @@ impl<RT: Runtime> Committer<RT> {
         )?;
         let mut table_mapping = local_table_mapping.clone();
         transaction.augment_table_mapping(&mut table_mapping)?;
-        let writes = Self::remap_participant_system_table_writes(
+        let mut writes = Self::remap_participant_system_table_writes(
             transaction.writes,
             &table_mapping,
             &local_table_mapping,
         )?;
+        if allow_explicit_ts_rewrite {
+            writes = Self::filter_satisfied_replayed_catalog_creations(
+                writes,
+                &table_mapping,
+                &local_snapshot,
+            )?;
+        }
         self.stage_prepared_transaction(
             transaction_id,
             *transaction.begin_timestamp,
@@ -5654,6 +5657,86 @@ impl<RT: Runtime> Committer<RT> {
             }
         }
         Ok(())
+    }
+
+    fn filter_satisfied_replayed_catalog_creations(
+        writes: Vec<DocumentUpdateWithPrevTs>,
+        table_mapping: &TableMapping,
+        local_snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<DocumentUpdateWithPrevTs>> {
+        let tables_tablet = table_mapping
+            .namespace(value::TableNamespace::Global)
+            .id(&TABLES_TABLE)?
+            .tablet_id;
+        let index_tablet = table_mapping
+            .namespace(value::TableNamespace::Global)
+            .id(&common::bootstrap_model::index::INDEX_TABLE)?
+            .tablet_id;
+        let local_mapping = local_snapshot.table_mapping();
+        let mut filtered = Vec::with_capacity(writes.len());
+
+        for write in writes {
+            let is_insert = write.old_document.is_none() && write.new_document.is_some();
+            if is_insert && write.id.tablet_id == tables_tablet {
+                let new_document = write
+                    .new_document
+                    .as_ref()
+                    .expect("catalog insert should have a new document");
+                let metadata: ParsedDocument<TableMetadata> = new_document.parse()?;
+                let metadata = metadata.into_value();
+                let proposed_tablet = value::TabletId(write.id.internal_id());
+                if local_mapping.tablet_id_exists(proposed_tablet) {
+                    anyhow::ensure!(
+                        local_mapping.tablet_namespace(proposed_tablet)? == metadata.namespace
+                            && local_mapping.tablet_number(proposed_tablet)? == metadata.number
+                            && local_mapping.tablet_name(proposed_tablet)? == metadata.name,
+                        "2PC replay found tablet {:?} already mapped to a different table than \
+                         '{}'",
+                        proposed_tablet,
+                        metadata.name,
+                    );
+                    tracing::info!(
+                        "2PC replay: catalog creation for table '{}' is already materialized with \
+                         stable tablet {:?} and table number {}; staging the remaining intent",
+                        metadata.name,
+                        proposed_tablet,
+                        u32::from(metadata.number),
+                    );
+                    continue;
+                }
+            } else if is_insert && write.id.tablet_id == index_tablet {
+                let new_document = write
+                    .new_document
+                    .as_ref()
+                    .expect("index catalog insert should have a new document");
+                let metadata = common::bootstrap_model::index::TabletIndexMetadata::from_document(
+                    new_document.clone(),
+                )?;
+                let existing = [
+                    local_snapshot.index_registry.get_enabled(&metadata.name),
+                    local_snapshot.index_registry.get_pending(&metadata.name),
+                ]
+                .into_iter()
+                .flatten()
+                .find(|existing| existing.id() == metadata.id().internal_id());
+                if let Some(existing) = existing {
+                    anyhow::ensure!(
+                        existing.metadata().config.same_spec(&metadata.config),
+                        "2PC replay found index {} with the same stable id but a different spec",
+                        metadata.name,
+                    );
+                    tracing::info!(
+                        "2PC replay: catalog creation for index {} is already materialized with \
+                         stable id {}; staging the remaining intent",
+                        metadata.name,
+                        existing.id(),
+                    );
+                    continue;
+                }
+            }
+            filtered.push(write);
+        }
+        Ok(filtered)
     }
 
     fn validate_participant_reads(
