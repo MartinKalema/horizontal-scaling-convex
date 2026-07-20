@@ -2609,20 +2609,22 @@ impl<RT: Runtime> Committer<RT> {
                             transaction_id,
                             result,
                         }) => {
-                            let r = self.handle_rollback_prepared(transaction_id.clone());
-                            if r.is_ok()
-                                && let Err(err) = Self::delete_two_phase_redo(
-                                    self.persistence.clone(),
-                                    &transaction_id,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "2PC RollbackPrepared: rolled back txn={} but failed to \
-                                     delete redo: {err:#}",
+                            let r = self
+                                .handle_rollback_prepared_through_raft(transaction_id)
+                                .await;
+                            let _ = result.send(r);
+                        },
+                        Some(CommitterMessage::ApplyRaftRollback {
+                            raft_state_machine_index,
+                            transaction_id,
+                            result,
+                        }) => {
+                            let r = self
+                                .handle_raft_rollback(
+                                    raft_state_machine_index,
                                     transaction_id,
-                                );
-                            }
+                                )
+                                .await;
                             let _ = result.send(r);
                         },
                     }
@@ -3713,6 +3715,26 @@ impl<RT: Runtime> Committer<RT> {
         }
     }
 
+    async fn wait_for_raft_rollback(
+        raft_commit_waiter: RaftCommitWaiter,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<Option<u64>> {
+        let Some(raft_commit_waiter) = raft_commit_waiter else {
+            return Ok(None);
+        };
+        match raft_commit_waiter.await {
+            Ok(RaftProposalResult::Committed { index }) => Ok(Some(index)),
+            Ok(RaftProposalResult::Rejected) => anyhow::bail!(
+                "Raft rejected 2PC rollback for txn={} before quorum commit",
+                transaction_id,
+            ),
+            Err(_) => anyhow::bail!(
+                "Raft proposal result channel closed before 2PC rollback txn={} reached quorum",
+                transaction_id,
+            ),
+        }
+    }
+
     fn block_on_current_runtime<F: Future>(future: F) -> F::Output {
         block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
@@ -4171,6 +4193,50 @@ impl<RT: Runtime> Committer<RT> {
             format!(
                 "Failed to propose 2PC prepare for txn={} to Raft partition {}",
                 redo.transaction_id,
+                raft.partition_id(),
+            )
+        })?;
+        Ok(Some(rx))
+    }
+
+    fn propose_two_phase_rollback_to_raft(
+        &self,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<RaftCommitWaiter> {
+        let Some(raft) = self.raft_state.as_ref() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            raft.is_cluster_genesis_ready(),
+            "Cluster genesis is not ready for partition {}",
+            raft.partition_id(),
+        );
+        if !raft.is_leader_ready() {
+            anyhow::bail!(
+                "Raft leader is not ready before proposing 2PC rollback for txn={} on partition {}",
+                transaction_id,
+                raft.partition_id(),
+            );
+        }
+        let data = RaftStateMachineEntry::two_phase_rollback(transaction_id.clone())
+            .to_bytes()
+            .with_context(|| {
+                format!(
+                    "Failed to serialize 2PC rollback for txn={} for Raft proposal",
+                    transaction_id,
+                )
+            })?;
+        let (tx, rx) = oneshot::channel();
+        raft.send(crate::raft_node::RaftMessage::Propose(
+            crate::raft_node::RaftProposal {
+                data,
+                result_tx: tx,
+            },
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to propose 2PC rollback for txn={} to Raft partition {}",
+                transaction_id,
                 raft.partition_id(),
             )
         })?;
@@ -5303,6 +5369,32 @@ impl<RT: Runtime> Committer<RT> {
         Ok(())
     }
 
+    async fn persist_two_phase_rollback_with_state_machine_index(
+        persistence: Arc<dyn Persistence>,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+        raft_state_machine_index: u64,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_two_phase_redo_records(persistence.clone()).await?;
+        records.remove(&transaction_id.0);
+        let redo_value = serde_json::to_value(records)
+            .context("2PC: Failed to serialize Raft-applied rollback redo records")?;
+        persistence
+            .write_with_persistence_globals(
+                &[],
+                &[],
+                ConflictStrategy::Overwrite,
+                &[
+                    PersistenceGlobalWrite::new(
+                        String::from(PersistenceGlobalKey::TwoPhaseRedoRecords),
+                        redo_value,
+                    ),
+                    state_machine_index_persistence_write(raft_state_machine_index),
+                ],
+            )
+            .await
+            .context("2PC: Failed to atomically persist rollback and Raft state-machine index")
+    }
+
     async fn redo_entry_is_already_committed(
         persistence_reader: Arc<dyn PersistenceReader>,
         retention_validator: Arc<dyn RetentionValidator>,
@@ -5356,6 +5448,11 @@ impl<RT: Runtime> Committer<RT> {
             .latest_snapshot()
             .table_mapping()
             .clone();
+        Self::validate_participant_catalog_creations(
+            &transaction,
+            &local_table_mapping,
+            &write_source,
+        )?;
         let mut table_mapping = local_table_mapping.clone();
         transaction.augment_table_mapping(&mut table_mapping)?;
         let writes = Self::remap_participant_system_table_writes(
@@ -5374,6 +5471,57 @@ impl<RT: Runtime> Committer<RT> {
             require_leader,
             allow_explicit_ts_rewrite,
         )
+    }
+
+    fn validate_participant_catalog_creations(
+        transaction: &crate::two_phase::ParticipantTransaction,
+        local_mapping: &TableMapping,
+        write_source: &WriteSource,
+    ) -> anyhow::Result<()> {
+        for write in &transaction.writes {
+            if write.old_document.is_some() {
+                continue;
+            }
+            let Some(new_document) = write.new_document.as_ref() else {
+                continue;
+            };
+            let Some(catalog_metadata) = transaction.tablet_metadata.get(&write.id.tablet_id)
+            else {
+                continue;
+            };
+            if &catalog_metadata.table_name != &*TABLES_TABLE {
+                continue;
+            }
+
+            let metadata: ParsedDocument<TableMetadata> =
+                new_document.parse().with_context(|| {
+                    format!(
+                        "failed to parse _tables metadata while validating 2PC catalog write {:?}",
+                        write.id
+                    )
+                })?;
+            let metadata = metadata.into_value();
+            if metadata.name.is_system() || !metadata.is_active() {
+                continue;
+            }
+
+            let proposed_tablet = value::TabletId(write.id.internal_id());
+            let existing_tablet = local_mapping
+                .namespace(metadata.namespace)
+                .id_if_exists(&metadata.name);
+            if existing_tablet.is_some_and(|existing| existing != proposed_tablet) {
+                let error = ErrorMetadata::system_occ(
+                    Some(u64::from(*transaction.begin_timestamp)),
+                    write_source.as_str().map(str::to_string),
+                );
+                anyhow::bail!(anyhow::anyhow!(error).context(format!(
+                    "2PC catalog create for table '{}' lost a concurrent creation race; retry \
+                     against the committed catalog",
+                    metadata.name,
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_participant_reads(
@@ -6296,15 +6444,13 @@ impl<RT: Runtime> Committer<RT> {
             return Ok(());
         }
 
-        let prepared = self
-            .prepared_transactions
-            .remove(&transaction_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "2PC RollbackPrepared: unknown transaction {}",
-                    transaction_id
-                )
-            })?;
+        let Some(prepared) = self.prepared_transactions.remove(&transaction_id) else {
+            tracing::debug!(
+                "2PC RollbackPrepared: txn={} was already absent on this Raft replica",
+                transaction_id,
+            );
+            return Ok(());
+        };
 
         tracing::info!(
             "2PC RollbackPrepared: txn={}, ts={}",
@@ -6326,6 +6472,66 @@ impl<RT: Runtime> Committer<RT> {
             })?;
 
         Ok(())
+    }
+
+    async fn handle_rollback_prepared_through_raft(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        self.ensure_leader_for_writes()?;
+        anyhow::ensure!(
+            !self.prepared_commit_waiters.contains_key(&transaction_id),
+            "2PC RollbackPrepared: transaction {} is already committing",
+            transaction_id,
+        );
+
+        // A prepare is a replicated state-machine entry, so its abort must be
+        // one too. The local leader may no longer have the intent after a
+        // failover, but followers can still have replayed it; always append the
+        // idempotent rollback marker before declaring the partition resolved.
+        let raft_rollback_waiter = self.propose_two_phase_rollback_to_raft(&transaction_id)?;
+        let raft_applied_index =
+            Self::wait_for_raft_rollback(raft_rollback_waiter, &transaction_id).await?;
+
+        self.handle_rollback_prepared(transaction_id.clone())?;
+        if let Some(raft_applied_index) = raft_applied_index {
+            Self::persist_two_phase_rollback_with_state_machine_index(
+                self.persistence.clone(),
+                &transaction_id,
+                raft_applied_index,
+            )
+            .await?;
+            let Some(raft_state) = self.raft_state.as_ref() else {
+                anyhow::bail!(
+                    "2PC RollbackPrepared txn={} returned Raft applied index {} without Raft state",
+                    transaction_id,
+                    raft_applied_index,
+                );
+            };
+            raft_state.mark_applied(raft_applied_index).await?;
+        } else {
+            Self::delete_two_phase_redo(self.persistence.clone(), &transaction_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_raft_rollback(
+        &mut self,
+        raft_state_machine_index: u64,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            "2PC Raft Rollback Apply: txn={}, index={}",
+            transaction_id,
+            raft_state_machine_index,
+        );
+        self.handle_rollback_prepared(transaction_id.clone())?;
+        Self::persist_two_phase_rollback_with_state_machine_index(
+            self.persistence.clone(),
+            &transaction_id,
+            raft_state_machine_index,
+        )
+        .await
     }
 
     fn handle_raft_prepared_redo(
@@ -6997,6 +7203,25 @@ impl CommitterClient {
         rx.await.map_err(|_| metrics::shutdown_error())?
     }
 
+    /// Apply an idempotent 2PC rollback marker committed through Raft.
+    pub async fn apply_raft_rollback(
+        &self,
+        raft_state_machine_index: u64,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::ApplyRaftRollback {
+            raft_state_machine_index,
+            transaction_id,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
     pub async fn set_raft_state(
         &self,
         raft_state: crate::raft_partition::RaftPartitionState,
@@ -7642,6 +7867,11 @@ enum CommitterMessage {
         raft_state_machine_index: u64,
         redo: crate::two_phase::TwoPhaseRedoEntry,
         result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
+    },
+    ApplyRaftRollback {
+        raft_state_machine_index: u64,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        result: oneshot::Sender<anyhow::Result<()>>,
     },
     SetRaftState {
         raft_state: crate::raft_partition::RaftPartitionState,

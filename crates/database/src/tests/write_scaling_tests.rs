@@ -64,6 +64,7 @@ use common::{
         Timestamp,
     },
 };
+use errors::ErrorMetadataAnyhowExt;
 use futures::{
     stream::BoxStream,
     TryStreamExt,
@@ -601,6 +602,9 @@ async fn commit_next_raft_delta_for_test(
         RaftStateMachineEntry::TwoPhasePrepare { .. } => {
             anyhow::bail!("expected a commit delta Raft entry")
         },
+        RaftStateMachineEntry::TwoPhaseRollback { .. } => {
+            anyhow::bail!("expected a commit delta Raft entry")
+        },
         RaftStateMachineEntry::ClusterGenesis { .. } => {
             anyhow::bail!("expected a commit delta, not cluster genesis")
         },
@@ -627,6 +631,9 @@ async fn commit_next_raft_prepare_for_test(
         RaftStateMachineEntry::CommitDelta { .. } => {
             anyhow::bail!("expected a 2PC prepare Raft entry")
         },
+        RaftStateMachineEntry::TwoPhaseRollback { .. } => {
+            anyhow::bail!("expected a 2PC prepare Raft entry")
+        },
         RaftStateMachineEntry::ClusterGenesis { .. } => {
             anyhow::bail!("expected a 2PC prepare, not cluster genesis")
         },
@@ -636,6 +643,35 @@ async fn commit_next_raft_prepare_for_test(
         .send(RaftProposalResult::Committed { index })
         .map_err(|_| anyhow::anyhow!("prepare waiter dropped before test Raft decision"))?;
     Ok(redo)
+}
+
+async fn commit_next_raft_rollback_for_test(
+    raft_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
+    index: u64,
+) -> anyhow::Result<TwoPhaseTransactionId> {
+    let message = tokio::time::timeout(Duration::from_secs(1), raft_rx.recv())
+        .await?
+        .context("test Raft mailbox closed before receiving a proposal")?;
+    let RaftMessage::Propose(proposal) = message else {
+        anyhow::bail!("expected a Raft proposal in the test mailbox")
+    };
+    let transaction_id = match RaftStateMachineEntry::from_bytes(&proposal.data)? {
+        RaftStateMachineEntry::TwoPhaseRollback { transaction_id } => transaction_id,
+        RaftStateMachineEntry::CommitDelta { .. } => {
+            anyhow::bail!("expected a 2PC rollback Raft entry")
+        },
+        RaftStateMachineEntry::TwoPhasePrepare { .. } => {
+            anyhow::bail!("expected a 2PC rollback Raft entry")
+        },
+        RaftStateMachineEntry::ClusterGenesis { .. } => {
+            anyhow::bail!("expected a 2PC rollback, not cluster genesis")
+        },
+    };
+    proposal
+        .result_tx
+        .send(RaftProposalResult::Committed { index })
+        .map_err(|_| anyhow::anyhow!("rollback waiter dropped before test Raft decision"))?;
+    Ok(transaction_id)
 }
 
 async fn acknowledge_next_raft_applied_for_test_ref(
@@ -1931,7 +1967,17 @@ async fn test_prepare_waits_for_raft_committed_prepared_write_publication(
     assert_eq!(second_redo.transaction_id(), second_txn_id);
     acknowledge_next_raft_applied_for_test_ref(&mut raft_rx, 12).await?;
     assert_eq!(prepare_task.await??.prepare_ts, second_prepare_ts);
-    committer.rollback_prepared(second_txn_id).await?;
+    let rollback_task = {
+        let committer = committer.clone();
+        let second_txn_id = second_txn_id.clone();
+        tokio::spawn(async move { committer.rollback_prepared(second_txn_id).await })
+    };
+    assert_eq!(
+        commit_next_raft_rollback_for_test(&mut raft_rx, 13).await?,
+        second_txn_id,
+    );
+    acknowledge_next_raft_applied_for_test_ref(&mut raft_rx, 13).await?;
+    rollback_task.await??;
 
     let rows = run_query(
         node,
@@ -1940,6 +1986,97 @@ async fn test_prepare_waits_for_raft_committed_prepared_write_publication(
     )
     .await?;
     assert_eq!(rows.len(), 2, "only the first prepared write should commit");
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_rollback_prepared_is_replicated_and_idempotent(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+    insert_doc(&node, "projects", assert_obj!("name" => "seed")).await?;
+
+    let mut tx = node.begin(Identity::system()).await?;
+    TestFacingModel::new(&mut tx)
+        .insert(
+            &"projects".parse()?,
+            assert_obj!("name" => "must-never-commit"),
+        )
+        .await?;
+    let final_tx = tx.finalize()?;
+    let write_indexes: Vec<_> = final_tx
+        .writes
+        .coalesced_writes()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect();
+    let write_source = WriteSource::new("raft_replicated_rollback_test");
+    let participant = ParticipantTransaction::from_final_transaction(
+        &final_tx,
+        PartitionId(1),
+        &write_indexes,
+        &partitioned_map(PartitionId(1)),
+        &write_source,
+    )?;
+    let transaction_id = TwoPhaseTransactionId::new();
+    let committer = node.committer_for_test();
+    let prepare_ts = committer.allocate_commit_ts().await?;
+    let (raft_state, mut raft_rx) =
+        RaftPartitionState::new_with_mailbox_for_test(true, 1, PartitionId(1), 1);
+    node.attach_raft_state(raft_state).await?;
+
+    let prepare_task = {
+        let committer = committer.clone();
+        let transaction_id = transaction_id.clone();
+        let write_source = write_source.clone();
+        tokio::spawn(async move {
+            committer
+                .prepare_remote(
+                    transaction_id,
+                    participant,
+                    write_source,
+                    prepare_ts,
+                    vec![PartitionId(1)],
+                )
+                .await
+        })
+    };
+    let redo = commit_next_raft_prepare_for_test(&mut raft_rx, 21).await?;
+    acknowledge_next_raft_applied_for_test_ref(&mut raft_rx, 21).await?;
+    assert_eq!(prepare_task.await??.prepare_ts, prepare_ts);
+
+    let rollback_task = {
+        let committer = committer.clone();
+        let transaction_id = transaction_id.clone();
+        tokio::spawn(async move { committer.rollback_prepared(transaction_id).await })
+    };
+    assert_eq!(
+        commit_next_raft_rollback_for_test(&mut raft_rx, 22).await?,
+        transaction_id,
+    );
+    acknowledge_next_raft_applied_for_test_ref(&mut raft_rx, 22).await?;
+    rollback_task.await??;
+    assert!(committer.two_phase_redo_records().await?.is_empty());
+
+    // Exercise the follower callback path independently. Replaying the committed
+    // prepare followed by the rollback marker must clear the intent, and a
+    // duplicate rollback marker must remain a no-op.
+    committer.apply_raft_prepared_redo(23, redo).await?;
+    anyhow::ensure!(!committer.two_phase_redo_records().await?.is_empty());
+    committer
+        .apply_raft_rollback(24, transaction_id.clone())
+        .await?;
+    committer.apply_raft_rollback(25, transaction_id).await?;
+    assert!(committer.two_phase_redo_records().await?.is_empty());
+
+    let rows = run_query(
+        node,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(rows.len(), 1, "rolled-back writes must remain invisible");
     Ok(())
 }
 
@@ -5757,8 +5894,8 @@ fn test_stale_same_name_creation_aborts_before_retrying_winning_catalog() -> any
             .await
             .expect_err("the stale same-name catalog proposal must not commit");
         assert!(
-            format!("{stale_error:#}").contains("duplicate table"),
-            "stale creator should lose at the catalog authority: {stale_error:#}",
+            stale_error.is_occ(),
+            "stale creator should return a retryable OCC error: {stale_error:#}",
         );
 
         insert_doc(

@@ -17,7 +17,10 @@ use crate::{
     },
     commit_delta::CommitDelta,
     nats_distributed_log::DeltaEnvelope,
-    two_phase::TwoPhaseRedoEntry,
+    two_phase::{
+        TwoPhaseRedoEntry,
+        TwoPhaseTransactionId,
+    },
 };
 
 /// Versioned Raft state-machine entry.
@@ -29,6 +32,9 @@ pub enum RaftStateMachineEntry {
     },
     TwoPhasePrepare {
         redo: TwoPhaseRedoEntry,
+    },
+    TwoPhaseRollback {
+        transaction_id: TwoPhaseTransactionId,
     },
     ClusterGenesis {
         manifest: ClusterGenesisManifest,
@@ -45,6 +51,10 @@ impl RaftStateMachineEntry {
 
     pub fn two_phase_prepare(redo: TwoPhaseRedoEntry) -> Self {
         Self::TwoPhasePrepare { redo }
+    }
+
+    pub fn two_phase_rollback(transaction_id: TwoPhaseTransactionId) -> Self {
+        Self::TwoPhaseRollback { transaction_id }
     }
 
     pub fn cluster_genesis(payload: &CanonicalGenesisPayload) -> Self {
@@ -105,6 +115,9 @@ mod tests {
             RaftStateMachineEntry::TwoPhasePrepare { .. } => {
                 panic!("expected commit delta entry")
             },
+            RaftStateMachineEntry::TwoPhaseRollback { .. } => {
+                panic!("expected commit delta entry")
+            },
             RaftStateMachineEntry::ClusterGenesis { .. } => {
                 panic!("expected commit delta entry")
             },
@@ -134,6 +147,9 @@ mod tests {
             RaftStateMachineEntry::TwoPhasePrepare { .. } => {
                 panic!("expected commit delta entry")
             },
+            RaftStateMachineEntry::TwoPhaseRollback { .. } => {
+                panic!("expected commit delta entry")
+            },
             RaftStateMachineEntry::ClusterGenesis { .. } => {
                 panic!("expected commit delta entry")
             },
@@ -159,6 +175,20 @@ mod tests {
                 assert_eq!(base64::decode(checkpoint_base64)?, payload.checkpoint_bytes);
             },
             _ => panic!("expected cluster genesis entry"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn two_phase_rollback_entry_roundtrips() -> anyhow::Result<()> {
+        let transaction_id = TwoPhaseTransactionId::new();
+        let bytes = RaftStateMachineEntry::two_phase_rollback(transaction_id.clone()).to_bytes()?;
+
+        match RaftStateMachineEntry::from_bytes(&bytes)? {
+            RaftStateMachineEntry::TwoPhaseRollback {
+                transaction_id: decoded,
+            } => assert_eq!(decoded, transaction_id),
+            _ => panic!("expected 2PC rollback entry"),
         }
         Ok(())
     }
