@@ -503,6 +503,32 @@ impl OwnerReadClient for PlacementChangingOwnerReadClient {
     }
 }
 
+struct CommitterBackedOwnerReadClient {
+    committer: CommitterClient,
+}
+
+#[async_trait]
+impl OwnerReadClient for CommitterBackedOwnerReadClient {
+    async fn close_read_timestamp(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        target_ts: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        self.committer.close_latest_read_timestamp(target_ts).await
+    }
+
+    async fn read_index_ranges(
+        &self,
+        _owner_partition: PartitionId,
+        _placement_version: PlacementVersion,
+        _snapshot_ts: Timestamp,
+        _ranges: Vec<RangeRequest>,
+    ) -> anyhow::Result<Vec<OwnerIndexRangeResult>> {
+        anyhow::bail!("read_index_ranges is not used by the read barrier test")
+    }
+}
+
 fn partitioned_map_with_version(
     local_partition: PartitionId,
     placement_version: PlacementVersion,
@@ -3258,6 +3284,38 @@ async fn test_cluster_read_barrier_retries_above_local_timeline(
 }
 
 #[convex_macro::test_runtime]
+async fn test_latest_read_barrier_does_not_reuse_stale_exact_fence(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log, Some(partitioned_map(PartitionId(0)))).await?;
+    let closed = node.committer_for_test().allocate_commit_ts().await?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_latest_read_timestamp(closed)
+            .await?,
+        ReadTimestampClosure::Closed(closed),
+    );
+
+    let later_commit = node.committer_for_test().allocate_commit_ts().await?;
+    assert_eq!(
+        node.committer_for_test()
+            .close_read_timestamp(closed)
+            .await?,
+        ReadTimestampClosure::Closed(closed),
+        "an exact historical snapshot must remain readable",
+    );
+    assert_eq!(
+        node.committer_for_test()
+            .close_latest_read_timestamp(closed)
+            .await?,
+        ReadTimestampClosure::RetryAt(later_commit),
+        "a latest read must discover commits newer than a cached exact fence",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
 async fn test_cluster_read_barrier_retries_all_owners_at_one_new_timestamp(
     rt: TestRuntime,
 ) -> anyhow::Result<()> {
@@ -3273,6 +3331,30 @@ async fn test_cluster_read_barrier_retries_all_owners_at_one_new_timestamp(
     assert_eq!(targets[0], initial_local_ts);
     assert!(targets[1] > targets[0]);
     assert_eq!(*safe_ts, targets[1]);
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cluster_latest_read_advances_after_remote_owner_commit(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let coordinator = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(0)))).await?;
+    let owner = create_node(&rt, log, Some(partitioned_map(PartitionId(1)))).await?;
+    let database =
+        coordinator.with_owner_read_client_for_test(Arc::new(CommitterBackedOwnerReadClient {
+            committer: owner.committer_for_test(),
+        }));
+
+    let first = database.cluster_safe_read_ts().await?;
+    let remote_commit = owner.committer_for_test().allocate_commit_ts().await?;
+    assert!(remote_commit > *first);
+
+    let next = database.cluster_safe_read_ts().await?;
+    assert!(
+        *next >= remote_commit,
+        "latest cluster read {next} did not include remote owner floor {remote_commit}",
+    );
     Ok(())
 }
 

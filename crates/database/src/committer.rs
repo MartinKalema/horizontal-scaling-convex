@@ -2667,9 +2667,19 @@ impl<RT: Runtime> Committer<RT> {
                                 .and_then(|_| self.next_commit_ts_at_or_after(min_ts));
                             let _ = result.send(r);
                         },
-                        Some(CommitterMessage::CloseReadTimestamp { target, result }) => {
+                        Some(CommitterMessage::CloseReadTimestamp {
+                            target,
+                            include_latest_floor,
+                            result,
+                        }) => {
                             let span = Span::noop();
-                            self.close_read_timestamp(target, result, commit_id, &span);
+                            self.close_read_timestamp(
+                                target,
+                                include_latest_floor,
+                                result,
+                                commit_id,
+                                &span,
+                            );
                             commit_id += 1;
                         },
                         Some(CommitterMessage::CommitPrepared {
@@ -2941,6 +2951,7 @@ impl<RT: Runtime> Committer<RT> {
     fn close_read_timestamp(
         &mut self,
         target: Timestamp,
+        include_latest_floor: bool,
         result: oneshot::Sender<anyhow::Result<ReadTimestampClosure>>,
         commit_id: usize,
         root_span: &Span,
@@ -2949,7 +2960,10 @@ impl<RT: Runtime> Committer<RT> {
             let _ = result.send(Err(err));
             return;
         }
-        if self.closed_read_timestamps.contains(&target) {
+        // An exact historical read may reuse a timestamp that was fenced before
+        // later commits. A latest-read barrier must first discover those later
+        // commits so it cannot mistake an old cached fence for the cluster tip.
+        if !include_latest_floor && self.closed_read_timestamps.contains(&target) {
             let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
             return;
         }
@@ -2971,6 +2985,10 @@ impl<RT: Runtime> Committer<RT> {
 
         if minimum > target {
             let _ = result.send(Ok(ReadTimestampClosure::RetryAt(minimum)));
+            return;
+        }
+        if self.closed_read_timestamps.contains(&target) {
+            let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
             return;
         }
         if let Some(prepared_ts) = self.prepared_writes.min_ts()
@@ -7729,8 +7747,29 @@ impl CommitterClient {
         &self,
         target: Timestamp,
     ) -> anyhow::Result<ReadTimestampClosure> {
+        self.close_read_timestamp_with_latest_floor(target, false)
+            .await
+    }
+
+    pub async fn close_latest_read_timestamp(
+        &self,
+        target: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        self.close_read_timestamp_with_latest_floor(target, true)
+            .await
+    }
+
+    async fn close_read_timestamp_with_latest_floor(
+        &self,
+        target: Timestamp,
+        include_latest_floor: bool,
+    ) -> anyhow::Result<ReadTimestampClosure> {
         let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::CloseReadTimestamp { target, result: tx };
+        let message = CommitterMessage::CloseReadTimestamp {
+            target,
+            include_latest_floor,
+            result: tx,
+        };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -8068,6 +8107,7 @@ enum CommitterMessage {
     },
     CloseReadTimestamp {
         target: Timestamp,
+        include_latest_floor: bool,
         result: oneshot::Sender<anyhow::Result<ReadTimestampClosure>>,
     },
     /// 2PC CommitPrepared: finalize a previously prepared transaction.

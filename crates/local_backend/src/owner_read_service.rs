@@ -220,7 +220,7 @@ impl OwnerReadService for OwnerReadGrpcService {
         })?;
         let outcome = self
             .committer
-            .close_read_timestamp(target_ts)
+            .close_latest_read_timestamp(target_ts)
             .await
             .map_err(|error| {
                 Status::unavailable(format!("Failed to close owner read timestamp: {error:#}"))

@@ -1941,8 +1941,10 @@ impl<RT: Runtime> Database<RT> {
                     owner_read_client.close_read_timestamp(partition, placement_version, target)
                 }),
         );
-        let (local, remotes) =
-            futures::join!(self.committer.close_read_timestamp(target), remote_closures,);
+        let (local, remotes) = futures::join!(
+            self.committer.close_latest_read_timestamp(target),
+            remote_closures,
+        );
         let mut closures = Vec::with_capacity(partition_map.num_partitions() as usize);
         closures.push(local?);
         closures.extend(remotes.into_iter().collect::<anyhow::Result<Vec<_>>>()?);
