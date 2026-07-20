@@ -29,6 +29,7 @@ use local_backend::{
     owner_read_service::OwnerReadGrpcService,
     proxy::dev_site_proxy,
     router::router,
+    subscription_invalidation_service::SubscriptionInvalidationGrpcService,
     two_phase_service,
     HttpActionRouteMapper,
     MAX_CONCURRENT_REQUESTS,
@@ -157,6 +158,13 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
             st.placement_metadata_store.clone(),
             cluster_grpc_auth.clone(),
         );
+        let subscription_invalidations = SubscriptionInvalidationGrpcService::new(
+            st.application.database().clone(),
+            st.application.database().committer_client(),
+            st.raft_state.clone(),
+            st.placement_metadata_store.clone(),
+            cluster_grpc_auth.clone(),
+        );
 
         // Add Raft transport server if Raft is enabled.
         let raft_transport = st.raft_mailbox_tx.as_ref().map(|mailbox_tx| {
@@ -172,7 +180,8 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
             let mut builder = tonic::transport::Server::builder()
                 .add_service(forwarder.into_server())
                 .add_service(two_pc.into_server())
-                .add_service(owner_reads.into_server());
+                .add_service(owner_reads.into_server())
+                .add_service(subscription_invalidations.into_server());
 
             if let Some(raft) = raft_transport {
                 builder = builder.add_service(raft.into_service());

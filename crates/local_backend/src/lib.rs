@@ -126,6 +126,7 @@ pub mod storage;
 pub mod streaming_export;
 pub mod streaming_import;
 pub mod subs;
+pub mod subscription_invalidation_service;
 #[cfg(test)]
 mod test_helpers;
 pub mod two_phase_service;
@@ -1673,6 +1674,26 @@ pub async fn make_app(
                                             .map_err(|e| {
                                                 anyhow::anyhow!(
                                                     "Raft 2PC prepare apply failed: {e:#}"
+                                                )
+                                            })
+                                    })?;
+                                },
+                                RaftStateMachineEntry::TwoPhaseRollback { transaction_id } => {
+                                    tracing::info!(
+                                        "Applying committed Raft 2PC rollback locally: txn={}, \
+                                         leader_now={}",
+                                        transaction_id,
+                                        raft_state_for_entries.is_leader(),
+                                    );
+                                    let committer = committer_for_entries.clone();
+                                    let rt = tokio::runtime::Handle::current();
+                                    rt.block_on(async {
+                                        committer
+                                            .apply_raft_rollback(raft_index, transaction_id)
+                                            .await
+                                            .map_err(|e| {
+                                                anyhow::anyhow!(
+                                                    "Raft 2PC rollback apply failed: {e:#}"
                                                 )
                                             })
                                     })?;

@@ -29,19 +29,22 @@ use database::{
     },
     CommitterClient,
 };
-use pb::replication::{
-    two_phase_commit_service_server::{
-        TwoPhaseCommitService,
-        TwoPhaseCommitServiceServer as TonicTwoPcServer,
+use pb::{
+    error_metadata::ErrorMetadataStatusExt,
+    replication::{
+        two_phase_commit_service_server::{
+            TwoPhaseCommitService,
+            TwoPhaseCommitServiceServer as TonicTwoPcServer,
+        },
+        TwoPcCommitRequest,
+        TwoPcCommitResponse,
+        TwoPcPrepareRequest,
+        TwoPcPrepareResponse,
+        TwoPcRollbackRequest,
+        TwoPcRollbackResponse,
+        TwoPcValidateReadsRequest,
+        TwoPcValidateReadsResponse,
     },
-    TwoPcCommitRequest,
-    TwoPcCommitResponse,
-    TwoPcPrepareRequest,
-    TwoPcPrepareResponse,
-    TwoPcRollbackRequest,
-    TwoPcRollbackResponse,
-    TwoPcValidateReadsRequest,
-    TwoPcValidateReadsResponse,
 };
 use tonic::{
     Request,
@@ -99,7 +102,7 @@ impl TwoPhaseCommitGrpcService {
                         required_prepare_ts: Some(u64::from(retry.required_ts)),
                     }));
                 }
-                Err(Status::internal(format!("{error_context}: {err:#}")))
+                Err(Status::from_anyhow(err.context(error_context.to_owned())))
             },
         }
     }
@@ -118,7 +121,7 @@ impl TwoPhaseCommitGrpcService {
                         required_prepare_ts: Some(u64::from(retry.required_ts)),
                     }));
                 }
-                Err(Status::internal(format!("{error_context}: {err:#}")))
+                Err(Status::from_anyhow(err.context(error_context.to_owned())))
             },
         }
     }
@@ -321,7 +324,7 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             let commit_ts = client
                 .commit_prepared(&txn_id)
                 .await
-                .map_err(|e| Status::internal(format!("Leader CommitPrepared failed: {e:#}")))?;
+                .map_err(|e| Status::from_anyhow(e.context("Leader CommitPrepared failed")))?;
             return Ok(Response::new(TwoPcCommitResponse { commit_ts }));
         }
 
@@ -329,7 +332,7 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             .committer
             .commit_prepared(txn_id)
             .await
-            .map_err(|e| Status::internal(format!("CommitPrepared failed: {e:#}")))?;
+            .map_err(|e| Status::from_anyhow(e.context("CommitPrepared failed")))?;
 
         Ok(Response::new(TwoPcCommitResponse {
             commit_ts: u64::from(ts),
@@ -348,15 +351,53 @@ impl TwoPhaseCommitService for TwoPhaseCommitGrpcService {
             client
                 .rollback_prepared(&txn_id)
                 .await
-                .map_err(|e| Status::internal(format!("Leader RollbackPrepared failed: {e:#}")))?;
+                .map_err(|e| Status::from_anyhow(e.context("Leader RollbackPrepared failed")))?;
             return Ok(Response::new(TwoPcRollbackResponse {}));
         }
 
         self.committer
             .rollback_prepared(txn_id)
             .await
-            .map_err(|e| Status::internal(format!("RollbackPrepared failed: {e:#}")))?;
+            .map_err(|e| Status::from_anyhow(e.context("RollbackPrepared failed")))?;
 
         Ok(Response::new(TwoPcRollbackResponse {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use errors::{
+        ErrorMetadata,
+        ErrorMetadataAnyhowExt,
+    };
+
+    use super::*;
+
+    fn system_occ_error() -> anyhow::Error {
+        ErrorMetadata::system_occ(Some(42), Some("catalog coherence test".to_owned())).into()
+    }
+
+    #[test]
+    fn prepare_response_preserves_occ_metadata() {
+        let status =
+            TwoPhaseCommitGrpcService::prepare_response(Err(system_occ_error()), "Prepare failed")
+                .expect_err("OCC prepare must return an error status");
+
+        let err = status.into_anyhow();
+        assert!(err.is_occ());
+        assert!(format!("{err:#}").contains("Prepare failed"));
+    }
+
+    #[test]
+    fn validate_reads_response_preserves_occ_metadata() {
+        let status = TwoPhaseCommitGrpcService::validate_reads_response(
+            Err(system_occ_error()),
+            "ValidateReads failed",
+        )
+        .expect_err("OCC read validation must return an error status");
+
+        let err = status.into_anyhow();
+        assert!(err.is_occ());
+        assert!(format!("{err:#}").contains("ValidateReads failed"));
     }
 }

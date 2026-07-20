@@ -192,6 +192,20 @@ message OwnerReadIndexEntry {
   common.ResolvedDocument document = 3;
 }
 
+// Low-latency reactive invalidation control plane. Data remains authoritative
+// at its placement owner; this signal only tells the coordinator's subscription
+// workers that affected queries must rerun against a new cluster-safe snapshot.
+service SubscriptionInvalidationService {
+  rpc InvalidateTables(InvalidateTablesRequest) returns (google.protobuf.Empty);
+}
+
+message InvalidateTablesRequest {
+  uint32 authority_partition = 1;
+  uint64 placement_version = 2;
+  uint64 commit_ts = 3;
+  repeated string table_names = 4;
+}
+
 // Two-Phase Commit service for cross-partition writes (Vitess 2PC pattern).
 // Each partitioned node runs this service. The coordinator sends Prepare
 // to remote partitions, then CommitPrepared or RollbackPrepared.

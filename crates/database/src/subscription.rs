@@ -115,7 +115,7 @@ impl SubscriptionsClient {
             Err(invalid_ts) => return Ok(Subscription::invalid(invalid_ts)),
         };
         let (subscription, sender) = Subscription::new(&token);
-        let request = SubscriptionRequest {
+        let request = SubscriptionRequest::Subscribe {
             token,
             interested_tables,
             sender,
@@ -134,6 +134,35 @@ impl SubscriptionsClient {
             });
         }
         Ok(subscription)
+    }
+
+    pub fn invalidate_tables(
+        &self,
+        table_names: BTreeSet<TableName>,
+        invalid_ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        let table_names = Arc::new(table_names);
+        let mut first_error = None;
+        for sender in &self.senders {
+            metrics::log_subscription_queue_length_delta(1);
+            let request = SubscriptionRequest::InvalidateTables {
+                table_names: table_names.clone(),
+                invalid_ts,
+            };
+            if let Err(error) = sender.try_send(request) {
+                metrics::log_subscription_queue_length_delta(-1);
+                if first_error.is_none() {
+                    first_error = Some(match error {
+                        TrySendError::Full(..) => metrics::subscriptions_worker_full_error().into(),
+                        TrySendError::Closed(..) => metrics::shutdown_error(),
+                    });
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn delta_interest_tracker(&self) -> DeltaInterestTracker {
@@ -182,11 +211,17 @@ impl SubscriptionSender {
     }
 }
 
-struct SubscriptionRequest {
-    token: Token,
-    interested_tables: Arc<BTreeSet<TableName>>,
-    sender: SubscriptionSender,
-    is_system: bool,
+enum SubscriptionRequest {
+    Subscribe {
+        token: Token,
+        interested_tables: Arc<BTreeSet<TableName>>,
+        sender: SubscriptionSender,
+        is_system: bool,
+    },
+    InvalidateTables {
+        table_names: Arc<BTreeSet<TableName>>,
+        invalid_ts: Timestamp,
+    },
 }
 
 /// Tracks the minimum processed_ts across all SubscriptionManagers to
@@ -333,7 +368,7 @@ impl SubscriptionManager {
                 },
                 request = rx.recv().fuse() => {
                     match request {
-                        Some(SubscriptionRequest {
+                        Some(SubscriptionRequest::Subscribe {
                             token,
                             interested_tables,
                             sender,
@@ -345,6 +380,12 @@ impl SubscriptionManager {
                                     report_error(&mut e).await;
                                 },
                             }
+                        },
+                        Some(SubscriptionRequest::InvalidateTables {
+                            table_names,
+                            invalid_ts,
+                        }) => {
+                            self.invalidate_tables(&table_names, invalid_ts);
                         },
                         None => {
                             tracing::info!("All clients have gone away, shutting down subscriptions worker...");
@@ -391,6 +432,11 @@ pub struct SubscriptionManager {
     // Invariant: All `ReadSet` in `subscribers` have a timestamp greater than or equal to
     // `processed_ts`.
     processed_ts: Timestamp,
+
+    // Latest direct cluster invalidation observed for each table. Keeping this
+    // watermark closes the race between a remote commit notification and a
+    // subscription being registered on this worker.
+    table_invalidation_watermarks: BTreeMap<TableName, Timestamp>,
 }
 
 struct Subscriber {
@@ -436,6 +482,7 @@ impl SubscriptionManager {
             delta_interest,
             retention_coordinator,
             processed_ts: initial_ts,
+            table_invalidation_watermarks: BTreeMap::new(),
         }
     }
 
@@ -470,6 +517,17 @@ impl SubscriptionManager {
         }
         assert!(token.ts() >= self.processed_ts);
 
+        if let Some(invalid_ts) = interested_tables
+            .iter()
+            .filter_map(|table_name| self.table_invalidation_watermarks.get(table_name))
+            .copied()
+            .filter(|invalid_ts| *invalid_ts > token.ts())
+            .max()
+        {
+            sender.drop_with_delay(None, Some(invalid_ts));
+            return Ok(usize::MAX);
+        }
+
         let entry = self.subscribers.vacant_entry();
         let subscriber_id = entry.key();
 
@@ -498,6 +556,32 @@ impl SubscriptionManager {
             .boxed(),
         );
         Ok(subscriber_id)
+    }
+
+    fn invalidate_tables(&mut self, table_names: &BTreeSet<TableName>, invalid_ts: Timestamp) {
+        for table_name in table_names {
+            self.table_invalidation_watermarks
+                .entry(table_name.clone())
+                .and_modify(|current| *current = (*current).max(invalid_ts))
+                .or_insert(invalid_ts);
+        }
+
+        let subscriber_ids = self
+            .subscribers
+            .iter()
+            .filter_map(|(subscriber_id, subscriber)| {
+                subscriber
+                    .interested_tables
+                    .iter()
+                    .any(|table_name| table_names.contains(table_name))
+                    .then_some(subscriber_id)
+            })
+            .collect_vec();
+        let invalidated = subscriber_ids.len();
+        for subscriber_id in subscriber_ids {
+            self._remove(subscriber_id, None, Some(invalid_ts));
+        }
+        log_subscriptions_invalidated(invalidated);
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -868,6 +952,7 @@ mod tests {
         },
         ops::Range,
         str::FromStr,
+        sync::Arc,
         time::Duration,
     };
 
@@ -921,6 +1006,7 @@ mod tests {
         FieldPath,
         PublicDocumentId,
         ResolvedDocumentId,
+        TableName,
         TableNumber,
         TabletId,
         TabletIdAndTableNumber,
@@ -930,6 +1016,7 @@ mod tests {
         subscription::{
             CountingReceiver,
             RetentionCoordinator,
+            Subscription,
             SubscriptionManager,
         },
         write_log::new_write_log,
@@ -1402,6 +1489,64 @@ mod tests {
             subscription.wait_for_invalidation().await,
             Some(Timestamp::must(120))
         );
+    }
+
+    #[tokio::test]
+    async fn test_direct_table_invalidation_covers_registration_races() -> anyhow::Result<()> {
+        let mut manager = SubscriptionManager::new_for_testing();
+        let watched_table: TableName = "projects".parse()?;
+        let unrelated_table: TableName = "messages".parse()?;
+        let token = Token::empty(Timestamp::must(100));
+        let (subscription, sender) = Subscription::new(&token);
+        manager.subscribe(
+            token,
+            Arc::new(btreeset! { watched_table.clone() }),
+            sender,
+            false,
+        )?;
+
+        manager.invalidate_tables(&btreeset! { unrelated_table }, Timestamp::must(110));
+        assert_eq!(subscription.current_ts(), Some(Timestamp::must(100)));
+
+        manager.invalidate_tables(&btreeset! { watched_table.clone() }, Timestamp::must(120));
+        assert_eq!(
+            subscription.wait_for_invalidation().await,
+            Some(Timestamp::must(120)),
+        );
+
+        // If the signal wins the race and reaches the manager first, its
+        // watermark must invalidate a subsequently registered older token.
+        let stale_token = Token::empty(Timestamp::must(115));
+        let (stale_subscription, stale_sender) = Subscription::new(&stale_token);
+        let stale_id = manager.subscribe(
+            stale_token,
+            Arc::new(btreeset! { watched_table.clone() }),
+            stale_sender,
+            false,
+        )?;
+        assert_eq!(stale_id, usize::MAX);
+        assert_eq!(
+            stale_subscription.wait_for_invalidation().await,
+            Some(Timestamp::must(120)),
+        );
+
+        // A query token at the invalidation timestamp already includes that
+        // commit and must remain subscribable.
+        let current_token = Token::empty(Timestamp::must(120));
+        let (current_subscription, current_sender) = Subscription::new(&current_token);
+        let current_id = manager.subscribe(
+            current_token,
+            Arc::new(btreeset! { watched_table }),
+            current_sender,
+            false,
+        )?;
+        assert_ne!(current_id, usize::MAX);
+        assert_eq!(
+            current_subscription.current_ts(),
+            Some(Timestamp::must(120)),
+        );
+
+        Ok(())
     }
 
     #[test]

@@ -236,6 +236,8 @@ impl PlacementMetadata {
             local_partition,
             num_partitions: self.num_partitions,
             placement_version: self.version,
+            #[cfg(any(test, feature = "testing"))]
+            enforce_catalog_coherence: true,
         }
     }
 }
@@ -371,6 +373,8 @@ impl PlacementMetadataStore for NatsPlacementMetadataStore {
 pub struct PlacementState {
     local_partition: PartitionId,
     metadata: Arc<RwLock<PlacementMetadata>>,
+    #[cfg(any(test, feature = "testing"))]
+    enforce_catalog_coherence: bool,
 }
 
 impl PlacementState {
@@ -379,10 +383,14 @@ impl PlacementState {
         Ok(Self {
             local_partition,
             metadata: Arc::new(RwLock::new(metadata)),
+            #[cfg(any(test, feature = "testing"))]
+            enforce_catalog_coherence: true,
         })
     }
 
     pub fn from_partition_map(partition_map: PartitionMap) -> Self {
+        #[cfg(any(test, feature = "testing"))]
+        let enforce_catalog_coherence = partition_map.enforces_catalog_coherence();
         let metadata = PlacementMetadata::from_partition_map(
             &partition_map,
             PlacementMetadataSource::StaticConfig,
@@ -390,14 +398,22 @@ impl PlacementState {
         Self {
             local_partition: partition_map.local_partition(),
             metadata: Arc::new(RwLock::new(metadata)),
+            #[cfg(any(test, feature = "testing"))]
+            enforce_catalog_coherence,
         }
     }
 
     pub fn partition_map(&self) -> PartitionMap {
-        self.metadata
+        let partition_map = self
+            .metadata
             .read()
             .expect("placement metadata lock poisoned")
-            .into_partition_map(self.local_partition)
+            .into_partition_map(self.local_partition);
+        #[cfg(any(test, feature = "testing"))]
+        if !self.enforce_catalog_coherence {
+            return partition_map.without_catalog_authority_for_test();
+        }
+        partition_map
     }
 
     pub fn refresh(&self, metadata: PlacementMetadata) -> anyhow::Result<()> {
@@ -463,6 +479,8 @@ pub struct PartitionMap {
     num_partitions: u32,
     /// Version of the placement metadata used to build this map.
     placement_version: PlacementVersion,
+    #[cfg(any(test, feature = "testing"))]
+    enforce_catalog_coherence: bool,
 }
 
 impl PartitionMap {
@@ -504,7 +522,28 @@ impl PartitionMap {
             local_partition: PartitionId::DEFAULT,
             num_partitions: 1,
             placement_version: PlacementVersion::STATIC,
+            #[cfg(any(test, feature = "testing"))]
+            enforce_catalog_coherence: true,
         }
+    }
+
+    pub(crate) fn enforces_catalog_coherence(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.enforce_catalog_coherence
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            true
+        }
+    }
+
+    /// Isolated data-plane tests deliberately run one partition without its
+    /// metadata authority. Production maps never disable catalog coherence.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn without_catalog_authority_for_test(mut self) -> Self {
+        self.enforce_catalog_coherence = false;
+        self
     }
 
     /// Get the partition that owns the given table.

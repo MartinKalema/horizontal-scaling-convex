@@ -130,7 +130,7 @@ services:
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
       PARTITION_ID: "0"
-      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1,catalog_probe=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       CLUSTER_NODE_ID: partition-0-peer-0
@@ -165,7 +165,7 @@ services:
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3220
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3221
       PARTITION_ID: "0"
-      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1,catalog_probe=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       CLUSTER_NODE_ID: partition-0-peer-1
@@ -201,7 +201,7 @@ services:
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3230
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3231
       PARTITION_ID: "0"
-      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1,catalog_probe=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       CLUSTER_NODE_ID: partition-0-peer-2
@@ -239,7 +239,7 @@ services:
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3310
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3311
       PARTITION_ID: "1"
-      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1,catalog_probe=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       CLUSTER_NODE_ID: partition-1-peer-0
@@ -274,7 +274,7 @@ services:
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3320
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3321
       PARTITION_ID: "1"
-      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1,catalog_probe=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       CLUSTER_NODE_ID: partition-1-peer-1
@@ -310,7 +310,7 @@ services:
       CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3330
       CONVEX_SITE_ORIGIN: http://127.0.0.1:3331
       PARTITION_ID: "1"
-      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1
+      PARTITION_MAP: messages=0,users=0,projects=1,tasks=1,catalog_probe=1
       NUM_PARTITIONS: "2"
       NODE_ADDRESSES: 0=node-p0a:50051|node-p0b:50051|node-p0c:50051,1=node-p1a:50051|node-p1b:50051|node-p1c:50051
       CLUSTER_NODE_ID: partition-1-peer-2

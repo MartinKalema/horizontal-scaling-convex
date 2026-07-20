@@ -438,6 +438,7 @@ pub struct CommitOutcome {
     pub ts: Timestamp,
     pub source_partition: Option<crate::partition::PartitionId>,
     pub read_after_write_partitions: Vec<crate::partition::PartitionId>,
+    pub invalidated_tables: BTreeSet<TableName>,
 }
 
 /// Result of asking one partition leader to make an exact timestamp readable.
@@ -487,6 +488,16 @@ enum PersistenceWrite {
         raft_apply_marker: Option<RaftApplyMarker>,
     },
     PreparedRejectedBeforePersistence {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        commit_id: usize,
+        err: anyhow::Error,
+    },
+    PreparedRollback {
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        commit_id: usize,
+        raft_applied_index: Option<u64>,
+    },
+    PreparedRollbackRejected {
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
         commit_id: usize,
         err: anyhow::Error,
@@ -850,6 +861,8 @@ impl PersistenceWrite {
             Self::RejectedBeforePersistence { commit_id, .. } => *commit_id,
             Self::PreparedCommit { commit_id, .. } => *commit_id,
             Self::PreparedRejectedBeforePersistence { commit_id, .. } => *commit_id,
+            Self::PreparedRollback { commit_id, .. } => *commit_id,
+            Self::PreparedRollbackRejected { commit_id, .. } => *commit_id,
             Self::MaxRepeatableTimestamp { commit_id, .. } => *commit_id,
             Self::ReplicaDelta { commit_id, .. } => *commit_id,
             Self::RaftReplayRecovery { commit_id, .. } => *commit_id,
@@ -1351,6 +1364,14 @@ pub struct Committer<RT: Runtime> {
         Vec<oneshot::Sender<anyhow::Result<Timestamp>>>,
     >,
 
+    // Rollback is also a replicated state-machine operation. Keep duplicate
+    // requests attached to one in-flight marker and prevent a contradictory
+    // CommitPrepared from starting while that marker is unresolved.
+    prepared_rollback_waiters: std::collections::HashMap<
+        crate::two_phase::TwoPhaseTransactionId,
+        Vec<oneshot::Sender<anyhow::Result<()>>>,
+    >,
+
     // Snapshots for queued-but-not-yet-published state machine writes.
     // Local commits and replica deltas must both build on the latest queued
     // snapshot, not just the latest published one, or a later publish can
@@ -1433,6 +1454,25 @@ impl<RT: Runtime> Committer<RT> {
             .unwrap_or(crate::partition::PartitionId(0))
     }
 
+    fn prepare_admission_blocker_ts(&self) -> Option<Timestamp> {
+        let pending_write_ts = self.pending_writes.min_ts();
+        let committing_prepared_ts = self
+            .prepared_commit_waiters
+            .keys()
+            .filter_map(|transaction_id| {
+                self.prepared_transactions
+                    .get(transaction_id)
+                    .map(|prepared| prepared.commit_ts)
+            })
+            .min();
+        match (pending_write_ts, committing_prepared_ts) {
+            (Some(pending), Some(prepared)) => Some(cmp::min(pending, prepared)),
+            (Some(pending), None) => Some(pending),
+            (None, Some(prepared)) => Some(prepared),
+            (None, None) => None,
+        }
+    }
+
     fn dequeue_snapshot(&mut self, commit_id: usize) {
         let (queued_commit_id, ..) = self
             .queued_snapshots
@@ -1495,6 +1535,7 @@ impl<RT: Runtime> Committer<RT> {
             maintenance_tso_refill_in_flight: Arc::new(AtomicBool::new(false)),
             prepared_transactions: std::collections::HashMap::new(),
             prepared_commit_waiters: std::collections::HashMap::new(),
+            prepared_rollback_waiters: std::collections::HashMap::new(),
             queued_snapshots: VecDeque::new(),
             raft_state,
             applied_delta_watermarks,
@@ -1593,7 +1634,7 @@ impl<RT: Runtime> Committer<RT> {
                 || pending_snapshot_install.is_some()
                 || snapshot_install_in_progress;
             if !snapshot_barrier_active
-                && self.pending_writes.min_ts().is_none()
+                && self.prepare_admission_blocker_ts().is_none()
                 && let Some(deferred_prepare) = deferred_prepares.pop_front()
             {
                 self.handle_deferred_prepare(deferred_prepare).await;
@@ -1806,6 +1847,12 @@ impl<RT: Runtime> Committer<RT> {
                                     .source_partition
                                     .into_iter()
                                     .collect(),
+                                invalidated_tables: published_commit
+                                    .delta
+                                    .tablet_id_to_table_name
+                                    .values()
+                                    .cloned()
+                                    .collect(),
                             }));
 
                             // When we next get free cycles and there is no ongoing bump,
@@ -1965,6 +2012,63 @@ impl<RT: Runtime> Committer<RT> {
                             ..
                         } => {
                             self.send_prepared_commit_waiters(&transaction_id, Err(err));
+                        },
+                        PersistenceWrite::PreparedRollback {
+                            transaction_id,
+                            raft_applied_index,
+                            ..
+                        } => {
+                            let apply_result = async {
+                                self.handle_rollback_prepared(transaction_id.clone())?;
+                                if let Some(raft_applied_index) = raft_applied_index {
+                                    Self::persist_two_phase_rollback_with_state_machine_index(
+                                        self.persistence.clone(),
+                                        &transaction_id,
+                                        raft_applied_index,
+                                    )
+                                    .await?;
+                                    let Some(raft_state) = self.raft_state.as_ref() else {
+                                        anyhow::bail!(
+                                            "2PC RollbackPrepared txn={} returned Raft applied index {} without Raft state",
+                                            transaction_id,
+                                            raft_applied_index,
+                                        );
+                                    };
+                                    raft_state.mark_applied(raft_applied_index).await?;
+                                } else {
+                                    Self::delete_two_phase_redo(
+                                        self.persistence.clone(),
+                                        &transaction_id,
+                                    )
+                                    .await?;
+                                }
+                                Ok::<(), anyhow::Error>(())
+                            }
+                            .await;
+                            match apply_result {
+                                Ok(()) => self.send_prepared_rollback_waiters(
+                                    &transaction_id,
+                                    Ok(()),
+                                ),
+                                Err(err) => {
+                                    let message = format!(
+                                        "Failed to apply committed 2PC rollback for txn={}: {err:#}",
+                                        transaction_id,
+                                    );
+                                    self.send_prepared_rollback_waiters(
+                                        &transaction_id,
+                                        Err(anyhow::anyhow!(message.clone())),
+                                    );
+                                    anyhow::bail!(message);
+                                },
+                            }
+                        },
+                        PersistenceWrite::PreparedRollbackRejected {
+                            transaction_id,
+                            err,
+                            ..
+                        } => {
+                            self.send_prepared_rollback_waiters(&transaction_id, Err(err));
                         },
                         PersistenceWrite::MaxRepeatableTimestamp {
                             new_max_repeatable,
@@ -2402,7 +2506,7 @@ impl<RT: Runtime> Committer<RT> {
                                 redo,
                                 result,
                             };
-                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                            if let Some(min_pending_ts) = self.prepare_admission_blocker_ts() {
                                 Self::defer_prepare_admission(
                                     &mut deferred_prepares,
                                     deferred_prepare,
@@ -2513,7 +2617,7 @@ impl<RT: Runtime> Committer<RT> {
                                 write_source,
                                 result,
                             };
-                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                            if let Some(min_pending_ts) = self.prepare_admission_blocker_ts() {
                                 Self::defer_prepare_admission(
                                     &mut deferred_prepares,
                                     deferred_prepare,
@@ -2539,7 +2643,7 @@ impl<RT: Runtime> Committer<RT> {
                                 participants,
                                 result,
                             };
-                            if let Some(min_pending_ts) = self.pending_writes.min_ts() {
+                            if let Some(min_pending_ts) = self.prepare_admission_blocker_ts() {
                                 Self::defer_prepare_admission(
                                     &mut deferred_prepares,
                                     deferred_prepare,
@@ -2570,9 +2674,19 @@ impl<RT: Runtime> Committer<RT> {
                                 .and_then(|_| self.next_commit_ts_at_or_after(min_ts));
                             let _ = result.send(r);
                         },
-                        Some(CommitterMessage::CloseReadTimestamp { target, result }) => {
+                        Some(CommitterMessage::CloseReadTimestamp {
+                            target,
+                            include_latest_floor,
+                            result,
+                        }) => {
                             let span = Span::noop();
-                            self.close_read_timestamp(target, result, commit_id, &span);
+                            self.close_read_timestamp(
+                                target,
+                                include_latest_floor,
+                                result,
+                                commit_id,
+                                &span,
+                            );
                             commit_id += 1;
                         },
                         Some(CommitterMessage::CommitPrepared {
@@ -2590,20 +2704,28 @@ impl<RT: Runtime> Committer<RT> {
                             transaction_id,
                             result,
                         }) => {
-                            let r = self.handle_rollback_prepared(transaction_id.clone());
-                            if r.is_ok()
-                                && let Err(err) = Self::delete_two_phase_redo(
-                                    self.persistence.clone(),
-                                    &transaction_id,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "2PC RollbackPrepared: rolled back txn={} but failed to \
-                                     delete redo: {err:#}",
+                            if let Some(persistence_write_future) =
+                                self.start_rollback_prepared_through_raft(
                                     transaction_id,
-                                );
+                                    result,
+                                    commit_id,
+                                )
+                            {
+                                self.persistence_writes.push_back(persistence_write_future);
+                                commit_id += 1;
                             }
+                        },
+                        Some(CommitterMessage::ApplyRaftRollback {
+                            raft_state_machine_index,
+                            transaction_id,
+                            result,
+                        }) => {
+                            let r = self
+                                .handle_raft_rollback(
+                                    raft_state_machine_index,
+                                    transaction_id,
+                                )
+                                .await;
                             let _ = result.send(r);
                         },
                     }
@@ -2836,6 +2958,7 @@ impl<RT: Runtime> Committer<RT> {
     fn close_read_timestamp(
         &mut self,
         target: Timestamp,
+        include_latest_floor: bool,
         result: oneshot::Sender<anyhow::Result<ReadTimestampClosure>>,
         commit_id: usize,
         root_span: &Span,
@@ -2844,7 +2967,10 @@ impl<RT: Runtime> Committer<RT> {
             let _ = result.send(Err(err));
             return;
         }
-        if self.closed_read_timestamps.contains(&target) {
+        // An exact historical read may reuse a timestamp that was fenced before
+        // later commits. A latest-read barrier must first discover those later
+        // commits so it cannot mistake an old cached fence for the cluster tip.
+        if !include_latest_floor && self.closed_read_timestamps.contains(&target) {
             let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
             return;
         }
@@ -2866,6 +2992,10 @@ impl<RT: Runtime> Committer<RT> {
 
         if minimum > target {
             let _ = result.send(Ok(ReadTimestampClosure::RetryAt(minimum)));
+            return;
+        }
+        if self.closed_read_timestamps.contains(&target) {
+            let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
             return;
         }
         if let Some(prepared_ts) = self.prepared_writes.min_ts()
@@ -3694,6 +3824,26 @@ impl<RT: Runtime> Committer<RT> {
         }
     }
 
+    async fn wait_for_raft_rollback(
+        raft_commit_waiter: RaftCommitWaiter,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<Option<u64>> {
+        let Some(raft_commit_waiter) = raft_commit_waiter else {
+            return Ok(None);
+        };
+        match raft_commit_waiter.await {
+            Ok(RaftProposalResult::Committed { index }) => Ok(Some(index)),
+            Ok(RaftProposalResult::Rejected) => anyhow::bail!(
+                "Raft rejected 2PC rollback for txn={} before quorum commit",
+                transaction_id,
+            ),
+            Err(_) => anyhow::bail!(
+                "Raft proposal result channel closed before 2PC rollback txn={} reached quorum",
+                transaction_id,
+            ),
+        }
+    }
+
     fn block_on_current_runtime<F: Future>(future: F) -> F::Output {
         block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
@@ -3731,6 +3881,29 @@ impl<RT: Runtime> Committer<RT> {
             Ok(commit_ts) => {
                 for waiter in waiters {
                     let _ = waiter.send(Ok(commit_ts));
+                }
+            },
+            Err(err) => {
+                let message = format!("{err:#}");
+                for waiter in waiters {
+                    let _ = waiter.send(Err(anyhow::anyhow!(message.clone())));
+                }
+            },
+        }
+    }
+
+    fn send_prepared_rollback_waiters(
+        &mut self,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+        result: anyhow::Result<()>,
+    ) {
+        let Some(waiters) = self.prepared_rollback_waiters.remove(transaction_id) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                for waiter in waiters {
+                    let _ = waiter.send(Ok(()));
                 }
             },
             Err(err) => {
@@ -4152,6 +4325,50 @@ impl<RT: Runtime> Committer<RT> {
             format!(
                 "Failed to propose 2PC prepare for txn={} to Raft partition {}",
                 redo.transaction_id,
+                raft.partition_id(),
+            )
+        })?;
+        Ok(Some(rx))
+    }
+
+    fn propose_two_phase_rollback_to_raft(
+        &self,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<RaftCommitWaiter> {
+        let Some(raft) = self.raft_state.as_ref() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            raft.is_cluster_genesis_ready(),
+            "Cluster genesis is not ready for partition {}",
+            raft.partition_id(),
+        );
+        if !raft.is_leader_ready() {
+            anyhow::bail!(
+                "Raft leader is not ready before proposing 2PC rollback for txn={} on partition {}",
+                transaction_id,
+                raft.partition_id(),
+            );
+        }
+        let data = RaftStateMachineEntry::two_phase_rollback(transaction_id.clone())
+            .to_bytes()
+            .with_context(|| {
+                format!(
+                    "Failed to serialize 2PC rollback for txn={} for Raft proposal",
+                    transaction_id,
+                )
+            })?;
+        let (tx, rx) = oneshot::channel();
+        raft.send(crate::raft_node::RaftMessage::Propose(
+            crate::raft_node::RaftProposal {
+                data,
+                result_tx: tx,
+            },
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to propose 2PC rollback for txn={} to Raft partition {}",
+                transaction_id,
                 raft.partition_id(),
             )
         })?;
@@ -5284,6 +5501,32 @@ impl<RT: Runtime> Committer<RT> {
         Ok(())
     }
 
+    async fn persist_two_phase_rollback_with_state_machine_index(
+        persistence: Arc<dyn Persistence>,
+        transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+        raft_state_machine_index: u64,
+    ) -> anyhow::Result<()> {
+        let mut records = Self::load_two_phase_redo_records(persistence.clone()).await?;
+        records.remove(&transaction_id.0);
+        let redo_value = serde_json::to_value(records)
+            .context("2PC: Failed to serialize Raft-applied rollback redo records")?;
+        persistence
+            .write_with_persistence_globals(
+                &[],
+                &[],
+                ConflictStrategy::Overwrite,
+                &[
+                    PersistenceGlobalWrite::new(
+                        String::from(PersistenceGlobalKey::TwoPhaseRedoRecords),
+                        redo_value,
+                    ),
+                    state_machine_index_persistence_write(raft_state_machine_index),
+                ],
+            )
+            .await
+            .context("2PC: Failed to atomically persist rollback and Raft state-machine index")
+    }
+
     async fn redo_entry_is_already_committed(
         persistence_reader: Arc<dyn PersistenceReader>,
         retention_validator: Arc<dyn RetentionValidator>,
@@ -5331,19 +5574,27 @@ impl<RT: Runtime> Committer<RT> {
         require_leader: bool,
         allow_explicit_ts_rewrite: bool,
     ) -> anyhow::Result<crate::two_phase::PrepareResult> {
-        let local_table_mapping = self
-            .snapshot_manager
-            .read()
-            .latest_snapshot()
-            .table_mapping()
-            .clone();
+        let local_snapshot = self.base_snapshot_for_new_writes();
+        let local_table_mapping = local_snapshot.table_mapping().clone();
+        Self::validate_participant_catalog_creations(
+            &transaction,
+            &local_table_mapping,
+            &write_source,
+        )?;
         let mut table_mapping = local_table_mapping.clone();
         transaction.augment_table_mapping(&mut table_mapping)?;
-        let writes = Self::remap_participant_system_table_writes(
+        let mut writes = Self::remap_participant_system_table_writes(
             transaction.writes,
             &table_mapping,
             &local_table_mapping,
         )?;
+        if allow_explicit_ts_rewrite {
+            writes = Self::filter_satisfied_replayed_catalog_creations(
+                writes,
+                &table_mapping,
+                &local_snapshot,
+            )?;
+        }
         self.stage_prepared_transaction(
             transaction_id,
             *transaction.begin_timestamp,
@@ -5355,6 +5606,137 @@ impl<RT: Runtime> Committer<RT> {
             require_leader,
             allow_explicit_ts_rewrite,
         )
+    }
+
+    fn validate_participant_catalog_creations(
+        transaction: &crate::two_phase::ParticipantTransaction,
+        local_mapping: &TableMapping,
+        write_source: &WriteSource,
+    ) -> anyhow::Result<()> {
+        for write in &transaction.writes {
+            if write.old_document.is_some() {
+                continue;
+            }
+            let Some(new_document) = write.new_document.as_ref() else {
+                continue;
+            };
+            let Some(catalog_metadata) = transaction.tablet_metadata.get(&write.id.tablet_id)
+            else {
+                continue;
+            };
+            if &catalog_metadata.table_name != &*TABLES_TABLE {
+                continue;
+            }
+
+            let metadata: ParsedDocument<TableMetadata> =
+                new_document.parse().with_context(|| {
+                    format!(
+                        "failed to parse _tables metadata while validating 2PC catalog write {:?}",
+                        write.id
+                    )
+                })?;
+            let metadata = metadata.into_value();
+            if metadata.name.is_system() || !metadata.is_active() {
+                continue;
+            }
+
+            let proposed_tablet = value::TabletId(write.id.internal_id());
+            let existing_tablet = local_mapping
+                .namespace(metadata.namespace)
+                .id_if_exists(&metadata.name);
+            if existing_tablet.is_some_and(|existing| existing != proposed_tablet) {
+                let error = ErrorMetadata::system_occ(
+                    Some(u64::from(*transaction.begin_timestamp)),
+                    write_source.as_str().map(str::to_string),
+                );
+                anyhow::bail!(anyhow::anyhow!(error).context(format!(
+                    "2PC catalog create for table '{}' lost a concurrent creation race; retry \
+                     against the committed catalog",
+                    metadata.name,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn filter_satisfied_replayed_catalog_creations(
+        writes: Vec<DocumentUpdateWithPrevTs>,
+        table_mapping: &TableMapping,
+        local_snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<DocumentUpdateWithPrevTs>> {
+        let tables_tablet = table_mapping
+            .namespace(value::TableNamespace::Global)
+            .id(&TABLES_TABLE)?
+            .tablet_id;
+        let index_tablet = table_mapping
+            .namespace(value::TableNamespace::Global)
+            .id(&common::bootstrap_model::index::INDEX_TABLE)?
+            .tablet_id;
+        let local_mapping = local_snapshot.table_mapping();
+        let mut filtered = Vec::with_capacity(writes.len());
+
+        for write in writes {
+            let is_insert = write.old_document.is_none() && write.new_document.is_some();
+            if is_insert && write.id.tablet_id == tables_tablet {
+                let new_document = write
+                    .new_document
+                    .as_ref()
+                    .expect("catalog insert should have a new document");
+                let metadata: ParsedDocument<TableMetadata> = new_document.parse()?;
+                let metadata = metadata.into_value();
+                let proposed_tablet = value::TabletId(write.id.internal_id());
+                if local_mapping.tablet_id_exists(proposed_tablet) {
+                    anyhow::ensure!(
+                        local_mapping.tablet_namespace(proposed_tablet)? == metadata.namespace
+                            && local_mapping.tablet_number(proposed_tablet)? == metadata.number
+                            && local_mapping.tablet_name(proposed_tablet)? == metadata.name,
+                        "2PC replay found tablet {:?} already mapped to a different table than \
+                         '{}'",
+                        proposed_tablet,
+                        metadata.name,
+                    );
+                    tracing::info!(
+                        "2PC replay: catalog creation for table '{}' is already materialized with \
+                         stable tablet {:?} and table number {}; staging the remaining intent",
+                        metadata.name,
+                        proposed_tablet,
+                        u32::from(metadata.number),
+                    );
+                    continue;
+                }
+            } else if is_insert && write.id.tablet_id == index_tablet {
+                let new_document = write
+                    .new_document
+                    .as_ref()
+                    .expect("index catalog insert should have a new document");
+                let metadata = common::bootstrap_model::index::TabletIndexMetadata::from_document(
+                    new_document.clone(),
+                )?;
+                let existing = [
+                    local_snapshot.index_registry.get_enabled(&metadata.name),
+                    local_snapshot.index_registry.get_pending(&metadata.name),
+                ]
+                .into_iter()
+                .flatten()
+                .find(|existing| existing.id() == metadata.id().internal_id());
+                if let Some(existing) = existing {
+                    anyhow::ensure!(
+                        existing.metadata().config.same_spec(&metadata.config),
+                        "2PC replay found index {} with the same stable id but a different spec",
+                        metadata.name,
+                    );
+                    tracing::info!(
+                        "2PC replay: catalog creation for index {} is already materialized with \
+                         stable id {}; staging the remaining intent",
+                        metadata.name,
+                        existing.id(),
+                    );
+                    continue;
+                }
+            }
+            filtered.push(write);
+        }
+        Ok(filtered)
     }
 
     fn validate_participant_reads(
@@ -5924,14 +6306,14 @@ impl<RT: Runtime> Committer<RT> {
     fn defer_prepare_admission(
         deferred_prepares: &mut VecDeque<DeferredPrepare>,
         deferred_prepare: DeferredPrepare,
-        min_pending_ts: Timestamp,
+        blocking_ts: Timestamp,
     ) {
         tracing::debug!(
             transaction_id = %deferred_prepare.transaction_id(),
             kind = deferred_prepare.kind(),
-            min_pending_ts = u64::from(min_pending_ts),
+            blocking_ts = u64::from(blocking_ts),
             deferred_prepares = deferred_prepares.len() + 1,
-            "Deferring 2PC prepare admission behind older pending write",
+            "Deferring 2PC prepare admission behind earlier unpublished state-machine write",
         );
         deferred_prepares.push_back(deferred_prepare);
     }
@@ -6003,6 +6385,13 @@ impl<RT: Runtime> Committer<RT> {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
+        if self.prepared_rollback_waiters.contains_key(&transaction_id) {
+            let _ = result.send(Err(anyhow::anyhow!(
+                "2PC CommitPrepared: transaction {} is already rolling back",
+                transaction_id,
+            )));
+            return None;
+        }
         if let Some(waiters) = self.prepared_commit_waiters.get_mut(&transaction_id) {
             tracing::debug!(
                 "2PC CommitPrepared: txn={} already committing; attaching duplicate waiter",
@@ -6277,15 +6666,13 @@ impl<RT: Runtime> Committer<RT> {
             return Ok(());
         }
 
-        let prepared = self
-            .prepared_transactions
-            .remove(&transaction_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "2PC RollbackPrepared: unknown transaction {}",
-                    transaction_id
-                )
-            })?;
+        let Some(prepared) = self.prepared_transactions.remove(&transaction_id) else {
+            tracing::debug!(
+                "2PC RollbackPrepared: txn={} was already absent on this Raft replica",
+                transaction_id,
+            );
+            return Ok(());
+        };
 
         tracing::info!(
             "2PC RollbackPrepared: txn={}, ts={}",
@@ -6307,6 +6694,84 @@ impl<RT: Runtime> Committer<RT> {
             })?;
 
         Ok(())
+    }
+
+    /// Queue a rollback marker without waiting inside the single committer
+    /// loop. Raft applies entries in order, so synchronously waiting here
+    /// can deadlock behind an earlier prepared commit that still needs this
+    /// loop to publish and send `MarkApplied`.
+    fn start_rollback_prepared_through_raft(
+        &mut self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        result: oneshot::Sender<anyhow::Result<()>>,
+        commit_id: usize,
+    ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
+        if let Some(waiters) = self.prepared_rollback_waiters.get_mut(&transaction_id) {
+            waiters.push(result);
+            return None;
+        }
+        if self.prepared_commit_waiters.contains_key(&transaction_id) {
+            let _ = result.send(Err(anyhow::anyhow!(
+                "2PC RollbackPrepared: transaction {} is already committing",
+                transaction_id,
+            )));
+            return None;
+        }
+        if let Err(err) = self.ensure_leader_for_writes() {
+            let _ = result.send(Err(err));
+            return None;
+        }
+
+        // A prepare is a replicated state-machine entry, so its abort must be
+        // one too. The local leader may no longer have the intent after a
+        // failover, but followers can still have replayed it; always append the
+        // idempotent rollback marker before declaring the partition resolved.
+        let raft_rollback_waiter = match self.propose_two_phase_rollback_to_raft(&transaction_id) {
+            Ok(waiter) => waiter,
+            Err(err) => {
+                let _ = result.send(Err(err));
+                return None;
+            },
+        };
+        self.prepared_rollback_waiters
+            .insert(transaction_id.clone(), vec![result]);
+
+        Some(
+            async move {
+                match Self::wait_for_raft_rollback(raft_rollback_waiter, &transaction_id).await {
+                    Ok(raft_applied_index) => Ok(PersistenceWrite::PreparedRollback {
+                        transaction_id,
+                        commit_id,
+                        raft_applied_index,
+                    }),
+                    Err(err) => Ok(PersistenceWrite::PreparedRollbackRejected {
+                        transaction_id,
+                        commit_id,
+                        err,
+                    }),
+                }
+            }
+            .boxed(),
+        )
+    }
+
+    async fn handle_raft_rollback(
+        &mut self,
+        raft_state_machine_index: u64,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            "2PC Raft Rollback Apply: txn={}, index={}",
+            transaction_id,
+            raft_state_machine_index,
+        );
+        self.handle_rollback_prepared(transaction_id.clone())?;
+        Self::persist_two_phase_rollback_with_state_machine_index(
+            self.persistence.clone(),
+            &transaction_id,
+            raft_state_machine_index,
+        )
+        .await
     }
 
     fn handle_raft_prepared_redo(
@@ -6367,6 +6832,7 @@ impl<RT: Runtime> Committer<RT> {
                     .as_ref()
                     .map(|placement_state| placement_state.local_partition()),
                 read_after_write_partitions: Vec::new(),
+                invalidated_tables: BTreeSet::new(),
             }));
             return None;
         }
@@ -6978,6 +7444,25 @@ impl CommitterClient {
         rx.await.map_err(|_| metrics::shutdown_error())?
     }
 
+    /// Apply an idempotent 2PC rollback marker committed through Raft.
+    pub async fn apply_raft_rollback(
+        &self,
+        raft_state_machine_index: u64,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let message = CommitterMessage::ApplyRaftRollback {
+            raft_state_machine_index,
+            transaction_id,
+            result: tx,
+        };
+        self.sender.try_send(message).map_err(|e| match e {
+            TrySendError::Full(..) => metrics::committer_full_error().into(),
+            TrySendError::Closed(..) => metrics::shutdown_error(),
+        })?;
+        rx.await.map_err(|_| metrics::shutdown_error())?
+    }
+
     pub async fn set_raft_state(
         &self,
         raft_state: crate::raft_partition::RaftPartitionState,
@@ -7353,8 +7838,29 @@ impl CommitterClient {
         &self,
         target: Timestamp,
     ) -> anyhow::Result<ReadTimestampClosure> {
+        self.close_read_timestamp_with_latest_floor(target, false)
+            .await
+    }
+
+    pub async fn close_latest_read_timestamp(
+        &self,
+        target: Timestamp,
+    ) -> anyhow::Result<ReadTimestampClosure> {
+        self.close_read_timestamp_with_latest_floor(target, true)
+            .await
+    }
+
+    async fn close_read_timestamp_with_latest_floor(
+        &self,
+        target: Timestamp,
+        include_latest_floor: bool,
+    ) -> anyhow::Result<ReadTimestampClosure> {
         let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::CloseReadTimestamp { target, result: tx };
+        let message = CommitterMessage::CloseReadTimestamp {
+            target,
+            include_latest_floor,
+            result: tx,
+        };
         self.sender.try_send(message).map_err(|e| match e {
             TrySendError::Full(..) => metrics::committer_full_error().into(),
             TrySendError::Closed(..) => metrics::shutdown_error(),
@@ -7624,6 +8130,11 @@ enum CommitterMessage {
         redo: crate::two_phase::TwoPhaseRedoEntry,
         result: oneshot::Sender<anyhow::Result<crate::two_phase::PrepareResult>>,
     },
+    ApplyRaftRollback {
+        raft_state_machine_index: u64,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        result: oneshot::Sender<anyhow::Result<()>>,
+    },
     SetRaftState {
         raft_state: crate::raft_partition::RaftPartitionState,
         result: oneshot::Sender<()>,
@@ -7687,6 +8198,7 @@ enum CommitterMessage {
     },
     CloseReadTimestamp {
         target: Timestamp,
+        include_latest_floor: bool,
         result: oneshot::Sender<anyhow::Result<ReadTimestampClosure>>,
     },
     /// 2PC CommitPrepared: finalize a previously prepared transaction.

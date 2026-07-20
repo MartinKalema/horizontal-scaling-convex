@@ -21,28 +21,20 @@ use anyhow::{
 };
 use common::{
     bootstrap_model::{
-        index::{
-            TabletIndexMetadata,
-            INDEX_TABLE,
-        },
-        tables::{
-            TableMetadata,
-            TABLES_TABLE,
-        },
+        index::INDEX_TABLE,
+        tables::TABLES_TABLE,
     },
-    document::{
-        DocumentUpdateWithPrevTs,
-        ParseDocument,
-        ResolvedDocument,
-    },
+    document::DocumentUpdateWithPrevTs,
     knobs::ENABLE_PARALLEL_2PC_EARLY_ACK,
     runtime::tokio_spawn,
     types::Timestamp,
 };
+use errors::ErrorMetadataAnyhowExt;
 use futures::{
     stream::FuturesUnordered,
     StreamExt,
 };
+use value::TableName;
 
 use crate::{
     committer::{
@@ -58,6 +50,8 @@ use crate::{
     transaction::FinalTransaction,
     two_phase::{
         prepare_timestamp_too_low,
+        transaction_has_user_catalog_writes,
+        user_catalog_write_target,
         NodeAddresses,
         ParticipantTransaction,
         StagingRecoveryResult,
@@ -125,7 +119,7 @@ pub fn classify_transaction(
         transaction,
         partition_map,
         write_source,
-    ));
+    )?);
 
     Ok(if partitions.is_empty() {
         TransactionClassification::SinglePartition
@@ -152,15 +146,14 @@ pub(crate) fn participant_write_indexes(
     let mut participant_indexes: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
 
     for (index, write) in transaction.writes.coalesced_writes().enumerate() {
-        let Some(participant) =
-            routed_partition_for_write(transaction, write, partition_map, write_source)?
-        else {
-            continue;
-        };
-        participant_indexes
-            .entry(participant)
-            .or_default()
-            .push(index);
+        for participant in
+            routed_partitions_for_write(transaction, write, partition_map, write_source)?
+        {
+            participant_indexes
+                .entry(participant)
+                .or_default()
+                .push(index);
+        }
     }
 
     participant_indexes.retain(|_, indexes| !indexes.is_empty());
@@ -175,7 +168,7 @@ pub(crate) fn participant_prepare_indexes(
     let mut participant_indexes =
         participant_write_indexes(transaction, partition_map, write_source)?;
 
-    for participant in participant_read_owners(transaction, partition_map, write_source) {
+    for participant in participant_read_owners(transaction, partition_map, write_source)? {
         participant_indexes.entry(participant).or_default();
     }
 
@@ -186,12 +179,23 @@ fn participant_read_owners(
     transaction: &FinalTransaction,
     partition_map: &PartitionMap,
     write_source: &WriteSource,
-) -> BTreeSet<PartitionId> {
+) -> anyhow::Result<BTreeSet<PartitionId>> {
     let mut participants = BTreeSet::new();
+    let metadata_authority = (partition_map.enforces_catalog_coherence()
+        && transaction_has_user_catalog_writes(transaction)?)
+    .then(|| partition_map.partition_for_table(&TABLES_TABLE));
     let mut visit_tablet = |tablet_id| {
         let Ok(table_name) = transaction.table_mapping.tablet_name(tablet_id) else {
             return;
         };
+        if metadata_authority.is_some()
+            && (&table_name == &*TABLES_TABLE || &table_name == &*INDEX_TABLE)
+        {
+            if let Some(metadata_authority) = metadata_authority {
+                participants.insert(metadata_authority);
+            }
+            return;
+        }
         if let Some(partition) =
             routed_partition_for_table(&table_name, partition_map, write_source)
         {
@@ -206,26 +210,34 @@ fn participant_read_owners(
         visit_tablet(*index_name.table());
     }
 
-    participants
+    Ok(participants)
 }
 
-fn routed_partition_for_write(
+fn routed_partitions_for_write(
     transaction: &FinalTransaction,
     write: &DocumentUpdateWithPrevTs,
     partition_map: &PartitionMap,
     write_source: &WriteSource,
-) -> anyhow::Result<Option<PartitionId>> {
+) -> anyhow::Result<BTreeSet<PartitionId>> {
+    let mut participants = BTreeSet::new();
     let Some(table_name) = transaction
         .table_mapping
         .tablet_name(write.id.tablet_id)
         .ok()
     else {
-        return Ok(None);
+        return Ok(participants);
     };
-    if let Some(partition) = routed_partition_for_table(&table_name, partition_map, write_source) {
-        return Ok(Some(partition));
+    if let Some(owner) = routed_partition_for_catalog_write(transaction, write, partition_map)? {
+        if partition_map.enforces_catalog_coherence() {
+            participants.insert(partition_map.partition_for_table(&TABLES_TABLE));
+        }
+        participants.insert(owner);
+        return Ok(participants);
     }
-    routed_partition_for_catalog_write(transaction, write, partition_map)
+    if let Some(partition) = routed_partition_for_table(&table_name, partition_map, write_source) {
+        participants.insert(partition);
+    }
+    Ok(participants)
 }
 
 fn routed_partition_for_catalog_write(
@@ -233,54 +245,21 @@ fn routed_partition_for_catalog_write(
     write: &DocumentUpdateWithPrevTs,
     partition_map: &PartitionMap,
 ) -> anyhow::Result<Option<PartitionId>> {
-    let Some(catalog_table) = transaction
-        .table_mapping
-        .tablet_name(write.id.tablet_id)
-        .ok()
-    else {
-        return Ok(None);
-    };
-    if &catalog_table != &*TABLES_TABLE && &catalog_table != &*INDEX_TABLE {
-        return Ok(None);
+    Ok(user_catalog_write_target(transaction, write)?
+        .map(|metadata| partition_map.partition_for_table(&metadata.table_name)))
+}
+
+fn invalidated_table_names(transaction: &FinalTransaction) -> anyhow::Result<BTreeSet<TableName>> {
+    let mut table_names = BTreeSet::new();
+    for write in transaction.writes.coalesced_writes() {
+        if let Ok(table_name) = transaction.table_mapping.tablet_name(write.id.tablet_id) {
+            table_names.insert(table_name);
+        }
+        if let Some(metadata) = user_catalog_write_target(transaction, write)? {
+            table_names.insert(metadata.table_name);
+        }
     }
-    let Some(document) = write
-        .new_document
-        .as_ref()
-        .or_else(|| write.old_document.as_ref().map(|(document, _)| document))
-    else {
-        return Ok(None);
-    };
-    let user_table = if &catalog_table == &*TABLES_TABLE {
-        catalog_write_user_table(document).with_context(|| {
-            format!(
-                "failed to parse _tables catalog metadata while routing write {:?}",
-                write.id
-            )
-        })?
-    } else {
-        let index: common::document::ParsedDocument<TabletIndexMetadata> =
-            document.parse().with_context(|| {
-                format!(
-                    "failed to parse _index catalog metadata while routing write {:?}",
-                    write.id
-                )
-            })?;
-        let index = index.into_value();
-        let indexed_tablet = *index.name.table();
-        transaction
-            .table_mapping
-            .tablet_name(indexed_tablet)
-            .with_context(|| {
-                format!(
-                    "_index catalog metadata for write {:?} references unknown tablet {:?}",
-                    write.id, indexed_tablet
-                )
-            })?
-    };
-    if user_table.is_system() {
-        return Ok(None);
-    }
-    Ok(Some(partition_map.partition_for_table(&user_table)))
+    Ok(table_names)
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -290,11 +269,6 @@ pub fn routed_partition_for_catalog_write_for_test(
     partition_map: &PartitionMap,
 ) -> anyhow::Result<Option<PartitionId>> {
     routed_partition_for_catalog_write(transaction, write, partition_map)
-}
-
-fn catalog_write_user_table(document: &ResolvedDocument) -> anyhow::Result<value::TableName> {
-    let metadata: common::document::ParsedDocument<TableMetadata> = document.parse()?;
-    Ok(metadata.into_value().name)
 }
 
 async fn prepare_participant(
@@ -875,6 +849,11 @@ fn is_ambiguous_prepare_error(err: &anyhow::Error) -> bool {
 }
 
 fn should_try_next_participant_address(err: &anyhow::Error) -> bool {
+    // An OCC is a deterministic participant response. Trying every peer only
+    // delays the application-level mutation retry and can overload a Raft group.
+    if err.is_occ() {
+        return false;
+    }
     let message = format!("{err:#}").to_ascii_lowercase();
     message.contains("transport error")
         || message.contains("connection error")
@@ -966,6 +945,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
     commit_mode: TwoPhaseCommitMode,
 ) -> anyhow::Result<CommitOutcome> {
     let timer = metrics::two_phase_coordinator_timer();
+    let invalidated_tables = invalidated_table_names(&transaction)?;
     let source_partition = match classify_transaction(&transaction, partition_map, &write_source)? {
         TransactionClassification::SinglePartition => {
             anyhow::bail!("2PC coordinator called for a local single-partition transaction");
@@ -1174,6 +1154,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                     ts: prepare_ts,
                     source_partition,
                     read_after_write_partitions: prepared_participants.clone(),
+                    invalidated_tables: invalidated_tables.clone(),
                 });
             },
             TwoPhaseCommitMode::ParallelEarlyAck => {
@@ -1210,6 +1191,7 @@ pub(crate) async fn coordinate_two_phase_commit_with_mode(
                     ts: prepare_ts,
                     source_partition,
                     read_after_write_partitions: prepared_participants.clone(),
+                    invalidated_tables: invalidated_tables.clone(),
                 });
             },
         }
@@ -1234,6 +1216,7 @@ mod tests {
         RepeatableTimestamp,
         Timestamp,
     };
+    use errors::ErrorMetadata;
 
     use super::{
         is_ambiguous_prepare_error,
@@ -1310,6 +1293,13 @@ mod tests {
         let err = anyhow::anyhow!(
             "gRPC Prepare failed: status: Internal, message: \"forced prepare failure\""
         );
+        assert!(!is_ambiguous_prepare_error(&err));
+    }
+
+    #[test]
+    fn ambiguous_prepare_error_rejects_structured_occ_from_forwarded_leader() {
+        let err = anyhow::Error::new(ErrorMetadata::system_occ(Some(42), None))
+            .context("Leader Prepare failed");
         assert!(!is_ambiguous_prepare_error(&err));
     }
 

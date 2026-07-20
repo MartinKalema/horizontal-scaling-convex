@@ -288,9 +288,23 @@ async fn wait_for_local_mutation_visibility(
     commit_ts: Timestamp,
     source_partition: Option<PartitionId>,
 ) -> anyhow::Result<()> {
+    // A remote partition's committed write is represented by the portable
+    // read-after-write token returned below. Do not delay that acknowledgement
+    // on this node's asynchronous replica materialization; subsequent reads
+    // enforce the owner-partition fence from the token.
+    if !mutation_commit_is_local(st.partition_id, source_partition) {
+        return Ok(());
+    }
     st.database
         .wait_for_read_after_write_fence(source_partition, commit_ts)
         .await
+}
+
+fn mutation_commit_is_local(
+    local_partition: Option<PartitionId>,
+    source_partition: Option<PartitionId>,
+) -> bool {
+    source_partition.is_none() || source_partition == local_partition
 }
 
 async fn maybe_forward_public_mutation(
@@ -1614,6 +1628,19 @@ mod tests {
         assert_eq!(stored["value"]["hello"], "partitioned-local");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_remote_mutation_ack_uses_owner_fence_without_local_visibility_wait() {
+        assert!(!super::mutation_commit_is_local(
+            Some(PartitionId(0)),
+            Some(PartitionId(1)),
+        ));
+        assert!(super::mutation_commit_is_local(
+            Some(PartitionId(1)),
+            Some(PartitionId(1)),
+        ));
+        assert!(super::mutation_commit_is_local(None, None));
     }
 
     #[convex_macro::prod_rt_test]

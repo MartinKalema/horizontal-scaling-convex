@@ -46,6 +46,7 @@ mod snapshot_manager;
 mod stack_traces;
 pub mod streaming_export_selection;
 pub mod subscription;
+pub mod subscription_invalidation;
 pub mod system_query;
 pub mod system_tables;
 mod table_number_allocator;
