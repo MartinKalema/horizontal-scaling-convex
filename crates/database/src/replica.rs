@@ -22,9 +22,12 @@ use futures::{
 
 use crate::{
     commit_delta::{
+        replication_poison_gap,
         CommitDelta,
         DistributedLog,
         ReplicationMessage,
+        ReplicationPoisonGap,
+        ReplicationPoisonKind,
         ReplicationTransportId,
         RetryableReplicaApplyError,
     },
@@ -94,14 +97,8 @@ where
 {
     while let Some(result) = stream.next().await {
         let message = result.context("Error reading from distributed log")?;
-        match apply_message(message).await {
-            Ok((applied_ts, num_updates)) => {
-                after_success(applied_ts, num_updates);
-            },
-            Err(e) => {
-                tracing::error!("Failed to apply replica delta; continuing consumer: {e:#}");
-            },
-        }
+        let (applied_ts, num_updates) = apply_message(message).await?;
+        after_success(applied_ts, num_updates);
     }
 
     anyhow::bail!("ReplicaDeltaConsumer stream ended")
@@ -118,6 +115,7 @@ where
 {
     let (delta, transport_id, ack) = message.into_parts();
     let ts = delta.ts;
+    let source_partition = delta.source_partition;
     let num_updates = delta.document_updates.len();
 
     if let Some(excluded_source_partition) = excluded_source_partition {
@@ -161,10 +159,10 @@ where
                         u64::from(ts),
                     );
                 }
-                anyhow::bail!(
-                    "Retryable failure applying replica delta at ts={}: {e:#}",
+                return Err(e.context(format!(
+                    "Retryable failure applying replica delta at ts={}",
                     u64::from(ts),
-                );
+                )));
             }
             tracing::error!(
                 "Failed to apply replica delta at ts={}: {e:#}",
@@ -176,10 +174,17 @@ where
                     u64::from(ts),
                 );
             }
-            anyhow::bail!(
-                "Failed to apply replica delta at ts={}: {e:#}",
-                u64::from(ts)
-            );
+            Err(ReplicationPoisonGap::new(
+                ReplicationPoisonKind::DeterministicApplyFailure,
+                None,
+                None,
+                transport_id.map(ReplicationTransportId::stream_sequence),
+                None,
+                source_partition,
+                Some(ts),
+                format!("failed to apply replica delta: {e:#}"),
+            )
+            .into())
         },
     }
 }
@@ -222,6 +227,13 @@ impl ReplicaDeltaConsumer {
                     tracing::warn!("ReplicaDeltaConsumer exited cleanly; restarting");
                 },
                 Err(e) => {
+                    if replication_poison_gap(&e).is_some() {
+                        tracing::error!(
+                            "ReplicaDeltaConsumer encountered a fatal replication gap and will \
+                             not restart: {e:#}"
+                        );
+                        return;
+                    }
                     tracing::error!(
                         "ReplicaDeltaConsumer failed; restarting after {:?}: {e:#}",
                         backoff,
@@ -285,9 +297,12 @@ mod tests {
     };
     use crate::{
         commit_delta::{
+            replication_poison_gap,
             CommitDelta,
             ReplicationAck,
             ReplicationMessage,
+            ReplicationPoisonGap,
+            ReplicationPoisonKind,
             RetryableReplicaApplyError,
         },
         partition::PartitionId,
@@ -421,10 +436,9 @@ mod tests {
         .unwrap_err();
 
         let message = format!("{err:#}");
-        assert!(
-            message.contains("Failed to apply replica delta"),
-            "{message}"
-        );
+        let gap = replication_poison_gap(&err).expect("apply failure must become a poison gap");
+        assert_eq!(gap.kind, ReplicationPoisonKind::DeterministicApplyFailure);
+        assert!(message.contains("replication poison gap"), "{message}");
         assert!(message.contains("forced apply failure"), "{message}");
         assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
@@ -513,7 +527,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumer_continues_after_retryable_apply_failure() -> anyhow::Result<()> {
+    async fn consumer_stops_before_later_delta_after_retryable_apply_failure() -> anyhow::Result<()>
+    {
         let counts = Arc::new(AckCounts::default());
         let first_ts = Timestamp::try_from(42u64)?;
         let second_ts = Timestamp::try_from(43u64)?;
@@ -522,13 +537,18 @@ mod tests {
         let successes_for_callback = successes.clone();
         let stream = futures::stream::iter(vec![
             Ok(test_message(first_ts, counts.clone())),
-            Ok(test_message(second_ts, counts.clone())),
+            Ok(test_message_from_partition(
+                second_ts,
+                Some(PartitionId(1)),
+                counts.clone(),
+            )),
         ]);
+        let attempts_for_consumer = attempts.clone();
 
         let err = consume_replication_stream_with(
             Box::pin(stream),
             move |message| {
-                let attempts = attempts.clone();
+                let attempts = attempts_for_consumer.clone();
                 async move {
                     apply_replication_message_with(message, None, |delta, _transport_id| {
                         let attempts = attempts.clone();
@@ -552,14 +572,16 @@ mod tests {
         .await
         .expect_err("finite test stream should report stream end");
 
-        assert!(
-            format!("{err:#}").contains("ReplicaDeltaConsumer stream ended"),
-            "unexpected error: {err:#}",
-        );
-        assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
+        assert!(format!("{err:#}").contains("Retryable failure applying replica delta"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 0);
         assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 1);
-        assert_eq!(successes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            successes.load(Ordering::SeqCst),
+            0,
+            "later frontier heartbeat must not cross the blocked delta",
+        );
         Ok(())
     }
 
@@ -593,7 +615,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumer_continues_after_apply_failure() -> anyhow::Result<()> {
+    async fn consumer_fails_closed_before_heartbeat_after_deterministic_apply_failure(
+    ) -> anyhow::Result<()> {
         let counts = Arc::new(AckCounts::default());
         let first_ts = Timestamp::try_from(42u64)?;
         let second_ts = Timestamp::try_from(43u64)?;
@@ -602,13 +625,18 @@ mod tests {
         let successes_for_callback = successes.clone();
         let stream = futures::stream::iter(vec![
             Ok(test_message(first_ts, counts.clone())),
-            Ok(test_message(second_ts, counts.clone())),
+            Ok(test_message_from_partition(
+                second_ts,
+                Some(PartitionId(1)),
+                counts.clone(),
+            )),
         ]);
+        let attempts_for_consumer = attempts.clone();
 
         let err = consume_replication_stream_with(
             Box::pin(stream),
             move |message| {
-                let attempts = attempts.clone();
+                let attempts = attempts_for_consumer.clone();
                 async move {
                     apply_replication_message_with(message, None, |delta, _transport_id| {
                         let attempts = attempts.clone();
@@ -629,14 +657,81 @@ mod tests {
         .await
         .expect_err("finite test stream should report stream end");
 
-        assert!(
-            format!("{err:#}").contains("ReplicaDeltaConsumer stream ended"),
-            "unexpected error: {err:#}",
+        let gap = replication_poison_gap(&err).expect("apply failure must become a poison gap");
+        assert_eq!(gap.kind, ReplicationPoisonKind::DeterministicApplyFailure);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "consumer must stop before applying the later heartbeat",
         );
-        assert_eq!(counts.ack.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
         assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
-        assert_eq!(successes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            successes.load(Ordering::SeqCst),
+            0,
+            "frontier callback must not advance beyond a poisoned delta",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_poison_stops_before_following_heartbeat() -> anyhow::Result<()> {
+        for kind in [
+            ReplicationPoisonKind::MalformedEnvelope,
+            ReplicationPoisonKind::UnsupportedEnvelopeVersion,
+            ReplicationPoisonKind::InvalidDeltaPayload,
+        ] {
+            let counts = Arc::new(AckCounts::default());
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let successes = Arc::new(AtomicUsize::new(0));
+            let heartbeat_ts = Timestamp::try_from(43u64)?;
+            let gap = ReplicationPoisonGap::new(
+                kind,
+                Some("node-1".to_string()),
+                Some("convex.commits.0".to_string()),
+                Some(42),
+                Some("node-0".to_string()),
+                Some(PartitionId(0)),
+                Some(Timestamp::try_from(42u64)?),
+                "forced transport poison",
+            );
+            let stream = futures::stream::iter(vec![
+                Err(anyhow::Error::new(gap.clone())),
+                Ok(test_message_from_partition(
+                    heartbeat_ts,
+                    Some(PartitionId(0)),
+                    counts.clone(),
+                )),
+            ]);
+            let attempts_for_consumer = attempts.clone();
+            let successes_for_callback = successes.clone();
+
+            let error = consume_replication_stream_with(
+                Box::pin(stream),
+                move |_message| {
+                    let attempts = attempts_for_consumer.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok((heartbeat_ts, 0))
+                    }
+                },
+                move |_ts, _num_updates| {
+                    successes_for_callback.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+            .expect_err("transport poison must terminate the consumer");
+
+            assert_eq!(replication_poison_gap(&error), Some(&gap));
+            assert_eq!(attempts.load(Ordering::SeqCst), 0);
+            assert_eq!(successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                counts.ack.load(Ordering::SeqCst),
+                0,
+                "heartbeat after {kind:?} must remain unacknowledged",
+            );
+        }
         Ok(())
     }
 }

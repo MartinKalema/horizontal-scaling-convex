@@ -40,6 +40,8 @@ use crate::{
         DistributedLog,
         ReplicationAck,
         ReplicationMessage,
+        ReplicationPoisonGap,
+        ReplicationPoisonKind,
         ReplicationTransportId,
     },
     metrics,
@@ -56,6 +58,45 @@ const STREAM_NAME: &str = "CONVEX_COMMITS";
 const SUBJECT_BASE: &str = "convex.commits";
 const SYSTEM_TABLE_SUBJECT: &str = "convex.commits.system";
 const FRONTIER_HEARTBEAT_SUBJECT: &str = "convex.commits.frontier_heartbeat";
+const DELTA_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+const POISON_REDELIVERY_DELAY: Duration = Duration::from_secs(30);
+
+const fn default_delta_envelope_schema_version() -> u32 {
+    DELTA_ENVELOPE_SCHEMA_VERSION
+}
+
+type EnvelopePoison = (ReplicationPoisonKind, String);
+
+fn deserialize_delta_envelope(payload: &[u8]) -> Result<DeltaEnvelope, EnvelopePoison> {
+    serde_json::from_slice(payload).map_err(|error| {
+        (
+            ReplicationPoisonKind::MalformedEnvelope,
+            format!("failed to deserialize delta envelope: {error}"),
+        )
+    })
+}
+
+fn validate_delta_envelope_version(envelope: &DeltaEnvelope) -> Result<(), EnvelopePoison> {
+    if envelope.schema_version == DELTA_ENVELOPE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err((
+        ReplicationPoisonKind::UnsupportedEnvelopeVersion,
+        format!(
+            "unsupported delta envelope schema version {}; expected {}",
+            envelope.schema_version, DELTA_ENVELOPE_SCHEMA_VERSION,
+        ),
+    ))
+}
+
+fn decode_delta_envelope(envelope: DeltaEnvelope) -> Result<CommitDelta, EnvelopePoison> {
+    envelope.to_delta().map_err(|error| {
+        (
+            ReplicationPoisonKind::InvalidDeltaPayload,
+            format!("failed to decode delta payload: {error:#}"),
+        )
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RetentionGap {
@@ -63,6 +104,17 @@ struct RetentionGap {
     first_retained_sequence: u64,
     ack_floor_stream_sequence: u64,
     delivered_stream_sequence: u64,
+}
+
+async fn reject_poison_message(msg: &JetStreamMessage, gap: ReplicationPoisonGap) -> anyhow::Error {
+    tracing::error!("{gap}");
+    if let Err(ack_err) = msg
+        .ack_with(AckKind::Nak(Some(POISON_REDELIVERY_DELAY)))
+        .await
+    {
+        tracing::warn!("Failed to keep poison NATS message pending for redelivery: {ack_err:?}");
+    }
+    anyhow::Error::new(gap)
 }
 
 /// Configuration for connecting to NATS.
@@ -151,6 +203,7 @@ impl NatsDistributedLog {
                     durable_name: Some(consumer_name.clone()),
                     deliver_policy: jetstream::consumer::DeliverPolicy::All,
                     ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                    max_ack_pending: 1,
                     filter_subjects: filter_subjects.clone().unwrap_or_default(),
                     ..Default::default()
                 },
@@ -177,17 +230,26 @@ impl NatsDistributedLog {
             from_ts,
         ) {
             metrics::log_replication_transport_retention_gap();
-            anyhow::bail!(
-                "NATS replication stream retention gap for consumer '{}': next required stream \
-                 sequence {} is older than first retained sequence {} (ack_floor={}, \
-                 delivered={}, from_ts={}). Rebootstrap from checkpoint before serving.",
-                consumer_name,
-                gap.expected_stream_sequence,
-                gap.first_retained_sequence,
-                gap.ack_floor_stream_sequence,
-                gap.delivered_stream_sequence,
-                from_ts_u64,
-            );
+            return Err(ReplicationPoisonGap::new(
+                ReplicationPoisonKind::RetentionGap,
+                Some(consumer_name.clone()),
+                Some(STREAM_NAME.to_string()),
+                Some(gap.expected_stream_sequence),
+                None,
+                None,
+                None,
+                format!(
+                    "next required stream sequence {} is older than first retained sequence {} \
+                     (ack_floor={}, delivered={}, from_ts={}). Rebootstrap from checkpoint before \
+                     serving",
+                    gap.expected_stream_sequence,
+                    gap.first_retained_sequence,
+                    gap.ack_floor_stream_sequence,
+                    gap.delivered_stream_sequence,
+                    from_ts_u64,
+                ),
+            )
+            .into());
         }
         metrics::log_replication_transport_pending_messages(consumer_info.num_pending);
         metrics::log_replication_transport_stream_sequence(consumer_info.delivered.stream_sequence);
@@ -245,21 +307,42 @@ impl NatsDistributedLog {
                                 None
                             },
                         };
-                        let envelope: DeltaEnvelope = match serde_json::from_slice(&msg.payload) {
+                        let stream_sequence =
+                            transport_id.map(ReplicationTransportId::stream_sequence);
+                        let subject = msg.subject.to_string();
+                        let envelope = match deserialize_delta_envelope(&msg.payload) {
                             Ok(e) => e,
-                            Err(e) => {
-                                tracing::error!("Failed to deserialize delta from NATS: {e}");
-                                if let Err(ack_err) = msg.ack_with(AckKind::Term).await {
-                                    tracing::warn!(
-                                        "Failed to terminate poison NATS message after \
-                                         deserialize error: {ack_err:?}"
-                                    );
-                                }
-                                return Some(Err(anyhow::anyhow!(
-                                    "Failed to deserialize delta: {e}"
-                                )));
+                            Err((kind, reason)) => {
+                                let gap = ReplicationPoisonGap::new(
+                                    kind,
+                                    Some(node_name),
+                                    Some(subject),
+                                    stream_sequence,
+                                    None,
+                                    None,
+                                    None,
+                                    reason,
+                                );
+                                return Some(Err(reject_poison_message(&msg, gap).await));
                             },
                         };
+                        let source_node = (!envelope.source_node.is_empty())
+                            .then(|| envelope.source_node.clone());
+                        let source_partition = envelope.source_partition.map(PartitionId);
+                        let origin_ts = Timestamp::try_from(envelope.ts).ok();
+                        if let Err((kind, reason)) = validate_delta_envelope_version(&envelope) {
+                            let gap = ReplicationPoisonGap::new(
+                                kind,
+                                Some(node_name),
+                                Some(subject),
+                                stream_sequence,
+                                source_node,
+                                source_partition,
+                                origin_ts,
+                                reason,
+                            );
+                            return Some(Err(reject_poison_message(&msg, gap).await));
+                        }
                         if envelope.ts <= from_ts_u64 {
                             if let Err(e) = msg.ack().await {
                                 return Some(Err(anyhow::anyhow!(
@@ -285,17 +368,20 @@ impl NatsDistributedLog {
                             envelope.ts,
                             envelope.source_node,
                         );
-                        let delta = match envelope.to_delta() {
+                        let delta = match decode_delta_envelope(envelope) {
                             Ok(delta) => delta,
-                            Err(e) => {
-                                tracing::error!("Failed to decode NATS delta envelope: {e:#}");
-                                if let Err(ack_err) = msg.ack_with(AckKind::Term).await {
-                                    tracing::warn!(
-                                        "Failed to terminate poison NATS message after delta \
-                                         decode error: {ack_err:?}"
-                                    );
-                                }
-                                return Some(Err(e));
+                            Err((kind, reason)) => {
+                                let gap = ReplicationPoisonGap::new(
+                                    kind,
+                                    Some(node_name),
+                                    Some(subject),
+                                    stream_sequence,
+                                    source_node,
+                                    source_partition,
+                                    origin_ts,
+                                    reason,
+                                );
+                                return Some(Err(reject_poison_message(&msg, gap).await));
                             },
                         };
                         let ack = Box::new(NatsReplicationAck { msg });
@@ -447,8 +533,10 @@ impl ReplicationAck for NatsReplicationAck {
 /// Serializable envelope for transporting CommitDelta over NATS and Raft.
 /// Used by both NatsDistributedLog and the Raft state machine to serialize
 /// deltas for transport between nodes.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeltaEnvelope {
+    #[serde(default = "default_delta_envelope_schema_version")]
+    schema_version: u32,
     ts: u64,
     write_source: Option<String>,
     write_bytes: u64,
@@ -493,6 +581,7 @@ impl DeltaEnvelope {
             .collect();
 
         Ok(Self {
+            schema_version: DELTA_ENVELOPE_SCHEMA_VERSION,
             ts: u64::from(delta.ts),
             write_source: delta.write_source.as_str().map(|s| s.to_string()),
             write_bytes: delta.write_bytes,
@@ -505,6 +594,12 @@ impl DeltaEnvelope {
     }
 
     pub fn to_delta(self) -> anyhow::Result<CommitDelta> {
+        anyhow::ensure!(
+            self.schema_version == DELTA_ENVELOPE_SCHEMA_VERSION,
+            "Unsupported delta envelope schema version {}; expected {}",
+            self.schema_version,
+            DELTA_ENVELOPE_SCHEMA_VERSION,
+        );
         let document_updates = self
             .document_updates_proto
             .into_iter()
@@ -665,11 +760,22 @@ impl DistributedLog for NatsDistributedLog {
 mod tests {
     use std::sync::Arc;
 
+    use anyhow::Context;
     use common::types::Timestamp;
 
-    use super::NatsDistributedLog;
+    use super::{
+        decode_delta_envelope,
+        deserialize_delta_envelope,
+        validate_delta_envelope_version,
+        DeltaEnvelope,
+        NatsDistributedLog,
+        DELTA_ENVELOPE_SCHEMA_VERSION,
+    };
     use crate::{
-        commit_delta::CommitDelta,
+        commit_delta::{
+            CommitDelta,
+            ReplicationPoisonKind,
+        },
         partition::PartitionId,
         write_log::WriteSource,
     };
@@ -702,6 +808,86 @@ mod tests {
         let mut no_source = heartbeat.clone();
         no_source.source_partition = None;
         assert!(!NatsDistributedLog::is_frontier_heartbeat_delta(&no_source));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_envelope_is_classified_as_poison() {
+        let (kind, reason) = deserialize_delta_envelope(br#"{"schema_version":"broken"}"#)
+            .expect_err("invalid JSON types must be rejected");
+
+        assert_eq!(kind, ReplicationPoisonKind::MalformedEnvelope);
+        assert!(reason.contains("failed to deserialize delta envelope"));
+    }
+
+    #[test]
+    fn unknown_envelope_version_is_classified_as_poison() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        };
+        let mut envelope = DeltaEnvelope::from_delta(&delta, "source", None)?;
+        envelope.schema_version = DELTA_ENVELOPE_SCHEMA_VERSION + 1;
+
+        let (kind, reason) = validate_delta_envelope_version(&envelope)
+            .expect_err("unknown schema versions must be rejected");
+        assert_eq!(kind, ReplicationPoisonKind::UnsupportedEnvelopeVersion);
+        assert!(reason.contains("unsupported delta envelope schema version"));
+        Ok(())
+    }
+
+    #[test]
+    fn retained_unversioned_envelope_is_version_one() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        };
+        let envelope = DeltaEnvelope::from_delta(&delta, "source", None)?;
+        let mut value = serde_json::to_value(envelope)?;
+        value
+            .as_object_mut()
+            .context("serialized envelope must be an object")?
+            .remove("schema_version");
+        let payload = serde_json::to_vec(&value)?;
+
+        let envelope =
+            deserialize_delta_envelope(&payload).expect("unversioned v1 envelope must decode");
+        validate_delta_envelope_version(&envelope)
+            .expect("unversioned retained envelope must default to v1");
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_document_proto_is_classified_as_poison() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_name: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        };
+        let mut envelope = DeltaEnvelope::from_delta(&delta, "source", None)?;
+        envelope.document_updates_proto.push(vec![0x80]);
+
+        let (kind, reason) =
+            decode_delta_envelope(envelope).expect_err("invalid protobuf must be rejected");
+        assert_eq!(kind, ReplicationPoisonKind::InvalidDeltaPayload);
+        assert!(reason.contains("failed to decode delta payload"));
         Ok(())
     }
 

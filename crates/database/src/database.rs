@@ -1024,6 +1024,17 @@ impl<RT: Runtime> Database<RT> {
 
         // Load data into a DatabaseSnapshot, including indexes.
         let reader = persistence.reader();
+        if let Some(value) = reader
+            .get_persistence_global(PersistenceGlobalKey::ReplicationPoisonGap)
+            .await?
+        {
+            let gap: crate::commit_delta::ReplicationPoisonGap = serde_json::from_value(value)
+                .context("Failed to decode durable replication poison-gap marker")?;
+            return Err(anyhow::Error::new(gap).context(
+                "This node cannot prove a contiguous replication history. Rebootstrap its local \
+                 persistence before serving.",
+            ));
+        }
 
         // Since we hold the lease, update the max repeatable timestamp and get
         // the latest timestamp to perform the load at.
