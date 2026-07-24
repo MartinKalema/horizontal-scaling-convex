@@ -122,6 +122,80 @@ impl fmt::Display for RetryableReplicaApplyError {
 
 impl Error for RetryableReplicaApplyError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationPoisonKind {
+    RetentionGap,
+    MalformedEnvelope,
+    UnsupportedEnvelopeVersion,
+    InvalidDeltaPayload,
+    DeterministicApplyFailure,
+}
+
+/// Durable evidence that a replica cannot prove it has applied a contiguous
+/// replication prefix. Serving past this point could expose stale reads or
+/// validate writes against incomplete state, so callers must fail the node
+/// closed and rebootstrap its local persistence.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ReplicationPoisonGap {
+    pub kind: ReplicationPoisonKind,
+    pub consumer: Option<String>,
+    pub subject: Option<String>,
+    pub stream_sequence: Option<u64>,
+    pub source_node: Option<String>,
+    pub source_partition: Option<u32>,
+    pub origin_ts: Option<u64>,
+    pub reason: String,
+}
+
+impl ReplicationPoisonGap {
+    pub fn new(
+        kind: ReplicationPoisonKind,
+        consumer: Option<String>,
+        subject: Option<String>,
+        stream_sequence: Option<u64>,
+        source_node: Option<String>,
+        source_partition: Option<PartitionId>,
+        origin_ts: Option<Timestamp>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            consumer,
+            subject,
+            stream_sequence,
+            source_node,
+            source_partition: source_partition.map(|partition| partition.0),
+            origin_ts: origin_ts.map(u64::from),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for ReplicationPoisonGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "replication poison gap ({:?}): consumer={:?}, subject={:?}, stream_sequence={:?}, \
+             source_node={:?}, source_partition={:?}, origin_ts={:?}: {}",
+            self.kind,
+            self.consumer,
+            self.subject,
+            self.stream_sequence,
+            self.source_node,
+            self.source_partition,
+            self.origin_ts,
+            self.reason,
+        )
+    }
+}
+
+impl Error for ReplicationPoisonGap {}
+
+pub fn replication_poison_gap(error: &anyhow::Error) -> Option<&ReplicationPoisonGap> {
+    error.downcast_ref::<ReplicationPoisonGap>()
+}
+
 pub struct ReplicationMessage {
     pub delta: CommitDelta,
     transport_id: Option<ReplicationTransportId>,

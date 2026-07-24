@@ -3,6 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use common::{
     assert_obj,
+    persistence::{
+        Persistence,
+        PersistenceGlobalKey,
+    },
     runtime::{
         new_unlimited_rate_limiter,
         testing::TestRuntime,
@@ -23,6 +27,8 @@ use crate::{
         CommitDelta,
         DistributedLog,
         ReplicationMessage,
+        ReplicationPoisonGap,
+        ReplicationPoisonKind,
     },
     Database,
     TestFacingModel,
@@ -32,11 +38,18 @@ async fn load_test_primary(
     rt: &TestRuntime,
     distributed_log: Arc<dyn DistributedLog>,
 ) -> anyhow::Result<Database<TestRuntime>> {
-    let tp = Arc::new(TestPersistence::new());
+    load_test_primary_with_persistence(rt, Arc::new(TestPersistence::new()), distributed_log).await
+}
+
+async fn load_test_primary_with_persistence(
+    rt: &TestRuntime,
+    persistence: Arc<dyn Persistence>,
+    distributed_log: Arc<dyn DistributedLog>,
+) -> anyhow::Result<Database<TestRuntime>> {
     let searcher: Arc<dyn search::Searcher> = Arc::new(SearcherStub {});
     let (deleted_tablet_sender, _) = tokio::sync::mpsc::channel(100);
     let primary = Database::load(
-        tp,
+        persistence,
         rt.clone(),
         searcher,
         ShutdownSignal::no_op(),
@@ -59,6 +72,49 @@ async fn load_test_primary(
     let handle = primary.start_search_and_vector_bootstrap();
     handle.join().await?;
     Ok(primary)
+}
+
+#[convex_macro::test_runtime]
+async fn test_database_rejects_persisted_replication_poison_gap(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let persistence = Arc::new(TestPersistence::new());
+    let gap = ReplicationPoisonGap::new(
+        ReplicationPoisonKind::MalformedEnvelope,
+        Some("node-1".to_string()),
+        Some("convex.commits.0".to_string()),
+        Some(42),
+        Some("node-0".to_string()),
+        Some(crate::partition::PartitionId(0)),
+        Some(Timestamp::try_from(100u64)?),
+        "invalid JSON",
+    );
+    persistence
+        .write_persistence_global(
+            PersistenceGlobalKey::ReplicationPoisonGap,
+            serde_json::to_value(&gap)?,
+        )
+        .await?;
+
+    let error = match load_test_primary_with_persistence(
+        &rt,
+        persistence,
+        Arc::new(InMemoryDistributedLog::new()),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("database must not start with a poison-gap marker"),
+        Err(error) => error,
+    };
+    let recovered_gap = error
+        .downcast_ref::<ReplicationPoisonGap>()
+        .expect("startup error must retain the poison-gap type");
+    assert_eq!(recovered_gap, &gap);
+    assert!(
+        format!("{error:#}").contains("Rebootstrap its local persistence before serving"),
+        "{error:#}",
+    );
+    Ok(())
 }
 
 struct FailingPublishDistributedLog;

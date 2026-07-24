@@ -579,6 +579,38 @@ async fn record_raft_applied_genesis(
     .await
 }
 
+async fn fail_closed_on_replication_poison(
+    persistence: &Arc<dyn Persistence>,
+    preempt_tx: &ShutdownSignal,
+    error: anyhow::Error,
+) -> Option<anyhow::Error> {
+    let Some(gap) = database::commit_delta::replication_poison_gap(&error).cloned() else {
+        return Some(error);
+    };
+    let marker_result = async {
+        let marker = serde_json::to_value(&gap)?;
+        persistence
+            .write_persistence_global(
+                common::persistence::PersistenceGlobalKey::ReplicationPoisonGap,
+                marker,
+            )
+            .await
+    }
+    .await;
+    let fatal_error = match marker_result {
+        Ok(()) => error.context(
+            "Persisted a replication poison-gap marker and failed this node closed. Rebootstrap \
+             its local persistence before serving.",
+        ),
+        Err(marker_error) => error.context(format!(
+            "Failed this node closed after a replication poison gap, but could not persist the \
+             poison marker: {marker_error:#}"
+        )),
+    };
+    preempt_tx.signal(fatal_error);
+    None
+}
+
 async fn prepare_cluster_genesis(
     runtime: &ProdRuntime,
     database: &Database<ProdRuntime>,
@@ -1425,6 +1457,8 @@ pub async fn make_app(
                 config.partition_id.map(database::partition::PartitionId);
             let consumer_runtime = runtime.clone();
             let consumer_genesis_ready = cluster_genesis_ready.clone();
+            let consumer_persistence = persistence.clone();
+            let consumer_preempt_tx = preempt_tx.clone();
             runtime.spawn_background("replica_delta_consumer_setup", async move {
                 while !consumer_genesis_ready.load(Ordering::SeqCst) {
                     consumer_runtime.wait(Duration::from_millis(100)).await;
@@ -1473,6 +1507,15 @@ pub async fn make_app(
                             )
                             .await;
                             if let Err(e) = result {
+                                let Some(e) = fail_closed_on_replication_poison(
+                                    &consumer_persistence,
+                                    &consumer_preempt_tx,
+                                    e,
+                                )
+                                .await
+                                else {
+                                    return;
+                                };
                                 tracing::error!(
                                     "ReplicaDeltaConsumer stream failed; restarting after {:?}: \
                                      {e:#}",
@@ -1486,6 +1529,15 @@ pub async fn make_app(
                             }
                         },
                         Err(e) => {
+                            let Some(e) = fail_closed_on_replication_poison(
+                                &consumer_persistence,
+                                &consumer_preempt_tx,
+                                e,
+                            )
+                            .await
+                            else {
+                                return;
+                            };
                             tracing::error!(
                                 "Failed to subscribe to NATS; retrying after {:?}: {e:#}",
                                 backoff,
@@ -1851,10 +1903,13 @@ mod tests {
         sync::Arc,
     };
 
+    use anyhow::Context;
     use common::{
         assert_obj,
         persistence::{
             NoopRetentionValidator,
+            Persistence,
+            PersistenceGlobalKey,
             PersistenceReader,
             TimestampRange,
         },
@@ -1896,6 +1951,49 @@ mod tests {
             local_snapshot_ts,
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replication_poison_is_persisted_before_fatal_shutdown() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let gap = database::commit_delta::ReplicationPoisonGap::new(
+            database::commit_delta::ReplicationPoisonKind::InvalidDeltaPayload,
+            Some("node-1".to_string()),
+            Some("convex.commits.0".to_string()),
+            Some(42),
+            Some("node-0".to_string()),
+            Some(database::partition::PartitionId(0)),
+            Some(Timestamp::try_from(100u64)?),
+            "invalid protobuf",
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let shutdown = ShutdownSignal::new(shutdown_tx);
+
+        let retry_error = super::fail_closed_on_replication_poison(
+            &persistence,
+            &shutdown,
+            anyhow::Error::new(gap.clone()),
+        )
+        .await;
+        assert!(
+            retry_error.is_none(),
+            "poison gaps must not return to the retry loop"
+        );
+
+        let fatal_error = shutdown_rx.await?;
+        assert_eq!(
+            fatal_error.downcast_ref::<database::commit_delta::ReplicationPoisonGap>(),
+            Some(&gap),
+        );
+        let persisted = persistence
+            .reader()
+            .get_persistence_global(PersistenceGlobalKey::ReplicationPoisonGap)
+            .await?
+            .context("poison marker must be persisted before shutdown")?;
+        let persisted_gap: database::commit_delta::ReplicationPoisonGap =
+            serde_json::from_value(persisted)?;
+        assert_eq!(persisted_gap, gap);
         Ok(())
     }
 

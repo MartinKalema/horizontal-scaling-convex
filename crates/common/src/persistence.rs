@@ -195,6 +195,11 @@ pub enum PersistenceGlobalKey {
     /// stream sequences for compact redelivery detection.
     AppliedDataDeltaIds,
 
+    /// Node-local marker for a correctness-critical replication event that
+    /// could not be decoded or applied. A marked node must be re-bootstrapped
+    /// before serving again, so this must not be copied into checkpoints.
+    ReplicationPoisonGap,
+
     /// Latest snapshot of all tables' summaries, cached to speed up startup.
     TableSummary,
 
@@ -251,6 +256,7 @@ impl From<PersistenceGlobalKey> for String {
                 "applied_data_delta_watermarks".to_string()
             },
             PersistenceGlobalKey::AppliedDataDeltaIds => "applied_data_delta_ids".to_string(),
+            PersistenceGlobalKey::ReplicationPoisonGap => "replication_poison_gap".to_string(),
             PersistenceGlobalKey::TableSummary => "table_summary".to_string(),
             PersistenceGlobalKey::TwoPhaseRedoRecords => "two_phase_redo_records".to_string(),
             PersistenceGlobalKey::RaftNatsOutbox => "raft_nats_outbox".to_string(),
@@ -280,6 +286,7 @@ impl FromStr for PersistenceGlobalKey {
             "applied_delta_watermarks" => Ok(Self::AppliedDeltaWatermarks),
             "applied_data_delta_watermarks" => Ok(Self::AppliedDataDeltaWatermarks),
             "applied_data_delta_ids" => Ok(Self::AppliedDataDeltaIds),
+            "replication_poison_gap" => Ok(Self::ReplicationPoisonGap),
             "table_summary" => Ok(Self::TableSummary),
             "two_phase_redo_records" => Ok(Self::TwoPhaseRedoRecords),
             "raft_nats_outbox" => Ok(Self::RaftNatsOutbox),
@@ -308,6 +315,7 @@ impl PersistenceGlobalKey {
                     Self::TwoPhaseRedoRecords
                         | Self::RaftNatsOutbox
                         | Self::ClusterGenesisRaftApplied
+                        | Self::ReplicationPoisonGap
                 )
             })
             .collect()
@@ -1054,5 +1062,13 @@ mod tests {
             let parse_key = s.parse().unwrap();
             assert_eq!(key, parse_key);
         }
+    }
+
+    #[test]
+    fn replication_poison_gap_is_node_local() {
+        assert!(
+            !PersistenceGlobalKey::checkpoint_keys()
+                .contains(&PersistenceGlobalKey::ReplicationPoisonGap)
+        );
     }
 }
