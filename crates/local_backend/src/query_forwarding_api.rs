@@ -2,10 +2,12 @@ use std::{
     collections::BTreeMap,
     ops::Bound,
     sync::Arc,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
-use anyhow::Context;
 use application::api::SubscriptionClient;
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -25,6 +27,7 @@ use common::{
     RequestId,
 };
 use database::{
+    membership::MembershipStore,
     partition::PartitionId,
     raft_partition::RaftPartitionState,
     Database,
@@ -57,6 +60,13 @@ use value::{
 };
 
 use crate::{
+    authority_routing::{
+        authority_leader_hint,
+        AttemptTimeoutDisposition,
+        AuthorityAttemptError,
+        AuthorityEndpointKind,
+        AuthorityResolver,
+    },
     mutation_forwarder::MutationForwarderGrpcClientPool,
     SharedNodeAddresses,
 };
@@ -70,9 +80,8 @@ pub struct SelectiveQueryForwardingApi {
     database: Database<ProdRuntime>,
     replica_mode: bool,
     partition_id: Option<PartitionId>,
-    node_addresses: SharedNodeAddresses,
     raft_state: Option<RaftPartitionState>,
-    raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+    authority_resolver: AuthorityResolver,
     mutation_forwarder_pool: MutationForwarderGrpcClientPool,
 }
 
@@ -85,77 +94,44 @@ impl SelectiveQueryForwardingApi {
         node_addresses: SharedNodeAddresses,
         raft_state: Option<RaftPartitionState>,
         raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+        membership_store: Option<Arc<dyn MembershipStore>>,
         cluster_grpc_auth: Option<ClusterGrpcAuth>,
     ) -> Self {
+        let authority_resolver = AuthorityResolver::new(
+            node_addresses,
+            membership_store,
+            raft_state.clone(),
+            raft_peer_grpc_urls,
+            None,
+        );
         Self {
             inner,
             database,
             replica_mode,
             partition_id,
-            node_addresses,
             raft_state,
-            raft_peer_grpc_urls,
+            authority_resolver,
             mutation_forwarder_pool: MutationForwarderGrpcClientPool::new(cluster_grpc_auth),
         }
     }
 
-    async fn public_query_target_grpc_url(&self) -> anyhow::Result<Option<String>> {
+    fn should_forward_public_query(&self) -> anyhow::Result<bool> {
         let Some(partition_id) = self.partition_id else {
-            return Ok(None);
+            return Ok(false);
         };
 
         if partition_id != SELECTIVE_QUERY_AUTHORITY_PARTITION {
-            return Ok(Some(self.authority_grpc_url()?));
+            return Ok(true);
         }
 
         let Some(raft_state) = self.raft_state.as_ref() else {
-            return Ok(None);
+            return Ok(false);
         };
         anyhow::ensure!(
             raft_state.is_cluster_genesis_ready(),
             "Canonical cluster genesis is not ready"
         );
-        if raft_state.is_leader() {
-            anyhow::ensure!(
-                raft_state.is_leader_ready(),
-                "Coordinator partition is elected leader but has not applied its current-term \
-                 barrier"
-            );
-            if raft_state.has_leader_serving_lease() {
-                return Ok(None);
-            }
-            anyhow::bail!(
-                "Coordinator partition is leader but does not have a fresh Raft serving lease"
-            );
-        }
-        let peer_grpc_urls = self.raft_peer_grpc_urls.as_ref().context(
-            "Follower public query forwarding requires RAFT_PEERS gRPC URLs to find the current \
-             leader",
-        )?;
-        for _ in 0..50 {
-            let leader_id = raft_state.leader_id();
-            if leader_id != 0 {
-                let leader_grpc_url = peer_grpc_urls.get(&leader_id).with_context(|| {
-                    format!("Missing RAFT_PEERS entry for Raft leader node {leader_id}")
-                })?;
-                return Ok(Some(leader_grpc_url.clone()));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Ok(None)
-    }
-
-    fn authority_grpc_url(&self) -> anyhow::Result<String> {
-        let addresses = self.node_addresses.get().context(
-            "Selective public query forwarding requires membership to find the authoritative \
-             query node",
-        )?;
-        addresses
-            .address_for(SELECTIVE_QUERY_AUTHORITY_PARTITION)
-            .map(ToOwned::to_owned)
-            .context(
-                "Selective public query forwarding requires a live partition-0 membership entry",
-            )
+        Ok(!raft_state.can_serve_as_leader())
     }
 
     fn note_recent_interest(&self, token: &database::Token) {
@@ -255,30 +231,69 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
         read_after_write: Option<Vec<application::api::ReadAfterWriteFence>>,
         journal: Option<SerializedQueryJournal>,
     ) -> anyhow::Result<application::RedactedQueryReturn> {
-        let result = if let Some(target_grpc_url) = self.public_query_target_grpc_url().await? {
-            let client = self
-                .mutation_forwarder_pool
-                .client(&target_grpc_url)
-                .await
-                .with_context(|| {
-                    format!("Failed to connect to selective query authority at {target_grpc_url}")
-                })
-                .map_err(|e| anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(e))?;
-            client
-                .forward_query(
-                    &String::from(path.clone()),
-                    args.get(),
-                    identity,
-                    caller,
-                    match ts {
-                        application::api::ExecuteQueryTimestamp::Latest => None,
-                        application::api::ExecuteQueryTimestamp::At(ts) => Some(u64::from(ts)),
+        let result = if self.should_forward_public_query()? {
+            let path = String::from(path.clone());
+            let args = args.get().to_owned();
+            let ts = match ts {
+                application::api::ExecuteQueryTimestamp::Latest => None,
+                application::api::ExecuteQueryTimestamp::At(ts) => Some(u64::from(ts)),
+            };
+            let journal = journal.flatten();
+            let pool = self.mutation_forwarder_pool.clone();
+            self.authority_resolver
+                .route(
+                    SELECTIVE_QUERY_AUTHORITY_PARTITION,
+                    AuthorityEndpointKind::Grpc,
+                    AttemptTimeoutDisposition::Retry,
+                    move |attempt| {
+                        let pool = pool.clone();
+                        let path = path.clone();
+                        let args = args.clone();
+                        let identity = identity.clone();
+                        let caller = caller.clone();
+                        let read_after_write = read_after_write.clone();
+                        let journal = journal.clone();
+                        async move {
+                            let started = Instant::now();
+                            let client = pool.client(&attempt.endpoint).await.map_err(|error| {
+                                AuthorityAttemptError::retry(error.context(format!(
+                                    "Failed to connect to query authority at {}",
+                                    attempt.endpoint
+                                )))
+                            })?;
+                            let Some(request_timeout) =
+                                attempt.timeout.checked_sub(started.elapsed())
+                            else {
+                                return Err(AuthorityAttemptError::retry(anyhow::anyhow!(
+                                    "Query authority connection consumed the attempt deadline"
+                                )));
+                            };
+                            client
+                                .forward_query_with_timeout(
+                                    &path,
+                                    &args,
+                                    identity,
+                                    caller,
+                                    ts,
+                                    read_after_write,
+                                    journal,
+                                    request_timeout,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    let leader_hint = authority_leader_hint(&error);
+                                    AuthorityAttemptError::retry_with_leader(error, leader_hint)
+                                })
+                        }
                     },
-                    read_after_write,
-                    journal.flatten(),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(e))?
+                .map(|resolved| resolved.value)
+                .map_err(|e| {
+                    anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(format!(
+                        "Failed to route query to the current authority: {e:#}"
+                    ))
+                })?
         } else {
             self.inner
                 .execute_public_query(

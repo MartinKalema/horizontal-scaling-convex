@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Instant,
+};
 
 use anyhow::Context;
 use application::{
@@ -60,6 +63,14 @@ use value::{
 use crate::{
     args_structs::UdfPostRequestWithComponent,
     authentication::ExtractAuthenticationToken,
+    authority_routing::{
+        authority_leader_hint,
+        is_authority_redirect,
+        AttemptTimeoutDisposition,
+        AuthorityAttemptError,
+        AuthorityEndpointKind,
+        AuthorityResolver,
+    },
     mutation_forwarder::MutationForwarderGrpcClient,
     parse::{
         parse_export_path,
@@ -317,7 +328,7 @@ async fn maybe_forward_public_mutation(
 ) -> Result<Option<Result<UdfResponse, HttpResponseError>>, HttpResponseError> {
     enum ForwardingMode {
         Replica(Arc<MutationForwarderGrpcClient>),
-        RaftFollower(Arc<MutationForwarderGrpcClient>),
+        RaftFollower(PartitionId),
     }
 
     let forwarding_mode = if st.replica_mode {
@@ -346,40 +357,7 @@ async fn maybe_forward_public_mutation(
                 ),
             ));
         } else {
-            let leader_id = raft_state.leader_id();
-            if leader_id == 0 {
-                tracing::warn!(
-                    "Skipping follower mutation forwarding because partition has no elected Raft \
-                     leader yet"
-                );
-                return Ok(None);
-            }
-            let Some(leader_grpc_url) = st
-                .raft_peer_grpc_urls
-                .as_ref()
-                .and_then(|urls| urls.get(&leader_id))
-                .cloned()
-            else {
-                tracing::warn!(
-                    "Skipping follower mutation forwarding because RAFT_PEERS is missing leader \
-                     node {leader_id}"
-                );
-                return Ok(None);
-            };
-            let client_result = st.mutation_forwarder_pool.client(&leader_grpc_url).await;
-            match client_result {
-                Ok(client) => Some(ForwardingMode::RaftFollower(client)),
-                Err(e) => {
-                    tracing::warn!(
-                        "Skipping follower mutation forwarding because leader {} at {} is not \
-                         reachable yet: {:#}",
-                        leader_id,
-                        leader_grpc_url,
-                        e
-                    );
-                    return Ok(None);
-                },
-            }
+            Some(ForwardingMode::RaftFollower(raft_state.partition_id()))
         }
     } else {
         None
@@ -388,36 +366,103 @@ async fn maybe_forward_public_mutation(
     let Some(forwarding_mode) = forwarding_mode else {
         return Ok(None);
     };
-    let forwarder = match &forwarding_mode {
-        ForwardingMode::Replica(client) | ForwardingMode::RaftFollower(client) => client,
-    };
 
     let value_format = format.map(|f| f.parse()).transpose()?;
-    let forwarded = match forwarder
-        .forward(
-            path,
-            serialized_args.get(),
-            identity,
-            &client_version.to_string(),
-        )
-        .await
-    {
-        Ok(forwarded) => forwarded,
-        Err(e) => match forwarding_mode {
-            ForwardingMode::Replica(_) => {
-                return Ok(Some(Err(anyhow::anyhow!(
-                    ErrorMetadata::service_unavailable()
+    let forwarded = match &forwarding_mode {
+        ForwardingMode::Replica(forwarder) => {
+            match forwarder
+                .forward(
+                    path,
+                    serialized_args.get(),
+                    identity,
+                    &client_version.to_string(),
                 )
-                .context(format!("Failed to forward mutation to primary: {e:#}"))
-                .into())));
-            },
-            ForwardingMode::RaftFollower(_) => {
-                tracing::warn!(
-                    "Skipping follower mutation forwarding because the leader RPC failed: {:#}",
-                    e
-                );
-                return Ok(None);
-            },
+                .await
+            {
+                Ok(forwarded) => forwarded,
+                Err(e) => {
+                    return Ok(Some(Err(anyhow::anyhow!(
+                        ErrorMetadata::service_unavailable()
+                    )
+                    .context(format!("Failed to forward mutation to primary: {e:#}"))
+                    .into())));
+                },
+            }
+        },
+        ForwardingMode::RaftFollower(partition) => {
+            let resolver = AuthorityResolver::new(
+                st.node_addresses.clone(),
+                st.membership_store.clone(),
+                st.raft_state.clone(),
+                st.raft_peer_grpc_urls.clone(),
+                None,
+            );
+            let pool = st.mutation_forwarder_pool.clone();
+            let path = path.to_owned();
+            let args = serialized_args.get().to_owned();
+            let caller = client_version.to_string();
+            let resolved = resolver
+                .route(
+                    *partition,
+                    AuthorityEndpointKind::Grpc,
+                    AttemptTimeoutDisposition::Fail,
+                    move |attempt| {
+                        let pool = pool.clone();
+                        let path = path.clone();
+                        let args = args.clone();
+                        let identity = identity.clone();
+                        let caller = caller.clone();
+                        async move {
+                            let started = Instant::now();
+                            let client = pool.client(&attempt.endpoint).await.map_err(|error| {
+                                AuthorityAttemptError::retry(error.context(format!(
+                                    "Failed to connect to mutation authority at {}",
+                                    attempt.endpoint
+                                )))
+                            })?;
+                            let Some(request_timeout) =
+                                attempt.timeout.checked_sub(started.elapsed())
+                            else {
+                                return Err(AuthorityAttemptError::retry(anyhow::anyhow!(
+                                    "Mutation authority connection consumed the attempt deadline"
+                                )));
+                            };
+                            client
+                                .forward_with_timeout(
+                                    &path,
+                                    &args,
+                                    identity,
+                                    &caller,
+                                    request_timeout,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    if is_authority_redirect(&error) {
+                                        let leader_hint = authority_leader_hint(&error);
+                                        AuthorityAttemptError::retry_with_leader(error, leader_hint)
+                                    } else {
+                                        AuthorityAttemptError::fail(error.context(
+                                            "Mutation forwarding failed after dispatch; refusing \
+                                             to replay an ambiguous side effect",
+                                        ))
+                                    }
+                                })
+                        }
+                    },
+                )
+                .await;
+            match resolved {
+                Ok(resolved) => resolved.value,
+                Err(e) => {
+                    return Ok(Some(Err(anyhow::anyhow!(
+                        ErrorMetadata::service_unavailable()
+                    )
+                    .context(format!(
+                        "Failed to route mutation to the current Raft leader: {e:#}"
+                    ))
+                    .into())));
+                },
+            }
         },
     };
 
@@ -1073,7 +1118,13 @@ where
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::Arc,
+        sync::{
+            atomic::{
+                AtomicUsize,
+                Ordering,
+            },
+            Arc,
+        },
         time::Duration,
     };
 
@@ -1121,6 +1172,10 @@ mod tests {
     use http_body_util::BodyExt;
     use keybroker::Identity;
     use metrics::SERVER_VERSION_STR;
+    use pb::replication::mutation_forwarder_server::{
+        MutationForwarder as TonicMutationForwarder,
+        MutationForwarderServer as TonicMutationForwarderServer,
+    };
     use runtime::prod::ProdRuntime;
     use serde_json::{
         json,
@@ -1143,6 +1198,30 @@ mod tests {
         SharedNodeAddresses,
         MAX_CONCURRENT_REQUESTS,
     };
+
+    struct CountingMutationForwarder {
+        inner: MutationForwarderService,
+        mutation_calls: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl TonicMutationForwarder for CountingMutationForwarder {
+        async fn forward_mutation(
+            &self,
+            request: tonic::Request<pb::replication::ForwardMutationRequest>,
+        ) -> Result<tonic::Response<pb::replication::ForwardMutationResponse>, tonic::Status>
+        {
+            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            TonicMutationForwarder::forward_mutation(&self.inner, request).await
+        }
+
+        async fn forward_query(
+            &self,
+            request: tonic::Request<pb::replication::ForwardQueryRequest>,
+        ) -> Result<tonic::Response<pb::replication::ForwardQueryResponse>, tonic::Status> {
+            TonicMutationForwarder::forward_query(&self.inner, request).await
+        }
+    }
 
     async fn expect_success_from_app<T: serde::de::DeserializeOwned>(
         app: &ConvexHttpService,
@@ -1509,6 +1588,83 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
+    async fn test_http_mutation_retries_dead_leader_before_dispatch(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt.clone()).await?;
+        backend.st.application.load_udf_tests_modules().await?;
+
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let dead_grpc_addr = dead_listener.local_addr()?;
+        drop(dead_listener);
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let live_grpc_addr = live_listener.local_addr()?;
+        let mutation_calls = Arc::new(AtomicUsize::new(0));
+        let forwarder = CountingMutationForwarder {
+            inner: MutationForwarderService::new(
+                Arc::new(backend.st.application.clone()),
+                backend.st.instance_name.clone(),
+                backend.st.cluster_grpc_auth.clone(),
+            ),
+            mutation_calls: mutation_calls.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _server_handle = rt.spawn("test_dead_leader_mutation_retry", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(TonicMutationForwarderServer::new(forwarder))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(live_listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let dead_grpc_addr = dead_grpc_addr.to_string();
+        let live_grpc_addr = live_grpc_addr.to_string();
+        let mut follower_state = backend.st.clone();
+        follower_state.partition_id = Some(PartitionId::DEFAULT);
+        follower_state.raft_state = Some(RaftPartitionState::new_for_test(
+            false,
+            3,
+            PartitionId::DEFAULT,
+            1,
+        ));
+        follower_state.raft_peer_grpc_urls = Some(BTreeMap::from([(3, dead_grpc_addr.clone())]));
+        follower_state.node_addresses = SharedNodeAddresses::new(Some(NodeAddresses::from_config(
+            &format!("0={dead_grpc_addr}|{live_grpc_addr}"),
+        )));
+        follower_state.membership_store = None;
+        let follower_app = ConvexHttpService::new(
+            router(follower_state),
+            "backend_dead_leader_mutation_retry_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let response: JsonValue = expect_success_from_app(
+            &follower_app,
+            post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "retried before dispatch" } },
+                }),
+            )?,
+        )
+        .await?;
+        assert_eq!(response["status"], "success");
+        assert_eq!(
+            mutation_calls.load(Ordering::SeqCst),
+            1,
+            "the mutation must execute exactly once on the live authority",
+        );
+
+        let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
     async fn test_internal_grpc_services_reject_missing_cluster_auth(
         rt: ProdRuntime,
     ) -> anyhow::Result<()> {
@@ -1714,7 +1870,7 @@ mod tests {
     }
 
     #[convex_macro::prod_rt_test]
-    async fn test_selective_query_forwarding_api_routes_partitioned_queries(
+    async fn test_selective_query_forwarding_retries_when_first_authority_is_dead(
         rt: ProdRuntime,
     ) -> anyhow::Result<()> {
         let primary = setup_backend_for_test(rt.clone()).await?;
@@ -1738,6 +1894,9 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let grpc_addr = listener.local_addr()?;
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let dead_grpc_addr = dead_listener.local_addr()?;
+        drop(dead_listener);
         let forwarder = MutationForwarderService::new(
             Arc::new(primary.st.application.clone()),
             primary.st.instance_name.clone(),
@@ -1758,7 +1917,10 @@ mod tests {
             selective.st.application.database().clone(),
             false,
             Some(PartitionId(1)),
-            SharedNodeAddresses::new(Some(NodeAddresses::from_config(&format!("0={grpc_addr}")))),
+            SharedNodeAddresses::new(Some(NodeAddresses::from_config(&format!(
+                "0={dead_grpc_addr}|{grpc_addr}"
+            )))),
+            None,
             None,
             None,
             None,
@@ -1784,6 +1946,111 @@ mod tests {
         assert_eq!(value["hello"], "selective forwarded query");
 
         let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_selective_query_forwarding_follows_remote_leader_redirect(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let primary = setup_backend_for_test(rt.clone()).await?;
+        let selective = setup_backend_for_test(rt.clone()).await?;
+        primary.st.application.load_udf_tests_modules().await?;
+        selective.st.application.load_udf_tests_modules().await?;
+
+        let inserted: JsonValue = primary
+            .expect_success(post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "leader redirect" } },
+                }),
+            )?)
+            .await?;
+        let inserted_id = inserted["value"]
+            .as_str()
+            .context("insertObject should return a document id string")?
+            .to_string();
+
+        let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let leader_grpc_addr = leader_listener.local_addr()?;
+        let leader_forwarder = MutationForwarderService::new(
+            Arc::new(primary.st.application.clone()),
+            primary.st.instance_name.clone(),
+            None,
+        );
+        let (leader_shutdown_tx, leader_shutdown_rx) = oneshot::channel();
+        let _leader_handle = rt.spawn("test_redirected_query_leader", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(leader_forwarder.into_server())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(leader_listener), async move {
+                    let _ = leader_shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let follower_grpc_addr = follower_listener.local_addr()?;
+        let follower_forwarder = MutationForwarderService::new_with_raft(
+            Arc::new(selective.st.application.clone()),
+            selective.st.instance_name.clone(),
+            None,
+            Some(RaftPartitionState::new_for_test(
+                false,
+                3,
+                PartitionId::DEFAULT,
+                1,
+            )),
+            Some(BTreeMap::from([(3, format!("http://{leader_grpc_addr}"))])),
+        );
+        let (follower_shutdown_tx, follower_shutdown_rx) = oneshot::channel();
+        let _follower_handle = rt.spawn("test_redirected_query_follower", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(follower_forwarder.into_server())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(follower_listener),
+                    async move {
+                        let _ = follower_shutdown_rx.await;
+                    },
+                )
+                .await;
+        });
+
+        let api: Arc<dyn ApplicationApi> = Arc::new(SelectiveQueryForwardingApi::new(
+            Arc::new(selective.st.application.clone()),
+            selective.st.application.database().clone(),
+            false,
+            Some(PartitionId(1)),
+            SharedNodeAddresses::new(Some(NodeAddresses::from_config(&format!(
+                "0={follower_grpc_addr}"
+            )))),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let query_result = api
+            .execute_public_query(
+                &ResolvedHostname {
+                    instance_name: selective.st.instance_name.clone(),
+                    destination: RequestDestination::ConvexCloud,
+                },
+                common::RequestId::new(),
+                Identity::system(),
+                "values:getObject".parse()?,
+                SerializedArgs::from_args(vec![json!({ "id": inserted_id })])?,
+                FunctionCaller::HttpApi(ClientVersion::unknown()),
+                ExecuteQueryTimestamp::Latest,
+                None,
+                None,
+            )
+            .await?;
+
+        let value: JsonValue = serde_json::from_str(query_result.result?.as_str())?;
+        assert_eq!(value["hello"], "leader redirect");
+
+        let _ = follower_shutdown_tx.send(());
+        let _ = leader_shutdown_tx.send(());
         Ok(())
     }
 
@@ -1843,6 +2110,7 @@ mod tests {
             )),
             Some(raft_peer_grpc_urls),
             None,
+            None,
         ));
         let query_result = api
             .execute_public_query(
@@ -1879,6 +2147,7 @@ mod tests {
             false,
             Some(PartitionId(1)),
             SharedNodeAddresses::default(),
+            None,
             None,
             None,
             None,
@@ -1968,6 +2237,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
 
         let err = api
@@ -2008,6 +2278,7 @@ mod tests {
             false,
             Some(PartitionId(1)),
             SharedNodeAddresses::default(),
+            None,
             None,
             None,
             None,
@@ -2082,6 +2353,7 @@ mod tests {
             true,
             None,
             SharedNodeAddresses::default(),
+            None,
             None,
             None,
             None,

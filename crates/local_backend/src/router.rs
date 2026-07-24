@@ -558,6 +558,7 @@ pub fn router(st: BackendAppState) -> Router {
         cluster_grpc_auth: st.cluster_grpc_auth.clone(),
         mutation_forwarder_pool: st.mutation_forwarder_pool.clone(),
         replica_mutation_forwarder: st.replica_mutation_forwarder.clone(),
+        membership_store: st.membership_store.clone(),
     };
 
     let sync_routes = Router::new()

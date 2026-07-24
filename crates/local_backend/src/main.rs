@@ -142,8 +142,13 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
         let grpc_addr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
         let api = st.cluster_aware_api();
         let cluster_grpc_auth = st.cluster_grpc_auth.clone();
-        let forwarder =
-            MutationForwarderService::new(api, st.instance_name.clone(), cluster_grpc_auth.clone());
+        let forwarder = MutationForwarderService::new_with_raft(
+            api,
+            st.instance_name.clone(),
+            cluster_grpc_auth.clone(),
+            st.raft_state.clone(),
+            st.raft_peer_grpc_urls.clone(),
+        );
         let two_pc = two_phase_service::TwoPhaseCommitGrpcService::new(
             st.application.database().committer_client(),
             st.raft_state.clone(),
