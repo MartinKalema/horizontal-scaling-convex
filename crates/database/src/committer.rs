@@ -6868,6 +6868,22 @@ impl<RT: Runtime> Committer<RT> {
             .expect("validated commit should stage a pending snapshot");
         let commit_ts = pending_write.must_commit_ts();
         self.enqueue_snapshot(commit_id, commit_ts, queued_snapshot);
+        if result.is_closed() {
+            return Some(
+                async move {
+                    Ok(PersistenceWrite::RejectedBeforePersistence {
+                        pending_write,
+                        commit_timer,
+                        result,
+                        commit_id,
+                        err: anyhow::anyhow!(
+                            "Commit request was cancelled before Raft proposal at ts={commit_ts}"
+                        ),
+                    })
+                }
+                .boxed(),
+            );
+        }
         let virtual_system_mapping = self.virtual_system_mapping.clone();
 
         Self::track_commit(
