@@ -182,7 +182,16 @@ impl AuthorityResolver {
                     self.policy.total_timeout,
                     failures.join("; "),
                 );
-                let attempt_timeout = remaining.min(self.policy.per_attempt_timeout);
+                // Read-only attempts can use short probes and move on. Once a
+                // side-effecting request may be dispatched, give it the full
+                // remaining deadline because timing it out is ambiguous and we
+                // intentionally will not replay it.
+                let attempt_timeout = match timeout_disposition {
+                    AttemptTimeoutDisposition::Retry => {
+                        remaining.min(self.policy.per_attempt_timeout)
+                    },
+                    AttemptTimeoutDisposition::Fail => remaining,
+                };
                 let outcome = tokio::time::timeout(
                     attempt_timeout,
                     attempt(AuthorityAttempt {
@@ -680,6 +689,39 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(format!("{error:#}").contains("timed out"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn side_effect_attempt_receives_remaining_total_deadline() -> anyhow::Result<()> {
+        let policy = test_policy();
+        let resolver = AuthorityResolver::new(
+            SharedNodeAddresses::new(Some(database::two_phase::NodeAddresses::from_config(
+                "0=leader:50051",
+            ))),
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_policy(policy);
+
+        let result = resolver
+            .route(
+                PartitionId::DEFAULT,
+                AuthorityEndpointKind::Grpc,
+                AttemptTimeoutDisposition::Fail,
+                move |attempt| async move {
+                    assert!(
+                        attempt.timeout > policy.per_attempt_timeout,
+                        "a dispatched side effect must not inherit the short candidate timeout"
+                    );
+                    Ok("served")
+                },
+            )
+            .await?;
+
+        assert_eq!(result.value, "served");
         Ok(())
     }
 
