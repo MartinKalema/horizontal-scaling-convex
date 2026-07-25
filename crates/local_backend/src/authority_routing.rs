@@ -224,9 +224,6 @@ impl AuthorityResolver {
                         ));
                     },
                 }
-                if let Err(error) = self.refresh_membership().await {
-                    failures.push(format!("membership refresh failed: {error:#}"));
-                }
                 if received_leader_hint {
                     break;
                 }
@@ -244,6 +241,18 @@ impl AuthorityResolver {
                 self.policy.total_timeout,
                 failures.join("; "),
             );
+            let refresh_timeout = remaining.min(self.policy.per_attempt_timeout);
+            match tokio::time::timeout(refresh_timeout, self.refresh_membership()).await {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => {
+                    failures.push(format!("membership refresh failed: {error:#}"));
+                },
+                Err(_) => {
+                    failures.push(format!(
+                        "membership refresh timed out after {refresh_timeout:?}"
+                    ));
+                },
+            }
             tokio::time::sleep(backoff.min(remaining)).await;
             backoff = (backoff * 2).min(self.policy.max_backoff);
         }
@@ -390,6 +399,8 @@ mod tests {
         snapshot: MembershipSnapshot,
     }
 
+    struct BlockingMembershipStore;
+
     #[async_trait::async_trait]
     impl MembershipStore for StaticMembershipStore {
         async fn load(&self) -> anyhow::Result<Option<MembershipSnapshot>> {
@@ -405,6 +416,24 @@ mod tests {
 
         async fn register_node(&self, _node: NodeMembership) -> anyhow::Result<MembershipSnapshot> {
             Ok(self.snapshot.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MembershipStore for BlockingMembershipStore {
+        async fn load(&self) -> anyhow::Result<Option<MembershipSnapshot>> {
+            std::future::pending().await
+        }
+
+        async fn ensure_initialized(
+            &self,
+            _bootstrap_snapshot: MembershipSnapshot,
+        ) -> anyhow::Result<MembershipSnapshot> {
+            std::future::pending().await
+        }
+
+        async fn register_node(&self, _node: NodeMembership) -> anyhow::Result<MembershipSnapshot> {
+            std::future::pending().await
         }
     }
 
@@ -528,6 +557,98 @@ mod tests {
             *attempts.lock().unwrap(),
             vec!["stale-leader:50051", "current-leader:50051"]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn leader_redirect_does_not_wait_for_membership_refresh() -> anyhow::Result<()> {
+        let resolver = AuthorityResolver::new(
+            SharedNodeAddresses::new(Some(database::two_phase::NodeAddresses::from_config(
+                "0=follower:50051",
+            ))),
+            Some(Arc::new(BlockingMembershipStore)),
+            None,
+            None,
+            None,
+        )
+        .with_policy(test_policy());
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            resolver.route(
+                PartitionId::DEFAULT,
+                AuthorityEndpointKind::Grpc,
+                AttemptTimeoutDisposition::Retry,
+                move |attempt| {
+                    observed.lock().unwrap().push(attempt.endpoint.clone());
+                    async move {
+                        match attempt.endpoint.as_str() {
+                            "follower:50051" => Err(AuthorityAttemptError::retry_with_leader(
+                                anyhow::anyhow!("not leader"),
+                                Some("current-leader:50051".to_string()),
+                            )),
+                            "current-leader:50051" => Ok("served"),
+                            endpoint => Err(AuthorityAttemptError::retry(anyhow::anyhow!(
+                                "unexpected endpoint {endpoint}"
+                            ))),
+                        }
+                    }
+                },
+            ),
+        )
+        .await
+        .context("leader redirect waited for unavailable membership storage")??;
+
+        assert_eq!(result.value, "served");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["follower:50051", "current-leader:50051"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tries_cached_candidates_before_membership_refresh() -> anyhow::Result<()> {
+        let resolver = AuthorityResolver::new(
+            SharedNodeAddresses::new(Some(database::two_phase::NodeAddresses::from_config(
+                "0=dead:50051|live:50051",
+            ))),
+            Some(Arc::new(BlockingMembershipStore)),
+            None,
+            None,
+            None,
+        )
+        .with_policy(test_policy());
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            resolver.route(
+                PartitionId::DEFAULT,
+                AuthorityEndpointKind::Grpc,
+                AttemptTimeoutDisposition::Retry,
+                move |attempt| {
+                    observed.lock().unwrap().push(attempt.endpoint.clone());
+                    async move {
+                        if attempt.endpoint == "live:50051" {
+                            Ok("served")
+                        } else {
+                            Err(AuthorityAttemptError::retry(anyhow::anyhow!(
+                                "connection refused"
+                            )))
+                        }
+                    }
+                },
+            ),
+        )
+        .await
+        .context("cached live candidate was blocked by membership refresh")??;
+
+        assert_eq!(result.value, "served");
+        assert_eq!(*attempts.lock().unwrap(), vec!["dead:50051", "live:50051"]);
         Ok(())
     }
 
@@ -686,6 +807,40 @@ mod tests {
             )
             .await
             .expect_err("all unavailable candidates must fail");
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(format!("{error:#}").contains("timed out"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn membership_refresh_cannot_outlive_total_deadline() -> anyhow::Result<()> {
+        let resolver = AuthorityResolver::new(
+            SharedNodeAddresses::new(Some(database::two_phase::NodeAddresses::from_config(
+                "0=dead:50051",
+            ))),
+            Some(Arc::new(BlockingMembershipStore)),
+            None,
+            None,
+            None,
+        )
+        .with_policy(test_policy());
+        let started = Instant::now();
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            resolver.route(
+                PartitionId::DEFAULT,
+                AuthorityEndpointKind::Grpc,
+                AttemptTimeoutDisposition::Retry,
+                |_attempt| async {
+                    Err::<(), _>(AuthorityAttemptError::retry(anyhow::anyhow!("unavailable")))
+                },
+            ),
+        )
+        .await
+        .context("membership refresh outlived the routing deadline")?
+        .expect_err("unavailable authority must fail");
 
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(format!("{error:#}").contains("timed out"));
