@@ -1810,9 +1810,12 @@ impl<RT: Runtime> Committer<RT> {
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox {
-                                if let Err(err) = Self::record_and_replay_raft_nats_outbox_delta(
+                                // Raft has accepted this write. Durably enqueue cross-partition
+                                // delivery before acknowledging it, but do not make client success
+                                // depend on NATS availability. The ordered replay loop publishes the
+                                // outbox after transport recovery.
+                                if let Err(err) = Self::record_raft_nats_outbox_delta(
                                     self.persistence.clone(),
-                                    self.distributed_log.clone(),
                                     &published_commit.delta,
                                     "local",
                                 )
@@ -1959,9 +1962,11 @@ impl<RT: Runtime> Committer<RT> {
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox {
-                                if let Err(err) = Self::record_and_replay_raft_nats_outbox_delta(
+                                // The 2PC decision is final once the participant commits. Keep NATS
+                                // publication outside that acknowledgement boundary while retaining
+                                // the delta durably for ordered replay.
+                                if let Err(err) = Self::record_raft_nats_outbox_delta(
                                     self.persistence.clone(),
-                                    self.distributed_log.clone(),
                                     &published_commit.delta,
                                     "2pc_participant",
                                 )
@@ -4204,23 +4209,6 @@ impl<RT: Runtime> Committer<RT> {
             replayed += 1;
         }
         Ok(replayed)
-    }
-
-    async fn record_and_replay_raft_nats_outbox_delta(
-        persistence: Arc<dyn Persistence>,
-        distributed_log: Arc<dyn DistributedLog>,
-        delta: &CommitDelta,
-        path: &'static str,
-    ) -> anyhow::Result<()> {
-        Self::record_raft_nats_outbox_delta(persistence.clone(), delta, path).await?;
-        if let Err(err) = Self::replay_raft_nats_outbox_once(persistence, distributed_log).await {
-            tracing::error!(
-                "Failed to publish committed write at ts={} to replication log through ordered \
-                 Raft->NATS outbox; leaving outbox entries for replay: {err:#}",
-                u64::from(delta.ts),
-            );
-        }
-        Ok(())
     }
 
     fn should_record_raft_nats_outbox_delta(delta: &CommitDelta) -> bool {
@@ -8942,6 +8930,44 @@ mod tests {
                 .await?
                 .len(),
             1
+        );
+
+        log.allow_publishes();
+        let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+            persistence.clone(),
+            log.clone(),
+        )
+        .await?;
+        assert_eq!(replayed, 1);
+        assert_eq!(log.published(), vec![ts]);
+        assert!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_record_does_not_publish_synchronously() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let log = Arc::new(RecordingDistributedLog::failing());
+        let ts = Timestamp::must(13);
+
+        Committer::<TestRuntime>::record_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts),
+            "test",
+        )
+        .await?;
+
+        assert_eq!(log.published(), Vec::<Timestamp>::new());
+        assert_eq!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence.clone())
+                .await?
+                .len(),
+            1,
+            "the accepted write must be durable without waiting for NATS",
         );
 
         log.allow_publishes();
