@@ -78,6 +78,14 @@ pub trait TimestampOracle: Send + Sync + 'static {
     /// Used for read-after-write consistency.
     async fn max_committed_ts(&self) -> anyhow::Result<Timestamp>;
 
+    /// Record a committed timestamp in node-local state without network I/O.
+    ///
+    /// The commit path calls this before publishing the new snapshot so future
+    /// local allocations immediately respect the floor. Durable publication of
+    /// the cluster-wide floor is asynchronous and handled by
+    /// `advance_committed_ts`.
+    fn observe_committed_ts(&self, _ts: Timestamp) {}
+
     /// Advance the max committed timestamp. Called after a successful commit.
     async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()>;
 
@@ -144,11 +152,15 @@ impl<RT: Runtime> TimestampOracle for LocalTimestampOracle<RT> {
         Ok(self.state.lock().max_committed)
     }
 
-    async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
+    fn observe_committed_ts(&self, ts: Timestamp) {
         let mut state = self.state.lock();
         if ts > state.max_committed {
             state.max_committed = ts;
         }
+    }
+
+    async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
+        self.observe_committed_ts(ts);
         Ok(())
     }
 }
@@ -461,18 +473,19 @@ impl TimestampOracle for BatchTimestampOracle {
         result
     }
 
+    fn observe_committed_ts(&self, ts: Timestamp) {
+        let mut state = self.state.lock();
+        if ts > state.max_committed {
+            state.max_committed = ts;
+        }
+    }
+
     async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
         let timer = metrics::tso_operation_timer("advance_committed");
         let result = async {
             let ts_u64 = u64::from(ts);
 
-            // Update local state.
-            {
-                let mut state = self.state.lock();
-                if ts > state.max_committed {
-                    state.max_committed = ts;
-                }
-            }
+            self.observe_committed_ts(ts);
 
             let value = ts_u64.to_be_bytes().to_vec();
             for attempt in 0..10 {
@@ -587,11 +600,15 @@ pub mod testing {
             Ok(self.state.lock().max_committed)
         }
 
-        async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
+        fn observe_committed_ts(&self, ts: Timestamp) {
             let mut state = self.state.lock();
             if ts > state.max_committed {
                 state.max_committed = ts;
             }
+        }
+
+        async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
+            self.observe_committed_ts(ts);
             Ok(())
         }
     }

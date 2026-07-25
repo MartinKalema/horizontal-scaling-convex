@@ -102,7 +102,10 @@ use search::searcher::SearcherStub;
 use storage::LocalDirStorage;
 use tokio::{
     net::TcpListener,
-    sync::oneshot,
+    sync::{
+        oneshot,
+        Notify,
+    },
     task::JoinHandle,
 };
 use tokio_stream::wrappers::TcpListenerStream;
@@ -1479,6 +1482,63 @@ impl TimestampOracle for HangingTimestampOracle {
 
     async fn advance_committed_ts(&self, _ts: Timestamp) -> anyhow::Result<()> {
         std::future::pending().await
+    }
+}
+
+struct BlockingAdvanceTimestampOracle {
+    state: Mutex<RecordingTimestampOracleState>,
+    advance_targets: Mutex<Vec<Timestamp>>,
+    advance_started: Notify,
+    release_advance: Notify,
+    advance_finished: Notify,
+}
+
+impl BlockingAdvanceTimestampOracle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RecordingTimestampOracleState {
+                last_assigned: Timestamp::MIN,
+                max_committed: Timestamp::MIN,
+                requested_floors: Vec::new(),
+            }),
+            advance_targets: Mutex::new(Vec::new()),
+            advance_started: Notify::new(),
+            release_advance: Notify::new(),
+            advance_finished: Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl TimestampOracle for BlockingAdvanceTimestampOracle {
+    async fn next_ts_at_or_after(&self, min_ts: Timestamp) -> anyhow::Result<Timestamp> {
+        let mut state = self.state.lock();
+        let next = std::cmp::max(
+            min_ts,
+            std::cmp::max(state.last_assigned.succ()?, state.max_committed.succ()?),
+        );
+        state.last_assigned = next;
+        Ok(next)
+    }
+
+    async fn max_committed_ts(&self) -> anyhow::Result<Timestamp> {
+        Ok(self.state.lock().max_committed)
+    }
+
+    fn observe_committed_ts(&self, ts: Timestamp) {
+        let mut state = self.state.lock();
+        if ts > state.max_committed {
+            state.max_committed = ts;
+        }
+    }
+
+    async fn advance_committed_ts(&self, ts: Timestamp) -> anyhow::Result<()> {
+        self.observe_committed_ts(ts);
+        self.advance_targets.lock().push(ts);
+        self.advance_started.notify_one();
+        self.release_advance.notified().await;
+        self.advance_finished.notify_one();
+        Ok(())
     }
 }
 
@@ -10279,6 +10339,74 @@ fn test_tso_request_includes_local_replica_floor() -> anyhow::Result<()> {
              and letting the committer bump it outside the reserved range",
         );
 
+        Ok(())
+    })
+}
+
+#[test]
+fn test_committed_write_does_not_wait_for_tso_floor_publication() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso = Arc::new(BlockingAdvanceTimestampOracle::new());
+        let node = create_node_with_options(
+            &rt,
+            log,
+            Some(partitioned_map(PartitionId(0))),
+            None,
+            Some(tso.clone()),
+        )
+        .await?;
+
+        let first_commit_ts = tokio::time::timeout(
+            Duration::from_secs(1),
+            insert_doc(
+                &node,
+                "messages",
+                assert_obj!("text" => "committed-while-floor-blocked"),
+            ),
+        )
+        .await
+        .context("commit waited for cluster-wide TSO floor publication")??;
+
+        tokio::time::timeout(Duration::from_secs(1), tso.advance_started.notified())
+            .await
+            .context("background TSO floor publication did not start")?;
+        let second_commit_ts = tokio::time::timeout(
+            Duration::from_secs(1),
+            insert_doc(
+                &node,
+                "messages",
+                assert_obj!("text" => "second-commit-while-floor-blocked"),
+            ),
+        )
+        .await
+        .context("newer commit waited for an in-flight TSO floor publication")??;
+        let messages = run_query(
+            node,
+            TableNamespace::root_component(),
+            Query::full_table_scan("messages".parse()?, Order::Asc),
+        )
+        .await?;
+        assert_eq!(messages.len(), 2);
+
+        tso.release_advance.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), tso.advance_finished.notified())
+            .await
+            .context("first background TSO floor publication did not finish")?;
+        tokio::time::timeout(Duration::from_secs(1), tso.advance_started.notified())
+            .await
+            .context("coalesced TSO floor publication did not start")?;
+        assert_eq!(
+            *tso.advance_targets.lock(),
+            vec![first_commit_ts, second_commit_ts],
+            "the single background publisher must advance directly to the newest pending floor",
+        );
+        tso.release_advance.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), tso.advance_finished.notified())
+            .await
+            .context("coalesced TSO floor publication did not finish")?;
         Ok(())
     })
 }
