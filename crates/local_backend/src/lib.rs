@@ -96,6 +96,7 @@ pub mod admin;
 mod app_metrics;
 mod args_structs;
 pub mod authentication;
+mod authority_routing;
 pub mod beacon;
 pub mod canonical_urls;
 pub mod config;
@@ -135,22 +136,61 @@ pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 const MEMBERSHIP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MEMBERSHIP_LEASE_TTL: Duration = Duration::from_secs(15);
 
+#[derive(Default)]
+struct SharedNodeAddressState {
+    grpc_addresses: Option<database::two_phase::NodeAddresses>,
+    http_origins: BTreeMap<database::partition::PartitionId, Vec<String>>,
+}
+
 #[derive(Clone, Default)]
-pub struct SharedNodeAddresses(Arc<RwLock<Option<database::two_phase::NodeAddresses>>>);
+pub struct SharedNodeAddresses(Arc<RwLock<SharedNodeAddressState>>);
 
 impl SharedNodeAddresses {
     pub fn new(addresses: Option<database::two_phase::NodeAddresses>) -> Self {
-        Self(Arc::new(RwLock::new(addresses)))
+        Self(Arc::new(RwLock::new(SharedNodeAddressState {
+            grpc_addresses: addresses,
+            http_origins: BTreeMap::new(),
+        })))
     }
 
     pub fn get(&self) -> Option<database::two_phase::NodeAddresses> {
-        self.0.read().clone()
+        self.0.read().grpc_addresses.clone()
+    }
+
+    pub fn http_origins_for(&self, partition: database::partition::PartitionId) -> Vec<String> {
+        self.0
+            .read()
+            .http_origins
+            .get(&partition)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn refresh_from_membership(&self, snapshot: &database::membership::MembershipSnapshot) {
-        let addresses =
-            snapshot.to_live_node_addresses(database::membership::current_unix_timestamp_millis());
-        *self.0.write() = (!addresses.partitions().is_empty()).then_some(addresses);
+        let now_ms = database::membership::current_unix_timestamp_millis();
+        let addresses = snapshot.to_live_node_addresses(now_ms);
+        let mut http_origins: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for node in snapshot
+            .nodes()
+            .values()
+            .filter(|node| node.is_live_at(now_ms))
+        {
+            if let Some(http_origin) = node
+                .http_origin
+                .as_ref()
+                .map(|origin| origin.trim())
+                .filter(|origin| !origin.is_empty())
+            {
+                http_origins
+                    .entry(node.partition)
+                    .or_default()
+                    .push(http_origin.trim_end_matches('/').to_string());
+            }
+        }
+        *self.0.write() = SharedNodeAddressState {
+            grpc_addresses: (!addresses.partitions().is_empty()).then_some(addresses),
+            http_origins,
+        };
     }
 }
 
@@ -192,6 +232,7 @@ impl BackendAppState {
             self.node_addresses.clone(),
             self.raft_state.clone(),
             self.raft_peer_grpc_urls.clone(),
+            self.membership_store.clone(),
             self.cluster_grpc_auth.clone(),
         ))
     }
@@ -340,6 +381,7 @@ pub struct RouterState {
     pub cluster_grpc_auth: Option<common::grpc::ClusterGrpcAuth>,
     pub mutation_forwarder_pool: mutation_forwarder::MutationForwarderGrpcClientPool,
     pub replica_mutation_forwarder: Option<Arc<mutation_forwarder::MutationForwarderGrpcClient>>,
+    pub membership_store: Option<Arc<dyn database::membership::MembershipStore>>,
 }
 
 #[derive(Clone)]
@@ -352,6 +394,7 @@ pub struct DeployRouterState {
     pub node_addresses: SharedNodeAddresses,
     pub raft_state: Option<database::raft_partition::RaftPartitionState>,
     pub raft_peer_http_origins: Option<BTreeMap<u64, String>>,
+    pub membership_store: Option<Arc<dyn database::membership::MembershipStore>>,
 }
 
 impl From<&BackendAppState> for DeployRouterState {
@@ -365,6 +408,7 @@ impl From<&BackendAppState> for DeployRouterState {
             node_addresses: st.node_addresses.clone(),
             raft_state: st.raft_state.clone(),
             raft_peer_http_origins: st.raft_peer_http_origins.clone(),
+            membership_store: st.membership_store.clone(),
         }
     }
 }

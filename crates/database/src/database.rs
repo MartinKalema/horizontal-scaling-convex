@@ -3244,6 +3244,10 @@ impl<RT: Runtime> Database<RT> {
     pub fn runtime(&self) -> &RT {
         &self.runtime
     }
+
+    pub fn table_number_allocator(&self) -> Arc<dyn TableNumberAllocator> {
+        self.table_number_allocator.clone()
+    }
 }
 
 /// Transaction statistics reported for a retried transaction

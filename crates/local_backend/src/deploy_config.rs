@@ -3,7 +3,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
 use application::deploy_config::{
     EvaluatePushResponse,
     FinishPushDiff,
@@ -75,7 +74,6 @@ use serde::{
     Serialize,
 };
 use serde_json::Value as JsonValue;
-use url::Url;
 use value::{
     base64,
     DocumentObject,
@@ -87,6 +85,13 @@ use crate::{
     admin::{
         must_be_admin_from_key,
         must_be_admin_from_key_with_write_access,
+    },
+    authority_routing::{
+        http_origin_from_peer_addr as resolve_http_origin_from_peer_addr,
+        AttemptTimeoutDisposition,
+        AuthorityAttemptError,
+        AuthorityEndpointKind,
+        AuthorityResolver,
     },
     DeployRouterState,
 };
@@ -155,9 +160,13 @@ pub async fn get_config_hashes(
     }))
 }
 
-const INTERNAL_BACKEND_HTTP_PORT: u16 = 3210;
-
-async fn raft_leader_origin(st: &DeployRouterState) -> anyhow::Result<Option<String>> {
+fn deploy_target_partition(st: &DeployRouterState) -> anyhow::Result<Option<PartitionId>> {
+    let Some(local_partition) = st.partition_id else {
+        return Ok(None);
+    };
+    if local_partition != PartitionId::DEFAULT {
+        return Ok(Some(PartitionId::DEFAULT));
+    }
     let Some(raft_state) = st.raft_state.as_ref() else {
         return Ok(None);
     };
@@ -172,59 +181,11 @@ async fn raft_leader_origin(st: &DeployRouterState) -> anyhow::Result<Option<Str
         !raft_state.is_leader(),
         "Raft leader is still applying its current-term barrier and cannot serve deploy metadata"
     );
-    let peer_http_origins = st.raft_peer_http_origins.as_ref().context(
-        "RAFT_PEERS is required to forward deploy metadata operations to the Raft leader",
-    )?;
-    for _ in 0..50 {
-        let leader_id = raft_state.leader_id();
-        if leader_id != 0 {
-            let leader_origin = peer_http_origins.get(&leader_id).with_context(|| {
-                format!("Missing RAFT_PEERS entry for Raft leader node {leader_id}")
-            })?;
-            return Ok(Some(leader_origin.clone()));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Ok(None)
-}
-
-async fn deploy_target_origin(st: &DeployRouterState) -> anyhow::Result<Option<String>> {
-    if let Some(origin) = metadata_owner_origin(st)? {
-        return Ok(Some(origin));
-    }
-    raft_leader_origin(st).await
-}
-
-fn metadata_owner_origin(st: &DeployRouterState) -> anyhow::Result<Option<String>> {
-    let Some(local_partition) = st.partition_id else {
-        return Ok(None);
-    };
-    if local_partition == PartitionId::DEFAULT {
-        return Ok(None);
-    }
-    let node_addresses = st
-        .node_addresses
-        .get()
-        .context("Membership is required to forward deploy metadata operations to the owner")?;
-    let owner_addr = node_addresses
-        .address_for(PartitionId::DEFAULT)
-        .context("Missing live membership entry for deploy metadata owner partition-0")?;
-    Ok(Some(http_origin_from_peer_addr(owner_addr)?))
+    Ok(Some(PartitionId::DEFAULT))
 }
 
 pub(crate) fn http_origin_from_peer_addr(addr: &str) -> anyhow::Result<String> {
-    let normalized = if addr.contains("://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    };
-    let mut url = Url::parse(&normalized)?;
-    url.set_path("");
-    url.set_query(None);
-    url.set_fragment(None);
-    url.set_port(Some(INTERNAL_BACKEND_HTTP_PORT))
-        .map_err(|_| anyhow::anyhow!("Failed to map peer address {addr} to backend HTTP port"))?;
-    Ok(url.to_string().trim_end_matches('/').to_string())
+    resolve_http_origin_from_peer_addr(addr)
 }
 
 trait AdminKeyCarrier {
@@ -232,9 +193,17 @@ trait AdminKeyCarrier {
     fn set_admin_key(&mut self, admin_key: String);
 }
 
-async fn metadata_owner_instance_name(owner_origin: &str) -> anyhow::Result<String> {
+async fn metadata_owner_instance_name(
+    owner_origin: &str,
+    timeout: Duration,
+) -> anyhow::Result<String> {
     let url = format!("{owner_origin}/instance_name");
-    let response = reqwest::Client::new().get(&url).send().await?;
+    let response = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .get(&url)
+        .send()
+        .await?;
     let status = response.status();
     let body = response.text().await?;
     anyhow::ensure!(
@@ -287,7 +256,7 @@ where
     Req: Serialize + AdminKeyCarrier,
     Resp: DeserializeOwned,
 {
-    let Some(target_origin) = deploy_target_origin(st).await? else {
+    let Some(target_partition) = deploy_target_partition(st)? else {
         return Ok(None);
     };
     let identity = if needs_write_access {
@@ -305,11 +274,32 @@ where
         )
         .await?
     };
-    let target_instance_name = metadata_owner_instance_name(&target_origin).await?;
+    let resolver = AuthorityResolver::new(
+        st.node_addresses.clone(),
+        st.membership_store.clone(),
+        st.raft_state.clone(),
+        None,
+        st.raft_peer_http_origins.clone(),
+    );
+    let resolved = resolver
+        .route(
+            target_partition,
+            AuthorityEndpointKind::Http,
+            AttemptTimeoutDisposition::Retry,
+            |attempt| async move {
+                metadata_owner_instance_name(&attempt.endpoint, attempt.timeout)
+                    .await
+                    .map(|instance_name| (attempt.endpoint, instance_name))
+                    .map_err(AuthorityAttemptError::retry)
+            },
+        )
+        .await?;
+    let remaining = resolved.remaining()?;
+    let (target_origin, target_instance_name) = resolved.value;
     let target_admin_key = issue_owner_admin_key(st, &target_instance_name, &identity)?;
     req.set_admin_key(target_admin_key);
     Ok(Some(
-        forward_deploy_request(&target_origin, path, req).await?,
+        forward_deploy_request(&target_origin, path, req, remaining).await?,
     ))
 }
 
@@ -317,13 +307,20 @@ async fn forward_deploy_request<Req, Resp>(
     owner_origin: &str,
     path: &str,
     req: &Req,
+    timeout: Duration,
 ) -> anyhow::Result<Resp>
 where
     Req: Serialize + ?Sized,
     Resp: DeserializeOwned,
 {
     let url = format!("{owner_origin}{path}");
-    let response = reqwest::Client::new().post(&url).json(req).send().await?;
+    let response = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .post(&url)
+        .json(req)
+        .send()
+        .await?;
     let status = response.status();
     let body = response.text().await?;
     anyhow::ensure!(

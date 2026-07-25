@@ -10,6 +10,7 @@
 use std::{
     collections::BTreeMap,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -30,6 +31,7 @@ use common::{
 };
 use database::{
     partition::PartitionId,
+    raft_partition::RaftPartitionState,
     Token,
 };
 use keybroker::Identity;
@@ -54,18 +56,28 @@ use serde_json::Value as JsonValue;
 use sync_types::types::SerializedArgs;
 use tokio::sync::Mutex;
 use tonic::{
-    transport::Channel,
+    transport::{
+        Channel,
+        Endpoint,
+    },
     Request,
     Response,
     Status,
 };
 use value::JsonPackedValue;
 
+use crate::authority_routing::authority_redirect_status;
+
+const FORWARDER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const FORWARDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// gRPC server for mutation forwarding. Runs on the Primary.
 pub struct MutationForwarderService {
     api: Arc<dyn ApplicationApi>,
     instance_name: String,
     cluster_auth: Option<ClusterGrpcAuth>,
+    raft_state: Option<RaftPartitionState>,
+    raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
 }
 
 impl MutationForwarderService {
@@ -78,6 +90,24 @@ impl MutationForwarderService {
             api,
             instance_name,
             cluster_auth,
+            raft_state: None,
+            raft_peer_grpc_urls: None,
+        }
+    }
+
+    pub fn new_with_raft(
+        api: Arc<dyn ApplicationApi>,
+        instance_name: String,
+        cluster_auth: Option<ClusterGrpcAuth>,
+        raft_state: Option<RaftPartitionState>,
+        raft_peer_grpc_urls: Option<BTreeMap<u64, String>>,
+    ) -> Self {
+        Self {
+            api,
+            instance_name,
+            cluster_auth,
+            raft_state,
+            raft_peer_grpc_urls,
         }
     }
 
@@ -91,6 +121,29 @@ impl MutationForwarderService {
         }
         Ok(())
     }
+
+    fn ensure_authority(&self, require_serving_lease: bool) -> Result<(), Status> {
+        let Some(raft_state) = self.raft_state.as_ref() else {
+            return Ok(());
+        };
+        if raft_state.is_cluster_genesis_ready()
+            && raft_state.is_leader_ready()
+            && (!require_serving_lease || raft_state.has_leader_serving_lease())
+        {
+            return Ok(());
+        }
+        Err(authority_redirect_status(
+            format!(
+                "Node {} is not ready to serve as the authority for partition {}; current leader \
+                 is {}",
+                raft_state.node_id(),
+                raft_state.partition_id(),
+                raft_state.leader_id(),
+            ),
+            Some(raft_state),
+            self.raft_peer_grpc_urls.as_ref(),
+        ))
+    }
 }
 
 #[tonic::async_trait]
@@ -100,6 +153,7 @@ impl MutationForwarder for MutationForwarderService {
         request: Request<ForwardMutationRequest>,
     ) -> Result<Response<ForwardMutationResponse>, Status> {
         self.authenticate(&request)?;
+        self.ensure_authority(false)?;
         let req = request.into_inner();
 
         let identity = req
@@ -190,6 +244,7 @@ impl MutationForwarder for MutationForwarderService {
         request: Request<ForwardQueryRequest>,
     ) -> Result<Response<ForwardQueryResponse>, Status> {
         self.authenticate(&request)?;
+        self.ensure_authority(true)?;
         let req = request.into_inner();
 
         let identity = req
@@ -370,9 +425,12 @@ impl MutationForwarderGrpcClient {
         cluster_auth: Option<ClusterGrpcAuth>,
     ) -> anyhow::Result<Self> {
         let normalized_url = normalize_grpc_url(primary_url);
-        let client = TonicMutationForwarderClient::connect(normalized_url.clone())
+        let channel = Endpoint::from_shared(normalized_url.clone())?
+            .connect_timeout(FORWARDER_CONNECT_TIMEOUT)
+            .connect()
             .await
             .with_context(|| format!("Failed to connect to Primary at {normalized_url}"))?;
+        let client = TonicMutationForwarderClient::new(channel);
         tracing::info!("Connected to Primary mutation forwarder at {normalized_url}");
         Ok(Self {
             client,
@@ -387,6 +445,12 @@ impl MutationForwarderGrpcClient {
         }
     }
 
+    fn request_with_timeout<T>(&self, message: T, timeout: Duration) -> Request<T> {
+        let mut request = self.request(message);
+        request.set_timeout(timeout);
+        request
+    }
+
     /// Forward a mutation to the Primary and return the result.
     pub async fn forward(
         &self,
@@ -394,6 +458,18 @@ impl MutationForwarderGrpcClient {
         args: &str,
         identity: Identity,
         caller: &str,
+    ) -> anyhow::Result<ForwardMutationResponse> {
+        self.forward_with_timeout(path, args, identity, caller, FORWARDER_DEFAULT_TIMEOUT)
+            .await
+    }
+
+    pub async fn forward_with_timeout(
+        &self,
+        path: &str,
+        args: &str,
+        identity: Identity,
+        caller: &str,
+        timeout: Duration,
     ) -> anyhow::Result<ForwardMutationResponse> {
         let identity_proto: pb::convex_identity::UncheckedIdentity = identity.into();
         let request = ForwardMutationRequest {
@@ -407,7 +483,7 @@ impl MutationForwarderGrpcClient {
         let response = self
             .client
             .clone()
-            .forward_mutation(self.request(request))
+            .forward_mutation(self.request_with_timeout(request, timeout))
             .await
             .context("gRPC mutation forwarding failed")?;
         Ok(response.into_inner())
@@ -422,6 +498,31 @@ impl MutationForwarderGrpcClient {
         ts: Option<u64>,
         read_after_write: Option<Vec<ReadAfterWriteFence>>,
         journal: Option<String>,
+    ) -> anyhow::Result<RedactedQueryReturn> {
+        self.forward_query_with_timeout(
+            path,
+            args,
+            identity,
+            caller,
+            ts,
+            read_after_write,
+            journal,
+            FORWARDER_DEFAULT_TIMEOUT,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_query_with_timeout(
+        &self,
+        path: &str,
+        args: &str,
+        identity: Identity,
+        caller: FunctionCaller,
+        ts: Option<u64>,
+        read_after_write: Option<Vec<ReadAfterWriteFence>>,
+        journal: Option<String>,
+        timeout: Duration,
     ) -> anyhow::Result<RedactedQueryReturn> {
         let identity_proto: pb::convex_identity::UncheckedIdentity = identity.into();
         let read_after_write_fences = read_after_write.clone().unwrap_or_default();
@@ -447,7 +548,7 @@ impl MutationForwarderGrpcClient {
         let response = self
             .client
             .clone()
-            .forward_query(self.request(request))
+            .forward_query(self.request_with_timeout(request, timeout))
             .await
             .context("gRPC query forwarding failed")?;
         let response = response.into_inner();

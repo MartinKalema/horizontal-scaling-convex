@@ -1348,6 +1348,8 @@ pub struct Committer<RT: Runtime> {
     // None means single-node mode (local clock, existing behavior).
     timestamp_oracle: Option<Arc<dyn crate::timestamp_oracle::TimestampOracle>>,
     maintenance_tso_refill_in_flight: Arc<AtomicBool>,
+    pending_tso_committed_floor: Arc<Mutex<Timestamp>>,
+    tso_committed_floor_flush_in_flight: Arc<AtomicBool>,
 
     // 2PC prepared transactions awaiting CommitPrepared or RollbackPrepared.
     // Keyed by TwoPhaseTransactionId, storing the prepared intent and metadata
@@ -1533,6 +1535,8 @@ impl<RT: Runtime> Committer<RT> {
             placement_state,
             timestamp_oracle,
             maintenance_tso_refill_in_flight: Arc::new(AtomicBool::new(false)),
+            pending_tso_committed_floor: Arc::new(Mutex::new(Timestamp::MIN)),
+            tso_committed_floor_flush_in_flight: Arc::new(AtomicBool::new(false)),
             prepared_transactions: std::collections::HashMap::new(),
             prepared_commit_waiters: std::collections::HashMap::new(),
             prepared_rollback_waiters: std::collections::HashMap::new(),
@@ -1810,9 +1814,12 @@ impl<RT: Runtime> Committer<RT> {
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox {
-                                if let Err(err) = Self::record_and_replay_raft_nats_outbox_delta(
+                                // Raft has accepted this write. Durably enqueue cross-partition
+                                // delivery before acknowledging it, but do not make client success
+                                // depend on NATS availability. The ordered replay loop publishes the
+                                // outbox after transport recovery.
+                                if let Err(err) = Self::record_raft_nats_outbox_delta(
                                     self.persistence.clone(),
-                                    self.distributed_log.clone(),
                                     &published_commit.delta,
                                     "local",
                                 )
@@ -1959,9 +1966,11 @@ impl<RT: Runtime> Committer<RT> {
                             let use_raft_nats_outbox =
                                 Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox {
-                                if let Err(err) = Self::record_and_replay_raft_nats_outbox_delta(
+                                // The 2PC decision is final once the participant commits. Keep NATS
+                                // publication outside that acknowledgement boundary while retaining
+                                // the delta durably for ordered replay.
+                                if let Err(err) = Self::record_raft_nats_outbox_delta(
                                     self.persistence.clone(),
-                                    self.distributed_log.clone(),
                                     &published_commit.delta,
                                     "2pc_participant",
                                 )
@@ -4206,23 +4215,6 @@ impl<RT: Runtime> Committer<RT> {
         Ok(replayed)
     }
 
-    async fn record_and_replay_raft_nats_outbox_delta(
-        persistence: Arc<dyn Persistence>,
-        distributed_log: Arc<dyn DistributedLog>,
-        delta: &CommitDelta,
-        path: &'static str,
-    ) -> anyhow::Result<()> {
-        Self::record_raft_nats_outbox_delta(persistence.clone(), delta, path).await?;
-        if let Err(err) = Self::replay_raft_nats_outbox_once(persistence, distributed_log).await {
-            tracing::error!(
-                "Failed to publish committed write at ts={} to replication log through ordered \
-                 Raft->NATS outbox; leaving outbox entries for replay: {err:#}",
-                u64::from(delta.ts),
-            );
-        }
-        Ok(())
-    }
-
     fn should_record_raft_nats_outbox_delta(delta: &CommitDelta) -> bool {
         delta.source_partition.is_some()
     }
@@ -4485,29 +4477,7 @@ impl<RT: Runtime> Committer<RT> {
             latest_snapshot_ts,
         );
 
-        if let Some(ref tso) = self.timestamp_oracle {
-            let tso = tso.clone();
-            let tso_advance_timer =
-                metrics::commit_hot_path_stage_timer(path, "tso_advance_committed");
-            let advance_result = block_in_place(|| {
-                let rt = tokio::runtime::Handle::current();
-                if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                    futures::executor::block_on(tso.advance_committed_ts(commit_ts))
-                } else {
-                    rt.block_on(tso.advance_committed_ts(commit_ts))
-                }
-            });
-            if advance_result.is_ok() {
-                tso_advance_timer.finish();
-            }
-            if let Err(err) = advance_result {
-                tracing::warn!(
-                    "Failed to advance global max_committed to {} before publishing commit: \
-                     {err:#}",
-                    u64::from(commit_ts),
-                );
-            }
-        }
+        self.queue_tso_committed_floor_flush(commit_ts);
 
         // Write transaction state at the commit ts to the document store.
         let hot_path_apply_timer = metrics::commit_hot_path_stage_timer(path, "apply_visible");
@@ -6868,6 +6838,22 @@ impl<RT: Runtime> Committer<RT> {
             .expect("validated commit should stage a pending snapshot");
         let commit_ts = pending_write.must_commit_ts();
         self.enqueue_snapshot(commit_id, commit_ts, queued_snapshot);
+        if result.is_closed() {
+            return Some(
+                async move {
+                    Ok(PersistenceWrite::RejectedBeforePersistence {
+                        pending_write,
+                        commit_timer,
+                        result,
+                        commit_id,
+                        err: anyhow::anyhow!(
+                            "Commit request was cancelled before Raft proposal at ts={commit_ts}"
+                        ),
+                    })
+                }
+                .boxed(),
+            );
+        }
         let virtual_system_mapping = self.virtual_system_mapping.clone();
 
         Self::track_commit(
@@ -7292,6 +7278,71 @@ impl<RT: Runtime> Committer<RT> {
                 );
             }
             refill_in_flight.store(false, Ordering::Release);
+        });
+    }
+
+    fn queue_tso_committed_floor_flush(&self, commit_ts: Timestamp) {
+        let Some(tso) = self.timestamp_oracle.clone() else {
+            return;
+        };
+
+        // Timestamp uniqueness was established when this commit's batch range
+        // was reserved. Keep the local allocation floor current immediately,
+        // but do not make a quorum-committed write wait on NATS KV.
+        tso.observe_committed_ts(commit_ts);
+        {
+            let mut pending_floor = self.pending_tso_committed_floor.lock();
+            if commit_ts > *pending_floor {
+                *pending_floor = commit_ts;
+            }
+        }
+
+        if self
+            .tso_committed_floor_flush_in_flight
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let pending_floor = self.pending_tso_committed_floor.clone();
+        let flush_in_flight = self.tso_committed_floor_flush_in_flight.clone();
+        let runtime = self.runtime.clone();
+        tokio_spawn("flush_tso_committed_floor", async move {
+            let mut backoff = Backoff::new(
+                INITIAL_PERSISTENCE_WRITES_BACKOFF,
+                MAX_PERSISTENCE_WRITES_BACKOFF,
+            );
+            loop {
+                let target = *pending_floor.lock();
+                match tso.advance_committed_ts(target).await {
+                    Ok(()) => {
+                        backoff.reset();
+                    },
+                    Err(mut error) => {
+                        let delay = backoff.fail(&mut runtime.rng());
+                        report_error(&mut error).await;
+                        tracing::warn!(
+                            target = u64::from(target),
+                            retry_delay_seconds = delay.as_secs_f64(),
+                            "Failed to publish the TSO committed floor; retrying in background",
+                        );
+                        runtime.wait(delay).await;
+                        continue;
+                    },
+                }
+
+                if *pending_floor.lock() > target {
+                    continue;
+                }
+
+                // Clear the marker, then close the race with a commit that may
+                // have raised the pending floor while the marker was still set.
+                flush_in_flight.store(false, Ordering::Release);
+                if *pending_floor.lock() > target && !flush_in_flight.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                break;
+            }
         });
     }
 }
@@ -8926,6 +8977,44 @@ mod tests {
                 .await?
                 .len(),
             1
+        );
+
+        log.allow_publishes();
+        let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+            persistence.clone(),
+            log.clone(),
+        )
+        .await?;
+        assert_eq!(replayed, 1);
+        assert_eq!(log.published(), vec![ts]);
+        assert!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_record_does_not_publish_synchronously() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let log = Arc::new(RecordingDistributedLog::failing());
+        let ts = Timestamp::must(13);
+
+        Committer::<TestRuntime>::record_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts),
+            "test",
+        )
+        .await?;
+
+        assert_eq!(log.published(), Vec::<Timestamp>::new());
+        assert_eq!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence.clone())
+                .await?
+                .len(),
+            1,
+            "the accepted write must be durable without waiting for NATS",
         );
 
         log.allow_publishes();
