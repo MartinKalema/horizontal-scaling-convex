@@ -39,6 +39,7 @@ pub(crate) enum AuthorityEndpointKind {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AttemptTimeoutDisposition {
     Retry,
+    RetryableRead,
     Fail,
 }
 
@@ -182,15 +183,19 @@ impl AuthorityResolver {
                     self.policy.total_timeout,
                     failures.join("; "),
                 );
-                // Read-only attempts can use short probes and move on. Once a
-                // side-effecting request may be dispatched, give it the full
-                // remaining deadline because timing it out is ambiguous and we
-                // intentionally will not replay it.
+                // Lightweight probes can use short attempts and move on. Real
+                // reads and side-effecting requests need the remaining
+                // end-to-end deadline once dispatched: queries can legitimately
+                // spend longer than the candidate-probe timeout establishing a
+                // cluster-safe snapshot, while replaying an ambiguously timed
+                // out mutation would be unsafe.
                 let attempt_timeout = match timeout_disposition {
                     AttemptTimeoutDisposition::Retry => {
                         remaining.min(self.policy.per_attempt_timeout)
                     },
-                    AttemptTimeoutDisposition::Fail => remaining,
+                    AttemptTimeoutDisposition::RetryableRead | AttemptTimeoutDisposition::Fail => {
+                        remaining
+                    },
                 };
                 let outcome = tokio::time::timeout(
                     attempt_timeout,
@@ -871,6 +876,40 @@ mod tests {
                         attempt.timeout > policy.per_attempt_timeout,
                         "a dispatched side effect must not inherit the short candidate timeout"
                     );
+                    Ok("served")
+                },
+            )
+            .await?;
+
+        assert_eq!(result.value, "served");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatched_read_can_outlive_candidate_probe_timeout() -> anyhow::Result<()> {
+        let policy = test_policy();
+        let resolver = AuthorityResolver::new(
+            SharedNodeAddresses::new(Some(database::two_phase::NodeAddresses::from_config(
+                "0=leader:50051",
+            ))),
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_policy(policy);
+
+        let result = resolver
+            .route(
+                PartitionId::DEFAULT,
+                AuthorityEndpointKind::Grpc,
+                AttemptTimeoutDisposition::RetryableRead,
+                move |attempt| async move {
+                    assert!(
+                        attempt.timeout > policy.per_attempt_timeout,
+                        "a dispatched read must receive the remaining request deadline"
+                    );
+                    tokio::time::sleep(policy.per_attempt_timeout * 2).await;
                     Ok("served")
                 },
             )

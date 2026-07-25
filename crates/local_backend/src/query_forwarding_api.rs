@@ -244,7 +244,7 @@ impl application::api::ApplicationApi for SelectiveQueryForwardingApi {
                 .route(
                     SELECTIVE_QUERY_AUTHORITY_PARTITION,
                     AuthorityEndpointKind::Grpc,
-                    AttemptTimeoutDisposition::Retry,
+                    AttemptTimeoutDisposition::RetryableRead,
                     move |attempt| {
                         let pool = pool.clone();
                         let path = path.clone();
