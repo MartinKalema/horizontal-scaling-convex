@@ -47,6 +47,7 @@ use database::{
     BootstrapMetadata,
     FollowerRetentionManager,
     TableCountSnapshot,
+    TableNumberAllocator,
     Transaction,
     TransactionTextSnapshot,
 };
@@ -194,6 +195,7 @@ pub struct FunctionRunnerCore<RT: Runtime, S: StorageForDeployment<RT>> {
     module_cache: ModuleCache<RT>,
     code_cache: CodeCache,
     isolate_client: IsolateClient<RT>,
+    table_number_allocator: Arc<dyn TableNumberAllocator>,
 }
 
 impl<RT: Runtime, S: StorageForDeployment<RT>> Clone for FunctionRunnerCore<RT, S> {
@@ -205,6 +207,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> Clone for FunctionRunnerCore<RT, 
             module_cache: self.module_cache.clone(),
             code_cache: self.code_cache.clone(),
             isolate_client: self.isolate_client.clone(),
+            table_number_allocator: self.table_number_allocator.clone(),
         }
     }
 }
@@ -230,8 +233,19 @@ pub async fn validate_run_function_result(
 }
 
 impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
-    pub fn new(rt: RT, storage: S, max_percent_per_client: usize) -> anyhow::Result<Self> {
-        Self::_new(rt, storage, max_percent_per_client, MAX_ISOLATE_WORKERS)
+    pub fn new(
+        rt: RT,
+        storage: S,
+        max_percent_per_client: usize,
+        table_number_allocator: Arc<dyn TableNumberAllocator>,
+    ) -> anyhow::Result<Self> {
+        Self::_new(
+            rt,
+            storage,
+            max_percent_per_client,
+            MAX_ISOLATE_WORKERS,
+            table_number_allocator,
+        )
     }
 
     fn _new(
@@ -239,6 +253,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         storage: S,
         max_percent_per_client: usize,
         max_isolate_workers: usize,
+        table_number_allocator: Arc<dyn TableNumberAllocator>,
     ) -> anyhow::Result<Self> {
         let isolate_client = IsolateClient::new(
             rt.clone(),
@@ -257,6 +272,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             module_cache,
             code_cache,
             isolate_client,
+            table_number_allocator,
         })
     }
 
@@ -349,6 +365,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 usage_tracker.clone(),
                 retention_validator,
                 index_reader_override,
+                self.table_number_allocator.clone(),
             )
             .await?;
         let storage = self

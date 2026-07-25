@@ -122,7 +122,9 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
     ) -> anyhow::Result<Self> {
         // InProcessFunrun is single tenant and thus can use the full capacity.
         let max_percent_per_client = 100;
-        let server = FunctionRunnerCore::new(rt, storage, max_percent_per_client)?;
+        let table_number_allocator = database.table_number_allocator();
+        let server =
+            FunctionRunnerCore::new(rt, storage, max_percent_per_client, table_number_allocator)?;
         Ok(Self {
             server,
             persistence_reader,

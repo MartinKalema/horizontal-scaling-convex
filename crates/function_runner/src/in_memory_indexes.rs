@@ -46,6 +46,7 @@ use database::{
     DatabaseSnapshot,
     SchemaRegistry,
     TableCountSnapshot,
+    TableNumberAllocator,
     TableRegistry,
     Transaction,
     TransactionIdGenerator,
@@ -105,6 +106,7 @@ fn make_transaction<RT: Runtime>(
     retention_validator: Arc<dyn RetentionValidator>,
     virtual_system_mapping: VirtualSystemMapping,
     usage_tracker: FunctionUsageTracker,
+    table_number_allocator: Arc<dyn TableNumberAllocator>,
 ) -> anyhow::Result<Transaction<RT>> {
     let id_generator = TransactionIdGenerator::new(&rt)?;
     // The transaction timestamp might be few minutes behind if the backend
@@ -112,7 +114,7 @@ fn make_transaction<RT: Runtime>(
     let creation_time = CreationTime::try_from(cmp::max(*ts, rt.generate_timestamp()?))?;
     let transaction_index =
         TransactionIndex::new(index_registry, database_index_snapshot, text_index_snapshot);
-    Ok(Transaction::new(
+    Ok(Transaction::new_with_table_number_allocator(
         identity,
         id_generator,
         creation_time,
@@ -125,6 +127,7 @@ fn make_transaction<RT: Runtime>(
         usage_tracker,
         retention_validator,
         virtual_system_mapping,
+        table_number_allocator,
     ))
 }
 
@@ -600,6 +603,7 @@ impl<RT: Runtime> InMemoryIndexCache<RT> {
         usage_tracker: FunctionUsageTracker,
         retention_validator: Arc<dyn RetentionValidator>,
         index_reader_override: Option<Arc<dyn IndexReader>>,
+        table_number_allocator: Arc<dyn TableNumberAllocator>,
     ) -> anyhow::Result<Transaction<RT>> {
         let _timer = begin_tx_timer();
         for (index_id, last_modified) in &in_memory_index_last_modified {
@@ -650,6 +654,7 @@ impl<RT: Runtime> InMemoryIndexCache<RT> {
             retention_validator,
             virtual_system_mapping().clone(),
             usage_tracker,
+            table_number_allocator,
         )?;
         tx.merge_writes(existing_writes.updates)?;
         Ok(tx)
