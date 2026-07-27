@@ -120,6 +120,7 @@ use crate::{
     write_log::WriteSource,
 };
 
+const TWO_PHASE_GRPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const TWO_PHASE_GRPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Globally unique transaction ID for 2PC.
@@ -1807,7 +1808,7 @@ impl TwoPhaseCommitGrpcClient {
         let normalized_addr = normalize_grpc_addr(addr);
         let endpoint = Endpoint::from_shared(normalized_addr.clone())
             .with_context(|| format!("Invalid 2PC service address {normalized_addr}"))?
-            .connect_timeout(TWO_PHASE_GRPC_TIMEOUT)
+            .connect_timeout(TWO_PHASE_GRPC_CONNECT_TIMEOUT)
             .timeout(TWO_PHASE_GRPC_TIMEOUT);
         let channel = endpoint
             .connect()
