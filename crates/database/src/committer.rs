@@ -423,6 +423,16 @@ enum RaftNatsOutboxRecordStorage {
     PerEntry,
 }
 
+struct RaftNatsOutboxReplayGuard {
+    in_progress: Arc<AtomicBool>,
+}
+
+impl Drop for RaftNatsOutboxReplayGuard {
+    fn drop(&mut self) {
+        self.in_progress.store(false, Ordering::Release);
+    }
+}
+
 /// State held for a 2PC-prepared transaction awaiting commit/rollback.
 struct PreparedTransaction {
     prepared_write: PreparedWriteHandle,
@@ -1588,6 +1598,7 @@ impl<RT: Runtime> Committer<RT> {
         let mut last_remote_read_frontier_heartbeat = self.runtime.monotonic_now();
         let mut last_remote_read_frontier_heartbeat_ts = Timestamp::MIN;
         let mut last_raft_nats_outbox_replay = self.runtime.monotonic_now();
+        let raft_nats_outbox_replay_in_progress = Arc::new(AtomicBool::new(false));
         // Assume there were commits just before the backend restarted, so first do a
         // quick bump.
         // None means a bump is ongoing. Avoid parallel bumps in case they
@@ -1668,6 +1679,7 @@ impl<RT: Runtime> Committer<RT> {
                 Either::Right(std::future::pending())
             };
             let raft_nats_outbox_replay_fut = if !snapshot_barrier_active
+                && !raft_nats_outbox_replay_in_progress.load(Ordering::Acquire)
                 && self
                     .placement_state
                     .as_ref()
@@ -1715,20 +1727,11 @@ impl<RT: Runtime> Committer<RT> {
                 }
                 _ = raft_nats_outbox_replay_fut.fuse() => {
                     if self.should_replay_raft_nats_outbox() {
-                        match Self::replay_raft_nats_outbox_once(
+                        Self::spawn_raft_nats_outbox_replay(
                             self.persistence.clone(),
                             self.distributed_log.clone(),
-                        )
-                        .await
-                        {
-                            Ok(replayed) if replayed > 0 => {
-                                tracing::info!("Replayed {replayed} Raft->NATS outbox deltas");
-                            },
-                            Ok(_) => {},
-                            Err(err) => {
-                                tracing::warn!("Failed to replay Raft->NATS outbox: {err:#}");
-                            },
-                        }
+                            raft_nats_outbox_replay_in_progress.clone(),
+                        );
                     }
                     last_raft_nats_outbox_replay = self.runtime.monotonic_now();
                 }
@@ -4232,6 +4235,35 @@ impl<RT: Runtime> Committer<RT> {
             replayed += 1;
         }
         Ok(replayed)
+    }
+
+    fn spawn_raft_nats_outbox_replay(
+        persistence: Arc<dyn Persistence>,
+        distributed_log: Arc<dyn DistributedLog>,
+        in_progress: Arc<AtomicBool>,
+    ) -> bool {
+        if in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        tokio_spawn("replay_raft_nats_outbox", async move {
+            let _guard = RaftNatsOutboxReplayGuard {
+                in_progress: in_progress.clone(),
+            };
+            match Self::replay_raft_nats_outbox_once(persistence, distributed_log).await {
+                Ok(replayed) if replayed > 0 => {
+                    tracing::info!("Replayed {replayed} Raft->NATS outbox deltas");
+                },
+                Ok(_) => {},
+                Err(err) => {
+                    tracing::warn!("Failed to replay Raft->NATS outbox: {err:#}");
+                },
+            }
+        });
+        true
     }
 
     fn should_record_raft_nats_outbox_delta(delta: &CommitDelta) -> bool {
@@ -8394,8 +8426,10 @@ mod tests {
             },
             Arc,
         },
+        time::Duration,
     };
 
+    use anyhow::Context;
     use async_trait::async_trait;
     use common::{
         bootstrap_model::index::{
@@ -8421,7 +8455,10 @@ mod tests {
     use futures::stream::BoxStream;
     use runtime::testing::TestRuntime;
     use sync_types::Timestamp;
-    use tokio::sync::oneshot;
+    use tokio::sync::{
+        oneshot,
+        Barrier,
+    };
     use value::{
         InternalId,
         PublicDocumentId,
@@ -8464,6 +8501,34 @@ mod tests {
     struct FailTimestampDistributedLog {
         fail_ts: Timestamp,
         published: parking_lot::Mutex<Vec<Timestamp>>,
+    }
+
+    struct BlockingDistributedLog {
+        publish_started: Barrier,
+        release_publish: Barrier,
+        published: parking_lot::Mutex<Vec<Timestamp>>,
+    }
+
+    impl BlockingDistributedLog {
+        fn new() -> Self {
+            Self {
+                publish_started: Barrier::new(2),
+                release_publish: Barrier::new(2),
+                published: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn wait_until_publish_started(&self) {
+            self.publish_started.wait().await;
+        }
+
+        async fn release_publish(&self) {
+            self.release_publish.wait().await;
+        }
+
+        fn published(&self) -> Vec<Timestamp> {
+            self.published.lock().clone()
+        }
     }
 
     impl FailTimestampDistributedLog {
@@ -8594,6 +8659,23 @@ mod tests {
             if delta.ts == self.fail_ts {
                 anyhow::bail!("injected publish failure at {}", u64::from(delta.ts));
             }
+            self.published.lock().push(delta.ts);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _from_ts: Timestamp,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    #[async_trait]
+    impl DistributedLog for BlockingDistributedLog {
+        async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+            self.publish_started.wait().await;
+            self.release_publish.wait().await;
             self.published.lock().push(delta.ts);
             Ok(())
         }
@@ -8807,6 +8889,57 @@ mod tests {
         .await?;
 
         assert_eq!(replayed, 1);
+        assert_eq!(log.published(), vec![ts]);
+        assert!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_replay_is_nonblocking_and_single_flight() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let log = Arc::new(BlockingDistributedLog::new());
+        let ts = Timestamp::must(10);
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts),
+        )
+        .await?;
+        let in_progress = Arc::new(AtomicBool::new(false));
+
+        assert!(
+            Committer::<TestRuntime>::spawn_raft_nats_outbox_replay(
+                persistence.clone(),
+                log.clone(),
+                in_progress.clone(),
+            ),
+            "the first replay should start in the background",
+        );
+        tokio::time::timeout(Duration::from_secs(1), log.wait_until_publish_started())
+            .await
+            .context("background outbox replay did not reach the distributed log")?;
+        assert!(in_progress.load(Ordering::Acquire));
+        assert!(
+            !Committer::<TestRuntime>::spawn_raft_nats_outbox_replay(
+                persistence.clone(),
+                log.clone(),
+                in_progress.clone(),
+            ),
+            "a blocked replay must suppress overlapping maintenance attempts",
+        );
+
+        log.release_publish().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while in_progress.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("background outbox replay did not release its single-flight guard")?;
+
         assert_eq!(log.published(), vec![ts]);
         assert!(
             Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
