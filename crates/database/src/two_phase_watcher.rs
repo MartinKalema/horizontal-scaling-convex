@@ -47,7 +47,7 @@ async fn apply_final_decision_for_local_partition(
             // Transaction was committed but the coordinator may have crashed
             // before sending CommitPrepared to all participants. Try to commit
             // locally — if already committed, this is a no-op.
-            match committer.commit_prepared(txn_id.clone()).await {
+            match committer.try_commit_prepared(txn_id.clone()).await {
                 Ok(ts) => {
                     tracing::info!(
                         "2PC Watcher: resolved committed txn={} at ts={}",
@@ -308,6 +308,20 @@ pub fn start<RT: Runtime>(
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
 
+            // Resolve expired prepares before final decisions. Otherwise a
+            // committed transaction ordered after an abandoned prepare can
+            // wait forever and prevent this single watcher loop from ever
+            // reaching the timeout rollback that unblocks it.
+            if let Err(err) = rollback_expired_local_prepares(
+                &committer,
+                local_partition,
+                Duration::from_secs(PREPARE_TIMEOUT_SECS),
+            )
+            .await
+            {
+                tracing::debug!("2PC Watcher: failed to resolve expired prepares: {err:#}");
+            }
+
             // Scan all 2PC keys.
             let keys = match kv.keys().await {
                 Ok(keys) => {
@@ -354,16 +368,6 @@ pub fn start<RT: Runtime>(
                 {
                     tracing::debug!("2PC Watcher: failed to resolve local decision: {err:#}");
                 }
-            }
-
-            if let Err(err) = rollback_expired_local_prepares(
-                &committer,
-                local_partition,
-                Duration::from_secs(PREPARE_TIMEOUT_SECS),
-            )
-            .await
-            {
-                tracing::debug!("2PC Watcher: failed to resolve expired prepares: {err:#}");
             }
         }
     });

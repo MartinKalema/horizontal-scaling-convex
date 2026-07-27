@@ -9581,6 +9581,116 @@ async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
     Ok(())
 }
 
+#[convex_macro::test_runtime]
+async fn test_watcher_does_not_stall_behind_abandoned_prepare(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log,
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    insert_doc(
+        &node,
+        "projects",
+        assert_obj!("name" => "watcher-ordering-baseline"),
+    )
+    .await?;
+    let (abandoned_txn, ..) = prepare_project_insert_for_2pc_sim(
+        &node,
+        "watcher-abandoned-predecessor",
+        "watcher_abandoned_predecessor".to_string(),
+        vec![PartitionId(1)],
+    )
+    .await?;
+    let (committed_txn, committed_ts, _) = prepare_project_insert_for_2pc_sim(
+        &node,
+        "watcher-committed-successor",
+        "watcher_committed_successor".to_string(),
+        vec![PartitionId(1)],
+    )
+    .await?;
+    let committed = TwoPhaseDecision::committed(u64::from(committed_ts), vec![1]);
+    decision_log
+        .write_decision(&committed_txn, &committed)
+        .await?;
+
+    let resolved = tokio::time::timeout(
+        Duration::from_millis(250),
+        crate::two_phase_watcher::resolve_decision_for_local_partition(
+            &node.committer_for_test(),
+            PartitionId(1),
+            committed_txn.clone(),
+            committed.clone(),
+        ),
+    )
+    .await
+    .context("watcher must not wait indefinitely behind an earlier prepare")??;
+    assert!(
+        !resolved,
+        "the successor cannot commit until the abandoned predecessor is resolved",
+    );
+
+    crate::two_phase_watcher::rollback_expired_local_prepares(
+        &node.committer_for_test(),
+        PartitionId(1),
+        Duration::ZERO,
+    )
+    .await?;
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        committed_txn,
+        committed,
+    )
+    .await?;
+    assert!(
+        resolved,
+        "the committed successor should resolve after timeout cleanup removes its predecessor",
+    );
+    assert!(
+        decision_log
+            .get_decision(&abandoned_txn)
+            .await?
+            .is_some_and(|decision| matches!(decision, TwoPhaseDecision::RolledBack { .. })),
+        "the abandoned predecessor must receive a durable rollback decision",
+    );
+
+    let projects = run_query(
+        node.clone(),
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert!(
+        !projects.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("watcher-abandoned-predecessor"))
+        }),
+        "the abandoned predecessor must remain invisible",
+    );
+    assert!(
+        projects.iter().any(|project| {
+            project.value().0.get("name") == Some(&assert_val!("watcher-committed-successor"))
+        }),
+        "the committed successor must become visible after recovery",
+    );
+    assert!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .is_empty(),
+        "watcher recovery must remove both durable redo records",
+    );
+    Ok(())
+}
+
 #[test]
 fn test_watcher_gc_deletes_only_fully_resolved_decisions_after_grace() -> anyhow::Result<()> {
     let td = TestDriver::new_with_io();

@@ -2700,10 +2700,16 @@ impl<RT: Runtime> Committer<RT> {
                         },
                         Some(CommitterMessage::CommitPrepared {
                             transaction_id,
+                            wait_for_predecessors,
                             result,
                         }) => {
                             if let Some(persistence_write_future) =
-                                self.start_commit_prepared(transaction_id, result, commit_id)
+                                self.start_commit_prepared(
+                                    transaction_id,
+                                    wait_for_predecessors,
+                                    result,
+                                    commit_id,
+                                )
                             {
                                 self.persistence_writes.push_back(persistence_write_future);
                                 commit_id += 1;
@@ -6365,6 +6371,7 @@ impl<RT: Runtime> Committer<RT> {
     fn start_commit_prepared(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        wait_for_predecessors: bool,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
@@ -6409,6 +6416,16 @@ impl<RT: Runtime> Committer<RT> {
         if let Some(min_prepared_ts) = self.prepared_writes.min_ts()
             && min_prepared_ts < commit_ts
         {
+            if !wait_for_predecessors {
+                let _ = result.send(Err(anyhow::anyhow!(
+                    "2PC CommitPrepared: txn={} at ts={} is blocked behind unresolved prepared \
+                     ts={}",
+                    transaction_id,
+                    u64::from(commit_ts),
+                    u64::from(min_prepared_ts),
+                )));
+                return None;
+            }
             tracing::debug!(
                 "2PC CommitPrepared: deferring txn={} at ts={} behind unresolved prepared ts={}",
                 transaction_id,
@@ -6420,9 +6437,24 @@ impl<RT: Runtime> Committer<RT> {
             tokio_spawn(
                 "defer_commit_prepared_until_prior_intent_resolves",
                 async move {
+                    if result.is_closed() {
+                        tracing::debug!(
+                            "2PC CommitPrepared: caller stopped waiting for deferred txn={}",
+                            transaction_id,
+                        );
+                        return;
+                    }
                     rt.wait(Duration::from_millis(5)).await;
+                    if result.is_closed() {
+                        tracing::debug!(
+                            "2PC CommitPrepared: caller stopped waiting for deferred txn={}",
+                            transaction_id,
+                        );
+                        return;
+                    }
                     let message = CommitterMessage::CommitPrepared {
                         transaction_id,
+                        wait_for_predecessors,
                         result,
                     };
                     if let Err(err) = sender.try_send(message) {
@@ -7995,9 +8027,28 @@ impl CommitterClient {
         &self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
     ) -> anyhow::Result<Timestamp> {
+        self.commit_prepared_with_wait(transaction_id, true).await
+    }
+
+    /// Attempt participant cleanup without waiting behind an older unresolved
+    /// prepare. Recovery callers must remain free to resolve that predecessor
+    /// first instead of deadlocking the watcher on transaction order.
+    pub(crate) async fn try_commit_prepared(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<Timestamp> {
+        self.commit_prepared_with_wait(transaction_id, false).await
+    }
+
+    async fn commit_prepared_with_wait(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        wait_for_predecessors: bool,
+    ) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::CommitPrepared {
             transaction_id,
+            wait_for_predecessors,
             result: tx,
         };
         self.sender.try_send(message).map_err(|e| match e {
@@ -8269,6 +8320,7 @@ enum CommitterMessage {
     /// Writes to persistence, publishes commit, deletes redo log.
     CommitPrepared {
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        wait_for_predecessors: bool,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     /// 2PC RollbackPrepared: abort a previously prepared transaction.
