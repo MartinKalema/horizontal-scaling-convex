@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    fmt,
+    time::Duration,
+};
 
 use ::search::metrics::{
     SearchType,
@@ -1104,10 +1107,25 @@ register_convex_counter!(
     SHUTDOWN_TOTAL,
     "Count of errors caused due to the database shutting down"
 );
+
+#[derive(Debug)]
+struct DatabaseShutdown;
+
+impl fmt::Display for DatabaseShutdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Database Shutting Down")
+    }
+}
+
+impl std::error::Error for DatabaseShutdown {}
+
 pub fn shutdown_error() -> anyhow::Error {
     log_counter(&SHUTDOWN_TOTAL, 1);
-    anyhow::anyhow!("Database Shutting Down")
-        .context(ErrorMetadata::operational_internal_server_error())
+    anyhow::Error::new(DatabaseShutdown).context(ErrorMetadata::operational_internal_server_error())
+}
+
+pub(crate) fn is_shutdown_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DatabaseShutdown>().is_some()
 }
 
 register_convex_histogram!(BUMP_REPEATABLE_TS_SECONDS, "Time to bump max_repeatable_ts");

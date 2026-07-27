@@ -32,6 +32,7 @@ use crate::{
         RetryableReplicaApplyError,
     },
     committer::CommitterClient,
+    metrics,
     partition::PartitionId,
 };
 
@@ -147,6 +148,23 @@ where
             Ok((applied_ts, num_updates))
         },
         Err(e) => {
+            if metrics::is_shutdown_error(&e) {
+                tracing::info!(
+                    "Replica delta at ts={} was interrupted by database shutdown; NAKing for \
+                     redelivery",
+                    u64::from(ts),
+                );
+                if let Err(ack_err) = ack.nak().await {
+                    tracing::warn!(
+                        "Failed to NAK shutdown-interrupted replica delta at ts={}: {ack_err:#}",
+                        u64::from(ts),
+                    );
+                }
+                return Err(e.context(format!(
+                    "Database shutdown interrupted replica delta at ts={}",
+                    u64::from(ts),
+                )));
+            }
             if e.downcast_ref::<RetryableReplicaApplyError>().is_some() {
                 tracing::info!(
                     "Replica delta at ts={} is temporarily blocked; delayed-NAKing for {:?}: {e:#}",
@@ -305,6 +323,7 @@ mod tests {
             ReplicationPoisonKind,
             RetryableReplicaApplyError,
         },
+        metrics,
         partition::PartitionId,
         write_log::WriteSource,
     };
@@ -440,6 +459,35 @@ mod tests {
         assert_eq!(gap.kind, ReplicationPoisonKind::DeterministicApplyFailure);
         assert!(message.contains("replication poison gap"), "{message}");
         assert!(message.contains("forced apply failure"), "{message}");
+        assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.term.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupted_apply_naks_without_poisoning() -> anyhow::Result<()> {
+        let counts = Arc::new(AckCounts::default());
+        let ts = Timestamp::try_from(42u64)?;
+        let err = apply_replication_message_with(
+            test_message(ts, counts.clone()),
+            None,
+            |_delta, _transport_id| async move { Err(metrics::shutdown_error()) },
+        )
+        .await
+        .expect_err("shutdown-interrupted apply must return to the retry supervisor");
+
+        let message = format!("{err:#}");
+        assert!(metrics::is_shutdown_error(&err), "{message}");
+        assert!(
+            replication_poison_gap(&err).is_none(),
+            "shutdown must not create durable replication poison: {message}",
+        );
+        assert!(
+            message.contains("Database shutdown interrupted replica delta"),
+            "{message}",
+        );
         assert_eq!(counts.ack.load(Ordering::SeqCst), 0);
         assert_eq!(counts.nak.load(Ordering::SeqCst), 1);
         assert_eq!(counts.delayed_nak.load(Ordering::SeqCst), 0);
