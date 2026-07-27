@@ -416,7 +416,7 @@ async fn maybe_forward_public_mutation(
                 .route(
                     *partition,
                     AuthorityEndpointKind::Grpc,
-                    AttemptTimeoutDisposition::Retry,
+                    AttemptTimeoutDisposition::IdempotentMutation,
                     move |attempt| {
                         let pool = pool.clone();
                         let path = path.clone();
