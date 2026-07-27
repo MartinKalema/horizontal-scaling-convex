@@ -302,6 +302,16 @@ impl ReplicationAck for NoopReplicationAck {
 /// to get an ordered stream of deltas starting from a given timestamp.
 #[async_trait]
 pub trait DistributedLog: Send + Sync + 'static {
+    /// Whether source-partition commits must use the durable persistence
+    /// outbox instead of publishing on the commit hot path.
+    ///
+    /// Remote transports default to the safer outbox behavior. In-process and
+    /// no-op implementations can opt out because they do not incur a network
+    /// availability dependency.
+    fn requires_commit_outbox(&self) -> bool {
+        true
+    }
+
     /// Publish a committed delta to the log.
     ///
     /// Must be durable: once this returns Ok, Replicas are guaranteed to
@@ -335,6 +345,10 @@ pub struct NoopDistributedLog;
 
 #[async_trait]
 impl DistributedLog for NoopDistributedLog {
+    fn requires_commit_outbox(&self) -> bool {
+        false
+    }
+
     async fn publish(&self, _delta: CommitDelta) -> anyhow::Result<()> {
         Ok(())
     }
@@ -363,6 +377,10 @@ impl ClusterGenesisGatedDistributedLog {
 
 #[async_trait]
 impl DistributedLog for ClusterGenesisGatedDistributedLog {
+    fn requires_commit_outbox(&self) -> bool {
+        self.inner.requires_commit_outbox()
+    }
+
     async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
         if !self.ready.load(Ordering::SeqCst) {
             return Ok(());
@@ -438,6 +456,10 @@ pub mod testing {
 
     #[async_trait]
     impl DistributedLog for InMemoryDistributedLog {
+        fn requires_commit_outbox(&self) -> bool {
+            false
+        }
+
         async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
             self.deltas.lock().push(delta.clone());
             let _ = self.sender.send(delta);

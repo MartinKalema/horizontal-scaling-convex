@@ -415,6 +415,10 @@ impl SwitchableDistributedLog {
 
 #[async_trait]
 impl DistributedLog for SwitchableDistributedLog {
+    fn requires_commit_outbox(&self) -> bool {
+        self.fail_publishes.load(Ordering::SeqCst)
+    }
+
     async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
         if self.fail_publishes.load(Ordering::SeqCst) {
             anyhow::bail!("injected replication publish failure");

@@ -1815,7 +1815,7 @@ impl<RT: Runtime> Committer<RT> {
                                     .await;
                             }
                             let use_raft_nats_outbox =
-                                Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
+                                self.should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox {
                                 // Raft has accepted this write. Durably enqueue cross-partition
                                 // delivery before acknowledging it, but do not make client success
@@ -1967,7 +1967,7 @@ impl<RT: Runtime> Committer<RT> {
                                     .await;
                             }
                             let use_raft_nats_outbox =
-                                Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
+                                self.should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox {
                                 // The 2PC decision is final once the participant commits. Keep NATS
                                 // publication outside that acknowledgement boundary while retaining
@@ -2348,7 +2348,7 @@ impl<RT: Runtime> Committer<RT> {
                                 if self.raft_apply_markers.contains(&marker) {
                                     self.consolidate_raft_apply_marker(marker).await?;
                                 }
-                                if Self::should_record_raft_nats_outbox_delta(&delta) {
+                                if self.should_record_raft_nats_outbox_delta(&delta) {
                                     Self::add_raft_nats_outbox_delta(
                                         self.persistence.clone(),
                                         &delta,
@@ -4266,8 +4266,8 @@ impl<RT: Runtime> Committer<RT> {
         true
     }
 
-    fn should_record_raft_nats_outbox_delta(delta: &CommitDelta) -> bool {
-        delta.source_partition.is_some()
+    fn should_record_raft_nats_outbox_delta(&self, delta: &CommitDelta) -> bool {
+        delta.source_partition.is_some() && self.distributed_log.requires_commit_outbox()
     }
 
     fn should_replay_raft_nats_outbox(&self) -> bool {
