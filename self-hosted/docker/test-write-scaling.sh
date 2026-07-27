@@ -758,10 +758,20 @@ query_with_args() {
         -d "{\"path\":\"$3\",\"args\":$4}"
 }
 
+query_at_ts_with_args() {
+    curl -sf "$1/api/query_at_ts" \
+        -H "Authorization: Convex $2" \
+        -H "Content-Type: application/json" \
+        -d "{\"path\":\"$3\",\"args\":$4,\"ts\":\"$5\"}"
+}
+
 jval() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']['$1']))" <<< "$2"; }
 jtotal() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" <<< "$1"; }
 raw_participant_fences() {
     python3 -c "import sys,json; r=json.load(sys.stdin); fences=r.get('readAfterWrite',{}).get('participantFences',[]); print(','.join(str(f.get('sourcePartition')) for f in sorted(fences, key=lambda f: f.get('sourcePartition', -1))))" <<< "$1"
+}
+raw_read_after_write_ts() {
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('readAfterWrite',{}).get('ts',''))" <<< "$1"
 }
 
 dashboard_message_task_counts_on_nodes() {
@@ -2425,6 +2435,18 @@ if [ "${EXPECT_PARALLEL_2PC_EARLY_ACK:-false}" = "true" ]; then
         && pass "Parallel early-ack 2PC write appeared exactly once on both nodes" \
         || fail "Parallel early-ack 2PC write was lost or duplicated" \
             "msgA=$PARALLEL_MSG_A msgB=$PARALLEL_MSG_B taskA=$PARALLEL_TASK_A taskB=$PARALLEL_TASK_B"
+
+    PARALLEL_COMMIT_TS=$(raw_read_after_write_ts "$PARALLEL_RESPONSE")
+    PARALLEL_EXACT_RESPONSE=$(query_at_ts_with_args \
+        "$NODE_A_URL" "$NODE_A_KEY" "messages:safeSnapshotPair" \
+        "{\"text\":\"$PARALLEL_TEXT\",\"taskTitle\":\"$PARALLEL_TASK\"}" \
+        "$PARALLEL_COMMIT_TS")
+    PARALLEL_EXACT_MESSAGES=$(jval messages "$PARALLEL_EXACT_RESPONSE")
+    PARALLEL_EXACT_TASKS=$(jval tasks "$PARALLEL_EXACT_RESPONSE")
+    [ "$PARALLEL_EXACT_MESSAGES" -eq 1 ] && [ "$PARALLEL_EXACT_TASKS" -eq 1 ] \
+        && pass "Parallel commit timestamp was certified across owners without a torn read" \
+        || fail "Parallel commit timestamp returned a torn cross-partition snapshot" \
+            "messages=$PARALLEL_EXACT_MESSAGES tasks=$PARALLEL_EXACT_TASKS ts=$PARALLEL_COMMIT_TS"
 
     PARALLEL_LOG_AFTER=$(parallel_commit_log_count)
     [ "$PARALLEL_LOG_AFTER" -gt "$PARALLEL_LOG_BEFORE" ] \

@@ -318,7 +318,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         }
         let ts = match ts {
             ExecuteQueryTimestamp::Latest => *self.database.cluster_safe_read_ts().await?,
-            ExecuteQueryTimestamp::At(ts) => ts,
+            ExecuteQueryTimestamp::At(ts) => *self.database.cluster_read_ts_at(ts).await?,
         };
         self.read_only_udf_at_ts(
             request_id,
@@ -349,7 +349,7 @@ impl<RT: Runtime> ApplicationApi for Application<RT> {
         );
         let ts = match ts {
             ExecuteQueryTimestamp::Latest => *self.database.cluster_safe_read_ts().await?,
-            ExecuteQueryTimestamp::At(ts) => ts,
+            ExecuteQueryTimestamp::At(ts) => *self.database.cluster_read_ts_at(ts).await?,
         };
         self.read_only_udf_at_ts(
             request_id,

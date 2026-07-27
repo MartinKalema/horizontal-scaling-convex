@@ -152,6 +152,7 @@ use crate::{
     owner_read::{
         OwnerIndexRangeResult,
         OwnerReadClient,
+        ReadTimestampKind,
     },
     partition::{
         PartitionId,
@@ -491,6 +492,7 @@ impl OwnerReadClient for RetryOnceOwnerReadClient {
         _owner_partition: PartitionId,
         _placement_version: PlacementVersion,
         target_ts: Timestamp,
+        _kind: ReadTimestampKind,
     ) -> anyhow::Result<ReadTimestampClosure> {
         self.targets.lock().push(target_ts);
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -523,6 +525,7 @@ impl OwnerReadClient for PlacementChangingOwnerReadClient {
         _owner_partition: PartitionId,
         _placement_version: PlacementVersion,
         target_ts: Timestamp,
+        _kind: ReadTimestampKind,
     ) -> anyhow::Result<ReadTimestampClosure> {
         self.committer
             .refresh_placement_metadata(self.replacement.clone())?;
@@ -551,8 +554,14 @@ impl OwnerReadClient for CommitterBackedOwnerReadClient {
         _owner_partition: PartitionId,
         _placement_version: PlacementVersion,
         target_ts: Timestamp,
+        kind: ReadTimestampKind,
     ) -> anyhow::Result<ReadTimestampClosure> {
-        self.committer.close_latest_read_timestamp(target_ts).await
+        match kind {
+            ReadTimestampKind::Exact => self.committer.close_read_timestamp(target_ts).await,
+            ReadTimestampKind::Latest => {
+                self.committer.close_latest_read_timestamp(target_ts).await
+            },
+        }
     }
 
     async fn read_index_ranges(
@@ -619,6 +628,42 @@ async fn insert_doc(
         .insert(&table_name, fields)
         .await?;
     db.commit(tx).await
+}
+
+async fn apply_source_deltas_through_table(
+    log: &InMemoryDistributedLog,
+    target: &Database<TestRuntime>,
+    source_partition: PartitionId,
+    table: &str,
+) -> anyhow::Result<()> {
+    let table_name: TableName = table.parse()?;
+    for _ in 0..200 {
+        let deltas = log.deltas();
+        if deltas.iter().any(|delta| {
+            delta.source_partition == Some(source_partition)
+                && delta
+                    .tablet_id_to_table_name
+                    .values()
+                    .any(|mapped_table| mapped_table == &table_name)
+        }) {
+            for delta in deltas
+                .into_iter()
+                .filter(|delta| delta.source_partition == Some(source_partition))
+            {
+                target
+                    .committer_for_test()
+                    .apply_replica_delta(delta)
+                    .await?;
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!(
+        "Timed out waiting for table '{}' in partition {} deltas",
+        table,
+        source_partition,
+    )
 }
 
 async fn prepare_project_insert_for_test(
@@ -858,6 +903,8 @@ struct TestTwoPhaseCommitGrpcService {
     prepare_calls: Arc<AtomicUsize>,
     validate_reads_calls: Arc<AtomicUsize>,
     forced_prepare_floor: Mutex<Option<Timestamp>>,
+    commit_started: Option<Arc<Notify>>,
+    commit_release: Option<Arc<Notify>>,
 }
 
 impl TestTwoPhaseCommitGrpcService {
@@ -879,6 +926,23 @@ impl TestTwoPhaseCommitGrpcService {
             prepare_calls,
             validate_reads_calls,
             forced_prepare_floor: Mutex::new(None),
+            commit_started: None,
+            commit_release: None,
+        }
+    }
+
+    fn with_blocked_commit(
+        committer: CommitterClient,
+        commit_started: Arc<Notify>,
+        commit_release: Arc<Notify>,
+    ) -> Self {
+        Self {
+            committer,
+            prepare_calls: Arc::new(AtomicUsize::new(0)),
+            validate_reads_calls: Arc::new(AtomicUsize::new(0)),
+            forced_prepare_floor: Mutex::new(None),
+            commit_started: Some(commit_started),
+            commit_release: Some(commit_release),
         }
     }
 
@@ -892,6 +956,8 @@ impl TestTwoPhaseCommitGrpcService {
             prepare_calls,
             validate_reads_calls: Arc::new(AtomicUsize::new(0)),
             forced_prepare_floor: Mutex::new(Some(forced_prepare_floor)),
+            commit_started: None,
+            commit_release: None,
         }
     }
 }
@@ -1000,6 +1066,12 @@ impl TwoPhaseCommitService for TestTwoPhaseCommitGrpcService {
         request: Request<TwoPcCommitRequest>,
     ) -> Result<Response<TwoPcCommitResponse>, Status> {
         let req = request.into_inner();
+        if let Some(commit_started) = &self.commit_started {
+            commit_started.notify_one();
+        }
+        if let Some(commit_release) = &self.commit_release {
+            commit_release.notified().await;
+        }
         let commit_ts = self
             .committer
             .commit_prepared(TwoPhaseTransactionId(req.transaction_id))
@@ -8452,15 +8524,7 @@ fn test_parallel_early_ack_recovers_staging_before_async_cleanup() -> anyhow::Re
         .await?;
 
         insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
-        let remote_seed_delta = log
-            .deltas()
-            .into_iter()
-            .last()
-            .expect("seed project should publish a delta");
-        node_a
-            .committer_for_test()
-            .apply_replica_delta(remote_seed_delta)
-            .await?;
+        apply_source_deltas_through_table(&log, &node_a, PartitionId(1), "projects").await?;
         insert_doc(&node_a, "messages", assert_obj!("text" => "seed")).await?;
         let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
         node_a
@@ -8519,7 +8583,7 @@ fn test_parallel_early_ack_recovers_staging_before_async_cleanup() -> anyhow::Re
         );
 
         let mut commit_deltas = Vec::new();
-        for _ in 0..50 {
+        for _ in 0..500 {
             let deltas = log.deltas();
             commit_deltas = deltas[initial_delta_count..]
                 .iter()
@@ -8559,6 +8623,205 @@ fn test_parallel_early_ack_recovers_staging_before_async_cleanup() -> anyhow::Re
                 .values()
                 .any(TwoPhaseDecision::all_participants_resolved),
             "async cleanup should mark every participant resolved",
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_parallel_early_ack_fences_reads_and_subscription_reruns() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let commit_started = Arc::new(Notify::new());
+        let commit_release = Arc::new(Notify::new());
+        let node_b = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+            decision_log.clone(),
+        )
+        .await?;
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::with_blocked_commit(
+            node_b.committer_for_test(),
+            commit_started.clone(),
+            commit_release.clone(),
+        ))
+        .await?;
+
+        let node_a_map = partitioned_map(PartitionId(0));
+        let node_a = create_node_with_options_and_decision_log(
+            &rt,
+            log.clone(),
+            Some(node_a_map.clone()),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(tso),
+            decision_log.clone(),
+        )
+        .await?;
+        let node_a =
+            node_a.with_owner_read_client_for_test(Arc::new(CommitterBackedOwnerReadClient {
+                committer: node_b.committer_for_test(),
+            }));
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        apply_source_deltas_through_table(&log, &node_a, PartitionId(1), "projects").await?;
+        insert_doc(&node_a, "messages", assert_obj!("text" => "seed")).await?;
+        let heartbeat_ts = node_b.bump_max_repeatable_ts().await?;
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(CommitDelta {
+                ts: heartbeat_ts,
+                document_writes: Arc::new(Vec::new()),
+                document_updates: Vec::new(),
+                index_writes: Arc::new(Vec::new()),
+                write_source: WriteSource::new("parallel_read_semantics_test"),
+                write_bytes: 0,
+                tablet_id_to_table_name: Default::default(),
+                source_partition: Some(PartitionId(1)),
+            })
+            .await?;
+
+        let mut subscription_tx = node_a.begin(Identity::system()).await?;
+        let mut subscription_query = ResolvedQuery::new(
+            &mut subscription_tx,
+            TableNamespace::root_component(),
+            Query::full_table_scan("messages".parse()?, Order::Asc),
+        )?;
+        while subscription_query
+            .next(&mut subscription_tx, Some(2))
+            .await?
+            .is_some()
+        {}
+        let subscription = node_a.subscribe(subscription_tx.into_token()?).await?;
+
+        let mut tx = node_a.begin(Identity::system()).await?;
+        let mut model = TestFacingModel::new(&mut tx);
+        model
+            .insert(
+                &"messages".parse()?,
+                assert_obj!("text" => "parallel-local-visible"),
+            )
+            .await?;
+        model
+            .insert(
+                &"projects".parse()?,
+                assert_obj!("name" => "parallel-remote-visible"),
+            )
+            .await?;
+        let outcome = coordinate_two_phase_commit_with_mode(
+            &node_a.committer_for_test(),
+            tx.finalize()?,
+            WriteSource::new("parallel_read_semantics_test"),
+            &node_a_map,
+            TwoPhaseCommitMode::ParallelEarlyAck,
+        )
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(2), commit_started.notified())
+            .await
+            .context("remote participant cleanup never reached the deterministic gate")?;
+        tokio::time::timeout(Duration::from_secs(2), subscription.wait_for_invalidation())
+            .await
+            .context("local committed half did not invalidate the existing subscription")?;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), node_a.cluster_safe_read_ts())
+                .await
+                .is_err(),
+            "an unrelated latest read must wait while one early-ack participant remains prepared",
+        );
+        let exact_read = tokio::time::timeout(
+            Duration::from_millis(100),
+            node_a.cluster_read_ts_at(outcome.ts),
+        )
+        .await;
+        assert!(
+            !matches!(exact_read, Ok(Ok(_))),
+            "an explicit timestamp read must not certify a partially applied early-ack commit",
+        );
+
+        commit_release.notify_waiters();
+        for _ in 0..100 {
+            if decision_log
+                .decisions()
+                .values()
+                .any(TwoPhaseDecision::all_participants_resolved)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            decision_log
+                .decisions()
+                .values()
+                .any(TwoPhaseDecision::all_participants_resolved),
+            "parallel cleanup should resolve both participants after the gate opens",
+        );
+
+        let safe_ts = node_a.cluster_safe_read_ts().await?;
+        assert!(*safe_ts >= outcome.ts);
+        assert_eq!(*node_a.cluster_read_ts_at(outcome.ts).await?, outcome.ts);
+
+        let local_messages = run_query(
+            node_a.clone(),
+            TableNamespace::root_component(),
+            Query::full_table_scan("messages".parse()?, Order::Asc),
+        )
+        .await?;
+        assert_eq!(
+            local_messages
+                .iter()
+                .filter(|document| {
+                    document.value().0.get("text") == Some(&assert_val!("parallel-local-visible"))
+                })
+                .count(),
+            1,
+        );
+        let remote_projects = run_query(
+            node_b.clone(),
+            TableNamespace::root_component(),
+            Query::full_table_scan("projects".parse()?, Order::Asc),
+        )
+        .await?;
+        assert_eq!(
+            remote_projects
+                .iter()
+                .filter(|document| {
+                    document.value().0.get("name") == Some(&assert_val!("parallel-remote-visible"))
+                })
+                .count(),
+            1,
+        );
+
+        let mut refreshed_tx = node_a.begin(Identity::system()).await?;
+        let mut refreshed_query = ResolvedQuery::new(
+            &mut refreshed_tx,
+            TableNamespace::root_component(),
+            Query::full_table_scan("messages".parse()?, Order::Asc),
+        )?;
+        while refreshed_query
+            .next(&mut refreshed_tx, Some(2))
+            .await?
+            .is_some()
+        {}
+        let refreshed_subscription = node_a.subscribe(refreshed_tx.into_token()?).await?;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                refreshed_subscription.wait_for_invalidation(),
+            )
+            .await
+            .is_err(),
+            "cleanup recovery must not emit a duplicate invalidation after a safe rerun",
         );
 
         server.shutdown().await?;

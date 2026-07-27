@@ -2999,6 +2999,26 @@ impl<RT: Runtime> Committer<RT> {
             minimum = cmp::max(minimum, prepared_ts);
         }
 
+        if let Some(prepared_ts) = self.prepared_writes.min_ts()
+            && prepared_ts <= target
+        {
+            let _ = result.send(Ok(ReadTimestampClosure::Blocked(prepared_ts)));
+            return;
+        }
+
+        // Once this owner has materialized a timestamp, MVCC can certify that
+        // exact historical snapshot even if newer commits have since arrived.
+        // Check prepared writes first: an unresolved 2PC intent at or before
+        // the target means the historical snapshot is not globally decided yet.
+        if !include_latest_floor && target <= latest_ts {
+            self.closed_read_timestamps.insert(target);
+            while self.closed_read_timestamps.len() > MAX_CLOSED_READ_TIMESTAMPS {
+                self.closed_read_timestamps.pop_first();
+            }
+            let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
+            return;
+        }
+
         if minimum > target {
             let _ = result.send(Ok(ReadTimestampClosure::RetryAt(minimum)));
             return;
@@ -3007,13 +3027,6 @@ impl<RT: Runtime> Committer<RT> {
             let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
             return;
         }
-        if let Some(prepared_ts) = self.prepared_writes.min_ts()
-            && prepared_ts <= target
-        {
-            let _ = result.send(Ok(ReadTimestampClosure::Blocked(prepared_ts)));
-            return;
-        }
-
         // From this point onward every locally allocated commit is above the
         // barrier. Persistence writes already queued before this message are
         // ordered before the barrier by `FuturesOrdered`.

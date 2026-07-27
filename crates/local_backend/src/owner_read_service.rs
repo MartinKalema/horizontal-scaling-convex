@@ -218,13 +218,14 @@ impl OwnerReadService for OwnerReadGrpcService {
         let target_ts = request.target_ts.try_into().map_err(|error| {
             Status::invalid_argument(format!("Invalid read barrier timestamp: {error:#}"))
         })?;
-        let outcome = self
-            .committer
-            .close_latest_read_timestamp(target_ts)
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!("Failed to close owner read timestamp: {error:#}"))
-            })?;
+        let outcome = if request.include_latest_floor {
+            self.committer.close_latest_read_timestamp(target_ts).await
+        } else {
+            self.committer.close_read_timestamp(target_ts).await
+        }
+        .map_err(|error| {
+            Status::unavailable(format!("Failed to close owner read timestamp: {error:#}"))
+        })?;
         // Recheck after the asynchronous persistence barrier. A leader that lost
         // its lease while closing must not certify a cluster snapshot.
         self.ensure_placement_version(placement_version).await?;
