@@ -343,7 +343,7 @@ fn start_membership_refresh_loop(
     runtime.spawn_background("cluster_membership_store_refresh", async move {
         let mut backoff = Duration::from_millis(250);
         loop {
-            let refresh_result = async {
+            let refresh_result: anyhow::Result<()> = async {
                 let snapshot = if let Some(base_node) = advertised_node.as_ref() {
                     let mut node = base_node.clone();
                     refresh_membership_lease(&mut node);
