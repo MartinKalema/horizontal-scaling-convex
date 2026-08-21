@@ -40,7 +40,7 @@ pub(crate) enum AuthorityEndpointKind {
 pub(crate) enum AttemptTimeoutDisposition {
     Retry,
     RetryableRead,
-    Fail,
+    IdempotentMutation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,7 +74,6 @@ pub(crate) enum AuthorityAttemptError {
         error: anyhow::Error,
         leader_hint: Option<String>,
     },
-    Fail(anyhow::Error),
 }
 
 impl AuthorityAttemptError {
@@ -90,10 +89,6 @@ impl AuthorityAttemptError {
             error: error.into(),
             leader_hint,
         }
-    }
-
-    pub fn fail(error: impl Into<anyhow::Error>) -> Self {
-        Self::Fail(error.into())
     }
 }
 
@@ -183,19 +178,17 @@ impl AuthorityResolver {
                     self.policy.total_timeout,
                     failures.join("; "),
                 );
-                // Lightweight probes can use short attempts and move on. Real
-                // reads and side-effecting requests need the remaining
-                // end-to-end deadline once dispatched: queries can legitimately
-                // spend longer than the candidate-probe timeout establishing a
-                // cluster-safe snapshot, while replaying an ambiguously timed
-                // out mutation would be unsafe.
+                // Lightweight probes can use short attempts and move on. Reads
+                // and mutations receive the remaining end-to-end deadline.
+                // Forwarded mutations have commit-time deduplication, but no
+                // durable in-flight marker, so overlapping timeout retries can
+                // still execute the UDF more than once.
                 let attempt_timeout = match timeout_disposition {
                     AttemptTimeoutDisposition::Retry => {
                         remaining.min(self.policy.per_attempt_timeout)
                     },
-                    AttemptTimeoutDisposition::RetryableRead | AttemptTimeoutDisposition::Fail => {
-                        remaining
-                    },
+                    AttemptTimeoutDisposition::RetryableRead
+                    | AttemptTimeoutDisposition::IdempotentMutation => remaining,
                 };
                 let outcome = tokio::time::timeout(
                     attempt_timeout,
@@ -207,7 +200,6 @@ impl AuthorityResolver {
                 .await;
                 match outcome {
                     Ok(Ok(value)) => return Ok(ResolvedAuthority { value, deadline }),
-                    Ok(Err(AuthorityAttemptError::Fail(error))) => return Err(error),
                     Ok(Err(AuthorityAttemptError::Retry { error, leader_hint })) => {
                         failures.push(format!("{endpoint}: {error:#}"));
                         if let Some(leader_hint) = leader_hint
@@ -217,10 +209,16 @@ impl AuthorityResolver {
                             received_leader_hint = true;
                         }
                     },
-                    Err(_) if matches!(timeout_disposition, AttemptTimeoutDisposition::Fail) => {
+                    Err(_)
+                        if matches!(
+                            timeout_disposition,
+                            AttemptTimeoutDisposition::IdempotentMutation
+                        ) =>
+                    {
                         anyhow::bail!(
-                            "Authority request to {endpoint} timed out after {attempt_timeout:?}; \
-                             the request may have reached the authority and will not be replayed"
+                            "Idempotent mutation request to {endpoint} timed out after \
+                             {attempt_timeout:?}; the outcome is unknown and will not be replayed \
+                             without a durable in-flight marker"
                         );
                     },
                     Err(_) => {
@@ -853,39 +851,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn side_effect_attempt_receives_remaining_total_deadline() -> anyhow::Result<()> {
-        let policy = test_policy();
-        let resolver = AuthorityResolver::new(
-            SharedNodeAddresses::new(Some(database::two_phase::NodeAddresses::from_config(
-                "0=leader:50051",
-            ))),
-            None,
-            None,
-            None,
-            None,
-        )
-        .with_policy(policy);
-
-        let result = resolver
-            .route(
-                PartitionId::DEFAULT,
-                AuthorityEndpointKind::Grpc,
-                AttemptTimeoutDisposition::Fail,
-                move |attempt| async move {
-                    assert!(
-                        attempt.timeout > policy.per_attempt_timeout,
-                        "a dispatched side effect must not inherit the short candidate timeout"
-                    );
-                    Ok("served")
-                },
-            )
-            .await?;
-
-        assert_eq!(result.value, "served");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn dispatched_read_can_outlive_candidate_probe_timeout() -> anyhow::Result<()> {
         let policy = test_policy();
         let resolver = AuthorityResolver::new(
@@ -908,6 +873,40 @@ mod tests {
                     assert!(
                         attempt.timeout > policy.per_attempt_timeout,
                         "a dispatched read must receive the remaining request deadline"
+                    );
+                    tokio::time::sleep(policy.per_attempt_timeout * 2).await;
+                    Ok("served")
+                },
+            )
+            .await?;
+
+        assert_eq!(result.value, "served");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idempotent_mutation_receives_remaining_total_deadline() -> anyhow::Result<()> {
+        let policy = test_policy();
+        let resolver = AuthorityResolver::new(
+            SharedNodeAddresses::new(Some(database::two_phase::NodeAddresses::from_config(
+                "0=leader:50051",
+            ))),
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_policy(policy);
+
+        let result = resolver
+            .route(
+                PartitionId::DEFAULT,
+                AuthorityEndpointKind::Grpc,
+                AttemptTimeoutDisposition::IdempotentMutation,
+                move |attempt| async move {
+                    assert!(
+                        attempt.timeout > policy.per_attempt_timeout,
+                        "a mutation must not inherit the short candidate timeout"
                     );
                     tokio::time::sleep(policy.per_attempt_timeout * 2).await;
                     Ok("served")

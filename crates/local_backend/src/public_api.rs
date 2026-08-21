@@ -40,12 +40,17 @@ use common::{
         HttpResponseError,
     },
     knobs::MAX_BACKEND_PUBLIC_API_REQUEST_SIZE,
-    types::FunctionCaller,
+    runtime::Runtime,
+    types::{
+        FunctionCaller,
+        SessionId,
+    },
     version::ClientVersion,
 };
 use database::partition::PartitionId;
 use errors::ErrorMetadata;
 use isolate::UdfArgsJson;
+use model::session_requests::types::SessionRequestIdentifier;
 use serde::{
     Deserialize,
     Serialize,
@@ -366,6 +371,10 @@ async fn maybe_forward_public_mutation(
     let Some(forwarding_mode) = forwarding_mode else {
         return Ok(None);
     };
+    let mutation_identifier = SessionRequestIdentifier {
+        session_id: SessionId::new(st.runtime.new_uuid_v4()),
+        request_id: 0,
+    };
 
     let value_format = format.map(|f| f.parse()).transpose()?;
     let forwarded = match &forwarding_mode {
@@ -376,6 +385,7 @@ async fn maybe_forward_public_mutation(
                     serialized_args.get(),
                     identity,
                     &client_version.to_string(),
+                    &mutation_identifier,
                 )
                 .await
             {
@@ -401,17 +411,19 @@ async fn maybe_forward_public_mutation(
             let path = path.to_owned();
             let args = serialized_args.get().to_owned();
             let caller = client_version.to_string();
+            let mutation_identifier = mutation_identifier.clone();
             let resolved = resolver
                 .route(
                     *partition,
                     AuthorityEndpointKind::Grpc,
-                    AttemptTimeoutDisposition::Fail,
+                    AttemptTimeoutDisposition::IdempotentMutation,
                     move |attempt| {
                         let pool = pool.clone();
                         let path = path.clone();
                         let args = args.clone();
                         let identity = identity.clone();
                         let caller = caller.clone();
+                        let mutation_identifier = mutation_identifier.clone();
                         async move {
                             let started = Instant::now();
                             let client = pool.client(&attempt.endpoint).await.map_err(|error| {
@@ -433,6 +445,7 @@ async fn maybe_forward_public_mutation(
                                     &args,
                                     identity,
                                     &caller,
+                                    &mutation_identifier,
                                     request_timeout,
                                 )
                                 .await
@@ -441,9 +454,8 @@ async fn maybe_forward_public_mutation(
                                         let leader_hint = authority_leader_hint(&error);
                                         AuthorityAttemptError::retry_with_leader(error, leader_hint)
                                     } else {
-                                        AuthorityAttemptError::fail(error.context(
-                                            "Mutation forwarding failed after dispatch; refusing \
-                                             to replay an ambiguous side effect",
+                                        AuthorityAttemptError::retry(error.context(
+                                            "Idempotent mutation forwarding attempt failed",
                                         ))
                                     }
                                 })
@@ -1223,6 +1235,36 @@ mod tests {
         }
     }
 
+    struct LoseFirstCommittedMutationResponse {
+        inner: MutationForwarderService,
+        mutation_calls: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl TonicMutationForwarder for LoseFirstCommittedMutationResponse {
+        async fn forward_mutation(
+            &self,
+            request: tonic::Request<pb::replication::ForwardMutationRequest>,
+        ) -> Result<tonic::Response<pb::replication::ForwardMutationResponse>, tonic::Status>
+        {
+            let call = self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            let response = TonicMutationForwarder::forward_mutation(&self.inner, request).await?;
+            if call == 0 {
+                return Err(tonic::Status::unavailable(
+                    "simulated response loss after committed mutation",
+                ));
+            }
+            Ok(response)
+        }
+
+        async fn forward_query(
+            &self,
+            request: tonic::Request<pb::replication::ForwardQueryRequest>,
+        ) -> Result<tonic::Response<pb::replication::ForwardQueryResponse>, tonic::Status> {
+            TonicMutationForwarder::forward_query(&self.inner, request).await
+        }
+    }
+
     async fn expect_success_from_app<T: serde::de::DeserializeOwned>(
         app: &ConvexHttpService,
         req: Request<Body>,
@@ -1658,6 +1700,91 @@ mod tests {
             mutation_calls.load(Ordering::SeqCst),
             1,
             "the mutation must execute exactly once on the live authority",
+        );
+
+        let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn test_http_mutation_retries_lost_response_without_duplicate_write(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let backend = setup_backend_for_test(rt.clone()).await?;
+        backend.st.application.load_udf_tests_modules().await?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_addr = listener.local_addr()?;
+        let mutation_calls = Arc::new(AtomicUsize::new(0));
+        let forwarder = LoseFirstCommittedMutationResponse {
+            inner: MutationForwarderService::new(
+                Arc::new(backend.st.application.clone()),
+                backend.st.instance_name.clone(),
+                backend.st.cluster_grpc_auth.clone(),
+            ),
+            mutation_calls: mutation_calls.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _server_handle = rt.spawn("test_lost_mutation_response_retry", async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(TonicMutationForwarderServer::new(forwarder))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let grpc_addr = grpc_addr.to_string();
+        let mut follower_state = backend.st.clone();
+        follower_state.partition_id = Some(PartitionId::DEFAULT);
+        follower_state.raft_state = Some(RaftPartitionState::new_for_test(
+            false,
+            3,
+            PartitionId::DEFAULT,
+            1,
+        ));
+        follower_state.raft_peer_grpc_urls = Some(BTreeMap::from([(3, grpc_addr.clone())]));
+        follower_state.node_addresses =
+            SharedNodeAddresses::new(Some(NodeAddresses::from_config(&format!("0={grpc_addr}"))));
+        follower_state.membership_store = None;
+        let follower_app = ConvexHttpService::new(
+            router(follower_state),
+            "backend_lost_mutation_response_retry_test",
+            SERVER_VERSION_STR.to_string(),
+            MAX_CONCURRENT_REQUESTS,
+            Duration::from_secs(125),
+            NoopRouteMapper,
+        );
+
+        let response: JsonValue = expect_success_from_app(
+            &follower_app,
+            post_request(
+                "/api/mutation",
+                json!({
+                    "path": "values:insertObject",
+                    "args": { "obj": { "hello": "committed exactly once" } },
+                }),
+            )?,
+        )
+        .await?;
+        assert_eq!(response["status"], "success");
+        assert_eq!(
+            mutation_calls.load(Ordering::SeqCst),
+            2,
+            "the follower should retry once after losing the committed response",
+        );
+
+        let snapshot = backend.st.application.database().latest_snapshot()?;
+        let mut test_documents = 0;
+        for entry in snapshot.iter_table_summaries()? {
+            let (_, _, table_name, summary) = entry?;
+            if table_name.to_string() == "test" {
+                test_documents += summary.num_values();
+            }
+        }
+        assert_eq!(
+            test_documents, 1,
+            "idempotent replay must not execute the mutation twice",
         );
 
         let _ = shutdown_tx.send(());

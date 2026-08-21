@@ -25,7 +25,10 @@ use application::{
 use common::{
     grpc::ClusterGrpcAuth,
     http::RequestDestination,
-    types::FunctionCaller,
+    types::{
+        FunctionCaller,
+        SessionId,
+    },
     version::ClientVersion,
     RequestId,
 };
@@ -35,6 +38,7 @@ use database::{
     Token,
 };
 use keybroker::Identity;
+use model::session_requests::types::SessionRequestIdentifier;
 use pb::replication::{
     forward_mutation_response,
     mutation_forwarder_client::MutationForwarderClient as TonicMutationForwarderClient,
@@ -51,6 +55,10 @@ use pb::replication::{
     QueryError,
     QuerySuccess,
     ReadAfterWriteFence as PbReadAfterWriteFence,
+};
+use serde::{
+    Deserialize,
+    Serialize,
 };
 use serde_json::Value as JsonValue;
 use sync_types::types::SerializedArgs;
@@ -70,6 +78,33 @@ use crate::authority_routing::authority_redirect_status;
 
 const FORWARDER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const FORWARDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForwardedMutationIdentifier {
+    session_id: String,
+    request_id: u32,
+}
+
+fn encode_mutation_identifier(identifier: &SessionRequestIdentifier) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(&ForwardedMutationIdentifier {
+        session_id: identifier.session_id.to_string(),
+        request_id: identifier.request_id,
+    })
+    .context("Failed to serialize forwarded mutation identifier")
+}
+
+fn decode_mutation_identifier(bytes: &[u8]) -> anyhow::Result<SessionRequestIdentifier> {
+    let identifier: ForwardedMutationIdentifier =
+        serde_json::from_slice(bytes).context("Invalid forwarded mutation identifier")?;
+    Ok(SessionRequestIdentifier {
+        session_id: identifier
+            .session_id
+            .parse::<SessionId>()
+            .context("Invalid forwarded mutation session ID")?,
+        request_id: identifier.request_id,
+    })
+}
 
 /// gRPC server for mutation forwarding. Runs on the Primary.
 pub struct MutationForwarderService {
@@ -177,6 +212,12 @@ impl MutationForwarder for MutationForwarderService {
                 .parse()
                 .unwrap_or_else(|_| ClientVersion::unknown()),
         );
+        let mutation_identifier = req
+            .mutation_identifier
+            .as_deref()
+            .map(decode_mutation_identifier)
+            .transpose()
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
 
         let host = common::http::ResolvedHostname {
             instance_name: self.instance_name.clone(),
@@ -192,7 +233,7 @@ impl MutationForwarder for MutationForwarderService {
                 path,
                 args,
                 caller,
-                None,
+                mutation_identifier,
                 req.mutation_queue_length.map(|n| n as usize),
             )
             .await;
@@ -458,9 +499,17 @@ impl MutationForwarderGrpcClient {
         args: &str,
         identity: Identity,
         caller: &str,
+        mutation_identifier: &SessionRequestIdentifier,
     ) -> anyhow::Result<ForwardMutationResponse> {
-        self.forward_with_timeout(path, args, identity, caller, FORWARDER_DEFAULT_TIMEOUT)
-            .await
+        self.forward_with_timeout(
+            path,
+            args,
+            identity,
+            caller,
+            mutation_identifier,
+            FORWARDER_DEFAULT_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn forward_with_timeout(
@@ -469,6 +518,7 @@ impl MutationForwarderGrpcClient {
         args: &str,
         identity: Identity,
         caller: &str,
+        mutation_identifier: &SessionRequestIdentifier,
         timeout: Duration,
     ) -> anyhow::Result<ForwardMutationResponse> {
         let identity_proto: pb::convex_identity::UncheckedIdentity = identity.into();
@@ -477,7 +527,7 @@ impl MutationForwarderGrpcClient {
             args: args.to_string(),
             identity: Some(identity_proto),
             caller: caller.to_string(),
-            mutation_identifier: None,
+            mutation_identifier: Some(encode_mutation_identifier(mutation_identifier)?),
             mutation_queue_length: None,
         };
         let response = self

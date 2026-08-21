@@ -199,6 +199,7 @@ use crate::{
         OwnerIndexEntry,
         OwnerIndexRangeResult,
         OwnerReadClient,
+        ReadTimestampKind,
     },
     retention::{
         LeaderRetentionManager,
@@ -1930,7 +1931,7 @@ impl<RT: Runtime> Database<RT> {
                 *REMOTE_READ_FRONTIER_WAIT_TIMEOUT,
             );
             match self
-                .close_cluster_read_timestamp(&partition_map, candidate)
+                .close_cluster_read_timestamp(&partition_map, candidate, ReadTimestampKind::Latest)
                 .await?
             {
                 ReadTimestampClosure::Closed(closed) => {
@@ -1957,10 +1958,75 @@ impl<RT: Runtime> Database<RT> {
         }
     }
 
+    /// Certify an exact timestamp across every current partition owner.
+    ///
+    /// Unlike a latest-read barrier, this method never raises the caller's
+    /// timestamp. It waits while a 2PC participant is still prepared at or
+    /// before the target and fails closed if the timestamp was not established
+    /// as one cluster-wide snapshot. This keeps explicit timestamp queries from
+    /// observing only the locally applied half of an asynchronously cleaned-up
+    /// parallel commit.
+    pub async fn cluster_read_ts_at(
+        &self,
+        target: Timestamp,
+    ) -> anyhow::Result<RepeatableTimestamp> {
+        let Some(partition_map) = self.committer.partition_map() else {
+            return self.now_ts_for_reads().prior_ts(target);
+        };
+        if partition_map.num_partitions() <= 1 {
+            return self.now_ts_for_reads().prior_ts(target);
+        }
+
+        let deadline = Instant::now() + *REMOTE_READ_FRONTIER_WAIT_TIMEOUT;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(
+                    anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(format!(
+                        "Timed out after {:?} certifying cluster read timestamp {}",
+                        *REMOTE_READ_FRONTIER_WAIT_TIMEOUT, target,
+                    )),
+                );
+            }
+            match self
+                .close_cluster_read_timestamp(&partition_map, target, ReadTimestampKind::Exact)
+                .await?
+            {
+                ReadTimestampClosure::Closed(closed) => {
+                    anyhow::ensure!(
+                        closed == target,
+                        "Cluster exact read barrier closed at {} instead of requested {}",
+                        closed,
+                        target,
+                    );
+                    anyhow::ensure!(
+                        self.committer.placement_version() == partition_map.placement_version(),
+                        "Placement changed from {} while certifying cluster read timestamp {}",
+                        partition_map.placement_version(),
+                        target,
+                    );
+                    return self.now_ts_for_reads().prior_ts(target);
+                },
+                ReadTimestampClosure::RetryAt(retry_at) => {
+                    return Err(
+                        anyhow::anyhow!(ErrorMetadata::service_unavailable()).context(format!(
+                            "Timestamp {} is not a certified cluster snapshot; an owner requires \
+                             a read timestamp at or after {}",
+                            target, retry_at,
+                        )),
+                    );
+                },
+                ReadTimestampClosure::Blocked(_) => {
+                    self.runtime.wait(Duration::from_millis(5)).await;
+                },
+            }
+        }
+    }
+
     async fn close_cluster_read_timestamp(
         &self,
         partition_map: &crate::partition::PartitionMap,
         target: Timestamp,
+        kind: ReadTimestampKind,
     ) -> anyhow::Result<ReadTimestampClosure> {
         let owner_read_client = self
             .owner_read_client
@@ -1974,13 +2040,23 @@ impl<RT: Runtime> Database<RT> {
                 .into_iter()
                 .filter(|partition| *partition != local_partition)
                 .map(|partition| {
-                    owner_read_client.close_read_timestamp(partition, placement_version, target)
+                    owner_read_client.close_read_timestamp(
+                        partition,
+                        placement_version,
+                        target,
+                        kind,
+                    )
                 }),
         );
-        let (local, remotes) = futures::join!(
-            self.committer.close_latest_read_timestamp(target),
-            remote_closures,
-        );
+        let local_closure = async {
+            match kind {
+                ReadTimestampKind::Exact => self.committer.close_read_timestamp(target).await,
+                ReadTimestampKind::Latest => {
+                    self.committer.close_latest_read_timestamp(target).await
+                },
+            }
+        };
+        let (local, remotes) = futures::join!(local_closure, remote_closures,);
         let mut closures = Vec::with_capacity(partition_map.num_partitions() as usize);
         closures.push(local?);
         closures.extend(remotes.into_iter().collect::<anyhow::Result<Vec<_>>>()?);

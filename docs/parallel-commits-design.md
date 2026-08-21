@@ -11,16 +11,16 @@ properties that make Convex feel like Convex.
 The current codebase already has durable-decision 2PC, Raft-backed participant
 prepare records, abandoned-prepare rollback, retained decision records,
 same-partition Raft failover, staged decision metadata, staged status recovery,
-and staged read/subscription policy hooks. The default runtime path remains the
-conservative durable-decision protocol.
+and production read/OCC/subscription fencing for staged cleanup. The default
+runtime path remains the conservative durable-decision protocol.
 
 Issue `#69` now has a guarded early-ack implementation behind
 `ENABLE_PARALLEL_2PC_EARLY_ACK=false` by default. When enabled, the coordinator
 acknowledges a cross-partition transaction after it writes a complete durable
 `Staging` record, recovers that proof into `Committed`, and schedules ordinary
 participant cleanup asynchronously. This preserves the durable-decision path as
-the production fallback while we continue hardening the staged cleanup and
-read-after-write windows.
+the production fallback while the guarded path continues through adversarial
+cluster validation.
 
 ## Summary
 
@@ -216,6 +216,30 @@ Rollback cleanup follows the same shape using `RollbackPrepared`.
 
 This is the part that protects Convex.
 
+### Production Enforcement
+
+The first implementation uses resolve-before-read barriers rather than exposing
+staged values through a second snapshot overlay:
+
+- latest public/admin queries, query batches, action `ctx.runQuery` callbacks,
+  and sync reruns call `Database::cluster_safe_read_ts()` before executing user
+  code;
+- explicit `query_at_ts` reads call `Database::cluster_read_ts_at()` and certify
+  that exact timestamp with every current partition owner;
+- owner barriers block behind unresolved prepared writes at or before the
+  requested timestamp, while exact historical timestamps that are already
+  materialized remain readable even if the owner has since advanced;
+- OCC validation checks prepared writes as pending conflicts;
+- participant staging emits no invalidation. Ordinary cleanup may invalidate a
+  subscription after one participant becomes visible, but the resulting rerun
+  cannot execute until the cluster-safe timestamp closes across every owner;
+- owner unavailability, leadership loss, placement changes, and unresolved
+  staged state fail closed instead of returning a partial snapshot.
+
+This keeps staged transaction metadata and partition topology out of the Convex
+API while preserving atomic snapshots and reactive reruns during asynchronous
+cleanup.
+
 ### Staged But Not Proven
 
 If a write is staged but the commit proof is incomplete:
@@ -308,6 +332,8 @@ state alone.
 - `#208` added transaction status recovery.
 - `#209` made reads, OCC, and subscriptions staged-write-aware.
 - `#210` added adversarial tests for 2PC/Raft/NATS ambiguity windows.
+- `#281` enforces staged transaction semantics in production latest,
+  timestamped-query, OCC, and subscription-rerun paths.
 - `#131` remains the broader resolver-style conflict checking work. Parallel
   commits must not make current read validation weaker while that evolves.
 - `#134` remains the long-term deterministic simulation goal.

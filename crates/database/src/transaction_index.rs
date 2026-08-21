@@ -1093,6 +1093,7 @@ mod tests {
             OwnerIndexEntry,
             OwnerIndexRangeResult,
             OwnerReadClient,
+            ReadTimestampKind,
         },
         partition::{
             PartitionId,
@@ -1126,6 +1127,7 @@ mod tests {
             _owner_partition: PartitionId,
             _placement_version: PlacementVersion,
             target_ts: Timestamp,
+            _kind: ReadTimestampKind,
         ) -> anyhow::Result<ReadTimestampClosure> {
             Ok(ReadTimestampClosure::Closed(target_ts))
         }

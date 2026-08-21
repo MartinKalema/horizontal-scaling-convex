@@ -758,10 +758,20 @@ query_with_args() {
         -d "{\"path\":\"$3\",\"args\":$4}"
 }
 
+query_at_ts_with_args() {
+    curl -sf "$1/api/query_at_ts" \
+        -H "Authorization: Convex $2" \
+        -H "Content-Type: application/json" \
+        -d "{\"path\":\"$3\",\"args\":$4,\"ts\":\"$5\"}"
+}
+
 jval() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']['$1']))" <<< "$2"; }
 jtotal() { python3 -c "import sys,json; print(int(json.load(sys.stdin)['value']))" <<< "$1"; }
 raw_participant_fences() {
     python3 -c "import sys,json; r=json.load(sys.stdin); fences=r.get('readAfterWrite',{}).get('participantFences',[]); print(','.join(str(f.get('sourcePartition')) for f in sorted(fences, key=lambda f: f.get('sourcePartition', -1))))" <<< "$1"
+}
+raw_read_after_write_ts() {
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('readAfterWrite',{}).get('ts',''))" <<< "$1"
 }
 
 dashboard_message_task_counts_on_nodes() {
@@ -2426,6 +2436,18 @@ if [ "${EXPECT_PARALLEL_2PC_EARLY_ACK:-false}" = "true" ]; then
         || fail "Parallel early-ack 2PC write was lost or duplicated" \
             "msgA=$PARALLEL_MSG_A msgB=$PARALLEL_MSG_B taskA=$PARALLEL_TASK_A taskB=$PARALLEL_TASK_B"
 
+    PARALLEL_COMMIT_TS=$(raw_read_after_write_ts "$PARALLEL_RESPONSE")
+    PARALLEL_EXACT_RESPONSE=$(query_at_ts_with_args \
+        "$NODE_A_URL" "$NODE_A_KEY" "messages:safeSnapshotPair" \
+        "{\"text\":\"$PARALLEL_TEXT\",\"taskTitle\":\"$PARALLEL_TASK\"}" \
+        "$PARALLEL_COMMIT_TS")
+    PARALLEL_EXACT_MESSAGES=$(jval messages "$PARALLEL_EXACT_RESPONSE")
+    PARALLEL_EXACT_TASKS=$(jval tasks "$PARALLEL_EXACT_RESPONSE")
+    [ "$PARALLEL_EXACT_MESSAGES" -eq 1 ] && [ "$PARALLEL_EXACT_TASKS" -eq 1 ] \
+        && pass "Parallel commit timestamp was certified across owners without a torn read" \
+        || fail "Parallel commit timestamp returned a torn cross-partition snapshot" \
+            "messages=$PARALLEL_EXACT_MESSAGES tasks=$PARALLEL_EXACT_TASKS ts=$PARALLEL_COMMIT_TS"
+
     PARALLEL_LOG_AFTER=$(parallel_commit_log_count)
     [ "$PARALLEL_LOG_AFTER" -gt "$PARALLEL_LOG_BEFORE" ] \
         && pass "Observed parallel-committed coordinator log during early-ack suite" \
@@ -3132,8 +3154,9 @@ CHURN_2PC_RUN="churn-2pc-$(date +%s)"
 CHURN_2PC_ACCEPTED=0
 CHURN_2PC_REJECTED=0
 CHURN_2PC_ATTEMPTED=0
-CHURN_2PC_ACCEPTED_TEXTS=()
-CHURN_2PC_ACCEPTED_TASKS=()
+CHURN_2PC_ATTEMPT_TEXTS=()
+CHURN_2PC_ATTEMPT_TASKS=()
+CHURN_2PC_ATTEMPT_OUTCOMES=()
 
 for round in 1 2 3 4; do
     case "$round" in
@@ -3185,15 +3208,17 @@ for round in 1 2 3 4; do
         CHURN_2PC_ATTEMPTED=$((CHURN_2PC_ATTEMPTED + 1))
         write_text="$CHURN_2PC_RUN-r${round}-$label"
         task_title="$CHURN_2PC_RUN-r${round}-task-$label"
+        CHURN_2PC_ATTEMPT_TEXTS+=("$write_text")
+        CHURN_2PC_ATTEMPT_TASKS+=("$task_title")
         R=$(mutation_response "${survivor_urls[$i]}" "${survivor_keys[$i]}" "messages:crossPartitionWrite" \
             "{\"text\":\"$write_text\",\"taskTitle\":\"$task_title\"}")
         if echo "$R" | grep -q '"status":"success"'; then
             CHURN_2PC_ACCEPTED=$((CHURN_2PC_ACCEPTED + 1))
             ROUND_ACCEPTED=$((ROUND_ACCEPTED + 1))
-            CHURN_2PC_ACCEPTED_TEXTS+=("$write_text")
-            CHURN_2PC_ACCEPTED_TASKS+=("$task_title")
+            CHURN_2PC_ATTEMPT_OUTCOMES+=("accepted")
         else
             CHURN_2PC_REJECTED=$((CHURN_2PC_REJECTED + 1))
+            CHURN_2PC_ATTEMPT_OUTCOMES+=("rejected")
             echo -e "  ${YELLOW}WARN${NC} $label 2PC write rejected during $stopped_label outage (fail-closed): $R"
         fi
     done
@@ -3275,22 +3300,29 @@ echo -e "${BOLD}Test 20f: Per-Write 2PC Exactness During Leadership Churn${NC}"
 
 CHURN_EXACTNESS_OK=true
 CHURN_EXACTNESS_DETAILS=""
-for i in "${!CHURN_2PC_ACCEPTED_TEXTS[@]}"; do
-    text="${CHURN_2PC_ACCEPTED_TEXTS[$i]}"
-    task="${CHURN_2PC_ACCEPTED_TASKS[$i]}"
+for i in "${!CHURN_2PC_ATTEMPT_TEXTS[@]}"; do
+    text="${CHURN_2PC_ATTEMPT_TEXTS[$i]}"
+    task="${CHURN_2PC_ATTEMPT_TASKS[$i]}"
+    outcome="${CHURN_2PC_ATTEMPT_OUTCOMES[$i]}"
     MSG_A=$(jtotal "$(query_with_args "$NODE_A_URL" "$NODE_A_KEY" "messages:countMessagesByText" "{\"text\":\"$text\"}")")
     MSG_B=$(jtotal "$(query_with_args "$NODE_B_URL" "$NODE_B_KEY" "messages:countMessagesByText" "{\"text\":\"$text\"}")")
     TASK_A=$(jtotal "$(query_with_args "$NODE_A_URL" "$NODE_A_KEY" "messages:countTasksByTitle" "{\"title\":\"$task\"}")")
     TASK_B=$(jtotal "$(query_with_args "$NODE_B_URL" "$NODE_B_KEY" "messages:countTasksByTitle" "{\"title\":\"$task\"}")")
-    if [ "$MSG_A" -ne 1 ] || [ "$MSG_B" -ne 1 ] || [ "$TASK_A" -ne 1 ] || [ "$TASK_B" -ne 1 ]; then
+    if [ "$outcome" = "accepted" ]; then
+        expected=1
+    else
+        expected=0
+    fi
+    if [ "$MSG_A" -ne "$expected" ] || [ "$MSG_B" -ne "$expected" ] || \
+        [ "$TASK_A" -ne "$expected" ] || [ "$TASK_B" -ne "$expected" ]; then
         CHURN_EXACTNESS_OK=false
-        CHURN_EXACTNESS_DETAILS="$CHURN_EXACTNESS_DETAILS [$text/$task msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
+        CHURN_EXACTNESS_DETAILS="$CHURN_EXACTNESS_DETAILS [$outcome $text/$task expected=$expected msgA=$MSG_A msgB=$MSG_B taskA=$TASK_A taskB=$TASK_B]"
     fi
 done
 
 $CHURN_EXACTNESS_OK \
-    && pass "Every accepted churn-window 2PC write appeared exactly once on both nodes" \
-    || fail "Churn-window 2PC exactness violated" "$CHURN_EXACTNESS_DETAILS"
+    && pass "Every churn-window 2PC attempt matched its client outcome on both nodes" \
+    || fail "Churn-window 2PC outcome/exactness violated" "$CHURN_EXACTNESS_DETAILS"
 
 # ============================================================
 echo ""

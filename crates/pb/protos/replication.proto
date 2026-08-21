@@ -148,6 +148,9 @@ message CloseReadTimestampRequest {
   uint32 owner_partition = 1;
   uint64 placement_version = 2;
   uint64 target_ts = 3;
+  // Latest-read barriers may raise the requested timestamp to include newer
+  // committed work. Exact barriers must certify this timestamp or fail closed.
+  bool include_latest_floor = 4;
 }
 
 message CloseReadTimestampResponse {

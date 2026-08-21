@@ -107,6 +107,18 @@ pub struct OwnerIndexRangeResult {
     pub cursor: CursorPosition,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadTimestampKind {
+    Exact,
+    Latest,
+}
+
+impl ReadTimestampKind {
+    fn include_latest_floor(self) -> bool {
+        matches!(self, Self::Latest)
+    }
+}
+
 #[async_trait]
 pub trait OwnerReadClient: Send + Sync + 'static {
     async fn close_read_timestamp(
@@ -114,6 +126,7 @@ pub trait OwnerReadClient: Send + Sync + 'static {
         owner_partition: PartitionId,
         placement_version: PlacementVersion,
         target_ts: Timestamp,
+        kind: ReadTimestampKind,
     ) -> anyhow::Result<ReadTimestampClosure>;
 
     async fn read_index_ranges(
@@ -417,11 +430,13 @@ impl OwnerReadGrpcClient {
         owner_partition: PartitionId,
         placement_version: PlacementVersion,
         target_ts: Timestamp,
+        kind: ReadTimestampKind,
     ) -> anyhow::Result<ReadTimestampClosure> {
         let request = CloseReadTimestampRequest {
             owner_partition: owner_partition.0,
             placement_version: u64::from(placement_version),
             target_ts: u64::from(target_ts),
+            include_latest_floor: kind.include_latest_floor(),
         };
         let request = match &self.cluster_auth {
             Some(auth) => auth.request(request),
@@ -500,6 +515,7 @@ impl OwnerReadClient for GrpcOwnerReadClient {
         owner_partition: PartitionId,
         placement_version: PlacementVersion,
         target_ts: Timestamp,
+        kind: ReadTimestampKind,
     ) -> anyhow::Result<ReadTimestampClosure> {
         let addresses = self
             .committer
@@ -514,7 +530,7 @@ impl OwnerReadClient for GrpcOwnerReadClient {
                 self.pool
                     .client(&address)
                     .await?
-                    .close_read_timestamp(owner_partition, placement_version, target_ts)
+                    .close_read_timestamp(owner_partition, placement_version, target_ts, kind)
                     .await
             }
             .await;

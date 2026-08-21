@@ -423,6 +423,16 @@ enum RaftNatsOutboxRecordStorage {
     PerEntry,
 }
 
+struct RaftNatsOutboxReplayGuard {
+    in_progress: Arc<AtomicBool>,
+}
+
+impl Drop for RaftNatsOutboxReplayGuard {
+    fn drop(&mut self) {
+        self.in_progress.store(false, Ordering::Release);
+    }
+}
+
 /// State held for a 2PC-prepared transaction awaiting commit/rollback.
 struct PreparedTransaction {
     prepared_write: PreparedWriteHandle,
@@ -1588,6 +1598,7 @@ impl<RT: Runtime> Committer<RT> {
         let mut last_remote_read_frontier_heartbeat = self.runtime.monotonic_now();
         let mut last_remote_read_frontier_heartbeat_ts = Timestamp::MIN;
         let mut last_raft_nats_outbox_replay = self.runtime.monotonic_now();
+        let raft_nats_outbox_replay_in_progress = Arc::new(AtomicBool::new(false));
         // Assume there were commits just before the backend restarted, so first do a
         // quick bump.
         // None means a bump is ongoing. Avoid parallel bumps in case they
@@ -1668,6 +1679,7 @@ impl<RT: Runtime> Committer<RT> {
                 Either::Right(std::future::pending())
             };
             let raft_nats_outbox_replay_fut = if !snapshot_barrier_active
+                && !raft_nats_outbox_replay_in_progress.load(Ordering::Acquire)
                 && self
                     .placement_state
                     .as_ref()
@@ -1715,20 +1727,11 @@ impl<RT: Runtime> Committer<RT> {
                 }
                 _ = raft_nats_outbox_replay_fut.fuse() => {
                     if self.should_replay_raft_nats_outbox() {
-                        match Self::replay_raft_nats_outbox_once(
+                        Self::spawn_raft_nats_outbox_replay(
                             self.persistence.clone(),
                             self.distributed_log.clone(),
-                        )
-                        .await
-                        {
-                            Ok(replayed) if replayed > 0 => {
-                                tracing::info!("Replayed {replayed} Raft->NATS outbox deltas");
-                            },
-                            Ok(_) => {},
-                            Err(err) => {
-                                tracing::warn!("Failed to replay Raft->NATS outbox: {err:#}");
-                            },
-                        }
+                            raft_nats_outbox_replay_in_progress.clone(),
+                        );
                     }
                     last_raft_nats_outbox_replay = self.runtime.monotonic_now();
                 }
@@ -1812,7 +1815,7 @@ impl<RT: Runtime> Committer<RT> {
                                     .await;
                             }
                             let use_raft_nats_outbox =
-                                Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
+                                self.should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox {
                                 // Raft has accepted this write. Durably enqueue cross-partition
                                 // delivery before acknowledging it, but do not make client success
@@ -1964,7 +1967,7 @@ impl<RT: Runtime> Committer<RT> {
                                     .await;
                             }
                             let use_raft_nats_outbox =
-                                Self::should_record_raft_nats_outbox_delta(&published_commit.delta);
+                                self.should_record_raft_nats_outbox_delta(&published_commit.delta);
                             if use_raft_nats_outbox {
                                 // The 2PC decision is final once the participant commits. Keep NATS
                                 // publication outside that acknowledgement boundary while retaining
@@ -2345,7 +2348,7 @@ impl<RT: Runtime> Committer<RT> {
                                 if self.raft_apply_markers.contains(&marker) {
                                     self.consolidate_raft_apply_marker(marker).await?;
                                 }
-                                if Self::should_record_raft_nats_outbox_delta(&delta) {
+                                if self.should_record_raft_nats_outbox_delta(&delta) {
                                     Self::add_raft_nats_outbox_delta(
                                         self.persistence.clone(),
                                         &delta,
@@ -2700,10 +2703,16 @@ impl<RT: Runtime> Committer<RT> {
                         },
                         Some(CommitterMessage::CommitPrepared {
                             transaction_id,
+                            wait_for_predecessors,
                             result,
                         }) => {
                             if let Some(persistence_write_future) =
-                                self.start_commit_prepared(transaction_id, result, commit_id)
+                                self.start_commit_prepared(
+                                    transaction_id,
+                                    wait_for_predecessors,
+                                    result,
+                                    commit_id,
+                                )
                             {
                                 self.persistence_writes.push_back(persistence_write_future);
                                 commit_id += 1;
@@ -2999,6 +3008,26 @@ impl<RT: Runtime> Committer<RT> {
             minimum = cmp::max(minimum, prepared_ts);
         }
 
+        if let Some(prepared_ts) = self.prepared_writes.min_ts()
+            && prepared_ts <= target
+        {
+            let _ = result.send(Ok(ReadTimestampClosure::Blocked(prepared_ts)));
+            return;
+        }
+
+        // Once this owner has materialized a timestamp, MVCC can certify that
+        // exact historical snapshot even if newer commits have since arrived.
+        // Check prepared writes first: an unresolved 2PC intent at or before
+        // the target means the historical snapshot is not globally decided yet.
+        if !include_latest_floor && target <= latest_ts {
+            self.closed_read_timestamps.insert(target);
+            while self.closed_read_timestamps.len() > MAX_CLOSED_READ_TIMESTAMPS {
+                self.closed_read_timestamps.pop_first();
+            }
+            let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
+            return;
+        }
+
         if minimum > target {
             let _ = result.send(Ok(ReadTimestampClosure::RetryAt(minimum)));
             return;
@@ -3007,13 +3036,6 @@ impl<RT: Runtime> Committer<RT> {
             let _ = result.send(Ok(ReadTimestampClosure::Closed(target)));
             return;
         }
-        if let Some(prepared_ts) = self.prepared_writes.min_ts()
-            && prepared_ts <= target
-        {
-            let _ = result.send(Ok(ReadTimestampClosure::Blocked(prepared_ts)));
-            return;
-        }
-
         // From this point onward every locally allocated commit is above the
         // barrier. Persistence writes already queued before this message are
         // ordered before the barrier by `FuturesOrdered`.
@@ -4215,8 +4237,37 @@ impl<RT: Runtime> Committer<RT> {
         Ok(replayed)
     }
 
-    fn should_record_raft_nats_outbox_delta(delta: &CommitDelta) -> bool {
-        delta.source_partition.is_some()
+    fn spawn_raft_nats_outbox_replay(
+        persistence: Arc<dyn Persistence>,
+        distributed_log: Arc<dyn DistributedLog>,
+        in_progress: Arc<AtomicBool>,
+    ) -> bool {
+        if in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        tokio_spawn("replay_raft_nats_outbox", async move {
+            let _guard = RaftNatsOutboxReplayGuard {
+                in_progress: in_progress.clone(),
+            };
+            match Self::replay_raft_nats_outbox_once(persistence, distributed_log).await {
+                Ok(replayed) if replayed > 0 => {
+                    tracing::info!("Replayed {replayed} Raft->NATS outbox deltas");
+                },
+                Ok(_) => {},
+                Err(err) => {
+                    tracing::warn!("Failed to replay Raft->NATS outbox: {err:#}");
+                },
+            }
+        });
+        true
+    }
+
+    fn should_record_raft_nats_outbox_delta(&self, delta: &CommitDelta) -> bool {
+        delta.source_partition.is_some() && self.distributed_log.requires_commit_outbox()
     }
 
     fn should_replay_raft_nats_outbox(&self) -> bool {
@@ -6352,6 +6403,7 @@ impl<RT: Runtime> Committer<RT> {
     fn start_commit_prepared(
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        wait_for_predecessors: bool,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
@@ -6396,6 +6448,16 @@ impl<RT: Runtime> Committer<RT> {
         if let Some(min_prepared_ts) = self.prepared_writes.min_ts()
             && min_prepared_ts < commit_ts
         {
+            if !wait_for_predecessors {
+                let _ = result.send(Err(anyhow::anyhow!(
+                    "2PC CommitPrepared: txn={} at ts={} is blocked behind unresolved prepared \
+                     ts={}",
+                    transaction_id,
+                    u64::from(commit_ts),
+                    u64::from(min_prepared_ts),
+                )));
+                return None;
+            }
             tracing::debug!(
                 "2PC CommitPrepared: deferring txn={} at ts={} behind unresolved prepared ts={}",
                 transaction_id,
@@ -6407,9 +6469,24 @@ impl<RT: Runtime> Committer<RT> {
             tokio_spawn(
                 "defer_commit_prepared_until_prior_intent_resolves",
                 async move {
+                    if result.is_closed() {
+                        tracing::debug!(
+                            "2PC CommitPrepared: caller stopped waiting for deferred txn={}",
+                            transaction_id,
+                        );
+                        return;
+                    }
                     rt.wait(Duration::from_millis(5)).await;
+                    if result.is_closed() {
+                        tracing::debug!(
+                            "2PC CommitPrepared: caller stopped waiting for deferred txn={}",
+                            transaction_id,
+                        );
+                        return;
+                    }
                     let message = CommitterMessage::CommitPrepared {
                         transaction_id,
+                        wait_for_predecessors,
                         result,
                     };
                     if let Err(err) = sender.try_send(message) {
@@ -7982,9 +8059,28 @@ impl CommitterClient {
         &self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
     ) -> anyhow::Result<Timestamp> {
+        self.commit_prepared_with_wait(transaction_id, true).await
+    }
+
+    /// Attempt participant cleanup without waiting behind an older unresolved
+    /// prepare. Recovery callers must remain free to resolve that predecessor
+    /// first instead of deadlocking the watcher on transaction order.
+    pub(crate) async fn try_commit_prepared(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+    ) -> anyhow::Result<Timestamp> {
+        self.commit_prepared_with_wait(transaction_id, false).await
+    }
+
+    async fn commit_prepared_with_wait(
+        &self,
+        transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        wait_for_predecessors: bool,
+    ) -> anyhow::Result<Timestamp> {
         let (tx, rx) = oneshot::channel();
         let message = CommitterMessage::CommitPrepared {
             transaction_id,
+            wait_for_predecessors,
             result: tx,
         };
         self.sender.try_send(message).map_err(|e| match e {
@@ -8256,6 +8352,7 @@ enum CommitterMessage {
     /// Writes to persistence, publishes commit, deletes redo log.
     CommitPrepared {
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
+        wait_for_predecessors: bool,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     /// 2PC RollbackPrepared: abort a previously prepared transaction.
@@ -8329,8 +8426,10 @@ mod tests {
             },
             Arc,
         },
+        time::Duration,
     };
 
+    use anyhow::Context;
     use async_trait::async_trait;
     use common::{
         bootstrap_model::index::{
@@ -8356,7 +8455,10 @@ mod tests {
     use futures::stream::BoxStream;
     use runtime::testing::TestRuntime;
     use sync_types::Timestamp;
-    use tokio::sync::oneshot;
+    use tokio::sync::{
+        oneshot,
+        Barrier,
+    };
     use value::{
         InternalId,
         PublicDocumentId,
@@ -8399,6 +8501,34 @@ mod tests {
     struct FailTimestampDistributedLog {
         fail_ts: Timestamp,
         published: parking_lot::Mutex<Vec<Timestamp>>,
+    }
+
+    struct BlockingDistributedLog {
+        publish_started: Barrier,
+        release_publish: Barrier,
+        published: parking_lot::Mutex<Vec<Timestamp>>,
+    }
+
+    impl BlockingDistributedLog {
+        fn new() -> Self {
+            Self {
+                publish_started: Barrier::new(2),
+                release_publish: Barrier::new(2),
+                published: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn wait_until_publish_started(&self) {
+            self.publish_started.wait().await;
+        }
+
+        async fn release_publish(&self) {
+            self.release_publish.wait().await;
+        }
+
+        fn published(&self) -> Vec<Timestamp> {
+            self.published.lock().clone()
+        }
     }
 
     impl FailTimestampDistributedLog {
@@ -8529,6 +8659,23 @@ mod tests {
             if delta.ts == self.fail_ts {
                 anyhow::bail!("injected publish failure at {}", u64::from(delta.ts));
             }
+            self.published.lock().push(delta.ts);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _from_ts: Timestamp,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    #[async_trait]
+    impl DistributedLog for BlockingDistributedLog {
+        async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+            self.publish_started.wait().await;
+            self.release_publish.wait().await;
             self.published.lock().push(delta.ts);
             Ok(())
         }
@@ -8742,6 +8889,57 @@ mod tests {
         .await?;
 
         assert_eq!(replayed, 1);
+        assert_eq!(log.published(), vec![ts]);
+        assert!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raft_nats_outbox_replay_is_nonblocking_and_single_flight() -> anyhow::Result<()> {
+        let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
+        let log = Arc::new(BlockingDistributedLog::new());
+        let ts = Timestamp::must(10);
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence.clone(),
+            &test_outbox_delta(ts),
+        )
+        .await?;
+        let in_progress = Arc::new(AtomicBool::new(false));
+
+        assert!(
+            Committer::<TestRuntime>::spawn_raft_nats_outbox_replay(
+                persistence.clone(),
+                log.clone(),
+                in_progress.clone(),
+            ),
+            "the first replay should start in the background",
+        );
+        tokio::time::timeout(Duration::from_secs(1), log.wait_until_publish_started())
+            .await
+            .context("background outbox replay did not reach the distributed log")?;
+        assert!(in_progress.load(Ordering::Acquire));
+        assert!(
+            !Committer::<TestRuntime>::spawn_raft_nats_outbox_replay(
+                persistence.clone(),
+                log.clone(),
+                in_progress.clone(),
+            ),
+            "a blocked replay must suppress overlapping maintenance attempts",
+        );
+
+        log.release_publish().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while in_progress.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("background outbox replay did not release its single-flight guard")?;
+
         assert_eq!(log.published(), vec![ts]);
         assert!(
             Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
