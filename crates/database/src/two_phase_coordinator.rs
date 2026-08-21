@@ -236,6 +236,12 @@ fn routed_partitions_for_write(
     }
     if let Some(partition) = routed_partition_for_table(&table_name, partition_map, write_source) {
         participants.insert(partition);
+    } else {
+        // Node-local system state is still a stateful participant. Recording
+        // its local owner here keeps system-only writes on the 1PC fast path,
+        // while transactions with remote reads must also validate at those
+        // read owners before the local system write can commit.
+        participants.insert(partition_map.local_partition());
     }
     Ok(participants)
 }
