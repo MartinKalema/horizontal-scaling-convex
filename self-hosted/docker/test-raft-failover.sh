@@ -20,6 +20,21 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-docker}"
+
+# Keep the historical service-name shorthand while allowing isolated Compose
+# projects to validate fresh volumes without colliding with another test run.
+docker() {
+    local args=()
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == docker-*-1 ]]; then
+            arg="${COMPOSE_PROJECT_NAME}-${arg#docker-}"
+        fi
+        args+=("$arg")
+    done
+    command docker "${args[@]}"
+}
 
 NODE_A_URL="http://127.0.0.1:3210"
 NODE_B_URL="http://127.0.0.1:3220"
