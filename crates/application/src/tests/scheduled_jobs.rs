@@ -20,6 +20,8 @@ use common::{
     RequestId,
 };
 use database::{
+    partition::PartitionId,
+    raft_partition::RaftPartitionState,
     BootstrapComponentsModel,
     SystemMetadataModel,
     TableModel,
@@ -71,6 +73,8 @@ use value::{
 
 use crate::{
     scheduled_jobs::{
+        SCHEDULED_ACTION_CLAIMED,
+        SCHEDULED_JOB_AUTHORITY_REJECTED,
         SCHEDULED_JOB_COMMITTING,
         SCHEDULED_JOB_EXECUTED,
         SCHEDULED_JOB_MUTATION_ERROR,
@@ -86,6 +90,7 @@ use crate::{
     },
     Application,
     ApplicationWorkerStartupPolicy,
+    ScheduledAndCronWorkerAuthority,
     ScheduledAndCronWorkerStartup,
 };
 
@@ -155,10 +160,203 @@ async fn test_scheduled_and_cron_workers_can_start_disabled(rt: TestRuntime) -> 
     .await?;
 
     assert!(!application.scheduled_and_cron_workers_running_for_test());
-    application.start_scheduled_and_cron_workers();
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::single_node());
     assert!(application.scheduled_and_cron_workers_running_for_test());
     application.stop_scheduled_and_cron_workers();
     assert!(!application.scheduled_and_cron_workers_running_for_test());
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_scheduled_action_leadership_handoff_fences_stale_owner(
+    rt: TestRuntime,
+    pause_controller: PauseController,
+) -> anyhow::Result<()> {
+    let application = Application::new_for_tests_with_args(
+        &rt,
+        ApplicationFixtureArgs {
+            worker_startup_policy: Some(ApplicationWorkerStartupPolicy {
+                scheduled_and_cron: ScheduledAndCronWorkerStartup::Disabled,
+                ..ApplicationWorkerStartupPolicy::single_node()
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    application.load_udf_tests_modules().await?;
+
+    let raft_state = RaftPartitionState::new_for_test(true, 1, PartitionId::DEFAULT, 1);
+    let old_epoch = raft_state
+        .current_leadership_epoch()
+        .expect("old owner should begin with authority");
+    let queried = pause_controller.hold(SCHEDULED_JOB_QUERIED);
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::raft(
+        raft_state.clone(),
+        old_epoch,
+    ));
+
+    let action_path = CanonicalizedComponentFunctionPath {
+        component: ComponentPath::test_user(),
+        udf_path: CanonicalizedUdfPath::from_str("action:insertObject")?,
+    };
+    let mut tx = application.begin(Identity::system()).await?;
+    let (job_id, _model) = create_scheduled_job(&rt, &mut tx, action_path).await?;
+    application.commit_test(tx).await?;
+
+    let queried_pause = queried
+        .wait_for_blocked()
+        .await
+        .expect("old owner should query the due action");
+    raft_state.set_leadership_for_test(false, 2, 2);
+    let rejected = pause_controller.hold(SCHEDULED_JOB_AUTHORITY_REJECTED);
+    queried_pause.unpause();
+    let rejected_pause = rejected
+        .wait_for_blocked()
+        .await
+        .expect("stale owner should be rejected at dispatch");
+
+    let mut tx = application.begin(Identity::system()).await?;
+    let state = SchedulerModel::new(&mut tx, TableNamespace::test_user())
+        .check_status(job_id)
+        .await?
+        .expect("scheduled action should still exist");
+    assert_eq!(state, ScheduledJobState::Pending);
+    assert_eq!(
+        TableModel::new(&mut tx)
+            .must_count(OBJECTS_TABLE_COMPONENT.into(), &OBJECTS_TABLE)
+            .await?,
+        0,
+        "stale owner must not start the action",
+    );
+    rejected_pause.unpause();
+    application.stop_scheduled_and_cron_workers();
+
+    raft_state.set_leadership_for_test(true, 1, 3);
+    let new_epoch = raft_state
+        .current_leadership_epoch()
+        .expect("new owner should expose a fresh authority epoch");
+    assert_ne!(new_epoch, old_epoch);
+    let executed = pause_controller.hold(SCHEDULED_JOB_EXECUTED);
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::raft(
+        raft_state, new_epoch,
+    ));
+    wait_for_scheduled_job_execution(executed).await;
+
+    let mut tx = application.begin(Identity::system()).await?;
+    let state = SchedulerModel::new(&mut tx, TableNamespace::test_user())
+        .check_status(job_id)
+        .await?
+        .expect("scheduled action should still exist");
+    assert_eq!(state, ScheduledJobState::Success);
+    assert_eq!(
+        TableModel::new(&mut tx)
+            .must_count(OBJECTS_TABLE_COMPONENT.into(), &OBJECTS_TABLE)
+            .await?,
+        1,
+        "fresh owner should execute the pending action",
+    );
+    application.stop_scheduled_and_cron_workers();
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_scheduled_action_handoff_after_claim_is_not_replayed(
+    rt: TestRuntime,
+    pause_controller: PauseController,
+) -> anyhow::Result<()> {
+    let application = Application::new_for_tests_with_args(
+        &rt,
+        ApplicationFixtureArgs {
+            worker_startup_policy: Some(ApplicationWorkerStartupPolicy {
+                scheduled_and_cron: ScheduledAndCronWorkerStartup::Disabled,
+                ..ApplicationWorkerStartupPolicy::single_node()
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    application.load_udf_tests_modules().await?;
+
+    let action_path = CanonicalizedComponentFunctionPath {
+        component: ComponentPath::test_user(),
+        udf_path: CanonicalizedUdfPath::from_str("action:insertObject")?,
+    };
+    let mut tx = application.begin(Identity::system()).await?;
+    let (job_id, _model) = create_scheduled_job(&rt, &mut tx, action_path).await?;
+    application.commit_test(tx).await?;
+
+    let raft_state = RaftPartitionState::new_for_test(true, 1, PartitionId::DEFAULT, 1);
+    let old_epoch = raft_state
+        .current_leadership_epoch()
+        .expect("old owner should begin with authority");
+    let claimed = pause_controller.hold(SCHEDULED_ACTION_CLAIMED);
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::raft(
+        raft_state.clone(),
+        old_epoch,
+    ));
+    let claimed_pause = claimed
+        .wait_for_blocked()
+        .await
+        .expect("old owner should durably claim the action");
+
+    raft_state.set_leadership_for_test(false, 2, 2);
+    let rejected = pause_controller.hold(SCHEDULED_JOB_AUTHORITY_REJECTED);
+    claimed_pause.unpause();
+    let rejected_pause = rejected
+        .wait_for_blocked()
+        .await
+        .expect("stale owner should be fenced after the durable claim");
+
+    let mut tx = application.begin(Identity::system()).await?;
+    let state = SchedulerModel::new(&mut tx, TableNamespace::test_user())
+        .check_status(job_id)
+        .await?
+        .expect("claimed action should still exist");
+    assert!(matches!(state, ScheduledJobState::InProgress { .. }));
+    assert_eq!(
+        TableModel::new(&mut tx)
+            .must_count(OBJECTS_TABLE_COMPONENT.into(), &OBJECTS_TABLE)
+            .await?,
+        0,
+        "the stale owner must not dispatch the claimed action",
+    );
+    let stale_finished = pause_controller.hold(SCHEDULED_JOB_EXECUTED);
+    rejected_pause.unpause();
+    let stale_finished_pause = stale_finished
+        .wait_for_blocked()
+        .await
+        .expect("stale claimed worker generation should finish without dispatching");
+    stale_finished_pause.unpause();
+    application.stop_scheduled_and_cron_workers();
+
+    raft_state.set_leadership_for_test(true, 1, 3);
+    let new_epoch = raft_state
+        .current_leadership_epoch()
+        .expect("new owner should expose a fresh authority epoch");
+    let executed = pause_controller.hold(SCHEDULED_JOB_EXECUTED);
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::raft(
+        raft_state, new_epoch,
+    ));
+    let executed_pause = executed
+        .wait_for_blocked()
+        .await
+        .expect("fresh owner should resolve the uncertain claim");
+
+    let mut tx = application.begin(Identity::system()).await?;
+    let state = SchedulerModel::new(&mut tx, TableNamespace::test_user())
+        .check_status(job_id)
+        .await?
+        .expect("resolved action should still exist");
+    assert!(matches!(state, ScheduledJobState::Failed(_)));
+    assert_eq!(
+        TableModel::new(&mut tx)
+            .must_count(OBJECTS_TABLE_COMPONENT.into(), &OBJECTS_TABLE)
+            .await?,
+        0,
+        "the fresh owner must not replay an action with an uncertain claim",
+    );
+    executed_pause.unpause();
+    application.stop_scheduled_and_cron_workers();
     Ok(())
 }
 

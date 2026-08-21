@@ -122,6 +122,7 @@ use crate::{
     scheduled_jobs::ScheduledJobContext,
     Application,
     ApplicationWorkerStartupPolicy,
+    ScheduledAndCronWorkerAuthority,
 };
 
 pub static OBJECTS_TABLE: LazyLock<TableName> = LazyLock::new(|| "objects".parse().unwrap());
@@ -330,6 +331,7 @@ impl<RT: Runtime> ApplicationTestExt<RT> for Application<RT> {
             self.database.clone(),
             self.runner.clone(),
             self.function_log.clone(),
+            ScheduledAndCronWorkerAuthority::single_node(),
         );
         let metadata_id = metadata.id();
         test_executor
@@ -345,6 +347,7 @@ impl<RT: Runtime> ApplicationTestExt<RT> for Application<RT> {
             self.database.clone(),
             self.runner.clone(),
             self.function_log.clone(),
+            ScheduledAndCronWorkerAuthority::single_node(),
         );
         test_executor.execute_job(job).await;
         Ok(())

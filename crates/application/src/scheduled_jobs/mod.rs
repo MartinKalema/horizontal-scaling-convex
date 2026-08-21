@@ -119,6 +119,8 @@ use value::{
 use crate::{
     application_function_runner::ApplicationFunctionRunner,
     function_log::FunctionExecutionLog,
+    scheduled_and_cron_authority::is_scheduled_and_cron_authority_lost,
+    ScheduledAndCronWorkerAuthority,
 };
 
 mod metrics;
@@ -128,7 +130,9 @@ pub(crate) const SCHEDULED_JOB_COMMITTING: &str = "scheduled_job_committing";
 pub(crate) const SCHEDULED_JOB_MUTATION_ERROR: &str = "scheduled_job_mutation_error";
 pub(crate) const SCHEDULED_JOB_SUCCEEDED: &str = "scheduled_job_succeeded";
 pub(crate) const SCHEDULED_JOB_QUERIED: &str = "scheduled_job_queried";
+pub(crate) const SCHEDULED_ACTION_CLAIMED: &str = "scheduled_action_claimed";
 pub(crate) const SCHEDULER_STARTED: &str = "scheduler_started";
+pub(crate) const SCHEDULED_JOB_AUTHORITY_REJECTED: &str = "scheduled_job_authority_rejected";
 
 #[derive(Clone)]
 pub struct ScheduledJobRunner {
@@ -143,6 +147,7 @@ impl ScheduledJobRunner {
         database: Database<RT>,
         runner: Arc<ApplicationFunctionRunner<RT>>,
         function_log: FunctionExecutionLog<RT>,
+        authority: ScheduledAndCronWorkerAuthority,
     ) -> Self {
         let executor_fut = ScheduledJobExecutor::run(
             rt.clone(),
@@ -150,6 +155,7 @@ impl ScheduledJobRunner {
             database.clone(),
             runner,
             function_log,
+            authority,
         );
         let executor = Arc::new(Mutex::new(rt.spawn("scheduled_job_executor", executor_fut)));
 
@@ -192,6 +198,7 @@ pub struct ScheduledJobContext<RT: Runtime> {
     database: Database<RT>,
     runner: Arc<ApplicationFunctionRunner<RT>>,
     function_log: FunctionExecutionLog<RT>,
+    authority: ScheduledAndCronWorkerAuthority,
 }
 
 impl<RT: Runtime> ScheduledJobContext<RT> {
@@ -201,12 +208,14 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
         database: Database<RT>,
         runner: Arc<ApplicationFunctionRunner<RT>>,
         function_log: FunctionExecutionLog<RT>,
+        authority: ScheduledAndCronWorkerAuthority,
     ) -> Self {
         ScheduledJobContext {
             rt,
             database,
             runner,
             function_log,
+            authority,
         }
     }
 }
@@ -218,6 +227,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
         database: Database<RT>,
         runner: Arc<ApplicationFunctionRunner<RT>>,
         function_log: FunctionExecutionLog<RT>,
+        authority: ScheduledAndCronWorkerAuthority,
     ) {
         let (job_finished_tx, job_finished_rx) =
             mpsc::channel(*SCHEDULED_JOB_EXECUTION_PARALLELISM);
@@ -227,6 +237,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
                 database,
                 runner,
                 function_log,
+                authority,
             },
             instance_name,
             running_job_ids: HashSet::new(),
@@ -243,6 +254,11 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
         loop {
             match executor.run_once().await {
                 Ok(()) => backoff.reset(),
+                Err(e) if is_scheduled_and_cron_authority_lost(&e) => {
+                    let delay = backoff.fail(&mut executor.context.rt.rng());
+                    tracing::debug!("Scheduled job executor lost authority, sleeping {delay:?}");
+                    executor.context.rt.wait(delay).await;
+                },
                 Err(mut e) => {
                     let delay = backoff.fail(&mut executor.context.rt.rng());
                     tracing::error!("Scheduled job executor failed, sleeping {delay:?}");
@@ -417,6 +433,9 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
             if next_ts > now || self.running_job_ids.len() == *SCHEDULED_JOB_EXECUTION_PARALLELISM {
                 return Ok(Some(next_ts));
             }
+            self.context
+                .ensure_authority("scheduled_job_dispatch")
+                .await?;
 
             let context = self.context.clone();
             let tx = self.job_finished_tx.clone();
@@ -456,6 +475,24 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
 }
 
 impl<RT: Runtime> ScheduledJobContext<RT> {
+    async fn ensure_authority(&self, boundary: &'static str) -> anyhow::Result<()> {
+        if let Err(error) = self.authority.ensure_current(boundary) {
+            metrics::log_scheduled_job_authority_rejection();
+            tracing::warn!(
+                boundary,
+                authority = ?self.authority,
+                error = %error,
+                "Fenced scheduled job work from a stale authority"
+            );
+            self.rt
+                .pause_client()
+                .wait(SCHEDULED_JOB_AUTHORITY_REJECTED)
+                .await;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     #[try_stream(boxed, ok = (ResolvedDocumentId, ScheduledJobMetadata), error = anyhow::Error)]
     async fn stream_jobs_to_run<'a>(&'a self, tx: &'a mut Transaction<RT>) {
         let namespaces: Vec<_> = tx
@@ -513,6 +550,13 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
     // This handles re-running the scheduled function on transient errors. It
     // guarantees that the job was successfully run or the job state changed.
     pub async fn execute_job(&self, job: ScheduledJobMetadata, job_id: ResolvedDocumentId) {
+        if self
+            .ensure_authority("scheduled_job_execution")
+            .await
+            .is_err()
+        {
+            return;
+        }
         match self
             .run_function(job.clone(), job_id, job.attempts.count_failures() as usize)
             .await
@@ -521,10 +565,12 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                 self.rt.pause_client().wait(SCHEDULED_JOB_SUCCEEDED).await;
                 metrics::log_scheduled_job_success(job.attempts.count_failures());
             },
+            Err(e) if is_scheduled_and_cron_authority_lost(&e) => {},
             Err(e) => {
                 metrics::log_scheduled_job_failure(&e, job.attempts.count_failures());
                 match self.schedule_retry(job, job_id, e).await {
                     Ok(()) => {},
+                    Err(retry_err) if is_scheduled_and_cron_authority_lost(&retry_err) => {},
                     Err(mut retry_err) => {
                         // If scheduling a retry hits an error, nothing has
                         // changed so the job will remain at the head of the queue and
@@ -542,6 +588,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
         job_id: ResolvedDocumentId,
         mut system_error: anyhow::Error,
     ) -> anyhow::Result<()> {
+        self.ensure_authority("scheduled_job_retry").await?;
         let Some((mut tx, mut job)) = self
             .new_transaction_for_job_state(job_id, &job, FunctionUsageTracker::new())
             .await?
@@ -577,6 +624,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
         job_id: ResolvedDocumentId,
         mutation_retry_count: usize,
     ) -> anyhow::Result<()> {
+        self.ensure_authority("scheduled_job_function_start")
+            .await?;
         let usage_tracker = FunctionUsageTracker::new();
         let Some((mut tx, job)) = self
             .new_transaction_for_job_state(job_id, &job, usage_tracker.clone())
@@ -730,6 +779,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
         let udf_args = job.udf_args()?;
         let request_id = RequestId::new();
         loop {
+            self.ensure_authority("scheduled_mutation_attempt").await?;
             let mutation_retry_count = backoff.failures() as usize;
             let usage_tracker = FunctionUsageTracker::new();
             let Some((mut tx, job)) = self
@@ -886,6 +936,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
         job_id: ResolvedDocumentId,
         usage_tracker: FunctionUsageTracker,
     ) -> anyhow::Result<()> {
+        self.ensure_authority("scheduled_action_claim").await?;
         let identity = tx.identity().clone();
         let Some((mut tx, metadata)) = self
             .new_transaction_for_job_state(job_id, &job, usage_tracker.clone())
@@ -914,8 +965,16 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                 self.database
                     .commit_with_write_source(tx, "scheduled_job_progress")
                     .await?;
+                self.rt.pause_client().wait(SCHEDULED_ACTION_CLAIMED).await;
 
-                // Execute the action
+                // Revalidate after the durable claim. If authority was lost,
+                // leave the action InProgress: retrying it could duplicate an
+                // external side effect that started before the handoff.
+                self.ensure_authority("scheduled_action_dispatch").await?;
+
+                // Execute the action. The fence orders the start across a
+                // leadership handoff; it does not make external side effects
+                // exactly once after user code has begun.
                 let path = job.path.clone();
                 let completion = self
                     .runner

@@ -34,6 +34,7 @@ use application::{
     Application,
     ApplicationWorkerStartupPolicy,
     QueryCache,
+    ScheduledAndCronWorkerAuthority,
 };
 use common::{
     self,
@@ -547,24 +548,35 @@ fn replica_delta_consumer_start_ts(
     }
 }
 
-fn should_run_cluster_singleton_workers(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterSingletonWorkerAuthority {
+    StaticCoordinator,
+    Raft(database::raft_partition::RaftLeadershipEpoch),
+}
+
+fn cluster_singleton_worker_authority(
     replica_mode: bool,
     partition_id: Option<database::partition::PartitionId>,
     raft_state: Option<&database::raft_partition::RaftPartitionState>,
-) -> bool {
+) -> Option<ClusterSingletonWorkerAuthority> {
     if !replica_mode && partition_id.is_none() {
-        return true;
+        return Some(ClusterSingletonWorkerAuthority::StaticCoordinator);
     }
     if replica_mode {
-        return false;
+        return None;
     }
     let Some(partition_id) = partition_id else {
-        return true;
+        return Some(ClusterSingletonWorkerAuthority::StaticCoordinator);
     };
     if partition_id != route_authority::CLUSTER_COORDINATOR_PARTITION {
-        return false;
+        return None;
     }
-    raft_state.is_none_or(database::raft_partition::RaftPartitionState::can_serve_as_leader)
+    match raft_state {
+        None => Some(ClusterSingletonWorkerAuthority::StaticCoordinator),
+        Some(raft_state) => raft_state
+            .current_leadership_epoch()
+            .map(ClusterSingletonWorkerAuthority::Raft),
+    }
 }
 
 fn start_cluster_singleton_worker_supervisor(
@@ -579,19 +591,37 @@ fn start_cluster_singleton_worker_supervisor(
     }
     let supervisor_runtime = runtime.clone();
     runtime.spawn_background("cluster_singleton_worker_authority", async move {
-        let mut running = false;
+        let mut running_authority = None;
         loop {
-            let should_run = should_run_cluster_singleton_workers(
-                replica_mode,
-                partition_id,
-                raft_state.as_ref(),
-            );
-            if should_run && !running {
-                application.start_scheduled_and_cron_workers();
-                running = true;
-            } else if !should_run && running {
-                application.stop_scheduled_and_cron_workers();
-                running = false;
+            let desired_authority =
+                cluster_singleton_worker_authority(replica_mode, partition_id, raft_state.as_ref());
+            if desired_authority != running_authority {
+                tracing::info!(
+                    previous_authority = ?running_authority,
+                    next_authority = ?desired_authority,
+                    "Scheduled job and cron ownership handoff"
+                );
+                if running_authority.is_some() {
+                    application.stop_scheduled_and_cron_workers();
+                }
+                if let Some(desired_authority) = desired_authority {
+                    let worker_authority = match desired_authority {
+                        ClusterSingletonWorkerAuthority::StaticCoordinator => {
+                            ScheduledAndCronWorkerAuthority::single_node()
+                        },
+                        ClusterSingletonWorkerAuthority::Raft(epoch) => {
+                            ScheduledAndCronWorkerAuthority::raft(
+                                raft_state
+                                    .as_ref()
+                                    .expect("Raft worker authority requires Raft state")
+                                    .clone(),
+                                epoch,
+                            )
+                        },
+                    };
+                    application.start_scheduled_and_cron_workers(worker_authority);
+                }
+                running_authority = desired_authority;
             }
             supervisor_runtime.wait(Duration::from_millis(250)).await;
         }
@@ -2119,46 +2149,81 @@ mod tests {
 
     #[test]
     fn cluster_singleton_workers_follow_coordinator_authority() {
-        assert!(super::should_run_cluster_singleton_workers(
-            false, None, None,
-        ));
-        assert!(!super::should_run_cluster_singleton_workers(
-            true, None, None,
-        ));
-        assert!(super::should_run_cluster_singleton_workers(
-            false,
-            Some(database::partition::PartitionId(0)),
+        use super::ClusterSingletonWorkerAuthority;
+
+        assert_eq!(
+            super::cluster_singleton_worker_authority(false, None, None),
+            Some(ClusterSingletonWorkerAuthority::StaticCoordinator),
+        );
+        assert_eq!(
+            super::cluster_singleton_worker_authority(true, None, None),
             None,
-        ));
-        assert!(!super::should_run_cluster_singleton_workers(
-            false,
-            Some(database::partition::PartitionId(1)),
+        );
+        assert_eq!(
+            super::cluster_singleton_worker_authority(
+                false,
+                Some(database::partition::PartitionId(0)),
+                None,
+            ),
+            Some(ClusterSingletonWorkerAuthority::StaticCoordinator),
+        );
+        assert_eq!(
+            super::cluster_singleton_worker_authority(
+                false,
+                Some(database::partition::PartitionId(1)),
+                None,
+            ),
             None,
-        ));
+        );
         let raft_state = database::raft_partition::RaftPartitionState::new_for_test(
             true,
             1,
             database::partition::PartitionId(0),
             1,
         );
-        assert!(super::should_run_cluster_singleton_workers(
+        let old_authority = super::cluster_singleton_worker_authority(
             false,
             Some(database::partition::PartitionId(0)),
             Some(&raft_state),
-        ));
+        )
+        .expect("ready Raft leader should own singleton workers");
         raft_state.mark_cluster_genesis_unready_for_test();
-        assert!(!super::should_run_cluster_singleton_workers(
-            false,
-            Some(database::partition::PartitionId(0)),
-            Some(&raft_state),
-        ));
+        assert_eq!(
+            super::cluster_singleton_worker_authority(
+                false,
+                Some(database::partition::PartitionId(0)),
+                Some(&raft_state),
+            ),
+            None,
+        );
         raft_state.mark_cluster_genesis_ready();
         raft_state.expire_leader_serving_lease_for_test();
-        assert!(!super::should_run_cluster_singleton_workers(
+        assert_eq!(
+            super::cluster_singleton_worker_authority(
+                false,
+                Some(database::partition::PartitionId(0)),
+                Some(&raft_state),
+            ),
+            None,
+        );
+
+        raft_state.set_leadership_for_test(false, 2, 2);
+        assert_eq!(
+            super::cluster_singleton_worker_authority(
+                false,
+                Some(database::partition::PartitionId(0)),
+                Some(&raft_state),
+            ),
+            None,
+        );
+        raft_state.set_leadership_for_test(true, 1, 3);
+        let new_authority = super::cluster_singleton_worker_authority(
             false,
             Some(database::partition::PartitionId(0)),
             Some(&raft_state),
-        ));
+        )
+        .expect("new leadership epoch should own singleton workers");
+        assert_ne!(new_authority, old_authority);
     }
 
     #[test]

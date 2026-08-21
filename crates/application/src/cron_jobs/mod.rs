@@ -87,6 +87,8 @@ use value::{
 use crate::{
     application_function_runner::ApplicationFunctionRunner,
     function_log::FunctionExecutionLog,
+    scheduled_and_cron_authority::is_scheduled_and_cron_authority_lost,
+    ScheduledAndCronWorkerAuthority,
 };
 
 mod metrics;
@@ -94,6 +96,10 @@ mod metrics;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
 pub(crate) const CRON_COMITTING: &str = "cron_committing";
+pub(crate) const CRON_JOB_EXECUTED: &str = "cron_job_executed";
+pub(crate) const CRON_JOB_AUTHORITY_REJECTED: &str = "cron_job_authority_rejected";
+pub(crate) const CRON_JOB_QUERIED: &str = "cron_job_queried";
+pub(crate) const CRON_ACTION_CLAIMED: &str = "cron_action_claimed";
 
 // Truncate result and log lines for cron job logs since they are only
 // used for the dashboard
@@ -118,6 +124,7 @@ pub struct CronJobContext<RT: Runtime> {
     database: Database<RT>,
     runner: Arc<ApplicationFunctionRunner<RT>>,
     function_log: FunctionExecutionLog<RT>,
+    authority: ScheduledAndCronWorkerAuthority,
 }
 
 impl<RT: Runtime> CronJobExecutor<RT> {
@@ -127,6 +134,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
         database: Database<RT>,
         runner: Arc<ApplicationFunctionRunner<RT>>,
         function_log: FunctionExecutionLog<RT>,
+        authority: ScheduledAndCronWorkerAuthority,
     ) {
         let (job_finished_tx, job_finished_rx) =
             mpsc::channel(*SCHEDULED_JOB_EXECUTION_PARALLELISM);
@@ -137,6 +145,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
                 database,
                 runner,
                 function_log,
+                authority,
             },
             running_job_ids: HashSet::new(),
             next_job_ready_time: None,
@@ -148,6 +157,11 @@ impl<RT: Runtime> CronJobExecutor<RT> {
         loop {
             match executor.run_once().await {
                 Ok(()) => backoff.reset(),
+                Err(e) if is_scheduled_and_cron_authority_lost(&e) => {
+                    let delay = backoff.fail(&mut executor.context.rt.rng());
+                    tracing::debug!("Cron job executor lost authority, sleeping {delay:?}");
+                    executor.context.rt.wait(delay).await;
+                },
                 Err(mut e) => {
                     // Only report OCCs that happen repeatedly
                     if !e.is_occ() || (backoff.failures() as usize) > *UDF_EXECUTOR_OCC_MAX_RETRIES
@@ -199,6 +213,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
         select_biased! {
             job_id = self.job_finished_rx.recv().fuse() => {
                 if let Some(job_id) = job_id {
+                    self.context.rt.pause_client().wait(CRON_JOB_EXECUTED).await;
                     self.running_job_ids.remove(&job_id);
                 } else {
                     anyhow::bail!("Job results channel closed, this is unexpected!");
@@ -220,6 +235,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
         let mut job_stream = stream_cron_jobs_to_run(tx);
         while let Some(job) = job_stream.try_next().await? {
             let job_id = job.id;
+            self.context.rt.pause_client().wait(CRON_JOB_QUERIED).await;
             if self.running_job_ids.contains(&job_id) {
                 continue;
             }
@@ -231,6 +247,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
             if next_ts > now || self.running_job_ids.len() == *SCHEDULED_JOB_EXECUTION_PARALLELISM {
                 return Ok(Some(next_ts));
             }
+            self.context.ensure_authority("cron_job_dispatch").await?;
             let sentry_hub = sentry::Hub::with(|hub| sentry::Hub::new_from_top(hub));
             let context = self.context.clone();
             let tx = self.job_finished_tx.clone();
@@ -263,6 +280,7 @@ impl<RT: Runtime> CronJobContext<RT> {
         database: Database<RT>,
         runner: Arc<ApplicationFunctionRunner<RT>>,
         function_log: FunctionExecutionLog<RT>,
+        authority: ScheduledAndCronWorkerAuthority,
     ) -> Self {
         Self {
             rt,
@@ -270,7 +288,26 @@ impl<RT: Runtime> CronJobContext<RT> {
             database,
             runner,
             function_log,
+            authority,
         }
+    }
+
+    async fn ensure_authority(&self, boundary: &'static str) -> anyhow::Result<()> {
+        if let Err(error) = self.authority.ensure_current(boundary) {
+            metrics::log_cron_job_authority_rejection();
+            tracing::warn!(
+                boundary,
+                authority = ?self.authority,
+                error = %error,
+                "Fenced cron job work from a stale authority"
+            );
+            self.rt
+                .pause_client()
+                .wait(CRON_JOB_AUTHORITY_REJECTED)
+                .await;
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     // This handles re-running the cron job on transient errors. It
@@ -278,6 +315,9 @@ impl<RT: Runtime> CronJobContext<RT> {
     pub async fn execute_job(&self, job: CronJob) -> ResolvedDocumentId {
         let mut function_backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
         loop {
+            if self.ensure_authority("cron_job_execution").await.is_err() {
+                return job.id;
+            }
             let mutation_retry_count = function_backoff.failures() as usize;
             let root = get_sampled_span(
                 &self.instance_name,
@@ -300,6 +340,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                     metrics::log_cron_job_success(function_backoff.failures());
                     return result;
                 },
+                Err(e) if is_scheduled_and_cron_authority_lost(&e) => return job.id,
                 Err(mut e) => {
                     let delay = function_backoff.fail(&mut self.rt.rng());
                     tracing::error!(
@@ -321,6 +362,7 @@ impl<RT: Runtime> CronJobContext<RT> {
         job: CronJob,
         mutation_retry_count: usize,
     ) -> anyhow::Result<ResolvedDocumentId> {
+        self.ensure_authority("cron_job_function_start").await?;
         let usage_tracker = FunctionUsageTracker::new();
         let Some(mut tx) = self
             .new_transaction_for_job_state(&job, usage_tracker.clone())
@@ -589,6 +631,7 @@ impl<RT: Runtime> CronJobContext<RT> {
         job: CronJob,
         usage_tracker: FunctionUsageTracker,
     ) -> anyhow::Result<()> {
+        self.ensure_authority("cron_action_claim").await?;
         let namespace = tx.table_mapping().tablet_namespace(job.id.tablet_id)?;
         let component = match namespace {
             TableNamespace::Global => ComponentId::Root,
@@ -616,8 +659,15 @@ impl<RT: Runtime> CronJobContext<RT> {
                 self.database
                     .commit_with_write_source(tx, "cron_in_progress")
                     .await?;
+                self.rt.pause_client().wait(CRON_ACTION_CLAIMED).await;
 
-                // Execute the action
+                // Keep an uncertain claim InProgress if the epoch changed.
+                // Resetting it to Pending could duplicate an external effect
+                // that began before the leadership handoff.
+                self.ensure_authority("cron_action_dispatch").await?;
+
+                // This fences the action start, not arbitrary external side
+                // effects after user code has begun.
                 let path = CanonicalizedComponentFunctionPath {
                     component: component_path,
                     udf_path: job.cron_spec.udf_path.clone(),
