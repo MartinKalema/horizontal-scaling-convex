@@ -139,6 +139,7 @@ use crate::{
         AFTER_RAFT_APPLIED_INDEX_PERSISTENCE,
         AFTER_RAFT_CONVEX_PERSISTENCE,
         AFTER_RAFT_SNAPSHOT_PUBLICATION,
+        BEFORE_DEFERRED_COMMIT_PREPARED_REQUEUE,
         RAFT_APPLY_MARKER_KEY_PREFIX,
         RAFT_NATS_OUTBOX_KEY_PREFIX,
     },
@@ -9776,6 +9777,192 @@ async fn test_watcher_rolls_back_abandoned_prepare_without_decision(
     )
     .await
     .context("timed-out prepare should no longer block conflicting writes")?;
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_deferred_commit_prepared_retries_before_deadline(
+    rt: TestRuntime,
+    pause: PauseController,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let node = create_node(&rt, log.clone(), Some(partitioned_map(PartitionId(1)))).await?;
+
+    insert_doc(
+        &node,
+        "projects",
+        assert_obj!("name" => "deferred-retry-baseline"),
+    )
+    .await?;
+    let (predecessor_txn, ..) = prepare_project_insert_for_2pc_sim(
+        &node,
+        "deferred-retry-predecessor",
+        "deferred_retry_predecessor".to_string(),
+        vec![PartitionId(1)],
+    )
+    .await?;
+    let (successor_txn, successor_ts, _) = prepare_project_insert_for_2pc_sim(
+        &node,
+        "deferred-retry-successor",
+        "deferred_retry_successor".to_string(),
+        vec![PartitionId(1)],
+    )
+    .await?;
+
+    let retry_hold = pause.hold(BEFORE_DEFERRED_COMMIT_PREPARED_REQUEUE);
+    let commit_task = {
+        let committer = node.committer_for_test();
+        let successor_txn = successor_txn.clone();
+        tokio::spawn(async move { committer.commit_prepared(successor_txn).await })
+    };
+    let retry_guard = retry_hold
+        .wait_for_blocked()
+        .await
+        .context("blocked CommitPrepared did not schedule a retry before its deadline")?;
+
+    node.committer_for_test()
+        .rollback_prepared(predecessor_txn)
+        .await?;
+    retry_guard.unpause();
+    let committed_ts = tokio::time::timeout(Duration::from_secs(1), commit_task).await???;
+    assert_eq!(committed_ts, successor_ts);
+    assert_eq!(
+        log.deltas()
+            .iter()
+            .filter(|delta| delta.ts == successor_ts)
+            .count(),
+        1,
+        "the pre-deadline retry should commit the successor once",
+    );
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_deferred_commit_prepared_deadline_hands_off_to_watcher_exactly_once(
+    rt: TestRuntime,
+) -> anyhow::Result<()> {
+    let log = Arc::new(InMemoryDistributedLog::new());
+    let decision_log = Arc::new(InMemoryTwoPhaseDecisionLog::new());
+    let node = create_node_with_options_and_decision_log(
+        &rt,
+        log.clone(),
+        Some(partitioned_map(PartitionId(1))),
+        None,
+        None,
+        decision_log.clone(),
+    )
+    .await?;
+
+    insert_doc(
+        &node,
+        "projects",
+        assert_obj!("name" => "deferred-deadline-baseline"),
+    )
+    .await?;
+    let (predecessor_txn, ..) = prepare_project_insert_for_2pc_sim(
+        &node,
+        "deferred-deadline-predecessor",
+        "deferred_deadline_predecessor".to_string(),
+        vec![PartitionId(1)],
+    )
+    .await?;
+    let (successor_txn, successor_ts, _) = prepare_project_insert_for_2pc_sim(
+        &node,
+        "deferred-deadline-successor",
+        "deferred_deadline_successor".to_string(),
+        vec![PartitionId(1)],
+    )
+    .await?;
+    let committed = TwoPhaseDecision::committed(u64::from(successor_ts), vec![1]);
+    decision_log
+        .write_decision(&successor_txn, &committed)
+        .await?;
+
+    let deadline_error = node
+        .committer_for_test()
+        .commit_prepared(successor_txn.clone())
+        .await
+        .expect_err("blocked CommitPrepared should stop at its local retry deadline");
+    let deadline_message = format!("{deadline_error:#}");
+    assert!(
+        deadline_message.contains("local deferred retry deadline exceeded"),
+        "deadline expiry should be operationally explicit: {deadline_message}",
+    );
+    assert!(
+        deadline_message.contains("durable watcher/recovery will continue"),
+        "deadline expiry should name the durable recovery handoff: {deadline_message}",
+    );
+    assert_eq!(
+        decision_log.get_decision(&successor_txn).await?,
+        Some(committed.clone()),
+        "the local retry deadline must not change the durable commit decision",
+    );
+
+    node.committer_for_test()
+        .rollback_prepared(predecessor_txn)
+        .await?;
+    rt.advance_time(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        node.committer_for_test()
+            .two_phase_redo_records()
+            .await?
+            .contains_key(&successor_txn.0),
+        "deadline expiry must leave the committed successor available to durable recovery",
+    );
+    assert_eq!(
+        log.deltas()
+            .iter()
+            .filter(|delta| delta.ts == successor_ts)
+            .count(),
+        0,
+        "resolving the predecessor after expiry must not restart local self-requeue",
+    );
+
+    let resolved = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        successor_txn.clone(),
+        committed.clone(),
+    )
+    .await?;
+    assert!(resolved, "the durable watcher should commit the successor");
+    let resolved_again = crate::two_phase_watcher::resolve_decision_for_local_partition(
+        &node.committer_for_test(),
+        PartitionId(1),
+        successor_txn,
+        committed,
+    )
+    .await?;
+    assert!(
+        resolved_again,
+        "duplicate durable recovery should be a no-op"
+    );
+    assert_eq!(
+        log.deltas()
+            .iter()
+            .filter(|delta| delta.ts == successor_ts)
+            .count(),
+        1,
+        "durable recovery must publish the committed successor exactly once",
+    );
+
+    let projects = run_query(
+        node,
+        TableNamespace::root_component(),
+        Query::full_table_scan("projects".parse()?, Order::Asc),
+    )
+    .await?;
+    assert_eq!(
+        projects
+            .iter()
+            .filter(|project| {
+                project.value().0.get("name") == Some(&assert_val!("deferred-deadline-successor"))
+            })
+            .count(),
+        1,
+        "the durable decision should become visible exactly once",
+    );
     Ok(())
 }
 

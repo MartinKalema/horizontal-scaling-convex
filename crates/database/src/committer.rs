@@ -217,6 +217,11 @@ use crate::{
 
 const INITIAL_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
+// Expire locally before the 10s 2PC RPC timeout can obscure the recovery
+// handoff.
+const DEFERRED_COMMIT_PREPARED_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const INITIAL_DEFERRED_COMMIT_PREPARED_BACKOFF: Duration = Duration::from_millis(25);
+const MAX_DEFERRED_COMMIT_PREPARED_BACKOFF: Duration = Duration::from_millis(500);
 const RAFT_NATS_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const RAFT_NATS_OUTBOX_KEY_PREFIX: &str = "raft_nats_outbox/";
 pub(crate) const RAFT_APPLY_MARKER_KEY_PREFIX: &str = "raft_apply_marker/";
@@ -441,6 +446,66 @@ struct PreparedTransaction {
     write_bytes: u64,
     document_writes: Arc<Vec<DocumentLogEntry>>,
     index_writes: Arc<Vec<PersistenceIndexEntry>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeferredCommitPreparedRetry {
+    deadline: tokio::time::Instant,
+    backoff: Backoff,
+}
+
+impl DeferredCommitPreparedRetry {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            deadline: now + DEFERRED_COMMIT_PREPARED_RETRY_TIMEOUT,
+            backoff: Backoff::new(
+                INITIAL_DEFERRED_COMMIT_PREPARED_BACKOFF,
+                MAX_DEFERRED_COMMIT_PREPARED_BACKOFF,
+            ),
+        }
+    }
+
+    fn next_delay<RT: Runtime>(&mut self, runtime: &RT) -> Duration {
+        let jittered = self.backoff.fail(&mut runtime.rng());
+        let bounded = cmp::max(jittered, INITIAL_DEFERRED_COMMIT_PREPARED_BACKOFF);
+        cmp::min(
+            bounded,
+            self.deadline
+                .saturating_duration_since(runtime.monotonic_now()),
+        )
+    }
+
+    fn retries(self) -> u32 {
+        self.backoff.failures()
+    }
+}
+
+fn signal_deferred_commit_prepared_deadline(
+    transaction_id: &crate::two_phase::TwoPhaseTransactionId,
+    commit_ts: Timestamp,
+    predecessor_ts: Timestamp,
+    retries: u32,
+    result: oneshot::Sender<anyhow::Result<Timestamp>>,
+) {
+    metrics::log_two_phase_deferred_commit_prepared_deadline_exceeded();
+    tracing::error!(
+        "2PC CommitPrepared: local deferred retry deadline exceeded for txn={} at ts={} behind \
+         unresolved prepared ts={} after {} retries; stopping local self-requeue and handing \
+         continued resolution to the durable watcher/recovery path",
+        transaction_id,
+        u64::from(commit_ts),
+        u64::from(predecessor_ts),
+        retries,
+    );
+    let _ = result.send(Err(anyhow::anyhow!(
+        "2PC CommitPrepared: local deferred retry deadline exceeded for txn={} at ts={} behind \
+         unresolved prepared ts={} after {} retries; durable watcher/recovery will continue \
+         participant resolution",
+        transaction_id,
+        u64::from(commit_ts),
+        u64::from(predecessor_ts),
+        retries,
+    )));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -886,6 +951,7 @@ pub const AFTER_PENDING_WRITE_SNAPSHOT: &str = "after_pending_write_snapshot";
 pub const AFTER_RAFT_CONVEX_PERSISTENCE: &str = "after_raft_convex_persistence";
 pub const AFTER_RAFT_SNAPSHOT_PUBLICATION: &str = "after_raft_snapshot_publication";
 pub const AFTER_RAFT_APPLIED_INDEX_PERSISTENCE: &str = "after_raft_applied_index_persistence";
+pub const BEFORE_DEFERRED_COMMIT_PREPARED_REQUEUE: &str = "before_deferred_commit_prepared_requeue";
 
 fn remote_read_partitions(
     reads: &ReadSet,
@@ -2704,12 +2770,14 @@ impl<RT: Runtime> Committer<RT> {
                         Some(CommitterMessage::CommitPrepared {
                             transaction_id,
                             wait_for_predecessors,
+                            deferred_retry,
                             result,
                         }) => {
                             if let Some(persistence_write_future) =
                                 self.start_commit_prepared(
                                     transaction_id,
                                     wait_for_predecessors,
+                                    deferred_retry,
                                     result,
                                     commit_id,
                                 )
@@ -6404,6 +6472,7 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
         wait_for_predecessors: bool,
+        deferred_retry: Option<DeferredCommitPreparedRetry>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> Option<BoxFuture<'static, anyhow::Result<PersistenceWrite>>> {
@@ -6464,8 +6533,22 @@ impl<RT: Runtime> Committer<RT> {
                 u64::from(commit_ts),
                 u64::from(min_prepared_ts),
             );
+            let mut deferred_retry = deferred_retry
+                .unwrap_or_else(|| DeferredCommitPreparedRetry::new(self.runtime.monotonic_now()));
+            if self.runtime.monotonic_now() >= deferred_retry.deadline {
+                signal_deferred_commit_prepared_deadline(
+                    &transaction_id,
+                    commit_ts,
+                    min_prepared_ts,
+                    deferred_retry.retries(),
+                    result,
+                );
+                return None;
+            }
+            let delay = deferred_retry.next_delay(&self.runtime);
             let sender = self.sender.clone();
             let rt = self.runtime.clone();
+            let pause_client = self.runtime.pause_client();
             tokio_spawn(
                 "defer_commit_prepared_until_prior_intent_resolves",
                 async move {
@@ -6476,7 +6559,10 @@ impl<RT: Runtime> Committer<RT> {
                         );
                         return;
                     }
-                    rt.wait(Duration::from_millis(5)).await;
+                    rt.wait(delay).await;
+                    pause_client
+                        .wait(BEFORE_DEFERRED_COMMIT_PREPARED_REQUEUE)
+                        .await;
                     if result.is_closed() {
                         tracing::debug!(
                             "2PC CommitPrepared: caller stopped waiting for deferred txn={}",
@@ -6484,9 +6570,20 @@ impl<RT: Runtime> Committer<RT> {
                         );
                         return;
                     }
+                    if rt.monotonic_now() >= deferred_retry.deadline {
+                        signal_deferred_commit_prepared_deadline(
+                            &transaction_id,
+                            commit_ts,
+                            min_prepared_ts,
+                            deferred_retry.retries(),
+                            result,
+                        );
+                        return;
+                    }
                     let message = CommitterMessage::CommitPrepared {
                         transaction_id,
                         wait_for_predecessors,
+                        deferred_retry: Some(deferred_retry),
                         result,
                     };
                     if let Err(err) = sender.try_send(message) {
@@ -8081,6 +8178,7 @@ impl CommitterClient {
         let message = CommitterMessage::CommitPrepared {
             transaction_id,
             wait_for_predecessors,
+            deferred_retry: None,
             result: tx,
         };
         self.sender.try_send(message).map_err(|e| match e {
@@ -8353,6 +8451,7 @@ enum CommitterMessage {
     CommitPrepared {
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
         wait_for_predecessors: bool,
+        deferred_retry: Option<DeferredCommitPreparedRetry>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
     },
     /// 2PC RollbackPrepared: abort a previously prepared transaction.
