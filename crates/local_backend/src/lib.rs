@@ -300,6 +300,21 @@ fn refresh_membership_lease(node: &mut database::membership::NodeMembership) {
     node.heartbeat_expires_at_ms = Some(now_ms.saturating_add(ttl_ms));
 }
 
+fn validate_dynamic_membership_advertisement(
+    partition_id: Option<u32>,
+    nats_url: Option<&str>,
+    advertise_grpc_addr: Option<&str>,
+) -> anyhow::Result<()> {
+    if partition_id.is_some() && nats_url.is_some() {
+        anyhow::ensure!(
+            advertise_grpc_addr.is_some_and(|address| !address.trim().is_empty()),
+            "Partitioned NATS membership requires ADVERTISE_GRPC_ADDR; NODE_ADDRESSES is only a \
+             one-TTL bootstrap seed"
+        );
+    }
+    Ok(())
+}
+
 fn apply_membership_snapshot(
     database: &Database<ProdRuntime>,
     shared_node_addresses: &SharedNodeAddresses,
@@ -319,12 +334,14 @@ fn start_membership_refresh_loop(
     database: Database<ProdRuntime>,
     store: Arc<dyn database::membership::MembershipStore>,
     shared_node_addresses: SharedNodeAddresses,
+    initial_snapshot: database::membership::MembershipSnapshot,
     advertised_node: Option<database::membership::NodeMembership>,
 ) {
-    let refresh_runtime = runtime.clone();
-    runtime.spawn_background("cluster_membership_refresh", async move {
+    let authoritative_snapshot = Arc::new(RwLock::new(initial_snapshot));
+    let store_snapshot = authoritative_snapshot.clone();
+    let store_runtime = runtime.clone();
+    runtime.spawn_background("cluster_membership_store_refresh", async move {
         let mut backoff = Duration::from_millis(250);
-        let mut last_live_addresses = None;
         loop {
             let refresh_result = async {
                 let snapshot = if let Some(base_node) = advertised_node.as_ref() {
@@ -345,17 +362,7 @@ fn start_membership_refresh_loop(
                         anyhow::anyhow!("Membership refresh found no current snapshot")
                     })?
                 };
-                let version = snapshot.version();
-                let live_addresses =
-                    apply_membership_snapshot(&database, &shared_node_addresses, snapshot)?;
-                if last_live_addresses.as_ref() != Some(&live_addresses) {
-                    tracing::info!(
-                        version = u64::from(version),
-                        ?live_addresses,
-                        "Refreshed cluster membership snapshot"
-                    );
-                    last_live_addresses = Some(live_addresses);
-                }
+                *store_snapshot.write() = snapshot;
                 Ok(())
             }
             .await;
@@ -363,17 +370,42 @@ fn start_membership_refresh_loop(
             match refresh_result {
                 Ok(()) => {
                     backoff = Duration::from_millis(250);
-                    refresh_runtime.wait(MEMBERSHIP_HEARTBEAT_INTERVAL).await;
+                    store_runtime.wait(MEMBERSHIP_HEARTBEAT_INTERVAL).await;
                 },
                 Err(e) => {
                     tracing::warn!(
                         "Cluster membership refresh failed; retrying after {:?}: {e:#}",
                         backoff
                     );
-                    refresh_runtime.wait(backoff).await;
+                    store_runtime.wait(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 },
             }
+        }
+    });
+
+    let liveness_runtime = runtime.clone();
+    runtime.spawn_background("cluster_membership_liveness", async move {
+        let mut last_live_addresses = None;
+        loop {
+            let snapshot = authoritative_snapshot.read().clone();
+            let version = snapshot.version();
+            match apply_membership_snapshot(&database, &shared_node_addresses, snapshot) {
+                Ok(live_addresses) => {
+                    if last_live_addresses.as_ref() != Some(&live_addresses) {
+                        tracing::info!(
+                            version = u64::from(version),
+                            ?live_addresses,
+                            "Refreshed cluster membership snapshot"
+                        );
+                        last_live_addresses = Some(live_addresses);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to apply cached cluster membership snapshot: {e:#}");
+                },
+            }
+            liveness_runtime.wait(MEMBERSHIP_HEARTBEAT_INTERVAL).await;
         }
     });
 }
@@ -1165,6 +1197,11 @@ pub async fn make_app(
         } else {
             None
         };
+    validate_dynamic_membership_advertisement(
+        config.partition_id,
+        config.nats_url.as_deref(),
+        config.advertise_grpc_addr.as_deref(),
+    )?;
     let membership_store: Option<Arc<dyn database::membership::MembershipStore>> =
         if let (Some(_), Some(nats_url)) = (config.partition_id, config.nats_url.as_deref()) {
             let store: Arc<dyn database::membership::MembershipStore> =
@@ -1211,6 +1248,7 @@ pub async fn make_app(
                 database.clone(),
                 store.clone(),
                 shared_node_addresses.clone(),
+                authoritative_snapshot,
                 advertised_node,
             );
             Some(store)
@@ -1989,7 +2027,32 @@ mod tests {
     use crate::{
         config::LocalConfig,
         make_app,
+        validate_dynamic_membership_advertisement,
     };
+
+    #[test]
+    fn partitioned_nats_membership_requires_advertised_grpc_address() {
+        assert!(
+            validate_dynamic_membership_advertisement(Some(0), Some("nats://nats:4222"), None)
+                .is_err()
+        );
+        assert!(validate_dynamic_membership_advertisement(
+            Some(0),
+            Some("nats://nats:4222"),
+            Some("   "),
+        )
+        .is_err());
+        assert!(validate_dynamic_membership_advertisement(
+            Some(0),
+            Some("nats://nats:4222"),
+            Some("node-p0a:50051"),
+        )
+        .is_ok());
+        assert!(validate_dynamic_membership_advertisement(Some(0), None, None).is_ok());
+        assert!(
+            validate_dynamic_membership_advertisement(None, Some("nats://nats:4222"), None).is_ok()
+        );
+    }
 
     #[test]
     fn partitioned_replica_consumers_do_not_start_from_local_snapshot_ts() -> anyhow::Result<()> {
