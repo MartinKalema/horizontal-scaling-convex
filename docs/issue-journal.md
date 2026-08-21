@@ -988,6 +988,42 @@ own for distributed changes.
   - `BACKEND_PULL_POLICY=never bash self-hosted/docker/test.sh` passed
     write-scaling `149/149`, Raft failover `24/24`, `ALL SUITES PASSED`.
 
+### 2026-08 — Enforced staged 2PC semantics on production reads
+
+- **Status:** complete
+- **Related issue:** `#281`
+- **What this fixes:** parallel-commit staging policy existed, but production
+  reads and subscription reruns did not fence visibility on unresolved prepared
+  transactions. A complete staging proof could therefore be acknowledged while
+  an unrelated latest read still risked observing only the participant state
+  already applied on that node.
+- **Behavior:** exact cluster reads now wait behind prepared transactions at or
+  below their certified timestamp without silently moving to a different
+  timestamp. Incomplete staging remains hidden; complete staging is recovered
+  to a final committed decision before participant visibility, and publishing
+  the recovered write invalidates overlapping subscriptions exactly once.
+  Recovery no longer stalls behind an older abandoned prepare, and forwarded
+  mutation retries preserve one logical request without overlapping attempts.
+- **Hardening found during validation:** participant connection attempts are
+  deadline-bounded; Raft-to-NATS outbox replay runs outside the committer loop;
+  ordered JetStream transport IDs remain distinct from unordered outbox replay;
+  and a graceful shutdown interrupting replica apply is retried without writing
+  a deterministic replication-poison marker.
+- **Validation:**
+  - `cargo test -p database two_phase -- --nocapture` passed `40/40`.
+  - `cargo test -p database raft_nats_outbox -- --nocapture` passed `9/9`.
+  - `cargo test -p database replica::tests -- --nocapture` passed `10/10`.
+  - `cargo test -p database tests::write_scaling_tests --lib` passed `107/107`.
+  - `cargo check -p database -p local_backend` passed.
+  - Built `ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest` and
+    verified every backend container used local image
+    `sha256:45ecfbe6dd7a17ae87c30f8199a61369decf8503d509202ae8edb78f4040b67d`
+    at revision `d05f7358befda0f78eab388f7b04c62033b4509a`, with registry pulls
+    disabled and fresh isolated data volumes.
+  - The full cluster harness passed in both configurations:
+    `ENABLE_PARALLEL_2PC_EARLY_ACK=true` and `false`; each run passed
+    write-scaling `156/156`, Raft failover `24/24`, and `ALL SUITES PASSED`.
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current
