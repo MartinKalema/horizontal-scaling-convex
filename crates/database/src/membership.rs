@@ -83,7 +83,7 @@ pub struct NodeMembership {
     pub generation: u64,
     pub draining: bool,
     /// Monotonic renewal sequence assigned while updating the shared KV entry.
-    /// `None` identifies static bootstrap entries that do not expire.
+    /// `None` identifies an unrenewed bootstrap entry in the dynamic directory.
     pub lease_renewal_sequence: Option<u64>,
     /// Writer wall-clock deadline retained for diagnostics and compatibility.
     /// Liveness decisions must not use this value.
@@ -116,7 +116,6 @@ impl NodeMembership {
 
     fn lease_revision(&self) -> Option<LeaseRevision> {
         self.lease_renewal_sequence
-            .or_else(|| self.heartbeat_expires_at_ms.map(|_| 0))
             .map(|renewal_sequence| LeaseRevision {
                 generation: self.generation,
                 renewal_sequence,
@@ -142,7 +141,7 @@ struct LeaseRevision {
 
 #[derive(Debug)]
 struct LeaseObservation {
-    revision: LeaseRevision,
+    revision: Option<LeaseRevision>,
     last_renewal_observed_at: Instant,
     expired: bool,
     last_clock_disagreement: Option<(bool, bool)>,
@@ -152,7 +151,8 @@ struct LeaseObservation {
 ///
 /// The persisted generation and renewal sequence identify a renewal, while the
 /// elapsed time is measured only with this process's monotonic clock. A newly
-/// started observer grants a leased member one full TTL to publish a renewal.
+/// started observer grants every directory entry one full TTL to publish its
+/// first or next renewal.
 pub struct MembershipLivenessTracker {
     lease_ttl: Duration,
     observations: BTreeMap<ClusterNodeId, LeaseObservation>,
@@ -179,13 +179,7 @@ impl MembershipLivenessTracker {
         let mut live_node_ids = BTreeSet::new();
 
         for node in snapshot.nodes().values() {
-            let Some(revision) = node.lease_revision() else {
-                if !node.draining {
-                    live_node_ids.insert(node.node_id.clone());
-                }
-                continue;
-            };
-
+            let revision = node.lease_revision();
             let observation = match self.observations.entry(node.node_id.clone()) {
                 Entry::Vacant(entry) => entry.insert(LeaseObservation {
                     revision,
@@ -199,10 +193,8 @@ impl MembershipLivenessTracker {
             if revision < observation.revision {
                 tracing::warn!(
                     node_id = %node.node_id,
-                    generation = revision.generation,
-                    renewal_sequence = revision.renewal_sequence,
-                    observed_generation = observation.revision.generation,
-                    observed_renewal_sequence = observation.revision.renewal_sequence,
+                    ?revision,
+                    observed_revision = ?observation.revision,
                     "Ignored regressed membership lease revision"
                 );
                 continue;
@@ -216,8 +208,8 @@ impl MembershipLivenessTracker {
                 if recovered_after_expiry {
                     tracing::info!(
                         node_id = %node.node_id,
-                        generation = revision.generation,
-                        renewal_sequence = revision.renewal_sequence,
+                        generation = node.generation,
+                        renewal_sequence = ?node.lease_renewal_sequence,
                         "Membership lease renewed after local expiry"
                     );
                 }
@@ -230,8 +222,8 @@ impl MembershipLivenessTracker {
                 crate::metrics::log_membership_expiration();
                 tracing::warn!(
                     node_id = %node.node_id,
-                    generation = revision.generation,
-                    renewal_sequence = revision.renewal_sequence,
+                    generation = node.generation,
+                    renewal_sequence = ?node.lease_renewal_sequence,
                     lease_age_ms = duration_millis_saturated(lease_age),
                     lease_ttl_ms = duration_millis_saturated(self.lease_ttl),
                     diagnostic_expires_at_ms = ?node.heartbeat_expires_at_ms,
@@ -251,8 +243,8 @@ impl MembershipLivenessTracker {
                         );
                         tracing::warn!(
                             node_id = %node.node_id,
-                            generation = revision.generation,
-                            renewal_sequence = revision.renewal_sequence,
+                            generation = node.generation,
+                            renewal_sequence = ?node.lease_renewal_sequence,
                             diagnostic_expires_at_ms = expires_at_ms,
                             diagnostic_now_ms,
                             timestamp_is_live,
@@ -802,27 +794,51 @@ mod tests {
     }
 
     #[test]
-    fn test_membership_static_and_drain_liveness() -> anyhow::Result<()> {
-        let static_node = NodeMembership::new(
-            ClusterNodeId::new("bootstrap")?,
-            PartitionId(0),
-            "bootstrap:50051",
-        )?;
+    fn test_membership_bootstrap_grace_expiry_and_drain() -> anyhow::Result<()> {
+        let bootstrap_id = ClusterNodeId::new("bootstrap")?;
+        let bootstrap =
+            NodeMembership::new(bootstrap_id.clone(), PartitionId(0), "bootstrap:50051")?;
         let draining_id = ClusterNodeId::new("draining")?;
         let mut draining =
             NodeMembership::new(draining_id.clone(), PartitionId(0), "draining:50051")?;
         draining.draining = true;
-        draining.heartbeat_expires_at_ms = Some(u64::MAX);
-        let snapshot = MembershipSnapshot::new(MembershipVersion::BOOTSTRAP, vec![static_node])
-            .with_registered_node(draining);
+        let snapshot =
+            MembershipSnapshot::new(MembershipVersion::BOOTSTRAP, vec![bootstrap, draining]);
+
+        assert_eq!(
+            snapshot.to_node_addresses().address_for(PartitionId(0)),
+            Some("bootstrap:50051")
+        );
 
         let ttl = Duration::from_secs(10);
         let started_at = Instant::now();
         let mut tracker = MembershipLivenessTracker::new(ttl);
-        tracker.live_snapshot_at(&snapshot, started_at, 1_000);
-        let live = tracker.live_snapshot_at(&snapshot, started_at + ttl * 10, 1_000);
-        assert!(live.nodes().contains_key(&ClusterNodeId::new("bootstrap")?));
-        assert!(!live.nodes().contains_key(&draining_id));
+        let initial = tracker.live_snapshot_at(&snapshot, started_at, 1_000);
+        assert!(initial.nodes().contains_key(&bootstrap_id));
+        assert!(!initial.nodes().contains_key(&draining_id));
+
+        let grace = tracker.live_snapshot_at(
+            &snapshot,
+            started_at + ttl - Duration::from_millis(1),
+            1_000,
+        );
+        assert!(grace.nodes().contains_key(&bootstrap_id));
+
+        let expired = tracker.live_snapshot_at(&snapshot, started_at + ttl, 1_000);
+        assert!(!expired.nodes().contains_key(&bootstrap_id));
+        assert!(!expired.nodes().contains_key(&draining_id));
+
+        let renewed =
+            snapshot.with_registered_node(snapshot.nodes().get(&bootstrap_id).unwrap().clone());
+        let recovered = tracker.live_snapshot_at(&renewed, started_at + ttl, 1_000);
+        assert_eq!(
+            recovered
+                .nodes()
+                .get(&bootstrap_id)
+                .unwrap()
+                .lease_renewal_sequence,
+            Some(1)
+        );
         Ok(())
     }
 }
