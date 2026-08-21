@@ -64,7 +64,7 @@ pub struct SerializedNamedDeveloperIndexConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 #[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct SerializedDeveloperIndexConfig {
     #[serde(flatten)]
@@ -158,6 +158,24 @@ mod tests {
             config,
             serde_json::from_value::<SerializedDeveloperIndexConfig>(old_format)?.try_into()?,
         );
+
+        let named = SerializedNamedDeveloperIndexConfig {
+            name: "by_creation_time".to_string(),
+            index_config: SerializedDeveloperIndexConfig::from(config.clone()),
+        };
+        let named_json = serde_json::to_value(&named)?;
+        assert_eq!(
+            named_json,
+            serde_json::json!({
+                "name": "by_creation_time",
+                "type": "database",
+                "fields": ["_creationTime"],
+                "staged": false,
+            })
+        );
+        let named_roundtrip =
+            serde_json::from_value::<SerializedNamedDeveloperIndexConfig>(named_json)?;
+        assert_eq!(config, named_roundtrip.index_config.try_into()?);
 
         Ok(())
     }

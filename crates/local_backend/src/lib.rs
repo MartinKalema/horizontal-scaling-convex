@@ -1813,6 +1813,8 @@ pub async fn make_app(
                                 RaftStateMachineEntry::CommitDelta { envelope } => {
                                     let proposed_locally =
                                         envelope.source_raft_node_id() == Some(raft_node_id);
+                                    let raft_nats_outbox_origin =
+                                        envelope.raft_nats_outbox_origin_if_present()?;
                                     let delta = envelope.to_delta()?;
 
                                     tracing::info!(
@@ -1826,7 +1828,11 @@ pub async fn make_app(
                                     let rt = tokio::runtime::Handle::current();
                                     rt.block_on(async {
                                         committer
-                                            .apply_raft_commit_delta(raft_index, delta)
+                                            .apply_raft_commit_delta(
+                                                raft_index,
+                                                delta,
+                                                raft_nats_outbox_origin,
+                                            )
                                             .await
                                             .map_err(|e| {
                                                 anyhow::anyhow!(

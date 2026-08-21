@@ -129,6 +129,7 @@ use crate::{
         testing::InMemoryDistributedLog,
         CommitDelta,
         DistributedLog,
+        RaftNatsOutboxOrigin,
         ReplicationMessage,
         ReplicationTransportId,
     },
@@ -395,6 +396,8 @@ fn raft_snapshot_for_test(index: u64, term: u64, bytes: Vec<u8>) -> RaftSnapshot
     snapshot
 }
 
+const SWITCHABLE_LOG_SOURCE_NODE: &str = "switchable-test-node";
+
 #[derive(Default)]
 struct SwitchableDistributedLog {
     fail_publishes: AtomicBool,
@@ -418,6 +421,10 @@ impl SwitchableDistributedLog {
 impl DistributedLog for SwitchableDistributedLog {
     fn requires_commit_outbox(&self) -> bool {
         self.fail_publishes.load(Ordering::SeqCst)
+    }
+
+    fn source_node(&self) -> Option<String> {
+        Some(SWITCHABLE_LOG_SOURCE_NODE.to_string())
     }
 
     async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
@@ -647,9 +654,9 @@ async fn apply_source_deltas_through_table(
         if deltas.iter().any(|delta| {
             delta.source_partition == Some(source_partition)
                 && delta
-                    .tablet_id_to_table_name
+                    .tablet_id_to_table_identity
                     .values()
-                    .any(|mapped_table| mapped_table == &table_name)
+                    .any(|identity| &identity.table_name == &table_name)
         }) {
             for delta in deltas
                 .into_iter()
@@ -741,15 +748,43 @@ async fn persisted_document_log_count(tp: &Arc<TestPersistence>) -> anyhow::Resu
 async fn commit_next_raft_delta_for_test(
     raft_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
     index: u64,
+) -> anyhow::Result<(CommitDelta, RaftNatsOutboxOrigin)> {
+    let envelope = commit_next_raft_delta_envelope_for_test(raft_rx, index).await?;
+    let origin = envelope
+        .raft_nats_outbox_origin()
+        .context("typed Raft commit proposal did not preserve its durable NATS origin")?;
+    let delta = envelope.to_delta()?;
+    anyhow::ensure!(
+        delta.source_partition == Some(origin.source_partition),
+        "typed Raft proposal delta partition does not match its durable NATS origin",
+    );
+    Ok((delta, origin))
+}
+
+async fn commit_next_raft_delta_without_outbox_for_test(
+    raft_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
+    index: u64,
 ) -> anyhow::Result<CommitDelta> {
+    let envelope = commit_next_raft_delta_envelope_for_test(raft_rx, index).await?;
+    anyhow::ensure!(
+        envelope.raft_nats_outbox_origin_if_present()?.is_none(),
+        "non-outbox test unexpectedly received a durable NATS origin",
+    );
+    envelope.to_delta()
+}
+
+async fn commit_next_raft_delta_envelope_for_test(
+    raft_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RaftMessage>,
+    index: u64,
+) -> anyhow::Result<DeltaEnvelope> {
     let message = tokio::time::timeout(Duration::from_secs(1), raft_rx.recv())
         .await?
         .context("test Raft mailbox closed before receiving a proposal")?;
     let RaftMessage::Propose(proposal) = message else {
         anyhow::bail!("expected a Raft proposal in the test mailbox")
     };
-    let delta = match RaftStateMachineEntry::from_bytes(&proposal.data)? {
-        RaftStateMachineEntry::CommitDelta { envelope } => envelope.to_delta()?,
+    let envelope = match RaftStateMachineEntry::from_bytes(&proposal.data)? {
+        RaftStateMachineEntry::CommitDelta { envelope } => envelope,
         RaftStateMachineEntry::TwoPhasePrepare { .. } => {
             anyhow::bail!("expected a commit delta Raft entry")
         },
@@ -764,7 +799,7 @@ async fn commit_next_raft_delta_for_test(
         .result_tx
         .send(RaftProposalResult::Committed { index })
         .map_err(|_| anyhow::anyhow!("commit waiter dropped before test Raft decision"))?;
-    Ok(delta)
+    Ok(envelope)
 }
 
 async fn commit_next_raft_prepare_for_test(
@@ -1861,7 +1896,7 @@ async fn test_failed_raft_proposal_does_not_publish_or_persist(
         &rt,
         persistence.clone(),
         log.clone(),
-        None,
+        Some(partitioned_map(PartitionId(0))),
         None,
         Arc::new(NoopTwoPhaseDecisionLog),
         None,
@@ -1896,7 +1931,7 @@ async fn test_failed_raft_proposal_does_not_publish_or_persist(
         &rt,
         persistence,
         log,
-        None,
+        Some(partitioned_map(PartitionId(0))),
         None,
         Arc::new(NoopTwoPhaseDecisionLog),
         None,
@@ -1950,7 +1985,10 @@ async fn assert_raft_replay_is_idempotent_across_crash_window(
         )
         .await
     });
-    let delta = commit_next_raft_delta_for_test(&mut raft_rx, 7).await?;
+    let (delta, origin) = commit_next_raft_delta_for_test(&mut raft_rx, 7).await?;
+    assert_eq!(origin.source_node, SWITCHABLE_LOG_SOURCE_NODE);
+    assert_eq!(origin.source_raft_node_id, 1);
+    assert_eq!(origin.source_partition, PartitionId(0));
     let mark_applied_task = tokio::spawn(acknowledge_next_raft_applied_for_test(raft_rx, 7));
     let pause_guard = hold
         .wait_for_blocked()
@@ -2014,7 +2052,7 @@ async fn assert_raft_replay_is_idempotent_across_crash_window(
     let snapshot_before_replay = *restarted.now_ts_for_reads();
     let replay_ts = restarted
         .committer_for_test()
-        .apply_raft_commit_delta(7, delta.clone())
+        .apply_raft_commit_delta(7, delta.clone(), Some(origin.clone()))
         .await?;
     assert_eq!(
         replay_ts, delta.ts,
@@ -2048,6 +2086,11 @@ async fn assert_raft_replay_is_idempotent_across_crash_window(
         "Raft replay recovery must restore exactly one cross-partition outbox record",
     );
     let recovered_envelope: DeltaEnvelope = serde_json::from_value(outbox_records[0].1.clone())?;
+    assert_eq!(
+        recovered_envelope.raft_nats_outbox_origin()?,
+        origin,
+        "restart recovery must preserve the original Raft/NATS producer identity",
+    );
     let recovered_delta = recovered_envelope.to_delta()?;
     assert_eq!(
         recovered_delta.ts, delta.ts,
@@ -2162,7 +2205,7 @@ async fn test_prepare_waits_for_raft_committed_prepared_write_publication(
             .commit_prepared(first_txn_id_for_commit)
             .await
     });
-    let first_delta = commit_next_raft_delta_for_test(&mut raft_rx, 11).await?;
+    let first_delta = commit_next_raft_delta_without_outbox_for_test(&mut raft_rx, 11).await?;
     assert_eq!(first_delta.ts, first_prepare_ts);
     let pause_guard = hold
         .wait_for_blocked()
@@ -2264,7 +2307,7 @@ async fn test_rollback_does_not_block_prior_raft_commit_apply(
         let winner_id = winner_id.clone();
         tokio::spawn(async move { committer.commit_prepared(winner_id).await })
     };
-    let winner_delta = commit_next_raft_delta_for_test(&mut raft_rx, 31).await?;
+    let winner_delta = commit_next_raft_delta_without_outbox_for_test(&mut raft_rx, 31).await?;
     assert_eq!(winner_delta.ts, winner_ts);
     let pause_guard = hold
         .wait_for_blocked()
@@ -2481,7 +2524,10 @@ async fn test_raft_prepared_commit_replay_after_crash_is_idempotent(
     let txn_id_for_commit = txn_id.clone();
     let commit_task =
         tokio::spawn(async move { committer.commit_prepared(txn_id_for_commit).await });
-    let delta = commit_next_raft_delta_for_test(&mut raft_rx, 11).await?;
+    let (delta, origin) = commit_next_raft_delta_for_test(&mut raft_rx, 11).await?;
+    assert_eq!(origin.source_node, SWITCHABLE_LOG_SOURCE_NODE);
+    assert_eq!(origin.source_raft_node_id, 1);
+    assert_eq!(origin.source_partition, PartitionId(1));
     let mark_applied_task = tokio::spawn(acknowledge_next_raft_applied_for_test(raft_rx, 11));
     let pause_guard = hold
         .wait_for_blocked()
@@ -2497,13 +2543,16 @@ async fn test_raft_prepared_commit_replay_after_crash_is_idempotent(
             .len(),
         1,
     );
+    let outbox_at_crash = persistence
+        .reader()
+        .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+        .await?;
+    assert_eq!(outbox_at_crash.len(), 1);
+    let outbox_envelope: DeltaEnvelope = serde_json::from_value(outbox_at_crash[0].1.clone())?;
     assert_eq!(
-        persistence
-            .reader()
-            .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
-            .await?
-            .len(),
-        1,
+        outbox_envelope.raft_nats_outbox_origin()?,
+        origin,
+        "prepared commit persistence must retain the typed Raft proposal origin",
     );
     let installed_document_count = persisted_document_log_count(&persistence).await?;
 
@@ -2533,7 +2582,7 @@ async fn test_raft_prepared_commit_replay_after_crash_is_idempotent(
     let snapshot_before_replay = *restarted.now_ts_for_reads();
     let replay_ts = restarted
         .committer_for_test()
-        .apply_raft_commit_delta(11, delta)
+        .apply_raft_commit_delta(11, delta, Some(origin.clone()))
         .await?;
     assert_eq!(replay_ts, prepare_ts);
     assert_eq!(
@@ -2558,6 +2607,17 @@ async fn test_raft_prepared_commit_replay_after_crash_is_idempotent(
             .await?,
         Some(serde_json::json!({})),
         "replayed prepared commit must clear its durable redo record",
+    );
+    let recovered_outbox = persistence
+        .reader()
+        .list_persistence_globals_with_prefix(RAFT_NATS_OUTBOX_KEY_PREFIX)
+        .await?;
+    assert_eq!(recovered_outbox.len(), 1);
+    let recovered_envelope: DeltaEnvelope = serde_json::from_value(recovered_outbox[0].1.clone())?;
+    assert_eq!(
+        recovered_envelope.raft_nats_outbox_origin()?,
+        origin,
+        "prepared commit restart replay must not replace or discard its origin",
     );
     let projects = run_query(
         restarted,
@@ -2921,7 +2981,7 @@ async fn test_cross_partition_prepare_waits_for_remote_frontier(
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("remote_read_frontier_heartbeat_test"),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         })
         .await?;
@@ -4520,7 +4580,7 @@ async fn test_replication_frontier_persists_across_restart(rt: TestRuntime) -> a
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("replication_frontier_persist_test"),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         })
         .await?;
@@ -4938,7 +4998,7 @@ async fn test_seeded_replica_apply_simulation_preserves_frontier_and_idempotency
                             index_writes: Arc::new(Vec::new()),
                             write_source: WriteSource::new("seeded_replica_frontier_heartbeat"),
                             write_bytes: 0,
-                            tablet_id_to_table_name: Default::default(),
+                            tablet_id_to_table_identity: Default::default(),
                             source_partition: Some(PartitionId(1)),
                         })
                         .await?;
@@ -5057,6 +5117,8 @@ async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
     let delta_ts = delta.ts;
 
     let replay_log = Arc::new(SwitchableDistributedLog::failing());
+    let origin =
+        RaftNatsOutboxOrigin::new(SWITCHABLE_LOG_SOURCE_NODE.to_string(), 1, PartitionId(1))?;
     let follower_persistence = Arc::new(TestPersistence::new());
     let follower = create_node_with_custom_distributed_log(
         &rt,
@@ -5069,7 +5131,7 @@ async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
 
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(1, delta)
+        .apply_raft_commit_delta(1, delta, Some(origin.clone()))
         .await?;
 
     let records = follower_persistence
@@ -5086,6 +5148,12 @@ async fn test_raft_apply_records_nats_outbox_when_publish_unavailable(
             .iter()
             .any(|(key, _)| key.ends_with(&format!("/{:020}", u64::from(delta_ts)))),
         "outbox should include one per-entry record for the failed delta timestamp",
+    );
+    let envelope: DeltaEnvelope = serde_json::from_value(records[0].1.clone())?;
+    assert_eq!(
+        envelope.raft_nats_outbox_origin()?,
+        origin,
+        "follower Raft apply must persist the original source node, Raft node, and partition",
     );
     assert!(
         replay_log.published().is_empty(),
@@ -5110,12 +5178,26 @@ async fn test_partitioned_commit_records_nats_outbox_when_publish_unavailable(
     )
     .await?;
 
-    let commit_ts = insert_doc(
-        &db,
-        "messages",
-        assert_obj!("body" => "accepted while nats is unavailable"),
-    )
-    .await?;
+    let (raft_state, mut raft_rx) =
+        RaftPartitionState::new_with_mailbox_for_test(true, 1, PartitionId(0), 1);
+    db.attach_raft_state(raft_state).await?;
+    let db_for_commit = db.clone();
+    let commit_task = tokio::spawn(async move {
+        insert_doc(
+            &db_for_commit,
+            "messages",
+            assert_obj!("body" => "accepted while nats is unavailable"),
+        )
+        .await
+    });
+    let (delta, origin) = commit_next_raft_delta_for_test(&mut raft_rx, 1).await?;
+    assert_eq!(origin.source_node, SWITCHABLE_LOG_SOURCE_NODE);
+    assert_eq!(origin.source_raft_node_id, 1);
+    assert_eq!(origin.source_partition, PartitionId(0));
+    let mark_applied_task = tokio::spawn(acknowledge_next_raft_applied_for_test(raft_rx, 1));
+    let commit_ts = commit_task.await??;
+    assert!(mark_applied_task.await??);
+    assert_eq!(delta.ts, commit_ts);
 
     let records = persistence
         .reader()
@@ -5131,6 +5213,12 @@ async fn test_partitioned_commit_records_nats_outbox_when_publish_unavailable(
             .iter()
             .any(|(key, _)| key.ends_with(&format!("/{:020}", u64::from(commit_ts)))),
         "outbox should include one per-entry record for the failed commit timestamp",
+    );
+    let envelope: DeltaEnvelope = serde_json::from_value(records[0].1.clone())?;
+    assert_eq!(
+        envelope.raft_nats_outbox_origin()?,
+        origin,
+        "local Raft commit must persist the typed proposal origin without rewriting it",
     );
     assert!(
         replay_log.published().is_empty(),
@@ -5184,7 +5272,7 @@ async fn test_frontier_heartbeat_does_not_dedupe_later_data_delta(
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("heartbeat_before_data_test"),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         })
         .await?;
@@ -5556,9 +5644,9 @@ fn rewrite_index_document_ids(mut delta: CommitDelta) -> anyhow::Result<CommitDe
     let mut rewritten = 1u8;
     for update in &mut delta.document_updates {
         if !delta
-            .tablet_id_to_table_name
+            .tablet_id_to_table_identity
             .get(&update.id.tablet_id)
-            .is_some_and(|name| name == &*INDEX_TABLE)
+            .is_some_and(|identity| &identity.table_name == &*INDEX_TABLE)
         {
             continue;
         }
@@ -5629,9 +5717,9 @@ async fn test_replica_delta_skips_equivalent_index_metadata_with_new_document_id
     duplicate_index_delta.ts = duplicate_index_delta.ts.succ()?;
     duplicate_index_delta.document_updates.retain(|update| {
         duplicate_index_delta
-            .tablet_id_to_table_name
+            .tablet_id_to_table_identity
             .get(&update.id.tablet_id)
-            .is_some_and(|name| name == &*INDEX_TABLE)
+            .is_some_and(|identity| &identity.table_name == &*INDEX_TABLE)
     });
     duplicate_index_delta.document_writes = Arc::new(Vec::new());
     duplicate_index_delta.index_writes = Arc::new(Vec::new());
@@ -5675,7 +5763,8 @@ async fn test_replica_delta_fails_for_unmapped_user_table(rt: TestRuntime) -> an
         .await
         .expect_err("data delta should fail until table metadata is available");
     assert!(
-        format!("{err:#}").contains("is not mapped locally"),
+        format!("{err:#}").contains("No local table matches replicated identity")
+            && format!("{err:#}").contains("projects"),
         "unexpected error: {err:#}",
     );
     assert_eq!(
@@ -5826,14 +5915,15 @@ async fn test_raft_delta_apply_preserves_full_system_state(rt: TestRuntime) -> a
         .await?;
     let cross_partition_docs =
         global_table_scan_or_empty(nats_replica, "_environment_variables").await?;
-    assert!(
-        cross_partition_docs.is_empty(),
-        "cross-partition NATS apply should continue filtering node-local system state",
+    assert_eq!(
+        cross_partition_docs.len(),
+        1,
+        "execution-critical environment variables must materialize before catalog activation",
     );
 
     raft_follower
         .committer_for_test()
-        .apply_raft_commit_delta(1, system_delta)
+        .apply_raft_commit_delta(1, system_delta, None)
         .await?;
     let raft_docs = global_table_scan_or_empty(raft_follower, "_environment_variables").await?;
     assert_eq!(
@@ -6856,7 +6946,7 @@ async fn test_raft_prepared_catalog_replay_accepts_equivalent_cross_partition_ca
         .context("catalog authority should publish its committed half")?;
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(2, authority_delta)
+        .apply_raft_commit_delta(2, authority_delta, None)
         .await?;
 
     let rows = run_local_replica_query(
@@ -7053,7 +7143,7 @@ async fn test_raft_prepared_redo_rewrites_when_follower_floor_advanced_by_replic
         .context("prepared commit should publish a delta")?;
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(2, delta)
+        .apply_raft_commit_delta(2, delta, None)
         .await?;
     follower
         .committer_for_test()
@@ -7457,7 +7547,7 @@ async fn test_raft_prepared_redo_rewrites_when_pre_replay_heartbeat_advances_ret
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("pre_replay_heartbeat_test"),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(0)),
         })
         .await?;
@@ -7493,7 +7583,7 @@ async fn test_raft_prepared_redo_rewrites_when_pre_replay_heartbeat_advances_ret
         .context("prepared commit should publish a delta")?;
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(2, delta)
+        .apply_raft_commit_delta(2, delta, None)
         .await?;
 
     let projects = run_query(
@@ -7585,7 +7675,7 @@ async fn test_raft_prepared_redo_replay_uses_local_anchor_when_begin_ts_is_out_o
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("pre_replay_floor_to_prepare_test"),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(0)),
         })
         .await?;
@@ -7621,7 +7711,7 @@ async fn test_raft_prepared_redo_replay_uses_local_anchor_when_begin_ts_is_out_o
         .context("prepared commit should publish a delta")?;
     follower
         .committer_for_test()
-        .apply_raft_commit_delta(2, delta)
+        .apply_raft_commit_delta(2, delta, None)
         .await?;
 
     let projects = run_query(
@@ -7727,7 +7817,7 @@ async fn test_raft_prepared_redo_rewrites_when_heartbeat_advances_last_assigned(
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("heartbeat_after_prepare_test"),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         })
         .await?;
@@ -7750,7 +7840,7 @@ async fn test_raft_prepared_redo_rewrites_when_heartbeat_advances_last_assigned(
         .context("prepared commit should publish a delta")?;
     let applied_ts = follower
         .committer_for_test()
-        .apply_raft_commit_delta(2, delta)
+        .apply_raft_commit_delta(2, delta, None)
         .await?;
     assert!(
         applied_ts > heartbeat_ts,
@@ -7818,7 +7908,7 @@ async fn test_remote_read_frontier_heartbeat_does_not_advance_snapshot_ts(
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("replication_frontier_snapshot_ts_test"),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         })
         .await?;
@@ -8538,7 +8628,7 @@ fn test_cross_partition_commit_uses_remote_prepare_over_grpc() -> anyhow::Result
                 index_writes: Arc::new(Vec::new()),
                 write_source: WriteSource::new("cross_partition_commit_grpc_test"),
                 write_bytes: 0,
-                tablet_id_to_table_name: Default::default(),
+                tablet_id_to_table_identity: Default::default(),
                 source_partition: Some(PartitionId(1)),
             })
             .await?;
@@ -8735,7 +8825,7 @@ fn test_parallel_early_ack_recovers_staging_before_async_cleanup() -> anyhow::Re
                 index_writes: Arc::new(Vec::new()),
                 write_source: WriteSource::new("parallel_early_ack_test"),
                 write_bytes: 0,
-                tablet_id_to_table_name: Default::default(),
+                tablet_id_to_table_identity: Default::default(),
                 source_partition: Some(PartitionId(1)),
             })
             .await?;
@@ -8883,7 +8973,7 @@ fn test_parallel_early_ack_fences_reads_and_subscription_reruns() -> anyhow::Res
                 index_writes: Arc::new(Vec::new()),
                 write_source: WriteSource::new("parallel_read_semantics_test"),
                 write_bytes: 0,
-                tablet_id_to_table_name: Default::default(),
+                tablet_id_to_table_identity: Default::default(),
                 source_partition: Some(PartitionId(1)),
             })
             .await?;
@@ -10954,7 +11044,7 @@ fn test_commit_decision_survives_failed_participant_commit() -> anyhow::Result<(
                 index_writes: Arc::new(Vec::new()),
                 write_source: WriteSource::new("commit_decision_recovery_test"),
                 write_bytes: 0,
-                tablet_id_to_table_name: Default::default(),
+                tablet_id_to_table_identity: Default::default(),
                 source_partition: Some(PartitionId(1)),
             })
             .await?;
@@ -11077,7 +11167,7 @@ fn test_tso_request_includes_local_replica_floor() -> anyhow::Result<()> {
                 index_writes: Arc::new(Vec::new()),
                 write_source: WriteSource::new("tso_local_floor_test"),
                 write_bytes: 0,
-                tablet_id_to_table_name: Default::default(),
+                tablet_id_to_table_identity: Default::default(),
                 source_partition: Some(PartitionId(1)),
             })
             .await?;

@@ -30,14 +30,18 @@ use futures::{
 };
 use prost::Message;
 use value::{
+    PublicDocumentId,
     TableName,
+    TableNamespace,
     TabletId,
 };
 
 use crate::{
     commit_delta::{
         CommitDelta,
+        DeltaTableIdentity,
         DistributedLog,
+        RaftNatsOutboxOrigin,
         ReplicationAck,
         ReplicationMessage,
         ReplicationPoisonGap,
@@ -58,12 +62,8 @@ const STREAM_NAME: &str = "CONVEX_COMMITS";
 const SUBJECT_BASE: &str = "convex.commits";
 const SYSTEM_TABLE_SUBJECT: &str = "convex.commits.system";
 const FRONTIER_HEARTBEAT_SUBJECT: &str = "convex.commits.frontier_heartbeat";
-const DELTA_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+const DELTA_ENVELOPE_SCHEMA_VERSION: u32 = 2;
 const POISON_REDELIVERY_DELAY: Duration = Duration::from_secs(30);
-
-const fn default_delta_envelope_schema_version() -> u32 {
-    DELTA_ENVELOPE_SCHEMA_VERSION
-}
 
 type EnvelopePoison = (ReplicationPoisonKind, String);
 
@@ -89,7 +89,17 @@ fn validate_delta_envelope_version(envelope: &DeltaEnvelope) -> Result<(), Envel
     ))
 }
 
+fn validate_nats_delta_envelope(envelope: &DeltaEnvelope) -> Result<(), EnvelopePoison> {
+    envelope.validate_nats_transport().map_err(|error| {
+        (
+            ReplicationPoisonKind::InvalidDeltaPayload,
+            format!("invalid NATS delta origin: {error:#}"),
+        )
+    })
+}
+
 fn decode_delta_envelope(envelope: DeltaEnvelope) -> Result<CommitDelta, EnvelopePoison> {
+    validate_nats_delta_envelope(&envelope)?;
     envelope.to_delta().map_err(|error| {
         (
             ReplicationPoisonKind::InvalidDeltaPayload,
@@ -184,6 +194,99 @@ impl NatsDistributedLog {
             && delta.document_writes.is_empty()
             && delta.document_updates.is_empty()
             && delta.index_writes.is_empty()
+    }
+
+    async fn publish_envelope(
+        &self,
+        delta: CommitDelta,
+        envelope: DeltaEnvelope,
+    ) -> anyhow::Result<()> {
+        let ts = u64::from(delta.ts);
+        let num_updates = delta.document_updates.len();
+        let payload = serde_json::to_vec(&envelope).context("Failed to serialize CommitDelta")?;
+        let payload_size = payload.len();
+        let publish_timer = metrics::replication_transport_publish_timer();
+        metrics::log_replication_transport_message_bytes("publish", payload_size);
+
+        let ack = self
+            .jetstream
+            .publish(self.publish_subject.clone(), payload.clone().into())
+            .await
+            .context("Failed to send publish to NATS")?
+            .await
+            .context("Failed to get publish acknowledgment from NATS")?;
+
+        tracing::info!(
+            "Published commit delta to NATS: ts={}, updates={}, bytes={}, stream_seq={}",
+            ts,
+            num_updates,
+            payload_size,
+            ack.sequence,
+        );
+        let touched_tables = delta.touched_table_names();
+        if touched_tables.iter().any(TableName::is_system) {
+            let ack = self
+                .jetstream
+                .publish(SYSTEM_TABLE_SUBJECT.to_string(), payload.clone().into())
+                .await
+                .context("Failed to send selective-delivery system-table publish")?
+                .await
+                .context("Failed to get selective-delivery system-table acknowledgment")?;
+            metrics::log_selective_delivery_targeted_deliveries(1);
+            tracing::debug!(
+                "Published selective-delivery system-table delta: ts={}, stream_seq={}",
+                ts,
+                ack.sequence,
+            );
+        } else if Self::is_frontier_heartbeat_delta(&delta) {
+            let ack = self
+                .jetstream
+                .publish(
+                    FRONTIER_HEARTBEAT_SUBJECT.to_string(),
+                    payload.clone().into(),
+                )
+                .await
+                .context("Failed to send selective-delivery frontier heartbeat publish")?
+                .await
+                .context("Failed to get selective-delivery frontier heartbeat acknowledgment")?;
+            metrics::log_selective_delivery_targeted_deliveries(1);
+            tracing::debug!(
+                "Published selective-delivery frontier heartbeat: ts={}, stream_seq={}",
+                ts,
+                ack.sequence,
+            );
+        } else if let Some(registry) = &self.selective_registry {
+            let interested_nodes = registry
+                .interested_nodes_for_tables(&touched_tables)
+                .into_iter()
+                .filter(|node| node != &self.consumer_name)
+                .collect::<Vec<_>>();
+            metrics::log_selective_delivery_targeted_deliveries(interested_nodes.len());
+            for node in interested_nodes {
+                let ack = self
+                    .jetstream
+                    .publish(
+                        SelectiveDeliveryRegistry::node_subject(&node),
+                        payload.clone().into(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to send selective-delivery publish to {node}")
+                    })?
+                    .await
+                    .with_context(|| {
+                        format!("Failed to get selective-delivery ack for target node {node}")
+                    })?;
+                tracing::debug!(
+                    "Published selective-delivery shadow delta to {}: ts={}, stream_seq={}",
+                    node,
+                    ts,
+                    ack.sequence,
+                );
+            }
+        }
+        drop(publish_timer);
+        Ok(())
     }
 
     async fn subscribe_subjects(
@@ -328,9 +431,22 @@ impl NatsDistributedLog {
                         };
                         let source_node = (!envelope.source_node.is_empty())
                             .then(|| envelope.source_node.clone());
-                        let source_partition = envelope.source_partition.map(PartitionId);
+                        let source_partition = envelope.source_partition.0.map(PartitionId);
                         let origin_ts = Timestamp::try_from(envelope.ts).ok();
                         if let Err((kind, reason)) = validate_delta_envelope_version(&envelope) {
+                            let gap = ReplicationPoisonGap::new(
+                                kind,
+                                Some(node_name),
+                                Some(subject),
+                                stream_sequence,
+                                source_node,
+                                source_partition,
+                                origin_ts,
+                                reason,
+                            );
+                            return Some(Err(reject_poison_message(&msg, gap).await));
+                        }
+                        if let Err((kind, reason)) = validate_nats_delta_envelope(&envelope) {
                             let gap = ReplicationPoisonGap::new(
                                 kind,
                                 Some(node_name),
@@ -534,29 +650,81 @@ impl ReplicationAck for NatsReplicationAck {
 /// Used by both NatsDistributedLog and the Raft state machine to serialize
 /// deltas for transport between nodes.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum SerializedDeltaTableNamespace {
+    Global,
+    ByComponent { component_id: String },
+}
+
+impl From<TableNamespace> for SerializedDeltaTableNamespace {
+    fn from(namespace: TableNamespace) -> Self {
+        match namespace {
+            TableNamespace::Global => Self::Global,
+            TableNamespace::ByComponent(component_id) => Self::ByComponent {
+                component_id: component_id.to_string(),
+            },
+        }
+    }
+}
+
+impl TryFrom<SerializedDeltaTableNamespace> for TableNamespace {
+    type Error = anyhow::Error;
+
+    fn try_from(namespace: SerializedDeltaTableNamespace) -> Result<Self, Self::Error> {
+        Ok(match namespace {
+            SerializedDeltaTableNamespace::Global => TableNamespace::Global,
+            SerializedDeltaTableNamespace::ByComponent { component_id } => {
+                TableNamespace::ByComponent(component_id.parse::<PublicDocumentId>()?)
+            },
+        })
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SerializedDeltaTabletIdentity {
+    tablet_id: String,
+    namespace: SerializedDeltaTableNamespace,
+    table_name: String,
+}
+
+/// A nullable wire field whose presence is mandatory. Serde treats a bare
+/// `Option<T>` field as absent when the key is missing, which would make a v2
+/// envelope unable to distinguish an explicit `null` from an older schema.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct RequiredNullable<T>(Option<T>);
+
+fn deserialize_required_nullable<'de, D, T>(
+    deserializer: D,
+) -> Result<RequiredNullable<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer).map(RequiredNullable)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeltaEnvelope {
-    #[serde(default = "default_delta_envelope_schema_version")]
     schema_version: u32,
     ts: u64,
     write_source: Option<String>,
     write_bytes: u64,
     /// DocumentUpdates encoded as proto bytes.
     document_updates_proto: Vec<Vec<u8>>,
-    /// Mapping from Primary's TabletId (16 bytes, hex-encoded) to table name.
-    /// Used by Replicas to remap document IDs to their own local TabletIds.
-    #[serde(default)]
-    tablet_mapping: Vec<(String, String)>, // (hex TabletId, table name string)
+    /// Stable source identity for every referenced tablet. Namespace is
+    /// mandatory so same-named component system tables cannot cross-apply.
+    tablet_mapping: Vec<SerializedDeltaTabletIdentity>,
     /// Name of the node that published this delta.
     /// Consumers skip deltas from their own node to avoid double-applying.
-    #[serde(default)]
     source_node: String,
     /// Raft node ID that originally proposed this delta, when serialized for
     /// intra-partition Raft replication.
-    #[serde(default)]
-    source_raft_node_id: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    source_raft_node_id: RequiredNullable<u64>,
     /// Partition that originated this replication event.
-    #[serde(default)]
-    source_partition: Option<u32>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    source_partition: RequiredNullable<u32>,
 }
 
 impl DeltaEnvelope {
@@ -575,10 +743,34 @@ impl DeltaEnvelope {
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         let tablet_mapping = delta
-            .tablet_id_to_table_name
+            .tablet_id_to_table_identity
             .iter()
-            .map(|(id, name)| (hex::encode(id.0 .0), name.to_string()))
+            .map(|(id, identity)| SerializedDeltaTabletIdentity {
+                tablet_id: hex::encode(id.0 .0),
+                namespace: identity.namespace.into(),
+                table_name: identity.table_name.to_string(),
+            })
             .collect();
+
+        for update in &delta.document_updates {
+            anyhow::ensure!(
+                delta
+                    .tablet_id_to_table_identity
+                    .contains_key(&update.id.tablet_id),
+                "Delta is missing stable tablet identity for {:?}",
+                update.id.tablet_id,
+            );
+        }
+        if !document_updates_proto.is_empty() {
+            anyhow::ensure!(
+                delta.source_partition.is_some(),
+                "data delta must include a source partition",
+            );
+            anyhow::ensure!(
+                !source_node.is_empty() || source_raft_node_id.is_some(),
+                "data delta must include a NATS source node or Raft source node ID",
+            );
+        }
 
         Ok(Self {
             schema_version: DELTA_ENVELOPE_SCHEMA_VERSION,
@@ -588,9 +780,49 @@ impl DeltaEnvelope {
             document_updates_proto,
             tablet_mapping,
             source_node: source_node.to_string(),
-            source_raft_node_id,
-            source_partition: delta.source_partition.map(|partition| partition.0),
+            source_raft_node_id: RequiredNullable(source_raft_node_id),
+            source_partition: RequiredNullable(delta.source_partition.map(|partition| partition.0)),
         })
+    }
+
+    pub fn from_raft_nats_outbox(
+        delta: &CommitDelta,
+        origin: &RaftNatsOutboxOrigin,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !origin.source_node.is_empty(),
+            "Raft->NATS outbox origin requires a non-empty logical source node",
+        );
+        anyhow::ensure!(
+            delta.source_partition == Some(origin.source_partition),
+            "Raft->NATS outbox origin partition {} does not match delta partition {:?}",
+            origin.source_partition.0,
+            delta.source_partition.map(|partition| partition.0),
+        );
+        Self::from_delta(delta, &origin.source_node, Some(origin.source_raft_node_id))
+    }
+
+    pub fn raft_nats_outbox_origin(&self) -> anyhow::Result<RaftNatsOutboxOrigin> {
+        RaftNatsOutboxOrigin::new(
+            self.source_node.clone(),
+            self.source_raft_node_id
+                .0
+                .context("Raft->NATS outbox envelope is missing source_raft_node_id")?,
+            PartitionId(
+                self.source_partition
+                    .0
+                    .context("Raft->NATS outbox envelope is missing source_partition")?,
+            ),
+        )
+    }
+
+    pub fn raft_nats_outbox_origin_if_present(
+        &self,
+    ) -> anyhow::Result<Option<RaftNatsOutboxOrigin>> {
+        if self.source_node.is_empty() {
+            return Ok(None);
+        }
+        self.raft_nats_outbox_origin().map(Some)
     }
 
     pub fn to_delta(self) -> anyhow::Result<CommitDelta> {
@@ -600,6 +832,7 @@ impl DeltaEnvelope {
             self.schema_version,
             DELTA_ENVELOPE_SCHEMA_VERSION,
         );
+        self.validate_data_source_partition()?;
         let document_updates = self
             .document_updates_proto
             .into_iter()
@@ -608,6 +841,35 @@ impl DeltaEnvelope {
                 DocumentUpdate::try_from(proto)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut tablet_id_to_table_identity = std::collections::BTreeMap::new();
+        for mapping in self.tablet_mapping {
+            let bytes = hex::decode(&mapping.tablet_id)
+                .with_context(|| format!("Invalid delta TabletId hex {}", mapping.tablet_id))?;
+            let arr: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Delta TabletId must contain exactly 16 bytes"))?;
+            let tablet_id = TabletId(value::InternalId(arr));
+            let identity = DeltaTableIdentity::new(
+                mapping.namespace.try_into()?,
+                mapping.table_name.parse::<TableName>()?,
+            );
+            anyhow::ensure!(
+                tablet_id_to_table_identity
+                    .insert(tablet_id, identity)
+                    .is_none(),
+                "Delta contains duplicate tablet identity for {:?}",
+                tablet_id,
+            );
+        }
+
+        for update in &document_updates {
+            anyhow::ensure!(
+                tablet_id_to_table_identity.contains_key(&update.id.tablet_id),
+                "Delta is missing stable tablet identity for {:?}",
+                update.id.tablet_id,
+            );
+        }
 
         Ok(CommitDelta {
             ts: Timestamp::try_from(self.ts)?,
@@ -619,125 +881,70 @@ impl DeltaEnvelope {
                 None => WriteSource::unknown(),
             },
             write_bytes: self.write_bytes,
-            tablet_id_to_table_name: self
-                .tablet_mapping
-                .into_iter()
-                .filter_map(|(id_hex, name_str)| {
-                    let bytes = hex::decode(&id_hex).ok()?;
-                    if bytes.len() != 16 {
-                        return None;
-                    }
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(&bytes);
-                    let tablet_id = TabletId(value::InternalId(arr));
-                    let name: TableName = name_str.parse().ok()?;
-                    Some((tablet_id, name))
-                })
-                .collect(),
-            source_partition: self.source_partition.map(PartitionId),
+            tablet_id_to_table_identity,
+            source_partition: self.source_partition.0.map(PartitionId),
         })
     }
 
     pub fn source_raft_node_id(&self) -> Option<u64> {
-        self.source_raft_node_id
+        self.source_raft_node_id.0
+    }
+
+    fn contains_data(&self) -> bool {
+        !self.document_updates_proto.is_empty()
+    }
+
+    fn validate_data_source_partition(&self) -> anyhow::Result<()> {
+        if self.contains_data() {
+            anyhow::ensure!(
+                self.source_partition.0.is_some(),
+                "data delta must include a non-null source_partition",
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_nats_transport(&self) -> anyhow::Result<()> {
+        self.validate_data_source_partition()?;
+        if self.contains_data() {
+            anyhow::ensure!(
+                !self.source_node.is_empty(),
+                "data delta must include a non-empty source_node for NATS self-filtering",
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_raft_transport(&self) -> anyhow::Result<()> {
+        self.validate_data_source_partition()?;
+        if self.contains_data() {
+            anyhow::ensure!(
+                self.source_raft_node_id.0.is_some(),
+                "data delta must include a non-null source_raft_node_id in a Raft entry",
+            );
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl DistributedLog for NatsDistributedLog {
+    fn source_node(&self) -> Option<String> {
+        Some(self.consumer_name.clone())
+    }
+
     async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
-        let ts = u64::from(delta.ts);
-        let num_updates = delta.document_updates.len();
-
         let envelope = DeltaEnvelope::from_delta(&delta, &self.consumer_name, None)?;
-        let payload = serde_json::to_vec(&envelope).context("Failed to serialize CommitDelta")?;
-        let payload_size = payload.len();
-        let publish_timer = metrics::replication_transport_publish_timer();
-        metrics::log_replication_transport_message_bytes("publish", payload_size);
+        self.publish_envelope(delta, envelope).await
+    }
 
-        // Publish and wait for acknowledgment from NATS server.
-        // The double .await is intentional:
-        // - First .await sends the publish request
-        // - Second .await waits for the server acknowledgment
-        let ack = self
-            .jetstream
-            .publish(self.publish_subject.clone(), payload.clone().into())
-            .await
-            .context("Failed to send publish to NATS")?
-            .await
-            .context("Failed to get publish acknowledgment from NATS")?;
-
-        tracing::info!(
-            "Published commit delta to NATS: ts={}, updates={}, bytes={}, stream_seq={}",
-            ts,
-            num_updates,
-            payload_size,
-            ack.sequence,
-        );
-        let touched_tables = delta.touched_table_names();
-        if touched_tables.iter().any(TableName::is_system) {
-            let ack = self
-                .jetstream
-                .publish(SYSTEM_TABLE_SUBJECT.to_string(), payload.clone().into())
-                .await
-                .context("Failed to send selective-delivery system-table publish")?
-                .await
-                .context("Failed to get selective-delivery system-table acknowledgment")?;
-            metrics::log_selective_delivery_targeted_deliveries(1);
-            tracing::debug!(
-                "Published selective-delivery system-table delta: ts={}, stream_seq={}",
-                ts,
-                ack.sequence,
-            );
-        } else if Self::is_frontier_heartbeat_delta(&delta) {
-            let ack = self
-                .jetstream
-                .publish(
-                    FRONTIER_HEARTBEAT_SUBJECT.to_string(),
-                    payload.clone().into(),
-                )
-                .await
-                .context("Failed to send selective-delivery frontier heartbeat publish")?
-                .await
-                .context("Failed to get selective-delivery frontier heartbeat acknowledgment")?;
-            metrics::log_selective_delivery_targeted_deliveries(1);
-            tracing::debug!(
-                "Published selective-delivery frontier heartbeat: ts={}, stream_seq={}",
-                ts,
-                ack.sequence,
-            );
-        } else if let Some(registry) = &self.selective_registry {
-            let interested_nodes = registry
-                .interested_nodes_for_tables(&touched_tables)
-                .into_iter()
-                .filter(|node| node != &self.consumer_name)
-                .collect::<Vec<_>>();
-            metrics::log_selective_delivery_targeted_deliveries(interested_nodes.len());
-            for node in interested_nodes {
-                let ack = self
-                    .jetstream
-                    .publish(
-                        SelectiveDeliveryRegistry::node_subject(&node),
-                        payload.clone().into(),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("Failed to send selective-delivery publish to {node}")
-                    })?
-                    .await
-                    .with_context(|| {
-                        format!("Failed to get selective-delivery ack for target node {node}")
-                    })?;
-                tracing::debug!(
-                    "Published selective-delivery shadow delta to {}: ts={}, stream_seq={}",
-                    node,
-                    ts,
-                    ack.sequence,
-                );
-            }
-        }
-        drop(publish_timer);
-        Ok(())
+    async fn publish_with_origin(
+        &self,
+        delta: CommitDelta,
+        origin: RaftNatsOutboxOrigin,
+    ) -> anyhow::Result<()> {
+        let envelope = DeltaEnvelope::from_raft_nats_outbox(&delta, &origin)?;
+        self.publish_envelope(delta, envelope).await
     }
 
     async fn subscribe(
@@ -774,6 +981,7 @@ mod tests {
     use crate::{
         commit_delta::{
             CommitDelta,
+            DeltaTableIdentity,
             ReplicationPoisonKind,
         },
         partition::PartitionId,
@@ -800,7 +1008,7 @@ mod tests {
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("remote_read_frontier_heartbeat_test"),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         };
         assert!(NatsDistributedLog::is_frontier_heartbeat_delta(&heartbeat));
@@ -829,7 +1037,7 @@ mod tests {
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::unknown(),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         };
         let mut envelope = DeltaEnvelope::from_delta(&delta, "source", None)?;
@@ -843,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_unversioned_envelope_is_version_one() -> anyhow::Result<()> {
+    fn unversioned_envelope_fails_closed() -> anyhow::Result<()> {
         let delta = CommitDelta {
             ts: Timestamp::try_from(42u64)?,
             document_writes: Arc::new(Vec::new()),
@@ -851,7 +1059,7 @@ mod tests {
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::unknown(),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         };
         let envelope = DeltaEnvelope::from_delta(&delta, "source", None)?;
@@ -862,10 +1070,161 @@ mod tests {
             .remove("schema_version");
         let payload = serde_json::to_vec(&value)?;
 
-        let envelope =
-            deserialize_delta_envelope(&payload).expect("unversioned v1 envelope must decode");
-        validate_delta_envelope_version(&envelope)
-            .expect("unversioned retained envelope must default to v1");
+        let (kind, reason) = deserialize_delta_envelope(&payload)
+            .expect_err("unversioned envelopes must fail closed");
+        assert_eq!(kind, ReplicationPoisonKind::MalformedEnvelope);
+        assert!(reason.contains("schema_version"));
+        Ok(())
+    }
+
+    #[test]
+    fn old_table_name_only_mapping_fails_closed() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_identity: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        };
+        let envelope = DeltaEnvelope::from_delta(&delta, "source", None)?;
+        let mut value = serde_json::to_value(envelope)?;
+        value["tablet_mapping"] =
+            serde_json::json!([[hex::encode(value::TabletId::MIN.0 .0), "_modules"]]);
+
+        let payload = serde_json::to_vec(&value)?;
+        let (kind, _) = deserialize_delta_envelope(&payload)
+            .expect_err("table-name-only mappings must not enter cluster apply");
+        assert_eq!(kind, ReplicationPoisonKind::MalformedEnvelope);
+        Ok(())
+    }
+
+    #[test]
+    fn v2_origin_fields_are_mandatory_on_the_wire() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_identity: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        };
+        let envelope = serde_json::to_value(DeltaEnvelope::from_delta(&delta, "source", None)?)?;
+
+        for field in ["source_node", "source_raft_node_id", "source_partition"] {
+            let mut missing = envelope.clone();
+            missing
+                .as_object_mut()
+                .context("serialized envelope must be an object")?
+                .remove(field);
+            let payload = serde_json::to_vec(&missing)?;
+            let (kind, reason) = deserialize_delta_envelope(&payload)
+                .expect_err("every v2 source field must be present");
+            assert_eq!(kind, ReplicationPoisonKind::MalformedEnvelope);
+            assert!(reason.contains(field), "unexpected error: {reason}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_null_origin_fields_are_not_treated_as_missing() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_identity: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        };
+        let envelope = DeltaEnvelope::from_delta(&delta, "source", None)?;
+        let mut nullable = serde_json::to_value(envelope)?;
+        nullable["source_raft_node_id"] = serde_json::Value::Null;
+        nullable["source_partition"] = serde_json::Value::Null;
+
+        let decoded: DeltaEnvelope = serde_json::from_value(nullable.clone())?;
+        assert_eq!(decoded.source_raft_node_id(), None);
+        assert_eq!(decoded.to_delta()?.source_partition, None);
+
+        nullable["source_node"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<DeltaEnvelope>(nullable).is_err(),
+            "source_node is present but cannot be null",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn data_delta_requires_non_null_nats_origin_identity() -> anyhow::Result<()> {
+        let delta = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_identity: Default::default(),
+            source_partition: Some(PartitionId(1)),
+        };
+        let mut envelope =
+            serde_json::to_value(DeltaEnvelope::from_delta(&delta, "source", None)?)?;
+        // The origin checks run before protobuf decoding, so an opaque payload
+        // is sufficient to prove malformed origin metadata fails closed.
+        envelope["document_updates_proto"] = serde_json::json!([[]]);
+        envelope["source_partition"] = serde_json::Value::Null;
+        let decoded: DeltaEnvelope = serde_json::from_value(envelope.clone())?;
+        let (kind, reason) = decode_delta_envelope(decoded)
+            .expect_err("a data delta with null source_partition must fail closed");
+        assert_eq!(kind, ReplicationPoisonKind::InvalidDeltaPayload);
+        assert!(reason.contains("non-null source_partition"));
+
+        envelope["source_partition"] = serde_json::json!(1);
+        envelope["source_node"] = serde_json::json!("");
+        let decoded: DeltaEnvelope = serde_json::from_value(envelope)?;
+        let (kind, reason) = decode_delta_envelope(decoded)
+            .expect_err("a NATS data delta with an empty source_node must fail closed");
+        assert_eq!(kind, ReplicationPoisonKind::InvalidDeltaPayload);
+        assert!(reason.contains("non-empty source_node"));
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_roundtrip_preserves_component_namespace_identity() -> anyhow::Result<()> {
+        let child_namespace = value::TableNamespace::ByComponent(value::PublicDocumentId::new(
+            value::TableNumber::try_from(10_001u32)?,
+            value::InternalId([0x44; 16]),
+        ));
+        let table_name: value::TableName = "_modules".parse()?;
+        let mut tablet_id_to_table_identity = std::collections::BTreeMap::new();
+        tablet_id_to_table_identity.insert(
+            value::TabletId::MIN,
+            DeltaTableIdentity::new(value::TableNamespace::Global, table_name.clone()),
+        );
+        tablet_id_to_table_identity.insert(
+            value::TabletId::MAX,
+            DeltaTableIdentity::new(child_namespace, table_name),
+        );
+        let delta = CommitDelta {
+            ts: Timestamp::try_from(42u64)?,
+            document_writes: Arc::new(Vec::new()),
+            document_updates: Vec::new(),
+            index_writes: Arc::new(Vec::new()),
+            write_source: WriteSource::unknown(),
+            write_bytes: 0,
+            tablet_id_to_table_identity: tablet_id_to_table_identity.clone(),
+            source_partition: Some(PartitionId(1)),
+        };
+
+        let decoded = DeltaEnvelope::from_delta(&delta, "source", None)?.to_delta()?;
+        assert_eq!(
+            decoded.tablet_id_to_table_identity,
+            tablet_id_to_table_identity,
+        );
         Ok(())
     }
 
@@ -878,7 +1237,7 @@ mod tests {
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::unknown(),
             write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            tablet_id_to_table_identity: Default::default(),
             source_partition: Some(PartitionId(1)),
         };
         let mut envelope = DeltaEnvelope::from_delta(&delta, "source", None)?;

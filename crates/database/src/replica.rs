@@ -382,7 +382,7 @@ mod tests {
                 index_writes: Arc::new(Vec::new()),
                 write_source: WriteSource::unknown(),
                 write_bytes: 0,
-                tablet_id_to_table_name: BTreeMap::new(),
+                tablet_id_to_table_identity: BTreeMap::new(),
                 source_partition,
             },
             Box::new(RecordingAck { counts }),

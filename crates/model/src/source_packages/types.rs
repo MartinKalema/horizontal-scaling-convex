@@ -111,7 +111,7 @@ impl std::fmt::Display for PackageSize {
     }
 }
 
-const MAX_ZIPPED_PACKAGES_SIZE: usize = 45_000_000; // 45 MB - Lambda gives us 50 MB so we have 5 MB wiggle room
+pub(crate) const MAX_ZIPPED_PACKAGES_SIZE: usize = 45_000_000; // 45 MB - Lambda gives us 50 MB so we have 5 MB wiggle room
 const MAX_UNZIPPED_PACKAGES_SIZE: usize = 230_000_000; // 230 MB - Lambda gives us 250 MB
 
 impl PackageSize {

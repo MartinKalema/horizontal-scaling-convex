@@ -32,7 +32,7 @@ pub type DatabaseVersion = i64;
 // migrations unless explicitly dropping support.
 // Add a user name next to the version when you make a change to highlight merge
 // conflicts.
-pub const DATABASE_VERSION: DatabaseVersion = 124; // reece
+pub const DATABASE_VERSION: DatabaseVersion = 125; // martin
 
 pub struct MigrationExecutor<RT: Runtime> {
     pub db: Database<RT>,
@@ -94,6 +94,11 @@ impl<RT: Runtime> MigrationExecutor<RT> {
                 self.db
                     .commit_with_write_source(tx, "migration_124")
                     .await?;
+                MigrationCompletionCriterion::MigrationComplete(to_version)
+            },
+            125 => {
+                // Empty migration because model initialization creates the
+                // deployment-global _catalog_versions system table.
                 MigrationCompletionCriterion::MigrationComplete(to_version)
             },
             // NOTE: Make sure to increase DATABASE_VERSION when adding new migrations.
