@@ -136,13 +136,13 @@ pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 const MEMBERSHIP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MEMBERSHIP_LEASE_TTL: Duration = Duration::from_secs(15);
 
-#[derive(Default)]
 struct SharedNodeAddressState {
     grpc_addresses: Option<database::two_phase::NodeAddresses>,
     http_origins: BTreeMap<database::partition::PartitionId, Vec<String>>,
+    membership_liveness: database::membership::MembershipLivenessTracker,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SharedNodeAddresses(Arc<RwLock<SharedNodeAddressState>>);
 
 impl SharedNodeAddresses {
@@ -150,6 +150,9 @@ impl SharedNodeAddresses {
         Self(Arc::new(RwLock::new(SharedNodeAddressState {
             grpc_addresses: addresses,
             http_origins: BTreeMap::new(),
+            membership_liveness: database::membership::MembershipLivenessTracker::new(
+                MEMBERSHIP_LEASE_TTL,
+            ),
         })))
     }
 
@@ -166,15 +169,15 @@ impl SharedNodeAddresses {
             .unwrap_or_default()
     }
 
-    pub fn refresh_from_membership(&self, snapshot: &database::membership::MembershipSnapshot) {
-        let now_ms = database::membership::current_unix_timestamp_millis();
-        let addresses = snapshot.to_live_node_addresses(now_ms);
+    pub fn refresh_from_membership(
+        &self,
+        snapshot: &database::membership::MembershipSnapshot,
+    ) -> database::membership::MembershipSnapshot {
+        let mut state = self.0.write();
+        let live_snapshot = state.membership_liveness.live_snapshot(snapshot);
+        let addresses = live_snapshot.to_node_addresses();
         let mut http_origins: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        for node in snapshot
-            .nodes()
-            .values()
-            .filter(|node| node.is_live_at(now_ms))
-        {
+        for node in live_snapshot.nodes().values() {
             if let Some(http_origin) = node
                 .http_origin
                 .as_ref()
@@ -187,10 +190,15 @@ impl SharedNodeAddresses {
                     .push(http_origin.trim_end_matches('/').to_string());
             }
         }
-        *self.0.write() = SharedNodeAddressState {
-            grpc_addresses: (!addresses.partitions().is_empty()).then_some(addresses),
-            http_origins,
-        };
+        state.grpc_addresses = (!addresses.partitions().is_empty()).then_some(addresses);
+        state.http_origins = http_origins;
+        live_snapshot
+    }
+}
+
+impl Default for SharedNodeAddresses {
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 
@@ -282,6 +290,8 @@ fn advertised_membership_node(
 }
 
 fn refresh_membership_lease(node: &mut database::membership::NodeMembership) {
+    // This wall-clock deadline is diagnostic only. KV-assigned renewal sequence
+    // changes are timed against each observer's monotonic clock for liveness.
     let now_ms = database::membership::current_unix_timestamp_millis();
     let ttl_ms = MEMBERSHIP_LEASE_TTL
         .as_millis()
@@ -294,12 +304,14 @@ fn apply_membership_snapshot(
     database: &Database<ProdRuntime>,
     shared_node_addresses: &SharedNodeAddresses,
     snapshot: database::membership::MembershipSnapshot,
-) -> anyhow::Result<()> {
-    shared_node_addresses.refresh_from_membership(&snapshot);
+) -> anyhow::Result<Option<database::two_phase::NodeAddresses>> {
+    let live_snapshot = shared_node_addresses.refresh_from_membership(&snapshot);
+    let live_addresses = live_snapshot.to_node_addresses();
+    let live_addresses = (!live_addresses.partitions().is_empty()).then_some(live_addresses);
     database
         .committer_client()
-        .refresh_membership_snapshot(snapshot)?;
-    Ok(())
+        .refresh_membership_snapshot(live_snapshot)?;
+    Ok(live_addresses)
 }
 
 fn start_membership_refresh_loop(
@@ -333,17 +345,18 @@ fn start_membership_refresh_loop(
                         anyhow::anyhow!("Membership refresh found no current snapshot")
                     })?
                 };
-                let live_addresses = snapshot
-                    .to_live_node_addresses(database::membership::current_unix_timestamp_millis());
+                let version = snapshot.version();
+                let live_addresses =
+                    apply_membership_snapshot(&database, &shared_node_addresses, snapshot)?;
                 if last_live_addresses.as_ref() != Some(&live_addresses) {
                     tracing::info!(
-                        version = u64::from(snapshot.version()),
+                        version = u64::from(version),
                         ?live_addresses,
                         "Refreshed cluster membership snapshot"
                     );
                     last_live_addresses = Some(live_addresses);
                 }
-                apply_membership_snapshot(&database, &shared_node_addresses, snapshot)
+                Ok(())
             }
             .await;
 

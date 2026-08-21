@@ -7680,10 +7680,11 @@ impl CommitterClient {
 
     pub fn refresh_membership_snapshot(
         &self,
-        snapshot: crate::membership::MembershipSnapshot,
+        live_snapshot: crate::membership::MembershipSnapshot,
     ) -> anyhow::Result<()> {
-        let node_addresses =
-            snapshot.to_live_node_addresses(crate::membership::current_unix_timestamp_millis());
+        // The local membership observer filters expired leases before this
+        // snapshot reaches transaction routing.
+        let node_addresses = live_snapshot.to_node_addresses();
         *self.node_addresses.write() =
             (!node_addresses.partitions().is_empty()).then_some(node_addresses);
         Ok(())
