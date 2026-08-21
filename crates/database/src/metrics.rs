@@ -499,6 +499,18 @@ pub fn log_two_phase_prepare_retry() {
     log_counter(&DATABASE_TWO_PHASE_PREPARE_RETRIES_TOTAL, 1);
 }
 
+register_convex_counter!(
+    DATABASE_TWO_PHASE_DEFERRED_COMMIT_PREPARED_DEADLINE_EXCEEDED_TOTAL,
+    "Number of deferred 2PC CommitPrepared attempts handed to durable recovery after their local \
+     retry deadline"
+);
+pub fn log_two_phase_deferred_commit_prepared_deadline_exceeded() {
+    log_counter(
+        &DATABASE_TWO_PHASE_DEFERRED_COMMIT_PREPARED_DEADLINE_EXCEEDED_TOTAL,
+        1,
+    );
+}
+
 register_convex_histogram!(
     DATABASE_TWO_PHASE_COORDINATOR_SECONDS,
     "End-to-end duration of a 2PC coordinator attempt",
