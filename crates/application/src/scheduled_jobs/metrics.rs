@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use errors::ErrorMetadataAnyhowExt;
 use metrics::{
+    log_counter,
     log_counter_with_labels,
     log_distribution,
     log_distribution_with_labels,
@@ -12,6 +13,14 @@ use metrics::{
     Timer,
     STATUS_LABEL,
 };
+
+register_convex_counter!(
+    SCHEDULED_JOB_AUTHORITY_REJECTIONS_TOTAL,
+    "Count of scheduled job work rejected by the leadership fence"
+);
+pub fn log_scheduled_job_authority_rejection() {
+    log_counter(&SCHEDULED_JOB_AUTHORITY_REJECTIONS_TOTAL, 1);
+}
 
 register_convex_counter!(
     SCHEDULED_JOB_RESULT_TOTAL,

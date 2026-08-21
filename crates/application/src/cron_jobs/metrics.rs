@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use errors::ErrorMetadataAnyhowExt;
 use metrics::{
+    log_counter,
     log_counter_with_labels,
     log_distribution,
     register_convex_counter,
@@ -9,6 +10,14 @@ use metrics::{
     StaticMetricLabel,
     STATUS_LABEL,
 };
+
+register_convex_counter!(
+    CRON_JOB_AUTHORITY_REJECTIONS_TOTAL,
+    "Count of cron job work rejected by the leadership fence"
+);
+pub fn log_cron_job_authority_rejection() {
+    log_counter(&CRON_JOB_AUTHORITY_REJECTIONS_TOTAL, 1);
+}
 
 register_convex_counter!(
     CRON_JOB_RESULT_TOTAL,

@@ -131,9 +131,10 @@ enum CommittedEntryAction {
 /// becomes leader or loses leadership, so the application can start/stop
 /// the Committer accordingly.
 pub struct LeadershipCallbacks {
-    /// Called when this node becomes the elected Raft leader. Application work
-    /// must still wait for [`LeadershipCallbacks::on_leader_ready`].
-    pub on_became_leader: Box<dyn FnMut() + Send>,
+    /// Called with the new term when this node becomes the elected Raft leader.
+    /// Application work must still wait for
+    /// [`LeadershipCallbacks::on_leader_ready`].
+    pub on_became_leader: Box<dyn FnMut(u64) + Send>,
     /// Called when this node loses leadership (stepped down or partitioned).
     /// The Committer should stop accepting writes and drain pending proposals.
     pub on_lost_leadership: Box<dyn FnMut() + Send>,
@@ -151,7 +152,7 @@ pub struct LeadershipCallbacks {
 impl Default for LeadershipCallbacks {
     fn default() -> Self {
         Self {
-            on_became_leader: Box::new(|| {}),
+            on_became_leader: Box::new(|_| {}),
             on_lost_leadership: Box::new(|| {}),
             on_leader_changed: Box::new(|_| {}),
             on_leader_ready: Box::new(|| {}),
@@ -698,7 +699,7 @@ impl RaftNode {
                             self.raw_node.raft.term,
                             self.raw_node.raft.raft_log.last_index(),
                         ));
-                        (self.leadership_callbacks.on_became_leader)();
+                        (self.leadership_callbacks.on_became_leader)(self.raw_node.raft.term);
                     } else if !now_leader && self.is_leader_flag {
                         tracing::info!(
                             "Raft node {}: lost leadership for partition {}",
@@ -984,7 +985,7 @@ impl RaftNode {
                     self.raw_node.raft.term,
                     self.raw_node.raft.raft_log.last_index(),
                 ));
-                (self.leadership_callbacks.on_became_leader)();
+                (self.leadership_callbacks.on_became_leader)(self.raw_node.raft.term);
             } else if !now_leader && self.is_leader_flag {
                 self.is_leader_flag = false;
                 self.is_leader_ready_flag = false;
@@ -1121,7 +1122,7 @@ mod tests {
         node.set_leadership_callbacks(LeadershipCallbacks {
             on_became_leader: Box::new({
                 let events = events.clone();
-                move || events.lock().unwrap().push("elected")
+                move |_| events.lock().unwrap().push("elected")
             }),
             on_leader_ready: Box::new({
                 let events = events.clone();
@@ -1698,7 +1699,7 @@ mod tests {
         let became_leader_clone = became_leader.clone();
 
         node.set_leadership_callbacks(LeadershipCallbacks {
-            on_became_leader: Box::new(move || {
+            on_became_leader: Box::new(move |_| {
                 became_leader_clone.store(true, std::sync::atomic::Ordering::SeqCst);
             }),
             on_leader_changed: Box::new(move |leader_id| {

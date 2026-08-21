@@ -21,7 +21,9 @@ use common::{
     runtime::Runtime,
 };
 use database::{
+    partition::PartitionId,
     query::TableFilter,
+    raft_partition::RaftPartitionState,
     DeveloperQuery,
     TableModel,
     Transaction,
@@ -44,6 +46,7 @@ use model::{
         types::{
             CronIdentifier,
             CronJob,
+            CronJobState,
             CronSchedule,
             CronSpec,
         },
@@ -57,7 +60,13 @@ use serde_json::Value as JsonValue;
 use udf::helpers::parse_udf_args;
 
 use crate::{
-    cron_jobs::CRON_COMITTING,
+    cron_jobs::{
+        CRON_ACTION_CLAIMED,
+        CRON_COMITTING,
+        CRON_JOB_AUTHORITY_REJECTED,
+        CRON_JOB_EXECUTED,
+        CRON_JOB_QUERIED,
+    },
     test_helpers::{
         ApplicationFixtureArgs,
         ApplicationTestExt,
@@ -65,6 +74,9 @@ use crate::{
         OBJECTS_TABLE_COMPONENT,
     },
     Application,
+    ApplicationWorkerStartupPolicy,
+    ScheduledAndCronWorkerAuthority,
+    ScheduledAndCronWorkerStartup,
 };
 
 fn test_cron_identifier() -> CronIdentifier {
@@ -154,6 +166,255 @@ pub(crate) async fn test_cron_jobs_success(rt: TestRuntime) -> anyhow::Result<()
     );
     let mut logs_query = cron_log_query(&mut tx, OBJECTS_TABLE_COMPONENT)?;
     assert!(logs_query.next(&mut tx, None).await?.is_some());
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cron_action_leadership_handoff_fences_stale_owner(
+    rt: TestRuntime,
+    pause_controller: PauseController,
+) -> anyhow::Result<()> {
+    let application = Application::new_for_tests_with_args(
+        &rt,
+        ApplicationFixtureArgs {
+            worker_startup_policy: Some(ApplicationWorkerStartupPolicy {
+                scheduled_and_cron: ScheduledAndCronWorkerStartup::Disabled,
+                ..ApplicationWorkerStartupPolicy::single_node()
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    application.load_udf_tests_modules().await?;
+
+    let name = CronIdentifier::from_str("handoff")?;
+    let path = CanonicalizedComponentFunctionPath {
+        component: ComponentPath::test_user(),
+        udf_path: "action:insertObject".parse()?,
+    };
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "key".to_string(),
+        serde_json::Value::String("value".to_string()),
+    );
+    let cron_spec = CronSpec {
+        udf_path: path.udf_path.clone(),
+        udf_args: parse_udf_args(&path.udf_path, vec![JsonValue::Object(args)])?
+            .into_serialized_args()?,
+        cron_schedule: CronSchedule::Interval { seconds: 60 },
+    };
+    let mut tx = application.begin(Identity::system()).await?;
+    let mut cron_model = CronModel::new(&mut tx, ComponentId::test_user());
+    let existing_metadata = cron_model.list_metadata().await?;
+    for metadata in existing_metadata.into_values() {
+        cron_model.delete(metadata).await?;
+    }
+    cron_model.create(name.clone(), cron_spec).await?;
+    let initial_job = cron_model
+        .list()
+        .await?
+        .remove(&name)
+        .expect("handoff cron should exist");
+    let initial_next_ts = initial_job.next_ts;
+    application.commit_test(tx).await?;
+    rt.wait(Duration::from_secs(100)).await;
+
+    let raft_state = RaftPartitionState::new_for_test(true, 1, PartitionId::DEFAULT, 1);
+    let old_epoch = raft_state
+        .current_leadership_epoch()
+        .expect("old owner should begin with authority");
+    let queried = pause_controller.hold(CRON_JOB_QUERIED);
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::raft(
+        raft_state.clone(),
+        old_epoch,
+    ));
+    let queried_pause = queried
+        .wait_for_blocked()
+        .await
+        .expect("old owner should query the due cron action");
+
+    raft_state.set_leadership_for_test(false, 2, 2);
+    let rejected = pause_controller.hold(CRON_JOB_AUTHORITY_REJECTED);
+    queried_pause.unpause();
+    let rejected_pause = rejected
+        .wait_for_blocked()
+        .await
+        .expect("stale cron owner should be rejected at dispatch");
+    let mut tx = application.begin(Identity::system()).await?;
+    let stale_job = CronModel::new(&mut tx, ComponentId::test_user())
+        .list()
+        .await?
+        .remove(&name)
+        .expect("handoff cron should remain pending");
+    assert_eq!(stale_job.state, CronJobState::Pending);
+    assert_eq!(stale_job.next_ts, initial_next_ts);
+    assert_eq!(
+        TableModel::new(&mut tx)
+            .must_count(OBJECTS_TABLE_COMPONENT.into(), &OBJECTS_TABLE)
+            .await?,
+        0,
+        "stale cron owner must not start the action",
+    );
+    rejected_pause.unpause();
+    application.stop_scheduled_and_cron_workers();
+
+    raft_state.set_leadership_for_test(true, 1, 3);
+    let new_epoch = raft_state
+        .current_leadership_epoch()
+        .expect("new owner should expose a fresh authority epoch");
+    assert_ne!(new_epoch, old_epoch);
+    let executed = pause_controller.hold(CRON_JOB_EXECUTED);
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::raft(
+        raft_state, new_epoch,
+    ));
+    if let Some(executed_pause) = executed.wait_for_blocked().await {
+        executed_pause.unpause();
+    }
+
+    let mut tx = application.begin(Identity::system()).await?;
+    let fresh_job = CronModel::new(&mut tx, ComponentId::test_user())
+        .list()
+        .await?
+        .remove(&name)
+        .expect("handoff cron should remain scheduled");
+    assert_eq!(fresh_job.state, CronJobState::Pending);
+    assert!(fresh_job.next_ts > initial_next_ts);
+    assert_eq!(
+        TableModel::new(&mut tx)
+            .must_count(OBJECTS_TABLE_COMPONENT.into(), &OBJECTS_TABLE)
+            .await?,
+        1,
+        "fresh cron owner should produce one action effect",
+    );
+    application.stop_scheduled_and_cron_workers();
+    Ok(())
+}
+
+#[convex_macro::test_runtime]
+async fn test_cron_action_handoff_after_claim_is_not_replayed(
+    rt: TestRuntime,
+    pause_controller: PauseController,
+) -> anyhow::Result<()> {
+    let application = Application::new_for_tests_with_args(
+        &rt,
+        ApplicationFixtureArgs {
+            worker_startup_policy: Some(ApplicationWorkerStartupPolicy {
+                scheduled_and_cron: ScheduledAndCronWorkerStartup::Disabled,
+                ..ApplicationWorkerStartupPolicy::single_node()
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    application.load_udf_tests_modules().await?;
+
+    let name = CronIdentifier::from_str("post-claim-handoff")?;
+    let path = CanonicalizedComponentFunctionPath {
+        component: ComponentPath::test_user(),
+        udf_path: "action:insertObject".parse()?,
+    };
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "key".to_string(),
+        serde_json::Value::String("value".to_string()),
+    );
+    let cron_spec = CronSpec {
+        udf_path: path.udf_path.clone(),
+        udf_args: parse_udf_args(&path.udf_path, vec![JsonValue::Object(args)])?
+            .into_serialized_args()?,
+        cron_schedule: CronSchedule::Interval { seconds: 60 },
+    };
+    let mut tx = application.begin(Identity::system()).await?;
+    let mut cron_model = CronModel::new(&mut tx, ComponentId::test_user());
+    let existing_metadata = cron_model.list_metadata().await?;
+    for metadata in existing_metadata.into_values() {
+        cron_model.delete(metadata).await?;
+    }
+    cron_model.create(name.clone(), cron_spec).await?;
+    let initial_next_ts = cron_model
+        .list()
+        .await?
+        .remove(&name)
+        .expect("post-claim cron should exist")
+        .next_ts;
+    application.commit_test(tx).await?;
+    rt.wait(Duration::from_secs(100)).await;
+
+    let raft_state = RaftPartitionState::new_for_test(true, 1, PartitionId::DEFAULT, 1);
+    let old_epoch = raft_state
+        .current_leadership_epoch()
+        .expect("old owner should begin with authority");
+    let claimed = pause_controller.hold(CRON_ACTION_CLAIMED);
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::raft(
+        raft_state.clone(),
+        old_epoch,
+    ));
+    let claimed_pause = claimed
+        .wait_for_blocked()
+        .await
+        .expect("old owner should durably claim the cron action");
+
+    raft_state.set_leadership_for_test(false, 2, 2);
+    let rejected = pause_controller.hold(CRON_JOB_AUTHORITY_REJECTED);
+    claimed_pause.unpause();
+    let rejected_pause = rejected
+        .wait_for_blocked()
+        .await
+        .expect("stale cron owner should be fenced after the durable claim");
+
+    let mut tx = application.begin(Identity::system()).await?;
+    let claimed_job = CronModel::new(&mut tx, ComponentId::test_user())
+        .list()
+        .await?
+        .remove(&name)
+        .expect("claimed cron should still exist");
+    assert!(matches!(claimed_job.state, CronJobState::InProgress { .. }));
+    assert_eq!(
+        TableModel::new(&mut tx)
+            .must_count(OBJECTS_TABLE_COMPONENT.into(), &OBJECTS_TABLE)
+            .await?,
+        0,
+        "the stale cron owner must not dispatch the claimed action",
+    );
+    let stale_finished = pause_controller.hold(CRON_JOB_EXECUTED);
+    rejected_pause.unpause();
+    let stale_finished_pause = stale_finished
+        .wait_for_blocked()
+        .await
+        .expect("stale claimed cron worker generation should finish without dispatching");
+    stale_finished_pause.unpause();
+    application.stop_scheduled_and_cron_workers();
+
+    raft_state.set_leadership_for_test(true, 1, 3);
+    let new_epoch = raft_state
+        .current_leadership_epoch()
+        .expect("new owner should expose a fresh authority epoch");
+    let executed = pause_controller.hold(CRON_JOB_EXECUTED);
+    application.start_scheduled_and_cron_workers(ScheduledAndCronWorkerAuthority::raft(
+        raft_state, new_epoch,
+    ));
+    let executed_pause = executed
+        .wait_for_blocked()
+        .await
+        .expect("fresh owner should resolve the uncertain cron claim");
+
+    let mut tx = application.begin(Identity::system()).await?;
+    let resolved_job = CronModel::new(&mut tx, ComponentId::test_user())
+        .list()
+        .await?
+        .remove(&name)
+        .expect("resolved cron should remain scheduled");
+    assert_eq!(resolved_job.state, CronJobState::Pending);
+    assert!(resolved_job.next_ts > initial_next_ts);
+    assert_eq!(
+        TableModel::new(&mut tx)
+            .must_count(OBJECTS_TABLE_COMPONENT.into(), &OBJECTS_TABLE)
+            .await?,
+        0,
+        "the fresh cron owner must not replay an action with an uncertain claim",
+    );
+    executed_pause.unpause();
+    application.stop_scheduled_and_cron_workers();
     Ok(())
 }
 

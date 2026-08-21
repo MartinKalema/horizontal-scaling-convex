@@ -36,6 +36,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{
         atomic::{
             AtomicBool,
@@ -63,6 +64,32 @@ use crate::{
     timestamp_oracle::TimestampOracle,
 };
 
+/// Identifies one elected coordinator leadership generation.
+///
+/// Raft terms are monotonic for a partition, and pairing the term with the
+/// local node ID makes ownership handoffs explicit in scheduler logs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RaftLeadershipEpoch {
+    term: u64,
+    node_id: u64,
+}
+
+impl RaftLeadershipEpoch {
+    pub fn term(self) -> u64 {
+        self.term
+    }
+
+    pub fn node_id(self) -> u64 {
+        self.node_id
+    }
+}
+
+impl fmt::Display for RaftLeadershipEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "term={} node={}", self.term, self.node_id)
+    }
+}
+
 /// Shared state for a Raft-enabled partition, accessible from the Committer
 /// and the HTTP layer.
 #[derive(Clone)]
@@ -73,6 +100,8 @@ pub struct RaftPartitionState {
     leader_ready: Arc<AtomicBool>,
     /// The current leader's node ID (0 if unknown).
     leader_id: Arc<AtomicU64>,
+    /// The Raft term in which this node most recently became leader.
+    leader_term: Arc<AtomicU64>,
     /// Channel to send proposals to the Raft node.
     proposal_tx: mpsc::UnboundedSender<RaftMessage>,
     /// Partition ID.
@@ -116,6 +145,37 @@ impl RaftPartitionState {
 
     pub fn can_serve_as_leader(&self) -> bool {
         self.is_cluster_genesis_ready() && self.is_leader() && self.has_leader_serving_lease()
+    }
+
+    /// Return the current scheduler authority epoch only while this node is
+    /// ready and covered by its coordinator serving lease.
+    pub fn current_leadership_epoch(&self) -> Option<RaftLeadershipEpoch> {
+        let term_before = self.leader_term.load(Ordering::SeqCst);
+        if term_before == 0 {
+            return None;
+        }
+        if !self.can_serve_as_leader() {
+            return None;
+        }
+        let term_after = self.leader_term.load(Ordering::SeqCst);
+        (term_before == term_after).then_some(RaftLeadershipEpoch {
+            term: term_after,
+            node_id: self.node_id,
+        })
+    }
+
+    /// Validate a token at an application work boundary. The readiness and
+    /// serving-lease checks fence a deposed or partitioned coordinator, while
+    /// the term prevents a token from surviving a later re-election.
+    pub fn is_current_leadership_epoch(&self, epoch: RaftLeadershipEpoch) -> bool {
+        if epoch.node_id != self.node_id || epoch.term == 0 {
+            return false;
+        }
+        let term_before = self.leader_term.load(Ordering::SeqCst);
+        if term_before != epoch.term || !self.can_serve_as_leader() {
+            return false;
+        }
+        self.leader_term.load(Ordering::SeqCst) == term_before
     }
 
     /// Get the current leader's node ID.
@@ -166,6 +226,7 @@ impl RaftPartitionState {
             is_leader: Arc::new(AtomicBool::new(is_leader)),
             leader_ready: Arc::new(AtomicBool::new(is_leader)),
             leader_id: Arc::new(AtomicU64::new(leader_id)),
+            leader_term: Arc::new(AtomicU64::new(u64::from(is_leader))),
             proposal_tx,
             partition_id,
             node_id,
@@ -191,6 +252,7 @@ impl RaftPartitionState {
                 is_leader: Arc::new(AtomicBool::new(is_leader)),
                 leader_ready: Arc::new(AtomicBool::new(is_leader)),
                 leader_id: Arc::new(AtomicU64::new(leader_id)),
+                leader_term: Arc::new(AtomicU64::new(u64::from(is_leader))),
                 proposal_tx,
                 partition_id,
                 node_id,
@@ -220,6 +282,23 @@ impl RaftPartitionState {
         self.leader_ready.store(ready, Ordering::SeqCst);
         if !ready {
             *self.leader_serving_lease_valid_until.lock() = None;
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_leadership_for_test(&self, is_leader: bool, leader_id: u64, term: u64) {
+        if is_leader {
+            self.leader_term.store(term, Ordering::SeqCst);
+            self.leader_id.store(leader_id, Ordering::SeqCst);
+            self.leader_ready.store(true, Ordering::SeqCst);
+            *self.leader_serving_lease_valid_until.lock() =
+                Some(Instant::now() + std::time::Duration::from_secs(60));
+            self.is_leader.store(true, Ordering::SeqCst);
+        } else {
+            self.is_leader.store(false, Ordering::SeqCst);
+            self.leader_ready.store(false, Ordering::SeqCst);
+            *self.leader_serving_lease_valid_until.lock() = None;
+            self.leader_id.store(leader_id, Ordering::SeqCst);
         }
     }
 }
@@ -277,12 +356,14 @@ impl RaftPartitionManager {
         let is_leader = Arc::new(AtomicBool::new(false));
         let leader_ready = Arc::new(AtomicBool::new(false));
         let leader_id = Arc::new(AtomicU64::new(0));
+        let leader_term = Arc::new(AtomicU64::new(0));
         let leader_serving_lease_valid_until = Arc::new(Mutex::new(None));
         let leader_serving_lease_duration = config.leader_serving_lease_duration();
 
         // Set up leadership callbacks that update shared atomic state.
         let is_leader_cb = is_leader.clone();
         let leader_ready_became_leader = leader_ready.clone();
+        let leader_term_became_leader = leader_term.clone();
         let serving_lease_became_leader = leader_serving_lease_valid_until.clone();
         let serving_lease_refresh = leader_serving_lease_valid_until.clone();
         let serving_lease_duration_refresh = leader_serving_lease_duration;
@@ -290,12 +371,13 @@ impl RaftPartitionManager {
         let tso_became_leader = timestamp_oracle.clone();
 
         node.set_leadership_callbacks(LeadershipCallbacks {
-            on_became_leader: Box::new(move || {
+            on_became_leader: Box::new(move |term| {
                 if let Some(tso) = tso_became_leader.as_ref() {
                     tso.discard_reserved_batch();
                 }
                 leader_ready_became_leader.store(false, Ordering::SeqCst);
                 *serving_lease_became_leader.lock() = None;
+                leader_term_became_leader.store(term, Ordering::SeqCst);
                 is_leader_cb.store(true, Ordering::SeqCst);
                 metrics::log_raft_is_leader(partition_id, true);
                 metrics::log_raft_leader_ready(partition_id, false);
@@ -364,6 +446,7 @@ impl RaftPartitionManager {
             is_leader: is_leader.clone(),
             leader_ready,
             leader_id,
+            leader_term,
             proposal_tx: mailbox_tx.clone(),
             partition_id: config.partition_id,
             node_id: config.node_id,
@@ -492,11 +575,37 @@ mod tests {
         assert!(state.is_leader_ready());
         assert!(state.has_leader_serving_lease());
         assert_eq!(state.leader_id(), 1);
+        let epoch = state
+            .current_leadership_epoch()
+            .expect("ready leader should expose its authority epoch");
+        assert_eq!(epoch.node_id(), 1);
+        assert!(epoch.term() > 0);
+        assert!(state.is_current_leadership_epoch(epoch));
         assert_eq!(
             state.leader_id(),
             1,
             "Shared state should expose the elected leader ID"
         );
+    }
+
+    #[test]
+    fn leadership_epoch_fences_handoff_and_re_election() {
+        let state = RaftPartitionState::new_for_test(true, 1, PartitionId(0), 1);
+        let old_epoch = state
+            .current_leadership_epoch()
+            .expect("initial leader should have an epoch");
+
+        state.set_leadership_for_test(false, 2, 2);
+        assert!(state.current_leadership_epoch().is_none());
+        assert!(!state.is_current_leadership_epoch(old_epoch));
+
+        state.set_leadership_for_test(true, 1, 3);
+        let new_epoch = state
+            .current_leadership_epoch()
+            .expect("re-elected leader should have a new epoch");
+        assert_ne!(new_epoch, old_epoch);
+        assert!(!state.is_current_leadership_epoch(old_epoch));
+        assert!(state.is_current_leadership_epoch(new_epoch));
     }
 
     #[tokio::test]

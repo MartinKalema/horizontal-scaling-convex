@@ -313,6 +313,7 @@ use model::{
 use node_executor::Actions;
 use parking_lot::Mutex;
 use rand::Rng;
+pub use scheduled_and_cron_authority::ScheduledAndCronWorkerAuthority;
 use scheduled_jobs::ScheduledJobRunner;
 use schema_worker::SchemaWorker;
 use search::{
@@ -412,6 +413,7 @@ pub mod log_visibility;
 mod metrics;
 mod module_cache;
 pub mod redaction;
+mod scheduled_and_cron_authority;
 pub mod scheduled_jobs;
 mod schema_worker;
 pub mod snapshot_import;
@@ -670,6 +672,7 @@ fn start_scheduled_and_cron_workers<RT: Runtime>(
     database: Database<RT>,
     runner: Arc<ApplicationFunctionRunner<RT>>,
     function_log: FunctionExecutionLog<RT>,
+    authority: ScheduledAndCronWorkerAuthority,
 ) -> (ScheduledJobRunner, Box<dyn SpawnHandle>) {
     let scheduled_job_runner = ScheduledJobRunner::start(
         runtime.clone(),
@@ -677,6 +680,7 @@ fn start_scheduled_and_cron_workers<RT: Runtime>(
         database.clone(),
         runner.clone(),
         function_log.clone(),
+        authority.clone(),
     );
     let cron_job_executor_fut = CronJobExecutor::run(
         runtime.clone(),
@@ -684,6 +688,7 @@ fn start_scheduled_and_cron_workers<RT: Runtime>(
         database,
         runner,
         function_log,
+        authority,
     );
     let cron_job_executor = runtime.spawn("cron_job_executor", cron_job_executor_fut);
     (scheduled_job_runner, cron_job_executor)
@@ -964,6 +969,7 @@ impl<RT: Runtime> Application<RT> {
                     database.clone(),
                     runner.clone(),
                     function_log.clone(),
+                    ScheduledAndCronWorkerAuthority::single_node(),
                 );
                 (Some(scheduled_job_runner), Some(cron_job_executor))
             },
@@ -1069,7 +1075,7 @@ impl<RT: Runtime> Application<RT> {
         self.runtime.clone()
     }
 
-    pub fn start_scheduled_and_cron_workers(&self) {
+    pub fn start_scheduled_and_cron_workers(&self, authority: ScheduledAndCronWorkerAuthority) {
         if !self
             .scheduled_and_cron_worker_starts_allowed
             .load(Ordering::SeqCst)
@@ -1082,13 +1088,17 @@ impl<RT: Runtime> Application<RT> {
             return;
         }
 
-        tracing::info!("Starting scheduled job and cron workers on cluster authority node");
+        tracing::info!(
+            authority = ?authority,
+            "Starting scheduled job and cron workers on authority node"
+        );
         let (new_scheduled_job_runner, new_cron_job_executor) = start_scheduled_and_cron_workers(
             self.runtime.clone(),
             self.instance_name.clone(),
             self.database.clone(),
             self.runner.clone(),
             self.function_log.clone(),
+            authority,
         );
         *scheduled_job_runner = Some(new_scheduled_job_runner);
         *cron_job_executor = Some(new_cron_job_executor);
