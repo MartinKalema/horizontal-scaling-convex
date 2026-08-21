@@ -53,6 +53,7 @@ const PHASE_LABELS: [&str; 1] = ["phase"];
 const COMMIT_PATH_LABEL: &str = "path";
 const COMMIT_STAGE_LABEL: &str = "stage";
 const TSO_OPERATION_LABEL: &str = "operation";
+const MEMBERSHIP_CLOCK_STATE_LABELS: [&str; 2] = ["timestamp_state", "renewal_state"];
 const COMMIT_HOT_PATH_STAGE_LABELS: [&str; 3] =
     [COMMIT_PATH_LABEL, COMMIT_STAGE_LABEL, STATUS_LABEL[0]];
 const TSO_OPERATION_LABELS: [&str; 2] = [TSO_OPERATION_LABEL, STATUS_LABEL[0]];
@@ -90,6 +91,42 @@ fn commit_stage_label(stage: &'static str) -> StaticMetricLabel {
 
 fn tso_operation_label(operation: &'static str) -> StaticMetricLabel {
     StaticMetricLabel::new(TSO_OPERATION_LABEL, operation)
+}
+
+register_convex_counter!(
+    DATABASE_MEMBERSHIP_LEASE_EXPIRATIONS_TOTAL,
+    "Number of members expired from locally observed renewal age"
+);
+pub(crate) fn log_membership_expiration() {
+    log_counter(&DATABASE_MEMBERSHIP_LEASE_EXPIRATIONS_TOTAL, 1);
+}
+
+register_convex_counter!(
+    DATABASE_MEMBERSHIP_CLOCK_SKEW_DISAGREEMENTS_TOTAL,
+    "Number of membership decisions where diagnostic wall time disagreed with renewal age",
+    &MEMBERSHIP_CLOCK_STATE_LABELS
+);
+pub(crate) fn log_membership_clock_skew_disagreement(
+    timestamp_is_live: bool,
+    renewal_is_live: bool,
+) {
+    let state = |is_live| if is_live { "live" } else { "expired" };
+    log_counter_with_labels(
+        &DATABASE_MEMBERSHIP_CLOCK_SKEW_DISAGREEMENTS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("timestamp_state", state(timestamp_is_live)),
+            StaticMetricLabel::new("renewal_state", state(renewal_is_live)),
+        ],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_MEMBERSHIP_STALE_GENERATION_REJECTIONS_TOTAL,
+    "Number of membership registrations rejected because a newer generation exists"
+);
+pub(crate) fn log_membership_stale_generation_rejection() {
+    log_counter(&DATABASE_MEMBERSHIP_STALE_GENERATION_REJECTIONS_TOTAL, 1);
 }
 
 register_convex_gauge!(

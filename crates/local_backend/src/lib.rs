@@ -136,13 +136,13 @@ pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 const MEMBERSHIP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MEMBERSHIP_LEASE_TTL: Duration = Duration::from_secs(15);
 
-#[derive(Default)]
 struct SharedNodeAddressState {
     grpc_addresses: Option<database::two_phase::NodeAddresses>,
     http_origins: BTreeMap<database::partition::PartitionId, Vec<String>>,
+    membership_liveness: database::membership::MembershipLivenessTracker,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SharedNodeAddresses(Arc<RwLock<SharedNodeAddressState>>);
 
 impl SharedNodeAddresses {
@@ -150,6 +150,9 @@ impl SharedNodeAddresses {
         Self(Arc::new(RwLock::new(SharedNodeAddressState {
             grpc_addresses: addresses,
             http_origins: BTreeMap::new(),
+            membership_liveness: database::membership::MembershipLivenessTracker::new(
+                MEMBERSHIP_LEASE_TTL,
+            ),
         })))
     }
 
@@ -166,15 +169,15 @@ impl SharedNodeAddresses {
             .unwrap_or_default()
     }
 
-    pub fn refresh_from_membership(&self, snapshot: &database::membership::MembershipSnapshot) {
-        let now_ms = database::membership::current_unix_timestamp_millis();
-        let addresses = snapshot.to_live_node_addresses(now_ms);
+    pub fn refresh_from_membership(
+        &self,
+        snapshot: &database::membership::MembershipSnapshot,
+    ) -> database::membership::MembershipSnapshot {
+        let mut state = self.0.write();
+        let live_snapshot = state.membership_liveness.live_snapshot(snapshot);
+        let addresses = live_snapshot.to_node_addresses();
         let mut http_origins: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        for node in snapshot
-            .nodes()
-            .values()
-            .filter(|node| node.is_live_at(now_ms))
-        {
+        for node in live_snapshot.nodes().values() {
             if let Some(http_origin) = node
                 .http_origin
                 .as_ref()
@@ -187,10 +190,15 @@ impl SharedNodeAddresses {
                     .push(http_origin.trim_end_matches('/').to_string());
             }
         }
-        *self.0.write() = SharedNodeAddressState {
-            grpc_addresses: (!addresses.partitions().is_empty()).then_some(addresses),
-            http_origins,
-        };
+        state.grpc_addresses = (!addresses.partitions().is_empty()).then_some(addresses);
+        state.http_origins = http_origins;
+        live_snapshot
+    }
+}
+
+impl Default for SharedNodeAddresses {
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 
@@ -282,6 +290,8 @@ fn advertised_membership_node(
 }
 
 fn refresh_membership_lease(node: &mut database::membership::NodeMembership) {
+    // This wall-clock deadline is diagnostic only. KV-assigned renewal sequence
+    // changes are timed against each observer's monotonic clock for liveness.
     let now_ms = database::membership::current_unix_timestamp_millis();
     let ttl_ms = MEMBERSHIP_LEASE_TTL
         .as_millis()
@@ -290,16 +300,33 @@ fn refresh_membership_lease(node: &mut database::membership::NodeMembership) {
     node.heartbeat_expires_at_ms = Some(now_ms.saturating_add(ttl_ms));
 }
 
+fn validate_dynamic_membership_advertisement(
+    partition_id: Option<u32>,
+    nats_url: Option<&str>,
+    advertise_grpc_addr: Option<&str>,
+) -> anyhow::Result<()> {
+    if partition_id.is_some() && nats_url.is_some() {
+        anyhow::ensure!(
+            advertise_grpc_addr.is_some_and(|address| !address.trim().is_empty()),
+            "Partitioned NATS membership requires ADVERTISE_GRPC_ADDR; NODE_ADDRESSES is only a \
+             one-TTL bootstrap seed"
+        );
+    }
+    Ok(())
+}
+
 fn apply_membership_snapshot(
     database: &Database<ProdRuntime>,
     shared_node_addresses: &SharedNodeAddresses,
     snapshot: database::membership::MembershipSnapshot,
-) -> anyhow::Result<()> {
-    shared_node_addresses.refresh_from_membership(&snapshot);
+) -> anyhow::Result<Option<database::two_phase::NodeAddresses>> {
+    let live_snapshot = shared_node_addresses.refresh_from_membership(&snapshot);
+    let live_addresses = live_snapshot.to_node_addresses();
+    let live_addresses = (!live_addresses.partitions().is_empty()).then_some(live_addresses);
     database
         .committer_client()
-        .refresh_membership_snapshot(snapshot)?;
-    Ok(())
+        .refresh_membership_snapshot(live_snapshot)?;
+    Ok(live_addresses)
 }
 
 fn start_membership_refresh_loop(
@@ -307,14 +334,16 @@ fn start_membership_refresh_loop(
     database: Database<ProdRuntime>,
     store: Arc<dyn database::membership::MembershipStore>,
     shared_node_addresses: SharedNodeAddresses,
+    initial_snapshot: database::membership::MembershipSnapshot,
     advertised_node: Option<database::membership::NodeMembership>,
 ) {
-    let refresh_runtime = runtime.clone();
-    runtime.spawn_background("cluster_membership_refresh", async move {
+    let authoritative_snapshot = Arc::new(RwLock::new(initial_snapshot));
+    let store_snapshot = authoritative_snapshot.clone();
+    let store_runtime = runtime.clone();
+    runtime.spawn_background("cluster_membership_store_refresh", async move {
         let mut backoff = Duration::from_millis(250);
-        let mut last_live_addresses = None;
         loop {
-            let refresh_result = async {
+            let refresh_result: anyhow::Result<()> = async {
                 let snapshot = if let Some(base_node) = advertised_node.as_ref() {
                     let mut node = base_node.clone();
                     refresh_membership_lease(&mut node);
@@ -333,34 +362,50 @@ fn start_membership_refresh_loop(
                         anyhow::anyhow!("Membership refresh found no current snapshot")
                     })?
                 };
-                let live_addresses = snapshot
-                    .to_live_node_addresses(database::membership::current_unix_timestamp_millis());
-                if last_live_addresses.as_ref() != Some(&live_addresses) {
-                    tracing::info!(
-                        version = u64::from(snapshot.version()),
-                        ?live_addresses,
-                        "Refreshed cluster membership snapshot"
-                    );
-                    last_live_addresses = Some(live_addresses);
-                }
-                apply_membership_snapshot(&database, &shared_node_addresses, snapshot)
+                *store_snapshot.write() = snapshot;
+                Ok(())
             }
             .await;
 
             match refresh_result {
                 Ok(()) => {
                     backoff = Duration::from_millis(250);
-                    refresh_runtime.wait(MEMBERSHIP_HEARTBEAT_INTERVAL).await;
+                    store_runtime.wait(MEMBERSHIP_HEARTBEAT_INTERVAL).await;
                 },
                 Err(e) => {
                     tracing::warn!(
                         "Cluster membership refresh failed; retrying after {:?}: {e:#}",
                         backoff
                     );
-                    refresh_runtime.wait(backoff).await;
+                    store_runtime.wait(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 },
             }
+        }
+    });
+
+    let liveness_runtime = runtime.clone();
+    runtime.spawn_background("cluster_membership_liveness", async move {
+        let mut last_live_addresses = None;
+        loop {
+            let snapshot = authoritative_snapshot.read().clone();
+            let version = snapshot.version();
+            match apply_membership_snapshot(&database, &shared_node_addresses, snapshot) {
+                Ok(live_addresses) => {
+                    if last_live_addresses.as_ref() != Some(&live_addresses) {
+                        tracing::info!(
+                            version = u64::from(version),
+                            ?live_addresses,
+                            "Refreshed cluster membership snapshot"
+                        );
+                        last_live_addresses = Some(live_addresses);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to apply cached cluster membership snapshot: {e:#}");
+                },
+            }
+            liveness_runtime.wait(MEMBERSHIP_HEARTBEAT_INTERVAL).await;
         }
     });
 }
@@ -1152,6 +1197,11 @@ pub async fn make_app(
         } else {
             None
         };
+    validate_dynamic_membership_advertisement(
+        config.partition_id,
+        config.nats_url.as_deref(),
+        config.advertise_grpc_addr.as_deref(),
+    )?;
     let membership_store: Option<Arc<dyn database::membership::MembershipStore>> =
         if let (Some(_), Some(nats_url)) = (config.partition_id, config.nats_url.as_deref()) {
             let store: Arc<dyn database::membership::MembershipStore> =
@@ -1198,6 +1248,7 @@ pub async fn make_app(
                 database.clone(),
                 store.clone(),
                 shared_node_addresses.clone(),
+                authoritative_snapshot,
                 advertised_node,
             );
             Some(store)
@@ -1976,7 +2027,32 @@ mod tests {
     use crate::{
         config::LocalConfig,
         make_app,
+        validate_dynamic_membership_advertisement,
     };
+
+    #[test]
+    fn partitioned_nats_membership_requires_advertised_grpc_address() {
+        assert!(
+            validate_dynamic_membership_advertisement(Some(0), Some("nats://nats:4222"), None)
+                .is_err()
+        );
+        assert!(validate_dynamic_membership_advertisement(
+            Some(0),
+            Some("nats://nats:4222"),
+            Some("   "),
+        )
+        .is_err());
+        assert!(validate_dynamic_membership_advertisement(
+            Some(0),
+            Some("nats://nats:4222"),
+            Some("node-p0a:50051"),
+        )
+        .is_ok());
+        assert!(validate_dynamic_membership_advertisement(Some(0), None, None).is_ok());
+        assert!(
+            validate_dynamic_membership_advertisement(None, Some("nats://nats:4222"), None).is_ok()
+        );
+    }
 
     #[test]
     fn partitioned_replica_consumers_do_not_start_from_local_snapshot_ts() -> anyhow::Result<()> {

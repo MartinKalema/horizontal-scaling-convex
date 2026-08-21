@@ -1448,12 +1448,21 @@ echo -e "${BOLD}Test 4d: Live Membership Refresh After Node Readdress${NC}"
 # without a process restart.
 READDR_RUN_ID="readdr-$(date +%s)"
 READDR_ADDR="node-p1a-${READDR_RUN_ID}:50051"
+READDR_OVERRIDE=$(mktemp)
+cat > "$READDR_OVERRIDE" << EOF
+services:
+  node-p1a:
+    environment:
+      CLUSTER_NODE_GENERATION: "1"
+EOF
 echo "  Recreating p1a with advertised address $READDR_ADDR..."
 (
     cd "$SCRIPT_DIR"
     CLUSTER_RUN_ID="$READDR_RUN_ID" BACKEND_PULL_POLICY=never \
-        docker compose --profile cluster up -d --no-deps --force-recreate node-p1a > /dev/null
+        docker compose -f docker-compose.yml -f "$READDR_OVERRIDE" --profile cluster \
+        up -d --no-deps --force-recreate node-p1a > /dev/null
 )
+rm -f "$READDR_OVERRIDE"
 
 for _ in $(seq 1 40); do
     curl -sf "$NODE_P1A_URL/version" > /dev/null 2>&1 && break
@@ -1524,6 +1533,7 @@ cat > "$DRAIN_OVERRIDE" << EOF
 services:
   node-p1a:
     environment:
+      CLUSTER_NODE_GENERATION: "2"
       CLUSTER_NODE_DRAINING: "true"
       ADVERTISE_GRPC_ADDR: "$DRAIN_ADDR"
 EOF
@@ -1579,6 +1589,7 @@ cat > "$STALE_OVERRIDE" << EOF
 services:
   node-p1a:
     environment:
+      CLUSTER_NODE_GENERATION: "3"
       CLUSTER_NODE_DRAINING: "false"
       ADVERTISE_GRPC_ADDR: "$STALE_ADDR"
 EOF
@@ -1622,11 +1633,20 @@ assert_cross_partition_write_exact_once \
     "Cross-partition routing avoided the expired p1a endpoint"
 
 echo "  Restoring p1a as a live non-draining member..."
+RESTORE_OVERRIDE=$(mktemp)
+cat > "$RESTORE_OVERRIDE" << EOF
+services:
+  node-p1a:
+    environment:
+      CLUSTER_NODE_GENERATION: "4"
+EOF
 (
     cd "$SCRIPT_DIR"
     CLUSTER_RUN_ID="$READDR_RUN_ID" BACKEND_PULL_POLICY=never \
-        docker compose --profile cluster up -d --no-deps --force-recreate node-p1a > /dev/null
+        docker compose -f docker-compose.yml -f "$RESTORE_OVERRIDE" --profile cluster \
+        up -d --no-deps --force-recreate node-p1a > /dev/null
 )
+rm -f "$RESTORE_OVERRIDE"
 for _ in $(seq 1 40); do
     curl -sf "$NODE_P1A_URL/version" > /dev/null 2>&1 && break
     sleep 1
