@@ -1024,6 +1024,37 @@ own for distributed changes.
     `ENABLE_PARALLEL_2PC_EARLY_ACK=true` and `false`; each run passed
     write-scaling `156/156`, Raft failover `24/24`, and `ALL SUITES PASSED`.
 
+### 2026-08 — Validated node-local system writes at remote read owners
+
+- **Status:** complete
+- **Related issue:** `#252`
+- **What this fixes:** a transaction that read a remotely owned user table but
+  wrote only node-local system state was classified as local 1PC. Its remote
+  read owner was therefore omitted from OCC validation, allowing the system
+  write to commit from a stale read.
+- **Behavior:** node-local system writes now record the local partition as their
+  stateful participant. System-only writes keep the local 1PC fast path, while
+  transactions with remote reads include each read owner as a validation-only
+  participant and abort before exposing local state when an owner reports a
+  conflict.
+- **Validation:**
+  - `cargo test -p database test_node_local_system_write -- --nocapture` passed
+    `2/2`.
+  - `cargo test -p database remote_read -- --nocapture` passed `8/8`.
+  - `cargo test -p database two_phase -- --nocapture` passed `40/40`.
+  - `cargo test -p database tests::write_scaling_tests --lib --quiet` passed
+    `109/109`.
+  - `cargo test -p database --lib --quiet` passed `623/623`, with `2` tests
+    intentionally ignored.
+  - `cargo check -p database -p local_backend` passed.
+  - Built `ghcr.io/martinkalema/convex-horizontal-scaling:backend-latest` and
+    verified every backend container used local image
+    `sha256:b5682810df492002e6f9b8d9757b1b9bb796e7cb520a25aa63b231fa8cb16da3`
+    at revision `70b719094a568344ef8086eb860ff15b19c15425`, with registry pulls
+    disabled and fresh isolated data volumes.
+  - `BACKEND_PULL_POLICY=never bash self-hosted/docker/test.sh` passed
+    write-scaling `156/156`, Raft failover `24/24`, and `ALL SUITES PASSED`.
+
 ## Open Issues
 
 - `#74` is no longer blocked on follower self-sufficiency. The current

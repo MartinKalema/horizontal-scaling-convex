@@ -4071,6 +4071,200 @@ fn test_local_commit_with_remote_read_routes_to_read_owner() -> anyhow::Result<(
 }
 
 #[test]
+fn test_node_local_system_write_with_remote_read_routes_to_read_owner() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+        )
+        .await?;
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let validate_reads_calls = Arc::new(AtomicUsize::new(0));
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::with_counters(
+            node_b.committer_for_test(),
+            prepare_calls.clone(),
+            validate_reads_calls.clone(),
+        ))
+        .await?;
+        let node_a = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(tso),
+        )
+        .await?;
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let project_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(project_delta)
+            .await?;
+
+        let system_table_name = "_resolver_local_state_success";
+        let system_table: TableName = system_table_name.parse()?;
+        insert_global_system_doc(&node_a, system_table_name, assert_obj!("value" => "seed"))
+            .await?;
+
+        let mut tx = node_a.begin(Identity::system()).await?;
+        SystemMetadataModel::new_global(&mut tx)
+            .insert(&system_table, assert_obj!("value" => "committed"))
+            .await?;
+        let remote_tablet = tx
+            .table_mapping()
+            .namespace(TableNamespace::Global)
+            .name_to_tablet()("projects".parse()?)?;
+        tx.reads.record_indexed_derived(
+            TabletIndexName::by_id(remote_tablet),
+            IndexedFields::by_id(),
+            Interval::all(),
+        );
+
+        node_a.commit(tx).await?;
+        assert_eq!(
+            validate_reads_calls.load(Ordering::SeqCst),
+            1,
+            "the remote read owner must validate a node-local system-table transaction",
+        );
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst),
+            0,
+            "the remote read owner must remain a validation-only participant",
+        );
+
+        let docs = global_table_scan_or_empty(node_a.clone(), system_table_name).await?;
+        assert_eq!(
+            docs.iter()
+                .filter(|doc| doc.value().0.get("value") == Some(&assert_val!("committed")))
+                .count(),
+            1,
+            "the locally owned system write should commit exactly once after owner validation",
+        );
+        server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_node_local_system_write_aborts_on_remote_read_owner_conflict() -> anyhow::Result<()> {
+    let td = TestDriver::new_with_io();
+    let rt = td.rt();
+    td.run_until(async move {
+        let log = Arc::new(InMemoryDistributedLog::new());
+        let tso: Arc<dyn TimestampOracle> = Arc::new(InMemoryTimestampOracle::new());
+        let node_b = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(1))),
+            None,
+            Some(tso.clone()),
+        )
+        .await?;
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let validate_reads_calls = Arc::new(AtomicUsize::new(0));
+        let server = start_two_pc_server(TestTwoPhaseCommitGrpcService::with_counters(
+            node_b.committer_for_test(),
+            prepare_calls.clone(),
+            validate_reads_calls.clone(),
+        ))
+        .await?;
+        let node_a = create_node_with_options(
+            &rt,
+            log.clone(),
+            Some(partitioned_map(PartitionId(0))),
+            Some(NodeAddresses::from_config(&format!("1={}", server.addr()))),
+            Some(tso),
+        )
+        .await?;
+
+        insert_doc(&node_b, "projects", assert_obj!("name" => "seed")).await?;
+        let project_delta = log
+            .deltas()
+            .into_iter()
+            .last()
+            .expect("seed project should publish a delta");
+        node_a
+            .committer_for_test()
+            .apply_replica_delta(project_delta)
+            .await?;
+
+        let system_table_name = "_resolver_local_state_conflict";
+        let system_table: TableName = system_table_name.parse()?;
+        insert_global_system_doc(&node_a, system_table_name, assert_obj!("value" => "seed"))
+            .await?;
+
+        let mut tx = node_a.begin(Identity::system()).await?;
+        SystemMetadataModel::new_global(&mut tx)
+            .insert(&system_table, assert_obj!("value" => "must-abort"))
+            .await?;
+        let remote_tablet = tx
+            .table_mapping()
+            .namespace(TableNamespace::Global)
+            .name_to_tablet()("projects".parse()?)?;
+        tx.reads.record_indexed_derived(
+            TabletIndexName::by_id(remote_tablet),
+            IndexedFields::by_id(),
+            Interval::all(),
+        );
+
+        insert_doc(
+            &node_b,
+            "projects",
+            assert_obj!("name" => "conflicting-owner-write"),
+        )
+        .await?;
+
+        let err = node_a
+            .commit(tx)
+            .await
+            .expect_err("remote owner conflict must abort the node-local system write");
+        assert!(
+            format!("{err:#}").contains("changed while this mutation was being run"),
+            "expected remote read-owner OCC conflict, got: {err:#}",
+        );
+        assert_eq!(
+            validate_reads_calls.load(Ordering::SeqCst),
+            1,
+            "the remote read owner must validate the stale read set",
+        );
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst),
+            0,
+            "the remote read owner must remain a validation-only participant",
+        );
+
+        let docs = global_table_scan_or_empty(node_a.clone(), system_table_name).await?;
+        assert!(
+            docs.iter()
+                .all(|doc| doc.value().0.get("value") != Some(&assert_val!("must-abort"))),
+            "a failed remote validation must not expose the node-local system write",
+        );
+        assert!(
+            node_a
+                .committer_for_test()
+                .two_phase_redo_records()
+                .await?
+                .is_empty(),
+            "aborting the local participant must remove its durable 2PC redo",
+        );
+        server.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn test_local_commit_retries_validate_reads_on_next_owner_address() -> anyhow::Result<()> {
     let td = TestDriver::new_with_io();
     let rt = td.rt();
