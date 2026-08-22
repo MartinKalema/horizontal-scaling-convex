@@ -51,6 +51,7 @@ use keybroker::{
 };
 use model::{
     auth::types::AuthDiff,
+    catalog::CatalogActivation,
     components::{
         config::{
             SerializedComponentDefinitionDiff,
@@ -365,6 +366,8 @@ impl TryFrom<StartPushResponse> for SerializedStartPushResponse {
                 .collect::<anyhow::Result<_>>()?,
             app: value.app.try_into()?,
             schema_change: value.schema_change.try_into()?,
+            catalog_version: value.catalog_activation.version().to_string(),
+            catalog_manifest_digest: value.catalog_activation.manifest_digest().to_string(),
         })
     }
 }
@@ -405,6 +408,10 @@ impl TryFrom<SerializedStartPushResponse> for StartPushResponse {
                 .collect::<anyhow::Result<_>>()?,
             app: value.app.try_into()?,
             schema_change: value.schema_change.try_into()?,
+            catalog_activation: CatalogActivation::new(
+                value.catalog_version.parse()?,
+                value.catalog_manifest_digest.parse()?,
+            ),
         })
     }
 }
@@ -437,6 +444,10 @@ pub struct SerializedStartPushResponse {
 
     // Schema changes.
     schema_change: SerializedSchemaChange,
+
+    // Mandatory server-generated catalog generation and deploy-manifest binding.
+    catalog_version: String,
+    catalog_manifest_digest: String,
 }
 
 impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
@@ -802,7 +813,39 @@ impl TryFrom<SerializedEventRecord> for EventRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::http_origin_from_peer_addr;
+    use application::{
+        test_helpers::ApplicationTestExt,
+        Application,
+    };
+    use runtime::prod::ProdRuntime;
+    use serde_json::Value;
+    use value::PublicDocumentId;
+
+    use super::{
+        http_origin_from_peer_addr,
+        SerializedStartPushResponse,
+    };
+
+    fn assert_manifest_mutation_rejected(
+        original: &Value,
+        description: &str,
+        mutate: impl FnOnce(&mut Value),
+    ) -> anyhow::Result<()> {
+        let mut mutated = original.clone();
+        mutate(&mut mutated);
+        let decoded: SerializedStartPushResponse = serde_json::from_value(mutated)
+            .map_err(|error| anyhow::anyhow!("{description} was not a valid mutation: {error}"))?;
+        let decoded = application::deploy_config::StartPushResponse::try_from(decoded)
+            .map_err(|error| anyhow::anyhow!("{description} was not a valid payload: {error}"))?;
+        let error = decoded
+            .verify_catalog_manifest_binding()
+            .expect_err("a changed deploy payload must not match its staged manifest");
+        assert!(
+            error.to_string().contains("staged catalog manifest"),
+            "{description} returned an unexpected error: {error:#}",
+        );
+        Ok(())
+    }
 
     #[test]
     fn peer_addr_to_http_origin_supports_host_port_pairs() -> anyhow::Result<()> {
@@ -819,6 +862,95 @@ mod tests {
             http_origin_from_peer_addr("http://node-p1a:50051")?,
             "http://node-p1a:3210"
         );
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn start_push_response_roundtrip_preserves_manifest_binding(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let application = Application::new_for_tests(&rt).await?;
+        let response = application.start_push_for_layout("basic").await?;
+        let expected_digest = response.verify_catalog_manifest_binding()?;
+
+        let serialized = SerializedStartPushResponse::try_from(response)?;
+        let wire_bytes = serde_json::to_vec(&serialized)?;
+        let decoded: SerializedStartPushResponse = serde_json::from_slice(&wire_bytes)?;
+        let decoded = application::deploy_config::StartPushResponse::try_from(decoded)?;
+
+        assert_eq!(decoded.verify_catalog_manifest_binding()?, expected_digest,);
+        Ok(())
+    }
+
+    #[convex_macro::prod_rt_test]
+    async fn start_push_response_manifest_matrix_fails_closed_on_mutation(
+        rt: ProdRuntime,
+    ) -> anyhow::Result<()> {
+        let application = Application::new_for_tests(&rt).await?;
+        let response = application.start_push_for_layout("basic").await?;
+        let serialized = SerializedStartPushResponse::try_from(response)?;
+        let wire_value = serde_json::to_value(serialized)?;
+        for binding in ["catalogVersion", "catalogManifestDigest"] {
+            let mut missing_binding = wire_value.clone();
+            missing_binding
+                .as_object_mut()
+                .expect("start-push response must serialize as an object")
+                .remove(binding);
+            assert!(
+                serde_json::from_value::<SerializedStartPushResponse>(missing_binding).is_err(),
+                "missing {binding} must not deserialize",
+            );
+        }
+
+        assert_manifest_mutation_rejected(&wire_value, "environment variable mutation", |value| {
+            value["environmentVariables"]["CATALOG_MANIFEST_MUTATION"] =
+                Value::String("tampered".to_string());
+        })?;
+        assert_manifest_mutation_rejected(&wire_value, "external package mutation", |value| {
+            value["externalDepsId"] = Value::String(PublicDocumentId::MAX.to_string());
+        })?;
+        assert_manifest_mutation_rejected(
+            &wire_value,
+            "component definition package mutation",
+            |value| {
+                let packages = value["componentDefinitionPackages"]
+                    .as_object_mut()
+                    .expect("component definition packages must be an object");
+                let key = packages
+                    .keys()
+                    .next()
+                    .cloned()
+                    .expect("basic deploy must include a component definition package");
+                packages.remove(&key);
+            },
+        )?;
+        assert_manifest_mutation_rejected(&wire_value, "auth provider mutation", |value| {
+            value["appAuth"]
+                .as_array_mut()
+                .expect("appAuth must be an array")
+                .push(serde_json::json!({
+                    "applicationID": "manifest-mutation",
+                    "domain": "manifest-mutation.example.com",
+                }));
+        })?;
+        assert_manifest_mutation_rejected(&wire_value, "analysis mutation", |value| {
+            let analysis = value["analysis"]
+                .as_object_mut()
+                .expect("analysis must be an object");
+            let key = analysis
+                .keys()
+                .next()
+                .cloned()
+                .expect("basic deploy must include analyzed component metadata");
+            analysis.remove(&key);
+        })?;
+        assert_manifest_mutation_rejected(&wire_value, "checked app mutation", |value| {
+            value["app"]["componentPath"] = Value::String("manifestMutation".to_string());
+        })?;
+        assert_manifest_mutation_rejected(&wire_value, "schema change mutation", |value| {
+            value["schemaChange"]["allocatedComponentIds"]["manifestMutation"] =
+                Value::String(PublicDocumentId::MIN.to_string());
+        })?;
         Ok(())
     }
 }

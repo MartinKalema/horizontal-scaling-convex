@@ -12,7 +12,10 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use common::{
-    auth::AuthInfo,
+    auth::{
+        AuthInfo,
+        SerializedAuthInfo,
+    },
     bootstrap_model::{
         components::definition::ComponentDefinitionMetadata,
         schema::{
@@ -66,6 +69,11 @@ use model::{
         types::AuthDiff,
         AuthInfoModel,
     },
+    catalog::{
+        CatalogActivation,
+        CatalogManifestDigest,
+        CatalogModel,
+    },
     components::{
         config::{
             ComponentConfigModel,
@@ -73,11 +81,13 @@ use model::{
             ComponentDefinitionDiff,
             ComponentDiff,
             SchemaChange,
+            SerializedSchemaChange,
         },
         file_based_routing::file_based_exports,
         type_checking::{
             CheckedComponent,
             InitializerEvaluator,
+            SerializedCheckedComponent,
             TypecheckContext,
         },
         types::{
@@ -85,6 +95,7 @@ use model::{
             ComponentDefinitionConfig,
             EvaluatedComponentDefinition,
             ProjectConfig,
+            SerializedEvaluatedComponentDefinition,
         },
     },
     config::types::{
@@ -108,6 +119,7 @@ use model::{
     source_packages::{
         types::{
             NodeVersion,
+            SerializedSourcePackage,
             SourcePackage,
         },
         upload_download::download_package,
@@ -167,6 +179,64 @@ struct EvaluatedDeployContents {
     app_functions: Vec<ModuleConfig>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedCatalogManifest {
+    environment_variables: BTreeMap<String, String>,
+    external_deps_id: Option<String>,
+    component_definition_packages: BTreeMap<String, SerializedSourcePackage>,
+    app_auth: Vec<SerializedAuthInfo>,
+    analysis: BTreeMap<String, SerializedEvaluatedComponentDefinition>,
+    app: SerializedCheckedComponent,
+    schema_change: SerializedSchemaChange,
+}
+
+fn catalog_manifest_digest(
+    environment_variables: &BTreeMap<EnvVarName, EnvVarValue>,
+    external_deps_id: &Option<ExternalDepsPackageId>,
+    component_definition_packages: &BTreeMap<ComponentDefinitionPath, SourcePackage>,
+    app_auth: &[AuthInfo],
+    analysis: &BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+    app: &CheckedComponent,
+    schema_change: &SchemaChange,
+) -> anyhow::Result<CatalogManifestDigest> {
+    let manifest = SerializedCatalogManifest {
+        environment_variables: environment_variables
+            .iter()
+            .map(|(name, value)| (String::from(name.clone()), String::from(value.clone())))
+            .collect(),
+        external_deps_id: external_deps_id
+            .clone()
+            .map(|id| String::from(PublicDocumentId::from(id))),
+        component_definition_packages: component_definition_packages
+            .iter()
+            .map(|(path, package)| {
+                Ok((
+                    String::from(path.clone()),
+                    SerializedSourcePackage::try_from(package.clone())?,
+                ))
+            })
+            .collect::<anyhow::Result<_>>()?,
+        app_auth: app_auth
+            .iter()
+            .cloned()
+            .map(SerializedAuthInfo::try_from)
+            .collect::<anyhow::Result<_>>()?,
+        analysis: analysis
+            .iter()
+            .map(|(path, definition)| {
+                Ok((
+                    String::from(path.clone()),
+                    SerializedEvaluatedComponentDefinition::try_from(definition.clone())?,
+                ))
+            })
+            .collect::<anyhow::Result<_>>()?,
+        app: SerializedCheckedComponent::try_from(app.clone())?,
+        schema_change: SerializedSchemaChange::try_from(schema_change.clone())?,
+    };
+    Ok(CatalogManifestDigest::hash(&serde_json::to_vec(&manifest)?))
+}
+
 impl<RT: Runtime> Application<RT> {
     #[fastrace::trace]
     pub async fn start_push(&self, config: &ProjectConfig) -> anyhow::Result<StartPushResult> {
@@ -199,6 +269,32 @@ impl<RT: Runtime> Application<RT> {
             definition.definition.exports = file_based_exports(&definition.functions)?;
         }
 
+        let catalog_manifest_digest = catalog_manifest_digest(
+            &user_environment_variables,
+            &external_deps_id,
+            &component_definition_packages,
+            &auth_info,
+            &evaluated_components,
+            &app,
+            &schema_change,
+        )?;
+        let (_ts, catalog_activation) = self
+            .execute_with_occ_retries(
+                Identity::system(),
+                FunctionUsageTracker::new(),
+                WriteSource::new("stage_catalog_version"),
+                |tx| {
+                    let catalog_manifest_digest = catalog_manifest_digest.clone();
+                    async move {
+                        CatalogModel::new(tx)
+                            .stage_version(catalog_manifest_digest)
+                            .await
+                    }
+                    .into()
+                },
+            )
+            .await?;
+
         let resp = StartPushResponse {
             environment_variables: user_environment_variables,
             external_deps_id,
@@ -207,6 +303,7 @@ impl<RT: Runtime> Application<RT> {
             analysis: evaluated_components,
             app,
             schema_change,
+            catalog_activation,
         };
         Ok(StartPushResult {
             response: resp,
@@ -323,10 +420,9 @@ impl<RT: Runtime> Application<RT> {
                 WriteSource::new("start_push"),
                 |tx| {
                     async move {
-                        let schema_change = ComponentConfigModel::new(tx)
+                        ComponentConfigModel::new(tx)
                             .start_component_schema_changes(app, evaluated_components)
-                            .await?;
-                        Ok(schema_change)
+                            .await
                     }
                     .into()
                 },
@@ -649,6 +745,8 @@ impl<RT: Runtime> Application<RT> {
         identity: Identity,
         mut start_push: StartPushResponse,
     ) -> anyhow::Result<(FinishPushDiff, Timestamp)> {
+        let actual_manifest_digest = start_push.verify_catalog_manifest_binding()?;
+        let catalog_activation = start_push.catalog_activation.clone();
         // Download all source packages. We can remove this once we don't store source
         // in the database.
         let mut downloaded_source_packages = BTreeMap::new();
@@ -678,6 +776,8 @@ impl<RT: Runtime> Application<RT> {
                 |tx| {
                     let start_push = &start_push;
                     let downloaded_source_packages = &downloaded_source_packages;
+                    let catalog_activation = &catalog_activation;
+                    let actual_manifest_digest = &actual_manifest_digest;
                     async move {
                         // Validate that environment variables haven't changed since `start_push`.
                         let environment_variables =
@@ -712,6 +812,13 @@ impl<RT: Runtime> Application<RT> {
                                 &start_push.schema_change,
                                 modules_by_definition,
                             )
+                            .await?;
+
+                        // This is the catalog commit point. The immutable generation was
+                        // staged before validation, and the selector changes atomically with
+                        // all module, schema, and index mutations above.
+                        CatalogModel::new(tx)
+                            .activate(catalog_activation, actual_manifest_digest)
                             .await?;
 
                         let diffs = PushComponentDiffs {
@@ -958,6 +1065,32 @@ pub struct StartPushResponse {
     pub app: CheckedComponent,
 
     pub schema_change: SchemaChange,
+
+    /// Mandatory server-generated generation and manifest binding carried
+    /// through the deploy handshake.
+    pub catalog_activation: CatalogActivation,
+}
+
+impl StartPushResponse {
+    /// Recompute the immutable deploy manifest from the actual handshake
+    /// payload. Callers must verify this after any serialization boundary and
+    /// before downloading or publishing deployment contents.
+    pub fn verify_catalog_manifest_binding(&self) -> anyhow::Result<CatalogManifestDigest> {
+        let actual_manifest_digest = catalog_manifest_digest(
+            &self.environment_variables,
+            &self.external_deps_id,
+            &self.component_definition_packages,
+            &self.app_auth,
+            &self.analysis,
+            &self.app,
+            &self.schema_change,
+        )?;
+        anyhow::ensure!(
+            self.catalog_activation.manifest_digest() == &actual_manifest_digest,
+            "finish_push payload does not match its staged catalog manifest"
+        );
+        Ok(actual_manifest_digest)
+    }
 }
 
 #[derive(Debug)]

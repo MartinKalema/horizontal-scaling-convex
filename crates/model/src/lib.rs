@@ -49,6 +49,10 @@ use backend_state::{
     BACKEND_STATE_TABLE,
 };
 use canonical_urls::CANONICAL_URLS_TABLE;
+use catalog::{
+    CatalogVersionsTable,
+    CATALOG_VERSIONS_TABLE,
+};
 use common::{
     bootstrap_model::{
         index::{
@@ -214,6 +218,7 @@ pub mod aws_lambda_versions;
 pub mod backend_info;
 pub mod backend_state;
 pub mod canonical_urls;
+pub mod catalog;
 pub mod components;
 pub mod config;
 pub mod cron_jobs;
@@ -274,9 +279,10 @@ enum DefaultTableNumber {
     IndexBackfills = 36,
     SchemaValidationProgress = 37,
     ScheduledJobArgs = 38,
+    CatalogVersions = 39,
     // Keep this number and your user name up to date. The number makes it easy to know
     // what to use next. The username on the same line detects merge conflicts
-    // Next Number - 39 - emma
+    // Next Number - 40 - martin
 }
 
 impl From<DefaultTableNumber> for TableNumber {
@@ -321,6 +327,7 @@ impl From<DefaultTableNumber> for &'static dyn ErasedSystemTable {
             DefaultTableNumber::IndexBackfills => &IndexBackfillTable,
             DefaultTableNumber::SchemaValidationProgress => &SchemaValidationProgressTable,
             DefaultTableNumber::ScheduledJobArgs => &ScheduledJobArgsTable,
+            DefaultTableNumber::CatalogVersions => &CatalogVersionsTable,
         }
     }
 }
@@ -558,6 +565,7 @@ pub fn app_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
         &LogSinksTable,
         &AwsLambdaVersionsTable,
         &BackendInfoTable,
+        &CatalogVersionsTable,
     ];
     system_tables.extend(component_system_tables());
     system_tables.extend(bootstrap_system_tables());
@@ -594,6 +602,7 @@ static APP_TABLES_TO_LOAD_IN_MEMORY: LazyLock<BTreeSet<TableName>> = LazyLock::n
         BACKEND_INFO_TABLE.clone(),
         AWS_LAMBDA_VERSIONS_TABLE.clone(),
         SOURCE_PACKAGES_TABLE.clone(),
+        CATALOG_VERSIONS_TABLE.clone(),
     }
 });
 
@@ -643,6 +652,7 @@ pub static FIRST_SEEN_TABLE: LazyLock<BTreeMap<TableName, DatabaseVersion>> = La
         INDEX_BACKFILLS_TABLE.clone() => 120,
         SCHEMA_VALIDATION_PROGRESS_TABLE.clone() => 122,
         SCHEDULED_JOBS_ARGS_TABLE.clone() => 123,
+        CATALOG_VERSIONS_TABLE.clone() => 125,
     }
 });
 

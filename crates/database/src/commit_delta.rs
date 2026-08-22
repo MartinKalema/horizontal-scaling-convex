@@ -34,6 +34,7 @@ use common::{
 use futures::stream::BoxStream;
 use value::{
     TableName,
+    TableNamespace,
     TabletId,
 };
 
@@ -77,10 +78,12 @@ pub struct CommitDelta {
     /// Total bytes written to persistence.
     pub write_bytes: u64,
 
-    /// Mapping from the Primary's TabletIds to table names.
-    /// Replicas use this to remap document IDs to their own local TabletIds
-    /// since each database instance generates unique TabletIds.
-    pub tablet_id_to_table_name: BTreeMap<TabletId, TableName>,
+    /// Stable identity for every tablet referenced by this delta.
+    ///
+    /// Table names alone are insufficient because component-scoped system
+    /// tables reuse names such as `_modules` and `_schemas`. Replicas must map
+    /// by the source component namespace and table name together.
+    pub tablet_id_to_table_identity: BTreeMap<TabletId, DeltaTableIdentity>,
 
     /// Partition that originated this replicated event.
     ///
@@ -88,6 +91,51 @@ pub struct CommitDelta {
     /// remote reads can prove they were validated against a sufficiently
     /// up-to-date replica state.
     pub source_partition: Option<PartitionId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeltaTableIdentity {
+    pub namespace: TableNamespace,
+    pub table_name: TableName,
+}
+
+impl DeltaTableIdentity {
+    pub fn new(namespace: TableNamespace, table_name: TableName) -> Self {
+        Self {
+            namespace,
+            table_name,
+        }
+    }
+}
+
+/// Stable origin of a Raft-accepted delta persisted for later NATS delivery.
+///
+/// `source_node` is the configured logical backend name, not a network
+/// address. Keeping all three fields lets a promoted follower replay the
+/// original producer identity without fabricating its own origin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RaftNatsOutboxOrigin {
+    pub source_node: String,
+    pub source_raft_node_id: u64,
+    pub source_partition: PartitionId,
+}
+
+impl RaftNatsOutboxOrigin {
+    pub fn new(
+        source_node: String,
+        source_raft_node_id: u64,
+        source_partition: PartitionId,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !source_node.is_empty(),
+            "Raft->NATS outbox origin requires a non-empty logical source node",
+        );
+        Ok(Self {
+            source_node,
+            source_raft_node_id,
+            source_partition,
+        })
+    }
 }
 
 #[async_trait]
@@ -312,11 +360,28 @@ pub trait DistributedLog: Send + Sync + 'static {
         true
     }
 
+    /// Stable logical name encoded by this transport for self-filtering.
+    fn source_node(&self) -> Option<String> {
+        None
+    }
+
     /// Publish a committed delta to the log.
     ///
     /// Must be durable: once this returns Ok, Replicas are guaranteed to
     /// eventually see this delta.
     async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()>;
+
+    /// Publish a durable outbox delta while preserving the original Raft
+    /// producer identity. Transport-neutral test logs may treat this like a
+    /// normal publish; remote transports must override it when origin affects
+    /// wire semantics.
+    async fn publish_with_origin(
+        &self,
+        delta: CommitDelta,
+        _origin: RaftNatsOutboxOrigin,
+    ) -> anyhow::Result<()> {
+        self.publish(delta).await
+    }
 
     /// Subscribe to deltas starting after `from_ts`. Returns an ordered stream
     /// that blocks when caught up, resuming when new deltas arrive.
@@ -378,7 +443,13 @@ impl ClusterGenesisGatedDistributedLog {
 #[async_trait]
 impl DistributedLog for ClusterGenesisGatedDistributedLog {
     fn requires_commit_outbox(&self) -> bool {
-        self.inner.requires_commit_outbox()
+        // Candidate bootstrap state must be neither published nor retained for
+        // publication after canonical genesis is selected.
+        self.ready.load(Ordering::SeqCst) && self.inner.requires_commit_outbox()
+    }
+
+    fn source_node(&self) -> Option<String> {
+        self.inner.source_node()
     }
 
     async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
@@ -386,6 +457,17 @@ impl DistributedLog for ClusterGenesisGatedDistributedLog {
             return Ok(());
         }
         self.inner.publish(delta).await
+    }
+
+    async fn publish_with_origin(
+        &self,
+        delta: CommitDelta,
+        origin: RaftNatsOutboxOrigin,
+    ) -> anyhow::Result<()> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.inner.publish_with_origin(delta, origin).await
     }
 
     async fn subscribe(
@@ -408,7 +490,10 @@ impl DistributedLog for ClusterGenesisGatedDistributedLog {
 
 impl CommitDelta {
     pub fn touched_table_names(&self) -> BTreeSet<TableName> {
-        self.tablet_id_to_table_name.values().cloned().collect()
+        self.tablet_id_to_table_identity
+            .values()
+            .map(|identity| identity.table_name.clone())
+            .collect()
     }
 }
 
@@ -514,6 +599,7 @@ mod tests {
     };
 
     use common::types::Timestamp;
+    use futures::stream::BoxStream;
     use value::TableName;
 
     use crate::{
@@ -522,9 +608,26 @@ mod tests {
             ClusterGenesisGatedDistributedLog,
             CommitDelta,
             DistributedLog,
+            ReplicationMessage,
         },
         write_log::WriteSource,
     };
+
+    struct OutboxRequiringDistributedLog(Arc<InMemoryDistributedLog>);
+
+    #[async_trait::async_trait]
+    impl DistributedLog for OutboxRequiringDistributedLog {
+        async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+            self.0.publish(delta).await
+        }
+
+        async fn subscribe(
+            &self,
+            from_ts: Timestamp,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+            self.0.subscribe(from_ts).await
+        }
+    }
 
     fn test_delta() -> CommitDelta {
         CommitDelta {
@@ -534,32 +637,41 @@ mod tests {
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::unknown(),
             write_bytes: 0,
-            tablet_id_to_table_name: BTreeMap::new(),
+            tablet_id_to_table_identity: BTreeMap::new(),
             source_partition: None,
         }
     }
 
     #[tokio::test]
     async fn cluster_genesis_gate_suppresses_candidate_deltas() {
-        let inner = Arc::new(InMemoryDistributedLog::new());
+        let published = Arc::new(InMemoryDistributedLog::new());
+        let inner = Arc::new(OutboxRequiringDistributedLog(published.clone()));
         let ready = Arc::new(AtomicBool::new(false));
-        let gated = ClusterGenesisGatedDistributedLog::new(inner.clone(), ready.clone());
+        let gated = ClusterGenesisGatedDistributedLog::new(inner, ready.clone());
 
+        assert!(!gated.requires_commit_outbox());
         gated.publish(test_delta()).await.unwrap();
-        assert!(inner.deltas().is_empty());
+        assert!(published.deltas().is_empty());
 
         ready.store(true, Ordering::SeqCst);
+        assert!(gated.requires_commit_outbox());
         gated.publish(test_delta()).await.unwrap();
-        assert_eq!(inner.deltas().len(), 1);
+        assert_eq!(published.deltas().len(), 1);
     }
 
     #[test]
     fn touched_table_names_collects_unique_tables() {
         let messages: TableName = "messages".parse().unwrap();
         let tasks: TableName = "tasks".parse().unwrap();
-        let mut tablet_id_to_table_name = BTreeMap::new();
-        tablet_id_to_table_name.insert(value::TabletId::MIN, messages.clone());
-        tablet_id_to_table_name.insert(value::TabletId::MAX, tasks.clone());
+        let mut tablet_id_to_table_identity = BTreeMap::new();
+        tablet_id_to_table_identity.insert(
+            value::TabletId::MIN,
+            super::DeltaTableIdentity::new(value::TableNamespace::Global, messages.clone()),
+        );
+        tablet_id_to_table_identity.insert(
+            value::TabletId::MAX,
+            super::DeltaTableIdentity::new(value::TableNamespace::Global, tasks.clone()),
+        );
         let delta = CommitDelta {
             ts: Timestamp::MIN,
             document_writes: Arc::new(Vec::new()),
@@ -567,7 +679,7 @@ mod tests {
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::unknown(),
             write_bytes: 0,
-            tablet_id_to_table_name,
+            tablet_id_to_table_identity,
             source_partition: None,
         };
 

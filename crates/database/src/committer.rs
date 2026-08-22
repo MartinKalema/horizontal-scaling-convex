@@ -156,7 +156,9 @@ use crate::{
     },
     commit_delta::{
         CommitDelta,
+        DeltaTableIdentity,
         DistributedLog,
+        RaftNatsOutboxOrigin,
         ReplicationTransportId,
         RetryableReplicaApplyError,
     },
@@ -547,6 +549,7 @@ enum PersistenceWrite {
         delta: CommitDelta,
         raft_applied_index: Option<u64>,
         raft_apply_marker: Option<RaftApplyMarker>,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
     },
     RejectedBeforePersistence {
         pending_write: PendingWriteHandle,
@@ -561,6 +564,7 @@ enum PersistenceWrite {
         delta: CommitDelta,
         raft_applied_index: Option<u64>,
         raft_apply_marker: Option<RaftApplyMarker>,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
     },
     PreparedRejectedBeforePersistence {
         transaction_id: crate::two_phase::TwoPhaseTransactionId,
@@ -600,6 +604,7 @@ enum PersistenceWrite {
         applied_data_delta_ids: Option<AppliedDataDeltaIds>,
         raft_apply_marker: Option<RaftApplyMarker>,
         raft_nats_outbox_delta: Option<CommitDelta>,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
         raft_state_machine_index: Option<u64>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
@@ -610,6 +615,7 @@ enum PersistenceWrite {
     RaftReplayRecovery {
         marker: RaftApplyMarker,
         delta: CommitDelta,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
         raft_state_machine_index: u64,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
@@ -1175,12 +1181,15 @@ fn checkpoint_index_entries(
 
 fn insert_delta_table_mapping(
     table_mapping: &TableMapping,
-    tablet_id_to_table_name: &mut BTreeMap<value::TabletId, TableName>,
+    tablet_id_to_table_identity: &mut BTreeMap<value::TabletId, DeltaTableIdentity>,
     tablet_id: value::TabletId,
 ) {
-    if !tablet_id_to_table_name.contains_key(&tablet_id) {
-        if let Ok(name) = table_mapping.tablet_name(tablet_id) {
-            tablet_id_to_table_name.insert(tablet_id, name);
+    if !tablet_id_to_table_identity.contains_key(&tablet_id) {
+        if let Ok((namespace, _, table_name)) = table_mapping.get_table_metadata(tablet_id) {
+            tablet_id_to_table_identity.insert(
+                tablet_id,
+                DeltaTableIdentity::new(*namespace, table_name.clone()),
+            );
         }
     }
 }
@@ -1191,6 +1200,69 @@ fn index_metadata_tablet_id(document: &ResolvedDocument) -> Option<value::Tablet
         return None;
     };
     table_id.parse().ok()
+}
+
+fn validate_delta_table_identities(delta: &CommitDelta) -> anyhow::Result<()> {
+    let index_table_name: &TableName = &common::bootstrap_model::index::INDEX_TABLE;
+    for update in &delta.document_updates {
+        let identity = delta
+            .tablet_id_to_table_identity
+            .get(&update.id.tablet_id)
+            .with_context(|| {
+                format!(
+                    "Replica delta is missing stable namespace identity for source TabletId {:?}",
+                    update.id.tablet_id,
+                )
+            })?;
+        if &identity.table_name == index_table_name {
+            for document in update.old_document.iter().chain(update.new_document.iter()) {
+                if let Some(indexed_tablet) = index_metadata_tablet_id(document) {
+                    anyhow::ensure!(
+                        delta
+                            .tablet_id_to_table_identity
+                            .contains_key(&indexed_tablet),
+                        "Replica delta is missing stable namespace identity for indexed source \
+                         TabletId {:?}",
+                        indexed_tablet,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_replica_tablet_remap(
+    table_mapping: &TableMapping,
+    tablet_identities: &BTreeMap<value::TabletId, DeltaTableIdentity>,
+    required_tablets: impl IntoIterator<Item = value::TabletId>,
+) -> anyhow::Result<BTreeMap<value::TabletId, value::TabletId>> {
+    let mut remap = BTreeMap::new();
+    for source_tablet in required_tablets {
+        let identity = tablet_identities.get(&source_tablet).with_context(|| {
+            format!(
+                "Replica delta is missing stable namespace identity for source TabletId {:?}",
+                source_tablet,
+            )
+        })?;
+        let local_tablet = table_mapping.namespace(identity.namespace).name_to_tablet()(
+            identity.table_name.clone(),
+        )
+        .with_context(|| {
+            format!(
+                "No local table matches replicated identity ({:?}, {}) for source TabletId {:?}",
+                identity.namespace, identity.table_name, source_tablet,
+            )
+        })?;
+        if let Some(previous) = remap.insert(source_tablet, local_tablet) {
+            anyhow::ensure!(
+                previous == local_tablet,
+                "Replicated source TabletId {:?} resolved ambiguously",
+                source_tablet,
+            );
+        }
+    }
+    Ok(remap)
 }
 
 fn remap_index_metadata_document(
@@ -1262,6 +1334,34 @@ fn remap_index_metadata_update(
             })
             .transpose()?,
     })
+}
+
+fn is_replicated_index_metadata_update(
+    update: &common::document::DocumentUpdate,
+    tablet_id_to_table_identity: &BTreeMap<value::TabletId, DeltaTableIdentity>,
+) -> bool {
+    update
+        .new_document
+        .as_ref()
+        .or(update.old_document.as_ref())
+        .and_then(|document| {
+            document
+                .value()
+                .0
+                .get(&"table_id".parse::<common::types::FieldName>().unwrap())
+        })
+        .and_then(|value| match value {
+            value::ConvexValue::String(tablet_id) => tablet_id.parse().ok(),
+            _ => None,
+        })
+        .is_some_and(|tablet_id| {
+            tablet_id_to_table_identity
+                .get(&tablet_id)
+                .is_some_and(|identity| {
+                    !identity.table_name.is_system()
+                        || is_global_deployment_table(&identity.table_name)
+                })
+        })
 }
 
 fn replicated_index_update_is_already_present(
@@ -1813,6 +1913,7 @@ impl<RT: Runtime> Committer<RT> {
                             delta,
                             raft_applied_index,
                             raft_apply_marker,
+                            raft_nats_outbox_origin,
                             ..
                         } => {
                             let commit_ts = pending_write.must_commit_ts();
@@ -1890,6 +1991,13 @@ impl<RT: Runtime> Committer<RT> {
                                 if let Err(err) = Self::record_raft_nats_outbox_delta(
                                     self.persistence.clone(),
                                     &published_commit.delta,
+                                    raft_nats_outbox_origin.as_ref().with_context(|| {
+                                        format!(
+                                            "Committed Raft delta at ts={} is missing its durable \
+                                             NATS origin",
+                                            u64::from(commit_ts),
+                                        )
+                                    })?,
                                     "local",
                                 )
                                 .await
@@ -1904,6 +2012,7 @@ impl<RT: Runtime> Committer<RT> {
                             } else if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta.clone(),
+                                None,
                                 "local",
                             )
                             .await
@@ -1925,9 +2034,9 @@ impl<RT: Runtime> Committer<RT> {
                                     .collect(),
                                 invalidated_tables: published_commit
                                     .delta
-                                    .tablet_id_to_table_name
+                                    .tablet_id_to_table_identity
                                     .values()
-                                    .cloned()
+                                    .map(|identity| identity.table_name.clone())
                                     .collect(),
                             }));
 
@@ -1964,6 +2073,7 @@ impl<RT: Runtime> Committer<RT> {
                             delta,
                             raft_applied_index,
                             raft_apply_marker,
+                            raft_nats_outbox_origin,
                             ..
                         } => {
                             let commit_ts = delta.ts;
@@ -2041,6 +2151,13 @@ impl<RT: Runtime> Committer<RT> {
                                 if let Err(err) = Self::record_raft_nats_outbox_delta(
                                     self.persistence.clone(),
                                     &published_commit.delta,
+                                    raft_nats_outbox_origin.as_ref().with_context(|| {
+                                        format!(
+                                            "Prepared Raft delta at ts={} is missing its durable \
+                                             NATS origin",
+                                            u64::from(commit_ts),
+                                        )
+                                    })?,
                                     "2pc_participant",
                                 )
                                 .await
@@ -2055,6 +2172,7 @@ impl<RT: Runtime> Committer<RT> {
                             } else if let Err(err) = Self::publish_commit_delta(
                                 self.distributed_log.clone(),
                                 published_commit.delta.clone(),
+                                None,
                                 "2pc_participant",
                             )
                             .await
@@ -2238,6 +2356,7 @@ impl<RT: Runtime> Committer<RT> {
                             applied_data_delta_ids,
                             raft_apply_marker,
                             raft_nats_outbox_delta,
+                            raft_nats_outbox_origin,
                             raft_state_machine_index,
                             result,
                             ..
@@ -2327,6 +2446,9 @@ impl<RT: Runtime> Committer<RT> {
                                 Self::add_raft_nats_outbox_delta(
                                     self.persistence.clone(),
                                     delta,
+                                    raft_nats_outbox_origin.as_ref().context(
+                                        "Raft-applied outbox delta lost its persisted origin",
+                                    )?,
                                 )
                                 .await?;
                             }
@@ -2395,6 +2517,7 @@ impl<RT: Runtime> Committer<RT> {
                         PersistenceWrite::RaftReplayRecovery {
                             marker,
                             delta,
+                            raft_nats_outbox_origin,
                             raft_state_machine_index,
                             result,
                             ..
@@ -2418,6 +2541,9 @@ impl<RT: Runtime> Committer<RT> {
                                     Self::add_raft_nats_outbox_delta(
                                         self.persistence.clone(),
                                         &delta,
+                                        raft_nats_outbox_origin.as_ref().context(
+                                            "Raft replay recovery lost its persisted NATS origin",
+                                        )?,
                                     )
                                     .await?;
                                 }
@@ -2557,6 +2683,7 @@ impl<RT: Runtime> Committer<RT> {
                         Some(CommitterMessage::ApplyReplicaDelta {
                             delta,
                             mode,
+                            raft_nats_outbox_origin,
                             raft_state_machine_index,
                             transport_id,
                             result,
@@ -2564,6 +2691,7 @@ impl<RT: Runtime> Committer<RT> {
                             if let Err(e) = self.apply_replica_delta(
                                 delta,
                                 mode,
+                                raft_nats_outbox_origin,
                                 raft_state_machine_index,
                                 transport_id,
                                 result,
@@ -3270,7 +3398,7 @@ impl<RT: Runtime> Committer<RT> {
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("remote_read_frontier_heartbeat"),
             write_bytes: 0,
-            tablet_id_to_table_name: BTreeMap::new(),
+            tablet_id_to_table_identity: BTreeMap::new(),
             source_partition: Some(partition_map.local_partition()),
         };
         let distributed_log = self.distributed_log.clone();
@@ -3851,13 +3979,15 @@ impl<RT: Runtime> Committer<RT> {
         document_writes: Arc<Vec<DocumentLogEntry>>,
         write_source: WriteSource,
         raft_apply_marker: Option<RaftApplyMarker>,
-        raft_nats_outbox_delta: Option<CommitDelta>,
+        raft_apply_delta: Option<CommitDelta>,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
         raft_state_machine_index: Option<u64>,
     ) -> anyhow::Result<()> {
         let timer = metrics::commit_persistence_write_timer();
         let raft_apply_writes = Self::raft_apply_persistence_writes(
             raft_apply_marker,
-            raft_nats_outbox_delta.as_ref(),
+            raft_apply_delta.as_ref(),
+            raft_nats_outbox_origin.as_ref(),
             raft_state_machine_index,
         )?;
         persistence
@@ -4032,11 +4162,18 @@ impl<RT: Runtime> Committer<RT> {
     async fn publish_commit_delta(
         distributed_log: Arc<dyn DistributedLog>,
         delta: CommitDelta,
+        origin: Option<RaftNatsOutboxOrigin>,
         path: &'static str,
     ) -> anyhow::Result<()> {
         let timer = metrics::commit_hot_path_stage_timer(path, "replication_publish");
         let delta_ts = delta.ts;
-        let result = distributed_log.publish(delta).await.with_context(|| {
+        let publish = async {
+            match origin {
+                Some(origin) => distributed_log.publish_with_origin(delta, origin).await,
+                None => distributed_log.publish(delta).await,
+            }
+        };
+        let result = publish.await.with_context(|| {
             format!(
                 "Failed to publish commit delta at ts={}",
                 u64::from(delta_ts)
@@ -4092,11 +4229,14 @@ impl<RT: Runtime> Committer<RT> {
     fn raft_apply_persistence_writes(
         marker: Option<RaftApplyMarker>,
         delta: Option<&CommitDelta>,
+        raft_nats_outbox_origin: Option<&RaftNatsOutboxOrigin>,
         raft_state_machine_index: Option<u64>,
     ) -> anyhow::Result<Vec<PersistenceGlobalWrite>> {
         let Some(marker) = marker else {
             anyhow::ensure!(
-                delta.is_none() && raft_state_machine_index.is_none(),
+                delta.is_none()
+                    && raft_nats_outbox_origin.is_none()
+                    && raft_state_machine_index.is_none(),
                 "Raft apply metadata supplied without an atomic apply marker",
             );
             return Ok(Vec::new());
@@ -4108,11 +4248,14 @@ impl<RT: Runtime> Committer<RT> {
         );
         let raft_state_machine_index = raft_state_machine_index
             .context("Raft apply marker supplied without a state-machine index")?;
-        Ok(vec![
-            marker.persistence_write()?,
-            Self::raft_nats_outbox_persistence_write(delta)?,
-            state_machine_index_persistence_write(raft_state_machine_index),
-        ])
+        let mut writes = vec![marker.persistence_write()?];
+        if let Some(origin) = raft_nats_outbox_origin {
+            writes.push(Self::raft_nats_outbox_persistence_write(delta, origin)?);
+        }
+        writes.push(state_machine_index_persistence_write(
+            raft_state_machine_index,
+        ));
+        Ok(writes)
     }
 
     fn raft_nats_outbox_key(ts: Timestamp) -> String {
@@ -4193,16 +4336,18 @@ impl<RT: Runtime> Committer<RT> {
     async fn add_raft_nats_outbox_delta(
         persistence: Arc<dyn Persistence>,
         delta: &CommitDelta,
+        origin: &RaftNatsOutboxOrigin,
     ) -> anyhow::Result<()> {
         let PersistenceGlobalWrite { key, value } =
-            Self::raft_nats_outbox_persistence_write(delta)?;
+            Self::raft_nats_outbox_persistence_write(delta, origin)?;
         persistence.write_persistence_global_raw(&key, value).await
     }
 
     fn raft_nats_outbox_persistence_write(
         delta: &CommitDelta,
+        origin: &RaftNatsOutboxOrigin,
     ) -> anyhow::Result<PersistenceGlobalWrite> {
-        let envelope = DeltaEnvelope::from_delta(delta, "", None)
+        let envelope = DeltaEnvelope::from_raft_nats_outbox(delta, origin)
             .context("Failed to encode Raft->NATS outbox delta")?;
         Ok(PersistenceGlobalWrite::new(
             Self::raft_nats_outbox_entry_key(delta)?,
@@ -4214,10 +4359,11 @@ impl<RT: Runtime> Committer<RT> {
     async fn record_raft_nats_outbox_delta(
         persistence: Arc<dyn Persistence>,
         delta: &CommitDelta,
+        origin: &RaftNatsOutboxOrigin,
         path: &'static str,
     ) -> anyhow::Result<()> {
         let timer = metrics::commit_hot_path_stage_timer(path, "raft_nats_outbox_record");
-        let result = Self::add_raft_nats_outbox_delta(persistence, delta).await;
+        let result = Self::add_raft_nats_outbox_delta(persistence, delta, origin).await;
         if result.is_ok() {
             timer.finish();
         }
@@ -4283,6 +4429,12 @@ impl<RT: Runtime> Committer<RT> {
                 .with_context(|| {
                     format!("Failed to parse Raft->NATS outbox delta {}", record.ts)
                 })?;
+            let origin = envelope.raft_nats_outbox_origin().with_context(|| {
+                format!(
+                    "Raft->NATS outbox delta {} is missing its origin",
+                    record.ts
+                )
+            })?;
             let delta = envelope.to_delta().with_context(|| {
                 format!("Failed to decode Raft->NATS outbox delta {}", record.ts)
             })?;
@@ -4292,8 +4444,13 @@ impl<RT: Runtime> Committer<RT> {
                 u64::from(record.ts),
                 u64::from(delta.ts),
             );
-            Self::publish_commit_delta(distributed_log.clone(), delta, "raft_nats_outbox_replay")
-                .await?;
+            Self::publish_commit_delta(
+                distributed_log.clone(),
+                delta,
+                Some(origin),
+                "raft_nats_outbox_replay",
+            )
+            .await?;
             Self::clear_raft_nats_outbox_record(
                 persistence.clone(),
                 &record,
@@ -4338,6 +4495,32 @@ impl<RT: Runtime> Committer<RT> {
         delta.source_partition.is_some() && self.distributed_log.requires_commit_outbox()
     }
 
+    fn raft_nats_outbox_origin(
+        &self,
+        delta: &CommitDelta,
+    ) -> anyhow::Result<Option<RaftNatsOutboxOrigin>> {
+        if !self.should_record_raft_nats_outbox_delta(delta) {
+            return Ok(None);
+        }
+        let raft_state = self
+            .raft_state
+            .as_ref()
+            .context("Raft->NATS outbox requested without Raft state")?;
+        let source_partition = delta
+            .source_partition
+            .context("Raft->NATS outbox delta is missing its source partition")?;
+        anyhow::ensure!(
+            source_partition == raft_state.partition_id(),
+            "Raft->NATS outbox delta partition {} does not match Raft partition {}",
+            source_partition.0,
+            raft_state.partition_id().0,
+        );
+        let source_node = self.distributed_log.source_node().context(
+            "Raft->NATS outbox transport did not expose its configured logical source node",
+        )?;
+        RaftNatsOutboxOrigin::new(source_node, raft_state.node_id(), source_partition).map(Some)
+    }
+
     fn should_replay_raft_nats_outbox(&self) -> bool {
         let Some(placement_state) = self.placement_state.as_ref() else {
             return false;
@@ -4345,7 +4528,9 @@ impl<RT: Runtime> Committer<RT> {
         if placement_state.num_partitions() <= 1 {
             return false;
         }
-        self.raft_state.as_ref().is_none_or(|raft_state| {
+        // Replaying before Raft attachment could clear records through the
+        // genesis gate without ever publishing them.
+        self.raft_state.as_ref().is_some_and(|raft_state| {
             raft_state.is_cluster_genesis_ready() && raft_state.is_leader_ready()
         })
     }
@@ -4353,6 +4538,7 @@ impl<RT: Runtime> Committer<RT> {
     fn propose_commit_to_raft_state(
         raft_state: Option<&crate::raft_partition::RaftPartitionState>,
         delta: &CommitDelta,
+        raft_nats_outbox_origin: Option<&RaftNatsOutboxOrigin>,
     ) -> anyhow::Result<RaftCommitWaiter> {
         let Some(raft) = raft_state else {
             return Ok(None);
@@ -4369,14 +4555,15 @@ impl<RT: Runtime> Committer<RT> {
                 raft.partition_id(),
             );
         }
-        let data = RaftStateMachineEntry::commit_delta(delta, raft.node_id())?
-            .to_bytes()
-            .with_context(|| {
-                format!(
-                    "Failed to serialize commit delta at ts={} for Raft proposal",
-                    u64::from(delta.ts),
-                )
-            })?;
+        let data =
+            RaftStateMachineEntry::commit_delta(delta, raft.node_id(), raft_nats_outbox_origin)?
+                .to_bytes()
+                .with_context(|| {
+                    format!(
+                        "Failed to serialize commit delta at ts={} for Raft proposal",
+                        u64::from(delta.ts),
+                    )
+                })?;
         let (tx, rx) = oneshot::channel();
         raft.send(crate::raft_node::RaftMessage::Propose(
             crate::raft_node::RaftProposal {
@@ -4394,8 +4581,17 @@ impl<RT: Runtime> Committer<RT> {
         Ok(Some(rx))
     }
 
-    fn propose_commit_to_raft(&self, delta: &CommitDelta) -> anyhow::Result<RaftCommitWaiter> {
-        Self::propose_commit_to_raft_state(self.raft_state.as_ref(), delta)
+    fn propose_commit_to_raft(
+        &self,
+        delta: &CommitDelta,
+    ) -> anyhow::Result<(RaftCommitWaiter, Option<RaftNatsOutboxOrigin>)> {
+        let raft_nats_outbox_origin = self.raft_nats_outbox_origin(delta)?;
+        let waiter = Self::propose_commit_to_raft_state(
+            self.raft_state.as_ref(),
+            delta,
+            raft_nats_outbox_origin.as_ref(),
+        )?;
+        Ok((waiter, raft_nats_outbox_origin))
     }
 
     fn propose_two_phase_prepare_to_raft(
@@ -4501,21 +4697,21 @@ impl<RT: Runtime> Committer<RT> {
             .map(|(_, update)| update.unpack())
             .collect();
         let table_mapping = new_snapshot.table_registry.table_mapping().clone();
-        let mut tablet_id_to_table_name = std::collections::BTreeMap::new();
+        let mut tablet_id_to_table_identity = std::collections::BTreeMap::new();
         let index_table_name: &TableName = &common::bootstrap_model::index::INDEX_TABLE;
         for update in &document_updates {
             let tablet_id = update.id.tablet_id;
-            insert_delta_table_mapping(&table_mapping, &mut tablet_id_to_table_name, tablet_id);
+            insert_delta_table_mapping(&table_mapping, &mut tablet_id_to_table_identity, tablet_id);
 
-            if tablet_id_to_table_name
+            if tablet_id_to_table_identity
                 .get(&tablet_id)
-                .is_some_and(|name| name == index_table_name)
+                .is_some_and(|identity| &identity.table_name == index_table_name)
             {
                 for document in update.old_document.iter().chain(update.new_document.iter()) {
                     if let Some(indexed_tablet_id) = index_metadata_tablet_id(document) {
                         insert_delta_table_mapping(
                             &table_mapping,
-                            &mut tablet_id_to_table_name,
+                            &mut tablet_id_to_table_identity,
                             indexed_tablet_id,
                         );
                     }
@@ -4529,7 +4725,7 @@ impl<RT: Runtime> Committer<RT> {
             index_writes,
             write_source,
             write_bytes,
-            tablet_id_to_table_name,
+            tablet_id_to_table_identity,
             source_partition,
         }
     }
@@ -4784,13 +4980,12 @@ impl<RT: Runtime> Committer<RT> {
         &mut self,
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
         raft_state_machine_index: Option<u64>,
         transport_id: Option<ReplicationTransportId>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         commit_id: usize,
     ) -> anyhow::Result<()> {
-        use std::collections::BTreeMap;
-
         use common::{
             bootstrap_model::tables::TABLES_TABLE,
             document::DocumentUpdate,
@@ -4800,6 +4995,28 @@ impl<RT: Runtime> Committer<RT> {
             },
         };
         use value::ResolvedDocumentId;
+
+        if let Err(error) = validate_delta_table_identities(&delta) {
+            let _ = result.send(Err(error));
+            return Ok(());
+        }
+
+        let raft_nats_outbox_origin = if mode == ReplicaDeltaApplyMode::FullRaftState
+            && !delta.document_updates.is_empty()
+            && self.should_record_raft_nats_outbox_delta(&delta)
+        {
+            let origin = raft_nats_outbox_origin
+                .context("Raft-applied data delta is missing its durable Raft->NATS origin")?;
+            anyhow::ensure!(
+                delta.source_partition == Some(origin.source_partition),
+                "Raft-applied delta partition {:?} does not match outbox origin partition {}",
+                delta.source_partition.map(|partition| partition.0),
+                origin.source_partition.0,
+            );
+            Some(origin)
+        } else {
+            None
+        };
 
         let raft_apply_marker = (mode == ReplicaDeltaApplyMode::FullRaftState
             && !delta.document_updates.is_empty())
@@ -4821,6 +5038,7 @@ impl<RT: Runtime> Committer<RT> {
                     Ok(PersistenceWrite::RaftReplayRecovery {
                         marker,
                         delta,
+                        raft_nats_outbox_origin,
                         raft_state_machine_index,
                         result,
                         commit_id,
@@ -4893,26 +5111,8 @@ impl<RT: Runtime> Committer<RT> {
             u64::from(remote_ts),
             u64::from(commit_ts),
             delta.document_updates.len(),
-            delta.tablet_id_to_table_name.len(),
+            delta.tablet_id_to_table_identity.len(),
         );
-
-        // Helper: build remap from current snapshot state.
-        let build_remap = |snapshot: &Snapshot,
-                           tablet_map: &BTreeMap<value::TabletId, value::TableName>|
-         -> BTreeMap<value::TabletId, value::TabletId> {
-            let mapping = snapshot.table_registry.table_mapping();
-            let mut remap = BTreeMap::new();
-            for (primary_id, name) in tablet_map {
-                for ns in mapping.namespaces_for_name(name) {
-                    let ns_mapping = mapping.namespace(ns);
-                    if let Ok(local_id) = ns_mapping.name_to_tablet()(name.clone()) {
-                        remap.insert(*primary_id, local_id);
-                        break;
-                    }
-                }
-            }
-            remap
-        };
 
         // Classify each update for the selected replication scope.
         //
@@ -4944,76 +5144,48 @@ impl<RT: Runtime> Committer<RT> {
         // Equivalent to CockroachDB's system.descriptor (schema definitions),
         // YugabyteDB's pg_proc (stored procedures), and TiDB's mysql.tidb
         // (DDL schema state).
-        let global_deployment_tables: &[&str] = &[
-            "_modules",         // JavaScript/TypeScript function source code
-            "_udf_config",      // UDF runtime configuration
-            "_source_packages", // Bundled source packages
-        ];
-        let is_global_deployment_table = |name: &value::TableName| -> bool {
-            let name_str = name.to_string();
-            global_deployment_tables.iter().any(|&t| name_str == t)
-        };
-
         let mut tables_updates = Vec::new();
         let mut other_updates = Vec::new();
         let mut skipped_system = 0usize;
 
         for update in &delta.document_updates {
             let primary_tablet = update.id.tablet_id;
-            let table_name = delta.tablet_id_to_table_name.get(&primary_tablet);
+            let table_identity = delta
+                .tablet_id_to_table_identity
+                .get(&primary_tablet)
+                .expect("delta identities were validated above");
+            let table_name = &table_identity.table_name;
 
             match mode {
                 ReplicaDeltaApplyMode::FullRaftState => {
-                    if table_name.map(|n| n == tables_table_name).unwrap_or(false) {
+                    if table_name == tables_table_name {
                         tables_updates.push(update);
                     } else {
                         other_updates.push(update);
                     }
                 },
                 ReplicaDeltaApplyMode::CrossPartitionReplica => {
-                    if table_name.map(|n| n == tables_table_name).unwrap_or(false) {
+                    if table_name == tables_table_name {
                         // _tables entry: kept for Phase 1 (user table creation).
                         // System table entries will be skipped in Phase 1 by the
                         // table_exists check.
                         tables_updates.push(update);
-                    } else if table_name.map(|n| n == index_table_name).unwrap_or(false) {
+                    } else if table_name == index_table_name {
                         // _index entry: check if it describes a user table index
                         // or a GLOBAL deployment table index.
-                        let is_replicated_index =
-                            update.new_document.as_ref().map_or(false, |doc| {
-                                doc.value()
-                                    .0
-                                    .get(&"table_id".parse::<common::types::FieldName>().unwrap())
-                                    .and_then(|v| {
-                                        if let value::ConvexValue::String(s) = v {
-                                            let tid: Result<value::TabletId, _> = s.parse();
-                                            tid.ok()
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .map_or(false, |tid| {
-                                        delta.tablet_id_to_table_name.get(&tid).map_or(
-                                            false,
-                                            |name| {
-                                                !name.is_system()
-                                                    || is_global_deployment_table(name)
-                                            },
-                                        )
-                                    })
-                            });
+                        let is_replicated_index = is_replicated_index_metadata_update(
+                            update,
+                            &delta.tablet_id_to_table_identity,
+                        );
                         if is_replicated_index {
                             other_updates.push(update);
                         } else {
                             skipped_system += 1;
                         }
-                    } else if table_name.map(|n| !n.is_system()).unwrap_or(false) {
+                    } else if !table_name.is_system() {
                         // User table data: replicate.
                         other_updates.push(update);
-                    } else if table_name
-                        .map(|n| is_global_deployment_table(n))
-                        .unwrap_or(false)
-                    {
+                    } else if is_global_deployment_table(table_name) {
                         // GLOBAL deployment system table: replicate.
                         // These contain function code and config needed by every node
                         // to execute queries and mutations (CockroachDB GLOBAL pattern).
@@ -5128,6 +5300,7 @@ impl<RT: Runtime> Committer<RT> {
                     Ok(PersistenceWrite::RaftReplayRecovery {
                         marker,
                         delta,
+                        raft_nats_outbox_origin,
                         raft_state_machine_index,
                         result,
                         commit_id,
@@ -5171,7 +5344,17 @@ impl<RT: Runtime> Committer<RT> {
         if !tables_updates.is_empty() {
             use value::DocumentObject;
 
-            let remap = build_remap(&snapshot, &delta.tablet_id_to_table_name);
+            let remap = match build_replica_tablet_remap(
+                snapshot.table_registry.table_mapping(),
+                &delta.tablet_id_to_table_identity,
+                tables_updates.iter().map(|update| update.id.tablet_id),
+            ) {
+                Ok(remap) => remap,
+                Err(error) => {
+                    let _ = result.send(Err(error));
+                    return Ok(());
+                },
+            };
 
             for update in &tables_updates {
                 let primary_tablet = update.id.tablet_id;
@@ -5266,18 +5449,45 @@ impl<RT: Runtime> Committer<RT> {
         }
 
         // Phase 2: Rebuild remap after table creation, apply remaining updates.
-        let remap = build_remap(&snapshot, &delta.tablet_id_to_table_name);
+        let mut required_tablets = BTreeSet::new();
+        for update in &other_updates {
+            let source_tablet = update.id.tablet_id;
+            required_tablets.insert(source_tablet);
+            let identity = delta
+                .tablet_id_to_table_identity
+                .get(&source_tablet)
+                .expect("delta identities were validated above");
+            if &identity.table_name == index_table_name {
+                for document in update.old_document.iter().chain(update.new_document.iter()) {
+                    if let Some(indexed_tablet) = index_metadata_tablet_id(document) {
+                        required_tablets.insert(indexed_tablet);
+                    }
+                }
+            }
+        }
+        let remap = match build_replica_tablet_remap(
+            snapshot.table_registry.table_mapping(),
+            &delta.tablet_id_to_table_identity,
+            required_tablets,
+        ) {
+            Ok(remap) => remap,
+            Err(error) => {
+                let _ = result.send(Err(error));
+                return Ok(());
+            },
+        };
         for update in &other_updates {
             let primary_tablet = update.id.tablet_id;
             let local_tablet = match remap.get(&primary_tablet) {
                 Some(t) => *t,
                 None => {
-                    let table_name = delta.tablet_id_to_table_name.get(&primary_tablet);
+                    let table_identity = delta.tablet_id_to_table_identity.get(&primary_tablet);
                     let err = anyhow::anyhow!(
-                        "Cannot apply replica delta at ts={} because table {:?} (TabletId {:?}) \
-                         is not mapped locally; retry after table metadata is available",
+                        "Cannot apply replica delta at ts={} because table identity {:?} \
+                         (TabletId {:?}) is not mapped locally; retry after table metadata is \
+                         available",
                         u64::from(remote_ts),
-                        table_name,
+                        table_identity,
                         primary_tablet,
                     );
                     let _ = result.send(Err(err));
@@ -5285,9 +5495,9 @@ impl<RT: Runtime> Committer<RT> {
                 },
             };
             let remapped = if delta
-                .tablet_id_to_table_name
+                .tablet_id_to_table_identity
                 .get(&primary_tablet)
-                .is_some_and(|name| name == index_table_name)
+                .is_some_and(|identity| &identity.table_name == index_table_name)
             {
                 let remapped = remap_index_metadata_update(
                     update,
@@ -5431,15 +5641,15 @@ impl<RT: Runtime> Committer<RT> {
         }
         self.applied_data_delta_ids
             .prune_origin_timestamps_below_watermarks(&self.applied_data_delta_watermarks);
-        let raft_nats_outbox_delta = (mode == ReplicaDeltaApplyMode::FullRaftState
-            && delta.source_partition.is_some())
-        .then(|| delta.clone());
+        let raft_apply_delta = raft_apply_marker.map(|_| delta.clone());
+        let raft_nats_outbox_delta = raft_nats_outbox_origin.as_ref().map(|_| delta.clone());
 
         let persistence = self.persistence.clone();
         let pause_client = self.runtime.pause_client();
         let raft_apply_writes = Self::raft_apply_persistence_writes(
             raft_apply_marker,
-            raft_nats_outbox_delta.as_ref(),
+            raft_apply_delta.as_ref(),
+            raft_nats_outbox_origin.as_ref(),
             raft_state_machine_index,
         )?;
         self.enqueue_snapshot(commit_id, commit_ts, snapshot.clone());
@@ -5496,6 +5706,7 @@ impl<RT: Runtime> Committer<RT> {
                     applied_data_delta_ids,
                     raft_apply_marker,
                     raft_nats_outbox_delta,
+                    raft_nats_outbox_origin,
                     raft_state_machine_index,
                     result,
                     commit_id,
@@ -6640,13 +6851,14 @@ impl<RT: Runtime> Committer<RT> {
             prepared.index_writes.clone(),
             source_partition,
         );
-        let raft_commit_waiter = match self.propose_commit_to_raft(&delta) {
-            Ok(waiter) => waiter,
-            Err(err) => {
-                let _ = result.send(Err(err));
-                return None;
-            },
-        };
+        let (raft_commit_waiter, raft_nats_outbox_origin) =
+            match self.propose_commit_to_raft(&delta) {
+                Ok(proposal) => proposal,
+                Err(err) => {
+                    let _ = result.send(Err(err));
+                    return None;
+                },
+            };
 
         self.prepared_commit_waiters
             .insert(transaction_id.clone(), vec![result]);
@@ -6692,6 +6904,7 @@ impl<RT: Runtime> Committer<RT> {
                             delta.write_source.clone(),
                             raft_apply_marker,
                             raft_apply_marker.map(|_| delta.clone()),
+                            raft_nats_outbox_origin.clone(),
                             raft_applied_index,
                         )
                         .in_span(Span::enter_with_local_parent(name)),
@@ -6719,6 +6932,7 @@ impl<RT: Runtime> Committer<RT> {
                             delta,
                             raft_applied_index,
                             raft_apply_marker,
+                            raft_nats_outbox_origin,
                         });
                     }
                 }
@@ -7083,23 +7297,24 @@ impl<RT: Runtime> Committer<RT> {
             index_writes,
             source_partition,
         );
-        let raft_commit_waiter = match self.propose_commit_to_raft(&delta) {
-            Ok(waiter) => waiter,
-            Err(err) => {
-                return Some(
-                    async move {
-                        Ok(PersistenceWrite::RejectedBeforePersistence {
-                            pending_write,
-                            commit_timer,
-                            result,
-                            commit_id,
-                            err,
-                        })
-                    }
-                    .boxed(),
-                );
-            },
-        };
+        let (raft_commit_waiter, raft_nats_outbox_origin) =
+            match self.propose_commit_to_raft(&delta) {
+                Ok(proposal) => proposal,
+                Err(err) => {
+                    return Some(
+                        async move {
+                            Ok(PersistenceWrite::RejectedBeforePersistence {
+                                pending_write,
+                                commit_timer,
+                                result,
+                                commit_id,
+                                err,
+                            })
+                        }
+                        .boxed(),
+                    );
+                },
+            };
 
         // necessary because this value is moved
         let parent_trace_copy = parent_trace.clone();
@@ -7150,6 +7365,7 @@ impl<RT: Runtime> Committer<RT> {
                             delta.write_source.clone(),
                             raft_apply_marker,
                             raft_apply_marker.map(|_| delta.clone()),
+                            raft_nats_outbox_origin.clone(),
                             raft_applied_index,
                         )
                         .in_span(Span::enter_with_local_parent(name)),
@@ -7180,6 +7396,7 @@ impl<RT: Runtime> Committer<RT> {
                             delta,
                             raft_applied_index,
                             raft_apply_marker,
+                            raft_nats_outbox_origin,
                         });
                     }
                 }
@@ -7589,6 +7806,7 @@ impl CommitterClient {
             ReplicaDeltaApplyMode::CrossPartitionReplica,
             None,
             None,
+            None,
         )
         .await
     }
@@ -7601,6 +7819,7 @@ impl CommitterClient {
         self.apply_delta_with_mode(
             delta,
             ReplicaDeltaApplyMode::CrossPartitionReplica,
+            None,
             None,
             Some(transport_id),
         )
@@ -7615,10 +7834,12 @@ impl CommitterClient {
         &self,
         raft_state_machine_index: u64,
         delta: CommitDelta,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
     ) -> anyhow::Result<Timestamp> {
         self.apply_delta_with_mode(
             delta,
             ReplicaDeltaApplyMode::FullRaftState,
+            raft_nats_outbox_origin,
             Some(raft_state_machine_index),
             None,
         )
@@ -7629,6 +7850,7 @@ impl CommitterClient {
         &self,
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
         raft_state_machine_index: Option<u64>,
         transport_id: Option<ReplicationTransportId>,
     ) -> anyhow::Result<Timestamp> {
@@ -7636,6 +7858,7 @@ impl CommitterClient {
         let message = CommitterMessage::ApplyReplicaDelta {
             delta,
             mode,
+            raft_nats_outbox_origin,
             raft_state_machine_index,
             transport_id,
             result: tx,
@@ -8367,6 +8590,7 @@ enum CommitterMessage {
     ApplyReplicaDelta {
         delta: CommitDelta,
         mode: ReplicaDeltaApplyMode,
+        raft_nats_outbox_origin: Option<RaftNatsOutboxOrigin>,
         raft_state_machine_index: Option<u64>,
         transport_id: Option<ReplicationTransportId>,
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
@@ -8511,6 +8735,32 @@ fn is_retryable_system_generated_id_conflict(
     document_exists && &**table_name == "_udf_config"
 }
 
+/// Deployment metadata that must travel with `_catalog_versions` during
+/// cross-partition replication. Publishing the active marker without any member
+/// of this set could make a remote node advertise a catalog whose executable
+/// metadata it does not have. The replicated marker records materialization,
+/// not local index-backfill readiness.
+const GLOBAL_DEPLOYMENT_TABLES: &[&str] = &[
+    "_auth",
+    "_canonical_urls",
+    "_catalog_versions",
+    "_component_definitions",
+    "_components",
+    "_environment_variables",
+    "_external_deps_packages",
+    "_function_handles",
+    "_modules",
+    "_schemas",
+    "_source_packages",
+    "_udf_config",
+];
+
+fn is_global_deployment_table(name: &TableName) -> bool {
+    GLOBAL_DEPLOYMENT_TABLES
+        .iter()
+        .any(|table| *table == &**name)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -8563,12 +8813,17 @@ mod tests {
         InternalId,
         PublicDocumentId,
         ResolvedDocumentId,
+        TableMapping,
         TableName,
+        TableNamespace,
         TableNumber,
         TabletId,
     };
 
     use super::{
+        build_replica_tablet_remap,
+        is_global_deployment_table,
+        is_replicated_index_metadata_update,
         is_retryable_system_generated_id_conflict,
         remap_index_metadata_update,
         replica_delta_timestamps,
@@ -8582,7 +8837,9 @@ mod tests {
     use crate::{
         commit_delta::{
             CommitDelta,
+            DeltaTableIdentity,
             DistributedLog,
+            RaftNatsOutboxOrigin,
             ReplicationMessage,
             ReplicationTransportId,
         },
@@ -8596,6 +8853,7 @@ mod tests {
     struct RecordingDistributedLog {
         fail_publishes: AtomicBool,
         published: parking_lot::Mutex<Vec<Timestamp>>,
+        published_origins: parking_lot::Mutex<Vec<RaftNatsOutboxOrigin>>,
     }
 
     struct FailTimestampDistributedLog {
@@ -8649,6 +8907,7 @@ mod tests {
             Self {
                 fail_publishes: AtomicBool::new(true),
                 published: parking_lot::Mutex::new(Vec::new()),
+                published_origins: parking_lot::Mutex::new(Vec::new()),
             }
         }
 
@@ -8658,6 +8917,10 @@ mod tests {
 
         fn published(&self) -> Vec<Timestamp> {
             self.published.lock().clone()
+        }
+
+        fn published_origins(&self) -> Vec<RaftNatsOutboxOrigin> {
+            self.published_origins.lock().clone()
         }
     }
 
@@ -8745,6 +9008,19 @@ mod tests {
             Ok(())
         }
 
+        async fn publish_with_origin(
+            &self,
+            delta: CommitDelta,
+            origin: RaftNatsOutboxOrigin,
+        ) -> anyhow::Result<()> {
+            if self.fail_publishes.load(Ordering::SeqCst) {
+                anyhow::bail!("injected publish failure");
+            }
+            self.published.lock().push(delta.ts);
+            self.published_origins.lock().push(origin);
+            Ok(())
+        }
+
         async fn subscribe(
             &self,
             _from_ts: Timestamp,
@@ -8789,16 +9065,50 @@ mod tests {
     }
 
     fn test_outbox_delta(ts: Timestamp) -> CommitDelta {
+        let tablet_id = test_tablet(71);
+        let document = ResolvedDocument::new(
+            test_resolved_id(tablet_id, 10_001, 72).expect("valid outbox document ID"),
+            CreationTime::ONE,
+            value::assert_obj!("body" => "durable outbox payload"),
+        )
+        .expect("valid outbox document");
         CommitDelta {
             ts,
             document_writes: Arc::new(Vec::new()),
-            document_updates: Vec::new(),
+            document_updates: vec![DocumentUpdate {
+                id: document.id(),
+                old_document: None,
+                new_document: Some(document),
+            }],
             index_writes: Arc::new(Vec::new()),
             write_source: WriteSource::new("test_outbox_delta"),
-            write_bytes: 0,
-            tablet_id_to_table_name: Default::default(),
+            write_bytes: 64,
+            tablet_id_to_table_identity: BTreeMap::from([(
+                tablet_id,
+                DeltaTableIdentity::new(
+                    TableNamespace::Global,
+                    "messages".parse().expect("valid user table name"),
+                ),
+            )]),
             source_partition: Some(PartitionId(0)),
         }
+    }
+
+    fn test_outbox_origin() -> RaftNatsOutboxOrigin {
+        RaftNatsOutboxOrigin::new("node-p0a".to_string(), 1, PartitionId(0))
+            .expect("valid test outbox origin")
+    }
+
+    async fn add_test_outbox_delta(
+        persistence: Arc<dyn Persistence>,
+        ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
+            persistence,
+            &test_outbox_delta(ts),
+            &test_outbox_origin(),
+        )
+        .await
     }
 
     fn test_tablet(byte: u8) -> TabletId {
@@ -8926,6 +9236,36 @@ mod tests {
     }
 
     #[test]
+    fn replicated_index_metadata_deletion_is_classified_and_remapped() -> anyhow::Result<()> {
+        let source_index_tablet = test_tablet(31);
+        let local_index_tablet = test_tablet(32);
+        let source_user_tablet = test_tablet(33);
+        let local_user_tablet = test_tablet(34);
+        let mut deletion = test_index_metadata_update(source_index_tablet, 2, source_user_tablet)?;
+        deletion.old_document = deletion.new_document.take();
+
+        let tablet_id_to_table_identity = BTreeMap::from([(
+            source_user_tablet,
+            DeltaTableIdentity::new(TableNamespace::Global, "messages".parse::<TableName>()?),
+        )]);
+        assert!(is_replicated_index_metadata_update(
+            &deletion,
+            &tablet_id_to_table_identity,
+        ));
+
+        let tablet_remap = BTreeMap::from([(source_user_tablet, local_user_tablet)]);
+        let remapped =
+            remap_index_metadata_update(&deletion, local_index_tablet, &tablet_remap, true)?;
+
+        assert_eq!(remapped.id.tablet_id, local_index_tablet);
+        assert!(remapped.new_document.is_none());
+        let metadata =
+            TabletIndexMetadata::from_document(remapped.old_document.unwrap())?.into_value();
+        assert_eq!(*metadata.name.table(), local_user_tablet);
+        Ok(())
+    }
+
+    #[test]
     fn replica_delta_timestamps_distinguish_origin_from_local_apply_ts() -> anyhow::Result<()> {
         let timestamps = replica_delta_timestamps(
             Timestamp::must(10),
@@ -8976,11 +9316,17 @@ mod tests {
         let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
         let log = Arc::new(RecordingDistributedLog::default());
         let ts = Timestamp::must(10);
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(ts),
-        )
-        .await?;
+        let expected_origin = test_outbox_origin();
+        add_test_outbox_delta(persistence.clone(), ts).await?;
+
+        let persisted =
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence.clone()).await?;
+        assert_eq!(persisted.len(), 1);
+        let envelope: DeltaEnvelope = serde_json::from_value(persisted[0].value.clone())?;
+        assert_eq!(envelope.raft_nats_outbox_origin()?, expected_origin);
+        let decoded = envelope.to_delta()?;
+        assert_eq!(decoded.source_partition, Some(PartitionId(0)));
+        assert_eq!(decoded.document_updates.len(), 1);
 
         let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
             persistence.clone(),
@@ -8990,6 +9336,7 @@ mod tests {
 
         assert_eq!(replayed, 1);
         assert_eq!(log.published(), vec![ts]);
+        assert_eq!(log.published_origins(), vec![expected_origin]);
         assert!(
             Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
                 .await?
@@ -9003,11 +9350,7 @@ mod tests {
         let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
         let log = Arc::new(BlockingDistributedLog::new());
         let ts = Timestamp::must(10);
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(ts),
-        )
-        .await?;
+        add_test_outbox_delta(persistence.clone(), ts).await?;
         let in_progress = Arc::new(AtomicBool::new(false));
 
         assert!(
@@ -9056,16 +9399,8 @@ mod tests {
         let ts_2 = Timestamp::must(2);
         let ts_10 = Timestamp::must(10);
 
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(ts_10),
-        )
-        .await?;
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(ts_2),
-        )
-        .await?;
+        add_test_outbox_delta(persistence.clone(), ts_10).await?;
+        add_test_outbox_delta(persistence.clone(), ts_2).await?;
 
         let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
             persistence.clone(),
@@ -9089,16 +9424,8 @@ mod tests {
         let ts_2 = Timestamp::must(2);
         let ts_10 = Timestamp::must(10);
 
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(ts_10),
-        )
-        .await?;
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(ts_2),
-        )
-        .await?;
+        add_test_outbox_delta(persistence.clone(), ts_10).await?;
+        add_test_outbox_delta(persistence.clone(), ts_2).await?;
 
         assert!(
             persistence
@@ -9125,11 +9452,7 @@ mod tests {
         let backlog_len = 256;
 
         for ts in 1..=backlog_len {
-            Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-                persistence.clone(),
-                &test_outbox_delta(Timestamp::must(ts)),
-            )
-            .await?;
+            add_test_outbox_delta(persistence.clone(), Timestamp::must(ts)).await?;
         }
 
         let raw_records = persistence
@@ -9175,37 +9498,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raft_nats_outbox_replays_and_clears_legacy_blob() -> anyhow::Result<()> {
+    async fn outbox_missing_origin_fails_closed_and_stays_durable() -> anyhow::Result<()> {
         let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
         let log = Arc::new(RecordingDistributedLog::default());
         let ts = Timestamp::must(12);
-        let envelope = DeltaEnvelope::from_delta(&test_outbox_delta(ts), "", None)?;
-        let legacy_records = BTreeMap::from([(
-            Committer::<TestRuntime>::raft_nats_outbox_key(ts),
-            serde_json::to_value(envelope)?,
-        )]);
+        let delta = test_outbox_delta(ts);
+        let envelope = DeltaEnvelope::from_raft_nats_outbox(&delta, &test_outbox_origin())?;
+        let mut persisted = serde_json::to_value(envelope)?;
+        persisted["source_node"] = serde_json::json!("");
+        persisted["source_raft_node_id"] = serde_json::Value::Null;
+        let key = Committer::<TestRuntime>::raft_nats_outbox_entry_key(&delta)?;
         persistence
-            .write_persistence_global(
-                PersistenceGlobalKey::RaftNatsOutbox,
-                serde_json::to_value(legacy_records)?,
-            )
+            .write_persistence_global_raw(&key, persisted)
             .await?;
 
-        let replayed = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
+        let error = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
             persistence.clone(),
             log.clone(),
         )
-        .await?;
+        .await
+        .expect_err("outbox replay must reject a record without its durable origin");
 
-        assert_eq!(replayed, 1);
-        assert_eq!(log.published(), vec![ts]);
         assert!(
-            persistence
-                .reader()
-                .get_persistence_global(PersistenceGlobalKey::RaftNatsOutbox)
+            format!("{error:#}").contains("missing its origin"),
+            "{error:#}",
+        );
+        assert!(log.published().is_empty());
+        assert_eq!(
+            Committer::<TestRuntime>::load_raft_nats_outbox_records(persistence)
                 .await?
-                .is_none(),
-            "legacy aggregate blob should be deleted after its final record replays",
+                .len(),
+            1,
+            "an invalid record must remain durable for operator recovery",
         );
         Ok(())
     }
@@ -9217,16 +9541,8 @@ mod tests {
         let newer_ts = Timestamp::must(10);
         let log = Arc::new(FailTimestampDistributedLog::new(older_ts));
 
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(newer_ts),
-        )
-        .await?;
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(older_ts),
-        )
-        .await?;
+        add_test_outbox_delta(persistence.clone(), newer_ts).await?;
+        add_test_outbox_delta(persistence.clone(), older_ts).await?;
 
         let err = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
             persistence.clone(),
@@ -9256,11 +9572,7 @@ mod tests {
         let persistence: Arc<dyn Persistence> = Arc::new(TestPersistence::new());
         let log = Arc::new(RecordingDistributedLog::failing());
         let ts = Timestamp::must(11);
-        Committer::<TestRuntime>::add_raft_nats_outbox_delta(
-            persistence.clone(),
-            &test_outbox_delta(ts),
-        )
-        .await?;
+        add_test_outbox_delta(persistence.clone(), ts).await?;
 
         let err = Committer::<TestRuntime>::replay_raft_nats_outbox_once(
             persistence.clone(),
@@ -9302,6 +9614,7 @@ mod tests {
         Committer::<TestRuntime>::record_raft_nats_outbox_delta(
             persistence.clone(),
             &test_outbox_delta(ts),
+            &test_outbox_origin(),
             "test",
         )
         .await?;
@@ -9348,6 +9661,117 @@ mod tests {
         assert!(!is_retryable_system_generated_id_conflict(
             &udf_table, false
         ));
+    }
+
+    #[test]
+    fn catalog_activation_metadata_is_global_cross_partition_state() {
+        for table in [
+            "_auth",
+            "_canonical_urls",
+            "_catalog_versions",
+            "_component_definitions",
+            "_components",
+            "_environment_variables",
+            "_external_deps_packages",
+            "_function_handles",
+            "_modules",
+            "_schemas",
+            "_source_packages",
+            "_udf_config",
+        ] {
+            let table_name = TableName::from_str(table).unwrap();
+            assert!(
+                is_global_deployment_table(&table_name),
+                "{table} must replicate with the catalog activation marker"
+            );
+        }
+    }
+
+    #[test]
+    fn component_catalog_tablets_remap_by_stable_namespace_identity() -> anyhow::Result<()> {
+        let child_a = TableNamespace::ByComponent(PublicDocumentId::new(
+            TableNumber::try_from(10_001u32)?,
+            InternalId([0xa1; 16]),
+        ));
+        let child_b = TableNamespace::ByComponent(PublicDocumentId::new(
+            TableNumber::try_from(10_001u32)?,
+            InternalId([0xb2; 16]),
+        ));
+        let namespaces = [TableNamespace::Global, child_a, child_b];
+        let table_names = ["_modules", "_schemas", "_source_packages", "_udf_config"];
+        let mut local_mapping = TableMapping::new();
+        let mut source_identities = BTreeMap::new();
+        let mut expected_remap = BTreeMap::new();
+        let mut next_id = 1u8;
+
+        for table_name in table_names {
+            let table_name: TableName = table_name.parse()?;
+            for namespace in namespaces {
+                let source_tablet = test_tablet(next_id);
+                next_id += 1;
+                let local_tablet = test_tablet(next_id);
+                next_id += 1;
+                local_mapping.insert(
+                    local_tablet,
+                    namespace,
+                    TableNumber::try_from(20_000u32 + u32::from(next_id))?,
+                    table_name.clone(),
+                );
+                source_identities.insert(
+                    source_tablet,
+                    DeltaTableIdentity::new(namespace, table_name.clone()),
+                );
+                expected_remap.insert(source_tablet, local_tablet);
+            }
+        }
+
+        let remap = build_replica_tablet_remap(
+            &local_mapping,
+            &source_identities,
+            source_identities.keys().copied(),
+        )?;
+        assert_eq!(remap, expected_remap);
+        Ok(())
+    }
+
+    #[test]
+    fn component_catalog_remap_never_falls_back_to_same_named_root_table() -> anyhow::Result<()> {
+        let table_name: TableName = "_modules".parse()?;
+        let local_root_tablet = test_tablet(1);
+        let source_child_tablet = test_tablet(2);
+        let child_namespace = TableNamespace::ByComponent(PublicDocumentId::new(
+            TableNumber::try_from(10_001u32)?,
+            InternalId([0xc3; 16]),
+        ));
+        let mut local_mapping = TableMapping::new();
+        local_mapping.insert(
+            local_root_tablet,
+            TableNamespace::Global,
+            TableNumber::try_from(20_001u32)?,
+            table_name.clone(),
+        );
+        let source_identities = BTreeMap::from([(
+            source_child_tablet,
+            DeltaTableIdentity::new(child_namespace, table_name),
+        )]);
+
+        let error =
+            build_replica_tablet_remap(&local_mapping, &source_identities, [source_child_tablet])
+                .expect_err("a missing child namespace must not resolve to the root component");
+        assert!(error.to_string().contains("No local table matches"));
+        Ok(())
+    }
+
+    #[test]
+    fn node_local_worker_state_is_not_catalog_metadata() {
+        // Cron definitions are already bound into the catalog manifest through analyzed
+        // modules. These rows contain mutable scheduler state (`nextTs`,
+        // claims, and execution progress), so replicating them as catalog
+        // metadata would create multiple scheduling authorities.
+        for table in ["_cron_jobs", "_scheduled_jobs", "_backend_state"] {
+            let table_name = TableName::from_str(table).unwrap();
+            assert!(!is_global_deployment_table(&table_name));
+        }
     }
 }
 

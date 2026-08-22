@@ -11,7 +11,10 @@ use async_zip_0_0_9::{
     ZipEntryBuilder,
     ZipEntryBuilderExt,
 };
-use bytes::Bytes;
+use bytes::{
+    Bytes,
+    BytesMut,
+};
 use common::{
     sha256::{
         Sha256,
@@ -50,7 +53,10 @@ use crate::{
         ModuleConfig,
     },
     modules::module_versions::ModuleSource,
-    source_packages::types::PackageSize,
+    source_packages::types::{
+        PackageSize,
+        MAX_ZIPPED_PACKAGES_SIZE,
+    },
 };
 
 #[derive(Debug)]
@@ -162,14 +168,62 @@ pub async fn upload_package(
 pub async fn download_package(
     storage: Arc<dyn Storage>,
     key: ObjectKey,
-    // TODO: Check that the hash matches.
-    _digest: Sha256Digest,
+    expected_digest: Sha256Digest,
 ) -> anyhow::Result<BTreeMap<CanonicalizedModulePath, ModuleConfig>> {
     let stream = storage
         .get(&key)
         .await?
         .context(format!("Src Pkg storage key not found?? {key:?}"))?;
-    let mut reader = ZipFileReader::new(stream.into_tokio_reader());
+    let storage::StorageGetStream {
+        content_length,
+        mut stream,
+    } = stream;
+    let expected_length: usize = content_length
+        .try_into()
+        .context("Source package content length cannot be negative")?;
+    anyhow::ensure!(
+        expected_length < MAX_ZIPPED_PACKAGES_SIZE,
+        "Source package download is too large: {expected_length} bytes",
+    );
+    let mut downloaded = BytesMut::with_capacity(expected_length);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let downloaded_length = downloaded
+            .len()
+            .checked_add(chunk.len())
+            .context("Source package download length overflow")?;
+        anyhow::ensure!(
+            downloaded_length < MAX_ZIPPED_PACKAGES_SIZE,
+            "Source package download exceeded the maximum zipped size",
+        );
+        downloaded.extend_from_slice(&chunk);
+    }
+    anyhow::ensure!(
+        downloaded.len() == expected_length,
+        "Source package content length mismatch: expected {expected_length}, downloaded {}",
+        downloaded.len(),
+    );
+    let downloaded = downloaded.freeze();
+    let actual_digest = Sha256::hash(&downloaded);
+    anyhow::ensure!(
+        actual_digest == expected_digest,
+        "Source package SHA-256 mismatch for {key:?}: expected {}, downloaded {}",
+        expected_digest.as_hex(),
+        actual_digest.as_hex(),
+    );
+
+    // Parse exactly the byte sequence whose digest was verified above. Keeping
+    // the verified object in memory also avoids a check/use race if an object
+    // store implementation permits replacement under the same key.
+    let stream =
+        futures::stream::once(async move { Ok::<Bytes, std::io::Error>(downloaded) }).boxed();
+    let mut reader = ZipFileReader::new(
+        storage::StorageGetStream {
+            content_length,
+            stream,
+        }
+        .into_tokio_reader(),
+    );
 
     let mut source = BTreeMap::new();
     let mut source_maps = BTreeMap::new();
