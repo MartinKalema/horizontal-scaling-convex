@@ -599,6 +599,7 @@ mod tests {
     };
 
     use common::types::Timestamp;
+    use futures::stream::BoxStream;
     use value::TableName;
 
     use crate::{
@@ -607,9 +608,26 @@ mod tests {
             ClusterGenesisGatedDistributedLog,
             CommitDelta,
             DistributedLog,
+            ReplicationMessage,
         },
         write_log::WriteSource,
     };
+
+    struct OutboxRequiringDistributedLog(Arc<InMemoryDistributedLog>);
+
+    #[async_trait::async_trait]
+    impl DistributedLog for OutboxRequiringDistributedLog {
+        async fn publish(&self, delta: CommitDelta) -> anyhow::Result<()> {
+            self.0.publish(delta).await
+        }
+
+        async fn subscribe(
+            &self,
+            from_ts: Timestamp,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ReplicationMessage>>> {
+            self.0.subscribe(from_ts).await
+        }
+    }
 
     fn test_delta() -> CommitDelta {
         CommitDelta {
@@ -626,18 +644,19 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_genesis_gate_suppresses_candidate_deltas() {
-        let inner = Arc::new(InMemoryDistributedLog::new());
+        let published = Arc::new(InMemoryDistributedLog::new());
+        let inner = Arc::new(OutboxRequiringDistributedLog(published.clone()));
         let ready = Arc::new(AtomicBool::new(false));
-        let gated = ClusterGenesisGatedDistributedLog::new(inner.clone(), ready.clone());
+        let gated = ClusterGenesisGatedDistributedLog::new(inner, ready.clone());
 
         assert!(!gated.requires_commit_outbox());
         gated.publish(test_delta()).await.unwrap();
-        assert!(inner.deltas().is_empty());
+        assert!(published.deltas().is_empty());
 
         ready.store(true, Ordering::SeqCst);
         assert!(gated.requires_commit_outbox());
         gated.publish(test_delta()).await.unwrap();
-        assert_eq!(inner.deltas().len(), 1);
+        assert_eq!(published.deltas().len(), 1);
     }
 
     #[test]
