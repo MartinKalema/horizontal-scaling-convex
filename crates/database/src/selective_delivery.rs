@@ -1,3 +1,13 @@
+//! Coarse table-level selective-delivery hints for the current NATS shadow
+//! path.
+//!
+//! This TTL registry is not a reactive-invalidation correctness authority: an
+//! expired or delayed entry may omit a node. Runtime fanout must therefore not
+//! rely on it until the replay-safe owner registration protocol in
+//! `delta_interest` is durably integrated end to end. Runtime cutover also
+//! requires durable owner state/delivery, owner fencing, a multi-owner
+//! activation barrier, and catalog-version transition handling.
+
 use std::{
     collections::{
         BTreeMap,
