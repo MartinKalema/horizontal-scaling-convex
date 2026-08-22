@@ -4528,7 +4528,9 @@ impl<RT: Runtime> Committer<RT> {
         if placement_state.num_partitions() <= 1 {
             return false;
         }
-        self.raft_state.as_ref().is_none_or(|raft_state| {
+        // Replaying before Raft attachment could clear records through the
+        // genesis gate without ever publishing them.
+        self.raft_state.as_ref().is_some_and(|raft_state| {
             raft_state.is_cluster_genesis_ready() && raft_state.is_leader_ready()
         })
     }

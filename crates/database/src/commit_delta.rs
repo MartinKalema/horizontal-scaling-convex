@@ -443,7 +443,9 @@ impl ClusterGenesisGatedDistributedLog {
 #[async_trait]
 impl DistributedLog for ClusterGenesisGatedDistributedLog {
     fn requires_commit_outbox(&self) -> bool {
-        self.inner.requires_commit_outbox()
+        // Candidate bootstrap state must be neither published nor retained for
+        // publication after canonical genesis is selected.
+        self.ready.load(Ordering::SeqCst) && self.inner.requires_commit_outbox()
     }
 
     fn source_node(&self) -> Option<String> {
@@ -628,10 +630,12 @@ mod tests {
         let ready = Arc::new(AtomicBool::new(false));
         let gated = ClusterGenesisGatedDistributedLog::new(inner.clone(), ready.clone());
 
+        assert!(!gated.requires_commit_outbox());
         gated.publish(test_delta()).await.unwrap();
         assert!(inner.deltas().is_empty());
 
         ready.store(true, Ordering::SeqCst);
+        assert!(gated.requires_commit_outbox());
         gated.publish(test_delta()).await.unwrap();
         assert_eq!(inner.deltas().len(), 1);
     }
