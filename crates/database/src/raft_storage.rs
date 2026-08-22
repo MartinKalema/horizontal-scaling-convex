@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use parking_lot::RwLock;
 use raft::{
     prelude::*,
     GetEntriesContext,
@@ -94,7 +95,7 @@ pub struct ConvexRaftStorage {
     engine: Arc<Engine>,
     /// Cached ConfState for the Storage trait (raft-engine doesn't track this
     /// separately from entries, so we cache it in memory and persist to KV).
-    conf_state: ConfState,
+    conf_state: Arc<RwLock<ConfState>>,
     /// Hook for generating state-machine snapshots on demand.
     snapshot_provider: Option<Arc<dyn RaftSnapshotProvider>>,
     #[cfg(test)]
@@ -160,7 +161,7 @@ impl ConvexRaftStorage {
         Ok(Self {
             partition_id,
             engine,
-            conf_state,
+            conf_state: Arc::new(RwLock::new(conf_state)),
             snapshot_provider,
             #[cfg(test)]
             fail_next_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -297,8 +298,48 @@ impl ConvexRaftStorage {
         self.engine
             .write(&mut batch, true)
             .context("Failed to write ConfState to raft-engine")?;
-        self.conf_state = cs;
+        *self.conf_state.write() = cs;
         Ok(())
+    }
+
+    /// Atomically persist a committed membership configuration and the Raft
+    /// index at which it became applied.
+    ///
+    /// A configuration change is itself part of the replicated state machine.
+    /// Persisting these values separately could leave a restarted node with the
+    /// new membership but an applied index that causes the same change to
+    /// replay.
+    pub fn set_conf_state_and_applied_index(
+        &mut self,
+        cs: ConfState,
+        index: u64,
+    ) -> anyhow::Result<()> {
+        self.check_fail_next_write_for_test()?;
+        anyhow::ensure!(
+            index >= self.applied_index()?,
+            "Cannot move Raft applied index backwards while persisting ConfState"
+        );
+
+        let mut batch = LogBatch::default();
+        batch
+            .put_message(self.region_id(), CONF_STATE_KEY.to_vec(), &cs)
+            .context("Failed to add ConfState to LogBatch")?;
+        batch
+            .put(
+                self.region_id(),
+                APPLIED_INDEX_KEY.to_vec(),
+                index.to_be_bytes().to_vec(),
+            )
+            .context("Failed to add configuration applied index to LogBatch")?;
+        self.engine
+            .write(&mut batch, true)
+            .context("Failed to write ConfState and applied index to raft-engine")?;
+        *self.conf_state.write() = cs;
+        Ok(())
+    }
+
+    pub fn conf_state(&self) -> ConfState {
+        self.conf_state.read().clone()
     }
 
     fn persisted_snapshot(&self) -> anyhow::Result<Option<Snapshot>> {
@@ -444,7 +485,7 @@ impl ConvexRaftStorage {
         let pending =
             Self::commit_pending_snapshot_install_to_engine(&self.engine, self.region_id())?;
         let metadata = pending.snapshot.get_metadata();
-        self.conf_state = metadata.get_conf_state().clone();
+        *self.conf_state.write() = metadata.get_conf_state().clone();
         Ok(metadata.index)
     }
 
@@ -508,7 +549,7 @@ impl Storage for ConvexRaftStorage {
 
         Ok(RaftState {
             hard_state: hs,
-            conf_state: self.conf_state.clone(),
+            conf_state: self.conf_state(),
         })
     }
 
@@ -633,7 +674,7 @@ impl Storage for ConvexRaftStorage {
         let mut metadata = SnapshotMetadata::default();
         metadata.index = snapshot_index;
         metadata.term = snapshot_term;
-        metadata.set_conf_state(self.conf_state.clone());
+        metadata.set_conf_state(self.conf_state());
 
         let mut snapshot = Snapshot::default();
         snapshot.set_metadata(metadata);
@@ -729,6 +770,39 @@ mod tests {
         let state = storage.initial_state().unwrap();
         let voters = state.conf_state.get_voters().to_vec();
         assert_eq!(voters, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_clones_share_configuration_updates_and_snapshot_membership() {
+        let engine = test_engine();
+        let mut node_storage =
+            ConvexRaftStorage::new(PartitionId(0), engine, 1, vec![1], None).unwrap();
+        let mut raw_node_storage = node_storage.clone();
+
+        node_storage
+            .set_conf_state_and_applied_index(ConfState::from((vec![1, 2], vec![])), 1)
+            .unwrap();
+        assert_eq!(
+            raw_node_storage
+                .initial_state()
+                .unwrap()
+                .conf_state
+                .get_voters(),
+            &[1, 2]
+        );
+
+        raw_node_storage
+            .apply_snapshot(&test_snapshot(2, 2, vec![2, 3]))
+            .unwrap();
+        assert_eq!(
+            node_storage
+                .initial_state()
+                .unwrap()
+                .conf_state
+                .get_voters(),
+            &[2, 3]
+        );
+        assert_eq!(node_storage.applied_index().unwrap(), 2);
     }
 
     #[test]

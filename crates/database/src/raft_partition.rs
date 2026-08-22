@@ -64,6 +64,14 @@ use crate::{
     timestamp_oracle::TimestampOracle,
 };
 
+fn leader_serving_lease_deadline_callback(
+    valid_until: Arc<Mutex<Option<Instant>>>,
+) -> Box<dyn FnMut(Instant) + Send> {
+    Box::new(move |proven_valid_until| {
+        *valid_until.lock() = Some(proven_valid_until);
+    })
+}
+
 /// Identifies one elected coordinator leadership generation.
 ///
 /// Raft terms are monotonic for a partition, and pairing the term with the
@@ -108,7 +116,8 @@ pub struct RaftPartitionState {
     partition_id: PartitionId,
     /// This node's ID within the Raft group.
     node_id: u64,
-    /// Local serving lease for coordinator-owned reads/subscriptions.
+    /// Absolute Raft-proven serving deadline for coordinator-owned
+    /// reads/subscriptions.
     leader_serving_lease_valid_until: Arc<Mutex<Option<Instant>>>,
     /// Cluster-wide genesis has been installed by every configured partition.
     cluster_genesis_ready: Arc<AtomicBool>,
@@ -358,7 +367,6 @@ impl RaftPartitionManager {
         let leader_id = Arc::new(AtomicU64::new(0));
         let leader_term = Arc::new(AtomicU64::new(0));
         let leader_serving_lease_valid_until = Arc::new(Mutex::new(None));
-        let leader_serving_lease_duration = config.leader_serving_lease_duration();
 
         // Set up leadership callbacks that update shared atomic state.
         let is_leader_cb = is_leader.clone();
@@ -366,7 +374,6 @@ impl RaftPartitionManager {
         let leader_term_became_leader = leader_term.clone();
         let serving_lease_became_leader = leader_serving_lease_valid_until.clone();
         let serving_lease_refresh = leader_serving_lease_valid_until.clone();
-        let serving_lease_duration_refresh = leader_serving_lease_duration;
         let partition_id = config.partition_id;
         let tso_became_leader = timestamp_oracle.clone();
 
@@ -419,10 +426,9 @@ impl RaftPartitionManager {
                     );
                 }
             }),
-            on_leader_serving_lease_refreshed: Box::new(move || {
-                *serving_lease_refresh.lock() =
-                    Some(Instant::now() + serving_lease_duration_refresh);
-            }),
+            on_leader_serving_lease_refreshed: leader_serving_lease_deadline_callback(
+                serving_lease_refresh,
+            ),
             on_leader_changed: Box::new({
                 let leader_id_changed = leader_id.clone();
                 let partition_id_changed = partition_id;
@@ -547,6 +553,29 @@ mod tests {
         assert_eq!(state.partition_id(), PartitionId(0));
     }
 
+    #[test]
+    fn delayed_serving_lease_callback_does_not_extend_proven_deadline() {
+        let state = RaftPartitionState::new_for_test(true, 1, PartitionId(0), 1);
+        let callback_handled_at = Instant::now();
+        let evidence_observed_at = callback_handled_at - std::time::Duration::from_secs(10);
+        let proven_valid_until = evidence_observed_at + std::time::Duration::from_secs(1);
+        assert!(proven_valid_until < callback_handled_at);
+
+        let mut callback =
+            leader_serving_lease_deadline_callback(state.leader_serving_lease_valid_until.clone());
+        callback(proven_valid_until);
+
+        assert_eq!(
+            *state.leader_serving_lease_valid_until.lock(),
+            Some(proven_valid_until),
+            "delayed callback handling must install Raft's absolute deadline unchanged"
+        );
+        assert!(
+            !state.has_leader_serving_lease(),
+            "an already-expired Raft lease must not become valid again when handled later"
+        );
+    }
+
     #[tokio::test]
     async fn test_leadership_updates_shared_state() {
         let config = RaftNodeConfig {
@@ -568,6 +597,9 @@ mod tests {
         for _ in 0..20 {
             node.raw_node.tick();
         }
+        node.process_ready_test();
+        // The first Ready makes the leader application-ready and starts the
+        // Safe ReadIndex round; the next Ready delivers its ReadState.
         node.process_ready_test();
 
         // The shared state should now reflect leadership.
